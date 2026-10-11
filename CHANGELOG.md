@@ -3,6 +3,12 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## Unreleased
+
+- More npm keywords, for a team of agents in sandboxes.
+- The README says what a module is, a part of the system you want to build, and how to
+  size one: its design fits in the Architect's context.
+
 ## 0.1.2 (2026-10-11)
 
 - The source is public, on GitHub, and the package links to it.
