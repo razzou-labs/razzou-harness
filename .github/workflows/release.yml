@@ -1,0 +1,57 @@
+# Publishes razzou-harness to npm when a GitHub release is published. npm trusts this
+# workflow through GitHub's OIDC (trusted publishing), so no npm token exists anywhere,
+# and each version carries a provenance attestation: built here, from this commit.
+#
+# To release: set the version in package.json and CHANGELOG.md on main, then publish a
+# GitHub release tagged v<version>. A release marked as a pre-release goes to npm's
+# "next" tag instead of "latest".
+name: release
+
+on:
+  release:
+    types: [published]
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: publish to npm
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # npm's trusted publisher names this environment, so no other workflow can publish.
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: The release's tag is the package's version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version="$(node -p 'require("./package.json").version')"
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::The release is tagged $TAG, but package.json says $version. Tag the release v$version."
+            exit 1
+          fi
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - name: npm 11.5.1 or later, which trusted publishing needs
+        run: npm install -g npm@^11.5.1
+      - name: Publish
+        env:
+          PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          if [ "$PRERELEASE" = true ]; then tag=next; else tag=latest; fi
+          npm publish --tag "$tag"

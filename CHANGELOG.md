@@ -6,6 +6,8 @@ may change how a project is set up, and its notes say how.
 ## Unreleased
 
 - The source is public, on GitHub, and the package links to it.
+- Releases are published to npm from GitHub Actions, with provenance: a GitHub release
+  tagged `v<version>` publishes that version.
 - A user guide in the README: your first module, the concepts, the commands, the
   configuration, the AWS setup, security, usage, and troubleshooting.
 - The README states what GitHub requires: an organization for the App, and a paid plan
