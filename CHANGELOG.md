@@ -3,7 +3,7 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
-## Unreleased
+## 0.1.2 (2026-10-11)
 
 - The source is public, on GitHub, and the package links to it.
 - Releases are published to npm from GitHub Actions, with provenance: a GitHub release
