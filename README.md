@@ -444,6 +444,11 @@ npm pack            # a package of these sources: npm install -g ./razzou-harnes
 npm run harness -- up --dir path/to/project   # from the sources; run `npm run build` once for the dashboard
 ```
 
+A GitHub release tagged with the package's version, such as `v0.1.2`, publishes it to
+npm. The release workflow checks the tag against `package.json`, runs the typecheck and
+the tests, then publishes with npm's trusted publishing, so each version shows where it
+was built.
+
 ## License
 
 MIT
