@@ -1,0 +1,74 @@
+{
+  "name": "razzou-harness",
+  "version": "0.1.1",
+  "description": "Your AI dev team, with you in charge: sandboxed Claude Code agents design, build and review your project, and you merge.",
+  "license": "MIT",
+  "author": "razzou",
+  "homepage": "https://github.com/razzou-labs/razzou-harness#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/razzou-labs/razzou-harness.git"
+  },
+  "bugs": {
+    "url": "https://github.com/razzou-labs/razzou-harness/issues"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "ai-agents",
+    "coding-agents",
+    "agent-harness",
+    "openshell",
+    "sandbox",
+    "terraform",
+    "aws",
+    "github-app"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "bin": {
+    "harness": "dist/cli.js",
+    "razzou-harness": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "roles",
+    "skills",
+    "shim",
+    "images",
+    "templates",
+    "src/ci/harness-ci.ts",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.build.json && vite build --config dashboard/vite.config.ts",
+    "prepack": "npm run build",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p dashboard",
+    "test": "node --test --test-reporter=spec \"test/**/*.test.ts\"",
+    "harness": "node src/cli.ts"
+  },
+  "dependencies": {
+    "ws": "^8.22.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@types/ws": "^8.18.2",
+    "@vitejs/plugin-react": "^6.1.2",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "dompurify": "^3.4.16",
+    "marked": "^18.1.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.4"
+  },
+  "optionalDependencies": {
+    "node-pty": "^1.1.0"
+  }
+}

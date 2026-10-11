@@ -1,0 +1,178 @@
+# The harness's CI (razzou-harness, proposal v2 §11.5). Only the owner changes this file:
+# the harness's GitHub App has no permission to touch workflows.
+name: harness
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions: {}
+
+# A newer push to a PR replaces its run. On main, nothing is cancelled: an apply cut short
+# leaves the state locked.
+concurrency:
+  group: harness-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Runs the verifier from the base branch, so a PR can't change the rules it is judged by.
+  verify:
+    name: verify
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the base branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+          persist-credentials: false
+      - name: Check out the pull request
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: head
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Verify
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+          TITLE: ${{ github.event.pull_request.title }}
+        run: >-
+          node base/.github/harness/harness-ci.ts verify --base base --head head
+          --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" --author "$AUTHOR" --branch "$BRANCH" --title "$TITLE"
+
+  # Plans iac/ with the plan role (OIDC, pull requests only). The plan's JSON feeds the
+  # checks that assert on it. Without iac/, it does nothing and passes.
+  tf-plan:
+    name: tf-plan
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Look for iac/
+        id: iac
+        run: if [ -d iac ]; then echo "present=true" >> "$GITHUB_OUTPUT"; fi
+      - name: AWS credentials, plan role
+        if: steps.iac.outputs.present == 'true'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_PLAN_ARN_STAGING }}
+          aws-region: ${{ vars.AWS_REGION_STAGING }}
+          role-session-name: harness-plan-${{ github.run_id }}
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        if: steps.iac.outputs.present == 'true'
+        with:
+          terraform_version: 1.16.3
+          terraform_wrapper: false
+      - name: Plan
+        if: steps.iac.outputs.present == 'true'
+        working-directory: iac
+        run: |
+          set -o pipefail
+          terraform fmt -check -recursive
+          terraform init -input=false -backend-config=backend-configs/staging.hcl
+          terraform validate
+          terraform plan -input=false -no-color -var-file=env/staging.tfvars -out=plan.bin | tee plan.txt
+          terraform show -json plan.bin > plan.json
+          { echo '### Terraform plan'; echo '```'; tail -c 60000 plan.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.iac.outputs.present == 'true'
+        with:
+          name: tfplan
+          path: iac/plan.json
+          retention-days: 7
+
+  # Runs init.sh, the project's checks and those of every accepted feature. No secrets.
+  checks:
+    name: checks
+    needs: [tf-plan]
+    if: ${{ !cancelled() && (needs.tf-plan.result == 'success' || needs.tf-plan.result == 'skipped') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the code under test
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: head
+          persist-credentials: false
+      - name: Check out the definitions of the checks
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          path: base
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: The plan, if there is one
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tfplan
+          path: tfplan
+      - name: Checks
+        run: |
+          if [ -f tfplan/plan.json ]; then export HARNESS_PLAN_JSON="$PWD/tfplan/plan.json"; fi
+          node base/.github/harness/harness-ci.ts checks --definitions base --dir head
+
+  # Applies iac/ after a merge, in the staging environment, which only main may use. The
+  # skipped tf-plan would skip it too, without the explicit condition on checks.
+  tf-apply:
+    name: tf-apply
+    needs: [checks]
+    if: ${{ !cancelled() && github.event_name == 'push' && needs.checks.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment: staging
+    concurrency:
+      group: harness-tf-apply
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Look for iac/
+        id: iac
+        run: if [ -d iac ]; then echo "present=true" >> "$GITHUB_OUTPUT"; fi
+      - name: AWS credentials, apply role
+        if: steps.iac.outputs.present == 'true'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_APPLY_ARN_STAGING }}
+          aws-region: ${{ vars.AWS_REGION_STAGING }}
+          role-session-name: harness-apply-${{ github.run_id }}
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        if: steps.iac.outputs.present == 'true'
+        with:
+          terraform_version: 1.16.3
+          terraform_wrapper: false
+      - name: Apply
+        if: steps.iac.outputs.present == 'true'
+        working-directory: iac
+        run: |
+          terraform init -input=false -backend-config=backend-configs/staging.hcl
+          terraform apply -input=false -auto-approve -no-color -var-file=env/staging.tfvars
