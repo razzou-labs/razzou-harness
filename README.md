@@ -2,11 +2,11 @@
 
 **Your AI dev team, with you in charge.**
 
-You describe a module. An Architect designs it with you, Developers build it one feature
-at a time, and a Manager reviews each one. Every agent works in its own
-[OpenShell](https://github.com/NVIDIA/OpenShell) sandbox with no credentials, every
-feature is checked in a fresh one, and nothing reaches `main` until you merge its pull
-request. A small daemon runs the loop, following Anthropic's
+You describe a module, a part of the system you want to build. An Architect designs it
+with you, Developers build it one feature at a time, and a Manager reviews each one.
+Every agent works in its own [OpenShell](https://github.com/NVIDIA/OpenShell) sandbox
+with no credentials, every feature is checked in a fresh one, and nothing reaches `main`
+until you merge its pull request. A small daemon runs the loop, following Anthropic's
 [Effective harnesses for long-running agents](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents).
 
 - [How it works](#how-it-works)
@@ -141,8 +141,12 @@ plans it finds there (see [Configuration](#configuration)).
 
 ## Concepts
 
-- **Module:** a unit of design, with one Architect and one accepted proposal, then its
-  plans. Modules are built one after another.
+- **Module:** a part of the system you want to build, with one Architect and one
+  accepted proposal, then its plans. Modules are built one after another. Size a module
+  so that its design fits in one conversation. With the default model, Opus 5.5, the
+  Architect's context holds up to a million tokens, and a well-sized module never fills
+  it. If a module's design keeps growing, split it into smaller modules: each gets its
+  own Architect, with a fresh context.
 - **Proposal:** the Architect's design document, in versions v1, v2 and so on. You
   accept one.
 - **Plan:** features that ship together as one pull request. A module's plans are built
