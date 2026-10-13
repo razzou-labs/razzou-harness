@@ -25,6 +25,49 @@ until you merge its pull request. A small daemon runs the loop, following Anthro
 
 ## How it works
 
+```mermaid
+flowchart TB
+    you(["You"])
+
+    subgraph machine["Your machine"]
+        dash["Dashboard<br/>localhost, behind a token"]
+        daemon["Daemon<br/>event log, brakes, .harness/git"]
+    end
+
+    subgraph sandboxes["OpenShell sandboxes, with no credentials"]
+        arch["Architect<br/>designs the module with you"]
+        mgr["Manager<br/>reviews, read-only"]
+        dev["Developers<br/>one feature per attempt"]
+        chk["Checks<br/>a fresh sandbox, no agent"]
+    end
+
+    proxy["OpenShell proxy<br/>adds the Claude token,<br/>signs AWS requests"]
+    claude["Claude API"]
+
+    subgraph github["GitHub"]
+        pr["Pull requests<br/>Arch:, Plan:, Fix:"]
+        ci["CI<br/>with the base branch's rules"]
+        mainb["main"]
+    end
+
+    aws["AWS<br/>read-only view role for agents"]
+
+    you <--> dash
+    you -- "talks it through" --> arch
+    dash <--> daemon
+    daemon <-- "harness tools" --> arch
+    daemon <-- "harness tools" --> mgr
+    daemon <-- "harness tools" --> dev
+    daemon -- "runs" --> chk
+    sandboxes --> proxy
+    proxy --> claude
+    proxy -- "read-only" --> aws
+    daemon -- "as a GitHub App:<br/>pushes, opens PRs" --> pr
+    pr --> ci
+    pr -- "you merge" --> mainb
+    mainb -- "CI applies Terraform" --> aws
+```
+
 You start a module in the dashboard, and talk with its Architect (Claude Code,
 interactive) in its terminal. The Architect asks you questions until the need is clear,
 writes proposals until you accept one, then turns it into plans, features, checks and
