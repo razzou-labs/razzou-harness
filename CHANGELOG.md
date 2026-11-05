@@ -3,6 +3,27 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## Unreleased
+
+- **Swarm mode**, designed in `docs/architecture/proposal-v3.md`: a second mode, switched
+  in the dashboard or with `harness mode`, in which the daemon merges a plan's pull
+  request once CI and the reviewers' statuses pass. `CODE` plans merge when
+  `swarm.merge.code` is `daemon`; `INFRA` and `MIXED` plans need the cost estimate
+  under `swarm.merge.infraMonthlyUsdCeiling`, which no project produces yet, so they
+  wait for the owner. A pull request the policy leaves to the owner shows the reason
+  under Needs you. `Arch:` and `Fix:` pull requests stay the owner's.
+- A plan is `CODE`, `INFRA` or `MIXED`, from its features' kinds. Plan pull requests
+  carry the tag in their title, and CI's `verify` job keeps a `CODE` plan's pull
+  request off the Terraform folder.
+- `harness github-setup` applies the ruleset of the daemon's mode, or of `--mode`: in
+  Swarm, no approval, and the reviewers' statuses required and pinned to the App.
+  `harness doctor` checks the ruleset against the mode, and that the App may write
+  commit statuses.
+- Budgets in the Project view: your hours for the whole project, and a threshold for
+  the agent hours, the Developers' attempt clocks summed, red when over.
+- An attempt's deadline is 120 minutes, and the Manager's turn 90, by default.
+- Spike 5 records how the subscription's usage can be read before a launch.
+
 ## 0.1.3 (2026-10-11)
 
 - More npm keywords, for a team of agents in sandboxes.
