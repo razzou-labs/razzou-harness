@@ -1,7 +1,7 @@
 import { z } from 'zod';
 
 /** The agents the harness runs. */
-export type Role = 'developer' | 'manager' | 'architect';
+export type Role = 'developer' | 'manager' | 'architect' | 'reviewer';
 
 /** Who says something, in a message. */
 export type Party = Role | 'owner' | 'daemon';
@@ -143,6 +143,8 @@ export const TOOLS: Record<Role, ToolSpec[]> = {
     { name: 'reply_to_manager', description: "Answers one of the Manager's escalations. Your decision reaches it at once.", waitSec: 120 },
     webRead,
   ],
+  /** The reviewers (v3 §5) read a diff and answer with their structured report: the web is their only harness tool. */
+  reviewer: [webRead],
 };
 
 /** `tools.json` for the shim: names, descriptions, JSON Schemas and waits. */

@@ -41,6 +41,14 @@ document doesn't change: it describes Manual mode, which keeps working as it doe
   Manager's turn 90.
 - **No cost monitoring after a merge.** The owner's account-wide AWS alarms cover it.
 
+### Amendments after acceptance
+
+| Date | Sections | Amendment |
+|---|---|---|
+| 2026-11-05 | 4.1 | M8. The Architect reads the owner-time numbers with `get_owner_time`, and hears of the budget in its welcome and in a note when it changes, rather than from a prompt the daemon rewrites. A design in review counts as committed, read from the Architect's ref. |
+| 2026-11-05 | 4.3 | M9. The usage is read at most every five minutes; a reset time in the past or unreadable pauses for an hour instead. |
+| 2026-11-05 | 5.1, 5.3, 5.5 | M10. The reviewers run as one print-mode session each, like a Developer, with the Manager's read-only permissions and model, and answer with a structured report instead of a `report_findings` tool. The daemon makes their inputs itself: the paid-call inventory from the base and head trees, and the Terraform plan's JSON the way a check that needs it gets one. The CI jobs of §5.5, the scanners and Infracost, move to M10b, with the cost estimate in the merge policy. An App created before this version can only read statuses: its tokens fall back to that, and a PR whose reviewer passed waits for the owner with the reason. |
+
 ---
 
 ## 1. Summary
@@ -545,7 +553,8 @@ that touch GitHub on a throwaway repository.
 | **M7 Mode and policy** | The mode switch, `MODE_CHANGED`, plan kinds in titles and in `verify`, the merge policy, `github-setup` per mode, the doctor check, the brake defaults, the agent-hours meter | On the fake forge, a `CODE` plan merges itself in Swarm with the statuses present, waits without them, and waits in Manual; `verify` fails a `CODE` PR that touches `iac/` |
 | **M8 Owner time** | `OWNER_HOURS_SET`, `estimatedMinutes`, the Architect's brief and prompt, the `submit_design` refusal, the meter | A stub Architect's design over the available hours is refused with the numbers; one within is accepted; the meter shows used and planned |
 | **M9 Usage probe** | The stored token, `readUsage`, the pre-launch check and pause until reset | With a fake endpoint, Swarm launches under the ceiling and pauses until the reset time above it |
-| **M10 Reviewers** | The two roles, the CI jobs and artifacts, `report_findings`, review comments and statuses, fix rounds, the Infracost ceiling in the policy | A stub reviewer blocks a plan, a fix round lands, the second review passes and the plan merges; an `INFRA` plan over the ceiling waits for the owner |
+| **M10 Reviewers** | The two roles, their briefs with the paid-call inventory and the Terraform plan, review comments and statuses, fix rounds | A stub reviewer blocks a plan, a fix round lands, the second review passes and the plan merges; a status the App can't set leaves the PR to the owner with the reason |
+| **M10b Cost estimate and scanners** | The CI jobs and artifacts of §5.5: Infracost and the ceiling in the policy, the scanners' reports in the security brief | An `INFRA` plan under the ceiling merges itself, one over it waits for the owner |
 | **M11 Parallel** | Plan and cross-plan dependencies, the scheduler, landing with re-check, rebase items, Managers per plan, the Architect digest, design changes in flight, the graph | Two independent plans build at once with three Developers; a conflict becomes a rebase item; a design change aborts only the redefined feature's attempt |
 
 M7 to M9 are useful on their own and land first; M10 is what lets Swarm merge by

@@ -8,7 +8,7 @@ import { sh, sha256 } from '../util.ts';
  * hash of what the sandbox works on, like `dev-1a2b3c4d-a1`. The hash includes the
  * project because several projects can share one gateway.
  */
-export function sandboxName(kind: 'dev' | 'chk' | 'mgr' | 'arc', project: string, key: string, suffix?: string): string {
+export function sandboxName(kind: 'dev' | 'chk' | 'mgr' | 'arc' | 'rev', project: string, key: string, suffix?: string): string {
   return `${kind}-${sha256(`${project}/${key}`).slice(0, 8)}${suffix ? `-${suffix}` : ''}`;
 }
 

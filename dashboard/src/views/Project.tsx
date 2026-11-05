@@ -242,6 +242,16 @@ function PlanDetails({ plan }: { plan: PlanState }) {
           <pre>{job.log ?? ''}</pre>
         </details>
       ))}
+      {plan.reviews?.filter((r) => r.head === plan.pushed).map((r) => (
+        <p key={`${r.role}-${r.head}`}>
+          {r.role === 'security' ? 'Security' : 'Cost'} review of {r.head.slice(0, 8)}:{' '}
+          {r.status === 'reported'
+            ? <><Badge status={r.verdict === 'pass' ? 'passed' : 'failed'} label={r.verdict} /> {r.findings?.filter((f) => f.severity === 'blocking').length ?? 0} blocking, {r.findings?.filter((f) => f.severity === 'advisory').length ?? 0} advisory{r.posted?.problem ? <span className="bad"> · {r.posted.problem}</span> : null}</>
+            : r.status === 'failed'
+              ? <span className="bad">failed: {r.reason}</span>
+              : <Badge status={r.status} />}
+        </p>
+      ))}
       {plan.deploy && (
         <p>
           Deploy of {plan.deploy.commit.slice(0, 8)}: <Badge status={plan.deploy.status} />

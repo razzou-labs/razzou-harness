@@ -18,12 +18,13 @@ import { buildPolicy } from '../sandbox/policy.ts';
 import { EventStore, type CiJob, type HarnessEvent, type NewEvent, type Ref } from '../state/events.ts';
 import {
   activeAttempt, apply, countedAttempts, featureKey, interruptions, planKey, project, writeSnapshot,
-  type Attempt, type FeatureState, type Mode, type PlanState, type State,
+  type Attempt, type FeatureState, type Mode, type PlanState, type ReviewState, type State,
 } from '../state/state.ts';
 import { clip, sh, sleep } from '../util.ts';
 import { Architects } from './architects.ts';
 import { AgentChannel, type AgentRequest } from './channel.ts';
 import { architectRef } from './design.ts';
+import { activeReview, reviewStep, stepReview } from './review.ts';
 import { Managers } from './manager.ts';
 import { attemptRefName, preMerge, probeScript, refOf, sandboxName, waitForFile } from './refs.ts';
 import { handleRequest, type AgentIdentity, type Reply } from './requests.ts';
@@ -92,6 +93,7 @@ export class Orchestrator {
   private stopping = false;
   private stepErrors = { key: '', count: 0 };
   private developer?: { sandbox: string; follower: Follower; channel: AgentChannel };
+  private reviewer?: { sandbox: string; follower: Follower; channel: AgentChannel };
 
   constructor(options: OrchestratorOptions) {
     this.options = options;
@@ -700,6 +702,9 @@ export class Orchestrator {
       this.nextPoll.delete(key);
       return 'progress';
     }
+    // A reviewer's session on the pushed head is stepped without reading GitHub (v3 §5).
+    const review = activeReview(plan);
+    if (review) return stepReview(this, plan, review);
     if (this.now() < (this.nextPoll.get(key) ?? 0)) return 'wait';
     const pr = await this.forge.pullRequest(plan.pr!.number);
     if (pr.merged) {
@@ -716,9 +721,18 @@ export class Orchestrator {
       const step = await this.readCi(plan);
       if (step) return step;
     }
-    if (plan.ci?.status === 'passed' && this.state.mode === 'swarm' && !plan.branch.startsWith('fix/') && (await this.mergeUnderPolicy(plan, pr))) {
-      this.nextPoll.delete(key);
-      return 'progress';
+    if (plan.ci?.status === 'passed' && !plan.branch.startsWith('fix/')) {
+      // The reviewers first (v3 §5), then the merge policy (v3 §3.2).
+      const reviewed = await reviewStep(this, plan, pr);
+      if (reviewed === 'progress') {
+        this.nextPoll.delete(key);
+        return 'progress';
+      }
+      if (reviewed === 'busy') return 'wait';
+      if (reviewed === 'ready' && this.state.mode === 'swarm' && (await this.mergeUnderPolicy(plan, pr))) {
+        this.nextPoll.delete(key);
+        return 'progress';
+      }
     }
     const quiet = plan.ci ? this.now() - Date.parse(plan.ci.since) : 0;
     this.nextPoll.set(key, this.now() + (plan.ci?.status === 'pending' ? 30_000 : quiet < 600_000 ? 60_000 : 300_000));
@@ -751,7 +765,12 @@ export class Orchestrator {
     }
     const statuses = await this.forge.commitStatuses(pr.head);
     const missing = policy.requiredStatuses.filter((context) => statuses.find((s) => s.context === context)?.state !== 'success');
-    if (missing.length > 0) return leave(`waiting for ${missing.join(', ')} to pass on ${pr.head.slice(0, 8)} (swarm.requiredStatuses)`);
+    if (missing.length > 0) {
+      // A reviewer that passed but whose status the App couldn't set says why, instead of a wait that never ends.
+      const unposted = (plan.reviews ?? []).find((r) => r.head === pr.head && r.posted?.status === 'error' && r.posted.problem);
+      if (unposted) return leave(`${unposted.posted!.problem}`);
+      return leave(`waiting for ${missing.join(', ')} to pass on ${pr.head.slice(0, 8)} (swarm.requiredStatuses)`);
+    }
     let commit: string;
     try {
       ({ commit } = await this.forge.mergePullRequest(pr.number, pr.head));
@@ -1229,7 +1248,7 @@ export class Orchestrator {
     return this.repo.fetchBundle(local, attemptRefName(ref));
   }
 
-  private async killAgent(sandbox: string): Promise<void> {
+  async killAgent(sandbox: string): Promise<void> {
     const p = this.paths(sandbox);
     await this.exec(sandbox, `pid="$(cat ${sh(p.pid)})"; kill -TERM -- "-$pid" 2>/dev/null; sleep 5; kill -KILL -- "-$pid" 2>/dev/null; true`);
   }
@@ -1257,6 +1276,22 @@ export class Orchestrator {
     this.developer?.follower.stop();
     this.developer?.channel.stop();
     this.developer = undefined;
+  }
+
+  /** A reviewer's transcript for the dashboard, and its channel for `web_read` (v3 §5.1). */
+  followReview(review: ReviewState): void {
+    if (this.reviewer?.sandbox === review.sandbox) return;
+    this.stopFollowingReview();
+    const agent = `${review.role}:${review.head.slice(0, 8)}`;
+    const follower = this.driver.follow(review.sandbox, this.paths(review.sandbox).stream, 1, (line) => this.events.emit('transcript', { agent, line }));
+    const channel = this.channel({ role: 'reviewer', sandbox: review.sandbox }, join(this.options.harnessDir, 'reviews', `${review.sandbox}.replied.txt`));
+    this.reviewer = { sandbox: review.sandbox, follower, channel };
+  }
+
+  stopFollowingReview(): void {
+    this.reviewer?.follower.stop();
+    this.reviewer?.channel.stop();
+    this.reviewer = undefined;
   }
 
   private agentRun(sandbox: string, attempt: Attempt): AgentRun {
@@ -1291,8 +1326,21 @@ export function makeForge(config: Config, projectDir: string): Forge {
   return config.project.repo ? new GitHubForge(new GitHubClient(loadAppCredentials(), config.project.repo)) : new LocalForge(projectDir);
 }
 
-/** A fix round, described as a feature so that it runs like one. It has no checks of its own: CI is its check. */
-function fixDefinition(id: string, plan: string, fix: { round: number; kind: 'ci' | 'deploy'; failure: string }): Feature {
+/** A fix round, described as a feature so that it runs like one. It has no checks of its own: CI, or the reviewer, is its check. */
+function fixDefinition(id: string, plan: string, fix: NonNullable<FeatureState['fix']>): Feature {
+  if (fix.kind === 'review') {
+    return {
+      id,
+      title: `Fix the ${fix.role} review, round ${fix.round}`,
+      kind: 'app',
+      description: `The ${fix.role} reviewer blocked the pull request of plan ${plan}. Fix every blocking finding below, without touching protected files. Advisory findings are yours to judge.\n\n${fix.failure}`,
+      expected: 'The reviewer passes the next head of the pull request, and every check listed below still passes.',
+      dependsOn: [],
+      gates: [],
+      resources: [],
+      checks: [],
+    };
+  }
   const what = fix.kind === 'ci' ? `CI failed on the pull request of plan ${plan}` : `After plan ${plan} was merged, its deploy failed`;
   return {
     id,
@@ -1324,7 +1372,7 @@ function outcomeReason(attempt: Attempt): string {
 
 function commitMessage(ref: Ref, feature: Feature, attempt: Attempt, results: CheckResult[], fix?: FeatureState['fix']): string {
   return [
-    fix ? `fix(${ref.module}/${ref.plan}): ${fix.kind === 'ci' ? 'CI' : 'the deploy'}, round ${fix.round}` : `feat(${featureKey(ref)}): ${feature.title}`,
+    fix ? `fix(${ref.module}/${ref.plan}): ${fix.kind === 'ci' ? 'CI' : fix.kind === 'review' ? `the ${fix.role} review` : 'the deploy'}, round ${fix.round}` : `feat(${featureKey(ref)}): ${feature.title}`,
     ...(fix ? [] : ['', feature.description]),
     ...(attempt.summary ? ['', attempt.summary] : []),
     '',

@@ -272,10 +272,29 @@ the window to reset. It reads it with the token `harness doctor` stores in
 setup, the doctor asks for the token again once Swarm is on. Without it, the daemon
 learns of a limit only when an attempt hits it, as in Manual.
 
-**Where it stands.** The reviewers that post `harness/security` and `harness/cost`,
-and the cost estimate, are the next milestones (proposal v3 §5). Until they exist,
-Swarm merges nothing unless you set `swarm.requiredStatuses` to `[]`, which merges
-`CODE` plans on CI alone. Parallel Developers and plans come last (v3 §6).
+**The reviewers.** Once CI passed on a plan's pull request, two reviewers read it, one
+after the other, each in a fresh read-only sandbox with the Manager's permissions: a
+security reviewer and a cost reviewer, with `roles/security.md` and `roles/cost.md`
+as their prompts and the Manager's model. Each gets a brief: the plan's features, the
+files changed, the pay-per-use AWS calls the change adds or removes, found by pattern
+in the code, and the Terraform plan's JSON when the project has one. Each answers
+with a verdict and findings. The daemon posts the findings on the pull request as a
+review, with comments on the lines of the diff, and sets the reviewer's commit status,
+`harness/security` or `harness/cost`. A blocking verdict opens a fix round on the
+plan branch, like a CI failure: a Developer fixes with the findings as guidance, the
+Manager reviews, CI and the reviewers run again on the new head. After
+`swarm.securityFixRounds` or `swarm.costFixRounds`, the pull request is yours. In
+Manual, `swarm.reviewersInManual` runs them as comments only.
+
+The App needs **Commit statuses: write** for the verdicts. An App created before this
+version has read only: give it the permission on GitHub, accept it on the installation,
+and `harness doctor` stops warning. Until then, a plan whose reviewer passed waits for
+you with the reason.
+
+**Where it stands.** The monthly cost estimate that lets `INFRA` plans merge under the
+ceiling, and the scanners in CI that the security reviewer would start from, are
+still to come (proposal v3 §5.3, §5.5): `INFRA` and `MIXED` plans wait for you.
+Parallel Developers and plans come last (v3 §6).
 
 **Budgets.** In both modes, the Project view shows two meters you set there:
 - **Your time.** The hours the whole project may take of you. Once set, every owner

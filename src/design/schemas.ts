@@ -183,6 +183,8 @@ export const ConfigSchema = z.object({
       usageCeilingPercent: z.number().int().min(1).max(100).nullable().default(80),
       securityFixRounds: z.number().int().min(0).max(5).default(2),
       costFixRounds: z.number().int().min(0).max(5).default(2),
+      /** A reviewer's clock: it reads one diff, so it is short. */
+      reviewTimeoutMinutes: z.number().int().positive().max(240).default(30),
       /** Run the reviewers in Manual mode too, as comments only. */
       reviewersInManual: z.boolean().default(false),
     })
@@ -215,6 +217,26 @@ export const ReportSchema = z.object({
   notes: z.string().max(4000).optional(),
 });
 export type Report = z.infer<typeof ReportSchema>;
+
+/** The two reviewers of v3 §5, which post `harness/security` and `harness/cost`. */
+export type ReviewerRole = 'security' | 'cost';
+export const REVIEWER_ROLES: readonly ReviewerRole[] = ['security', 'cost'];
+export const statusContext = (role: ReviewerRole): string => `harness/${role}`;
+
+/** What a reviewer returns as its structured output (v3 §5.4): a verdict, and findings with a place in the diff when there is one. */
+export const ReviewReportSchema = z.object({
+  verdict: z.enum(['pass', 'block']),
+  summary: z.string().min(1).max(2000),
+  findings: z.array(z.object({
+    file: z.string().min(1).optional(),
+    line: z.number().int().positive().optional(),
+    severity: z.enum(['blocking', 'advisory']),
+    title: z.string().min(1).max(200),
+    detail: z.string().min(1).max(4000),
+  })).max(50).default([]),
+});
+export type ReviewReport = z.infer<typeof ReviewReportSchema>;
+export type ReviewFinding = ReviewReport['findings'][number];
 
 /** Something only the owner can do (§8.4). A gate holds back what it blocks until the owner marks it done; a task holds nothing back. */
 export const OwnerActionSchema = z.object({

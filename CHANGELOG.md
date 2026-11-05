@@ -27,6 +27,15 @@ may change how a project is set up, and its notes say how.
   designs, and `submit_design` refuses a design over what remains. The Architect gets
   `get_owner_time`, and a note when the budget changes.
 - An attempt's deadline is 120 minutes, and the Manager's turn 90, by default.
+- Two reviewers, security and cost, read every plan's pull request once CI passed, in
+  Swarm, or in Manual as comments only with `swarm.reviewersInManual`. Each runs in a
+  fresh read-only sandbox with a brief: the features, the files changed, the
+  pay-per-use AWS calls the change adds or removes, and the Terraform plan's JSON.
+  Their findings are posted on the pull request, their verdicts set as the commit
+  statuses `harness/security` and `harness/cost`, and a blocking verdict opens a fix
+  round, two per reviewer by default, before the pull request is the owner's. The App
+  needs "Commit statuses: write"; an older App's tokens fall back to read, and the
+  pull request waits for the owner with the reason.
 - In Swarm, the daemon reads the subscription's usage before it starts an attempt, and
   at or above `swarm.usageCeilingPercent` the pipeline waits for the window to reset.
   `harness doctor` stores the provider's token in `~/.config/harness/claude.token` for

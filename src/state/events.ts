@@ -1,6 +1,7 @@
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, truncateSync, writeSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { CheckResult } from '../checks/runner.ts';
+import type { ReviewFinding, ReviewerRole } from '../design/schemas.ts';
 import type { Party, Role } from '../roles.ts';
 import type { ActionState, FeatureState, Mode, PlanState } from './state.ts';
 
@@ -107,6 +108,15 @@ interface Payloads {
   PR_LEFT_TO_OWNER: { number: number; head: string; reason: string };
   /** The daemon merged a plan's PR under the Swarm policy (v3 §3.2); PR_MERGED follows. */
   PR_MERGED_BY_DAEMON: { number: number; head: string; commit: string };
+  /** A reviewer's session on a PR head (v3 §5): starting, started, and ended with its report or why there is none. */
+  REVIEW_STARTING: { role: ReviewerRole; head: string; sandbox: string; sessionId: string; deadline: string };
+  REVIEW_STARTED: { role: ReviewerRole; head: string };
+  REVIEW_ENDED: {
+    role: ReviewerRole; head: string; outcome: AttemptOutcome;
+    verdict?: 'pass' | 'block'; summary?: string; findings?: ReviewFinding[]; usage?: Usage; reason?: string;
+  };
+  /** The review posted on the PR as comments, and the commit status set, or what went wrong. */
+  REVIEW_POSTED: { role: ReviewerRole; head: string; status: 'success' | 'failure' | 'error'; comments: number; problem?: string };
 
   // Messages.
   QUESTION: { requestId: string; question: string };
@@ -119,8 +129,8 @@ interface Payloads {
   OWNER_ANSWER: { module: string; requestId: string; answer: string };
   OWNER_MESSAGE: { module: string; text: string };
   PLAN_SUBMITTED: { requestId: string; summary: string };
-  /** The Manager asks for a fix round after CI failed; `failure` is what CI reported. */
-  REQUEST_FIX: { requestId: string; guidance: string; failure: string };
+  /** The Manager asks for a fix round after CI failed, or the daemon after a reviewer blocked (`review`); `failure` is what was reported. */
+  REQUEST_FIX: { requestId: string; guidance: string; failure: string; review?: ReviewerRole };
   PROPOSAL: { module: string; requestId: string; version: number; sha256: string };
   /** The Architect submits its design; `head` is its commit, now in the daemon's repository. */
   DESIGN: { module: string; requestId: string; summary: string; head: string };

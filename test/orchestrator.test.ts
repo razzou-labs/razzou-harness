@@ -14,7 +14,7 @@ import { recover } from '../src/setup/recover.ts';
 import { runOk, sleep } from '../src/util.ts';
 import { FAKE_BOT, FakeForge } from './helpers/fake-forge.ts';
 import { LocalDriver } from './helpers/local-driver.ts';
-import { stubAgent, type StubBehavior } from './helpers/stub-agent.ts';
+import { stubAgent, type ReviewBehavior, type StubBehavior } from './helpers/stub-agent.ts';
 import type { ArchitectBehavior } from './helpers/stub-architect.ts';
 import type { ManagerBehavior } from './helpers/stub-manager.ts';
 import { createToyRepo, SOLUTIONS, tempDir, toyDesign } from './helpers/toy-repo.ts';
@@ -37,6 +37,8 @@ interface SetupOptions {
   github?: boolean;
   /** Replaces the subscription's usage endpoint (v3 §4.3). */
   usage?: () => Promise<SubscriptionUsage | undefined>;
+  /** What the stub reviewers answer (v3 §5); every review passes by default. */
+  review?: ReviewBehavior;
   /** Starts with no design: an Architect writes it. */
   design?: boolean;
   architect?: ArchitectBehavior;
@@ -57,8 +59,10 @@ async function setup(decide: Decide, options: SetupOptions = {}) {
       driver,
       packageDir,
       version: 'test',
-      agent: stubAgent(decide, options.manager, options.architect),
+      agent: stubAgent(decide, options.manager, options.architect, options.review),
       webRead: async (url) => ({ ok: true, text: `the page at ${url}`, bytes: 20 }),
+      // HARNESS_TEST_LOG=1 prints the daemon's log, for a step that fails silently.
+      ...(process.env.HARNESS_TEST_LOG ? { log: (message: string) => console.error(`[daemon] ${message}`) } : {}),
       ...(options.usage ? { usage: options.usage } : {}),
       ...(options.now ? { now: options.now } : {}),
       ...(fake ? { forge: () => fake } : {}),
@@ -333,15 +337,19 @@ describe('pull requests', () => {
   });
 
   it('in Swarm, leaves the PR to the owner while a required status is missing, and merges once it passes', async () => {
+    // A status no reviewer of the harness posts, such as an external scanner's: the daemon can only wait for it.
     let skew = 0;
-    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true, now: () => Date.now() + skew });
+    const { orchestrator: o, fake } = await setup((f) => solved(f), {
+      github: true, config: { swarm: { requiredStatuses: ['harness/security', 'external/scan'] } }, now: () => Date.now() + skew,
+    });
     o.setMode('swarm');
     await until(o, () => plan(o)?.leftToOwner !== undefined);
     assert.equal(plan(o)!.status, 'ready_to_merge');
-    assert.match(plan(o)!.leftToOwner!.reason, /^waiting for harness\/security, harness\/cost to pass on [0-9a-f]{8}/);
+    assert.match(plan(o)!.leftToOwner!.reason, /^waiting for external\/scan to pass on [0-9a-f]{8}/);
+    assert.deepEqual(plan(o)!.reviews!.map((r) => [r.role, r.verdict]), [['security', 'pass']]);
     assert.equal(fake.prs[0]!.state, 'open');
 
-    fake.statuses = () => ({ 'harness/security': 'success', 'harness/cost': 'success' });
+    fake.statuses = () => ({ 'external/scan': 'success' });
     skew += 61_000;
     await until(o, completed(o));
     assert.equal(plan(o)!.mergedBy, 'daemon');
@@ -426,6 +434,98 @@ describe('pull requests', () => {
     });
     await until(o, completed(o));
     assert.equal(reads, 0);
+  });
+
+  it('in Swarm, both reviewers read the head, their verdicts are posted and set as statuses, and the plan merges itself', async () => {
+    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true });
+    o.setMode('swarm');
+    await until(o, completed(o));
+
+    const head = plan(o)!.pushed!;
+    assert.deepEqual(plan(o)!.reviews!.map((r) => [r.role, r.head === head, r.status, r.verdict, r.posted?.status]), [
+      ['security', true, 'reported', 'pass', 'success'],
+      ['cost', true, 'reported', 'pass', 'success'],
+    ]);
+    assert.deepEqual(fake.reviews.map((r) => [r.number, r.body.split('\n')[0], r.comments.length]), [
+      [1, `## Security review of ${head.slice(0, 8)}: pass`, 0],
+      [1, `## Cost review of ${head.slice(0, 8)}: pass`, 0],
+    ]);
+    assert.deepEqual(fake.statusesSet.map((s) => [s.sha === head, s.context, s.state, s.description]), [
+      [true, 'harness/security', 'success', 'passed'],
+      [true, 'harness/cost', 'success', 'passed'],
+    ]);
+    assert.equal(plan(o)!.mergedBy, 'daemon');
+  });
+
+  it('in Swarm, a blocking review opens a fix round with the findings, and the next head passes and merges', async () => {
+    const finding = { file: 'src/greet.sh', line: 1, severity: 'blocking' as const, title: 'Shell injection', detail: 'Quote the argument before it reaches the shell.' };
+    const review: ReviewBehavior = (role, rounds) => (role === 'security' && rounds === 0
+      ? { verdict: 'block', summary: 'One injection.', findings: [finding, { severity: 'advisory', title: 'No tests', detail: 'Add one.' }] }
+      : { verdict: 'pass', summary: 'Fixed.', findings: [] });
+    const { orchestrator: o, fake } = await setup((f) => (f === 'fix1' ? { files: { 'src/greet.sh': 'echo "hello"\n' } } : solved(f)), { github: true, review });
+    o.setMode('swarm');
+    await until(o, completed(o));
+
+    const fix = o.state.features['demo/P1/fix1']!;
+    assert.deepEqual([fix.fix!.kind, fix.fix!.role, fix.fix!.round, fix.status], ['review', 'security', 1, 'accepted']);
+    assert.match(fix.attempts[0]!.guidance!, /^- Shell injection \(src\/greet\.sh:1\): Quote the argument/);
+    assert.match(fix.fix!.failure, /^The security reviewer blocked PR #1 \(https:\/\/github\.test\/pull\/1\) at [0-9a-f]{8}: One injection\./);
+    assert.deepEqual(plan(o)!.reviewFixRounds, { security: 1 });
+
+    const first = fake.reviews[0]!;
+    assert.match(first.body, /^## Security review of [0-9a-f]{8}: block\n\nOne injection\.\n\n- \*\*\[advisory\] No tests\*\*: Add one\./);
+    assert.deepEqual(first.comments, [{ path: 'src/greet.sh', line: 1, body: '**[blocking] Shell injection**\n\nQuote the argument before it reaches the shell.' }]);
+    assert.deepEqual(fake.statusesSet.map((s) => [s.context, s.state, s.description]), [
+      ['harness/security', 'failure', '1 blocking finding'],
+      ['harness/security', 'success', 'passed'],
+      ['harness/cost', 'success', 'passed'],
+    ]);
+    const heads = [...new Set(plan(o)!.reviews!.map((r) => r.head))];
+    assert.equal(heads.length, 2);
+    const log = await runOk('git', ['--git-dir', fake.remote, 'log', '--format=%s', 'main']);
+    assert.match(log, /fix\(demo\/P1\): the security review, round 1/);
+    assert.equal(plan(o)!.mergedBy, 'daemon');
+  });
+
+  it('in Swarm, a reviewer that keeps blocking leaves the PR to the owner once its rounds are spent', async () => {
+    const review: ReviewBehavior = (role) => (role === 'security'
+      ? { verdict: 'block', summary: 'Still bad.', findings: [{ severity: 'blocking', title: 'Injection', detail: 'Quote it.' }] }
+      : { verdict: 'pass', summary: 'Fine.', findings: [] });
+    const { orchestrator: o, fake } = await setup((f) => (f.startsWith('fix') ? { files: { 'src/note.txt': f } } : solved(f)), {
+      github: true, review, config: { swarm: { securityFixRounds: 1 } },
+    });
+    o.setMode('swarm');
+    await until(o, () => plan(o)?.leftToOwner !== undefined);
+    assert.equal(plan(o)!.leftToOwner!.reason, 'the security reviewer still blocks PR #1 after 1 fix round(s): the owner decides');
+    assert.match(o.state.pipeline.paused!.reason, /still blocks PR #1 after 1 fix round/);
+    assert.deepEqual(plan(o)!.reviewFixRounds, { security: 1 });
+    assert.equal(fake.prs[0]!.state, 'open');
+  });
+
+  it('in Manual with reviewersInManual, the reviewers comment and gate nothing', async () => {
+    let skew = 0;
+    const review: ReviewBehavior = (role) => (role === 'cost'
+      ? { verdict: 'block', summary: 'A loop around Bedrock.', findings: [{ severity: 'blocking', title: 'Unbounded calls', detail: 'Cap it.' }] }
+      : { verdict: 'pass', summary: 'Fine.', findings: [] });
+    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true, review, config: { swarm: { reviewersInManual: true } }, now: () => Date.now() + skew });
+    await until(o, () => plan(o)?.reviews?.filter((r) => r.posted).length === 2);
+    assert.equal(plan(o)!.status, 'ready_to_merge');
+    assert.equal(plan(o)!.reviewFixRounds, undefined);
+    assert.deepEqual(fake.statusesSet.map((s) => [s.context, s.state]), [['harness/security', 'success'], ['harness/cost', 'failure']]);
+    await fake.merge(1);
+    skew += 120_000;
+    await until(o, completed(o));
+    assert.equal(plan(o)!.mergedBy, 'owner');
+  });
+
+  it('in Swarm, a status the App cannot set leaves the PR to the owner with the reason', async () => {
+    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true });
+    o.setMode('swarm');
+    fake.refuseStatus = 'Resource not accessible by integration';
+    await until(o, () => plan(o)?.leftToOwner !== undefined);
+    assert.match(plan(o)!.leftToOwner!.reason, /^could not set harness\/security: Resource not accessible by integration/);
+    assert.equal(fake.reviews.length >= 1, true);
+    assert.equal(plan(o)!.reviews![0]!.posted!.status, 'error');
   });
 
   it('runs a fix round when CI fails, and the PR passes on the next run', async () => {

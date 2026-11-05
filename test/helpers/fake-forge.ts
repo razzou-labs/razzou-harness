@@ -1,7 +1,7 @@
 import { join } from 'node:path';
 import type { Repo } from '../../src/git/repo.ts';
 import { GitHubError } from '../../src/github/app.ts';
-import type { CheckRun, CommitStatus, Forge, PullRequest } from '../../src/github/forge.ts';
+import type { CheckRun, CommitStatus, Forge, PullRequest, ReviewPost } from '../../src/github/forge.ts';
 import { runOk } from '../../src/util.ts';
 import { tempDir } from './toy-repo.ts';
 
@@ -30,6 +30,11 @@ export class FakeForge implements Forge {
   statuses: (sha: string) => Record<string, string> = () => ({});
   /** When set, the daemon's merge is refused with this message, as GitHub does under rules the merge doesn't meet. */
   refuseMerge?: string;
+  /** What the daemon posted for the reviewers (v3 §5.4), and the statuses it set. */
+  readonly reviews: Array<{ number: number } & ReviewPost> = [];
+  readonly statusesSet: Array<{ sha: string; context: string; state: string; description: string }> = [];
+  /** When set, setting a status fails with this message, as GitHub does for an App without the permission. */
+  refuseStatus?: string;
   private readonly runs = new Map<string, CheckRun[]>();
   private nextRun = 1;
 
@@ -93,8 +98,21 @@ export class FakeForge implements Forge {
     return `the ${run.name} job failed: expected 5, got 4`;
   }
 
+  /** The statuses a test declares, and the latest the daemon set, per context. */
   async commitStatuses(sha: string): Promise<CommitStatus[]> {
-    return Object.entries(this.statuses(sha)).map(([context, state]) => ({ context, state }));
+    const latest = new Map<string, string>(Object.entries(this.statuses(sha)));
+    for (const status of this.statusesSet) if (status.sha === sha) latest.set(status.context, status.state);
+    return [...latest].map(([context, state]) => ({ context, state }));
+  }
+
+  async createReview(number: number, review: ReviewPost): Promise<{ comments: number }> {
+    this.reviews.push({ number, ...review });
+    return { comments: review.comments.length };
+  }
+
+  async setCommitStatus(sha: string, status: { context: string; state: 'success' | 'failure' | 'pending'; description: string }): Promise<void> {
+    if (this.refuseStatus) throw new GitHubError(this.refuseStatus, 403);
+    this.statusesSet.push({ sha, ...status });
   }
 
   /** The daemon merges under Swarm's policy: refused like GitHub when the rules aren't met or the head moved. */

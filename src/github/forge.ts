@@ -26,6 +26,13 @@ export interface CommitStatus {
   state: string;
 }
 
+/** A review the daemon posts on a PR for a reviewer: a body, and comments on lines of the diff. */
+export interface ReviewPost {
+  head: string;
+  body: string;
+  comments: Array<{ path: string; line: number; body: string }>;
+}
+
 /**
  * Where the project lives: main comes from it, and plan branches and pull requests go to
  * it. GitHub, through the App; or the owner's local repository, with no pull requests,
@@ -53,6 +60,10 @@ export interface Forge {
    * is the commit the daemon expects at the PR's head. Throws when GitHub refuses.
    */
   mergePullRequest(number: number, head: string): Promise<{ commit: string }>;
+  /** Posts a reviewer's findings on the PR (v3 §5.4). Comments GitHub refuses, outside the diff, fold into the body. */
+  createReview(number: number, review: ReviewPost): Promise<{ comments: number }>;
+  /** Sets a commit status, the reviewers' verdict, which the Swarm ruleset requires (v3 §3.3). */
+  setCommitStatus(sha: string, status: { context: string; state: 'success' | 'failure' | 'pending'; description: string }): Promise<void>;
 }
 
 export class LocalForge implements Forge {
@@ -102,6 +113,12 @@ export class LocalForge implements Forge {
   async mergePullRequest(): Promise<{ commit: string }> {
     throw new GitHubError('a local project has no pull requests to merge', 0);
   }
+
+  async createReview(): Promise<{ comments: number }> {
+    return { comments: 0 };
+  }
+
+  async setCommitStatus(): Promise<void> {}
 }
 
 export class GitHubForge implements Forge {
@@ -181,6 +198,30 @@ export class GitHubForge implements Forge {
   async commitStatuses(sha: string): Promise<CommitStatus[]> {
     const combined = await this.client.request<{ statuses: Array<{ context: string; state: string }> }>('GET', `/repos/{repo}/commits/${sha}/status?per_page=100`);
     return combined.statuses.map((s) => ({ context: s.context, state: s.state }));
+  }
+
+  async createReview(number: number, review: ReviewPost): Promise<{ comments: number }> {
+    const post = (comments: ReviewPost['comments'], body: string) => this.client.request('POST', `/repos/{repo}/pulls/${number}/reviews`, {
+      commit_id: review.head,
+      body,
+      event: 'COMMENT',
+      comments: comments.map((c) => ({ path: c.path, line: c.line, side: 'RIGHT', body: c.body })),
+    });
+    try {
+      await post(review.comments, review.body);
+      return { comments: review.comments.length };
+    } catch (error) {
+      // A line outside the diff is refused as a whole: the findings go in the body instead.
+      if (!(error instanceof GitHubError) || error.status !== 422 || review.comments.length === 0) throw error;
+      const folded = review.comments.map((c) => `**${c.path}:${c.line}** ${c.body}`).join('\n\n');
+      await post([], `${review.body}\n\n${folded}`);
+      return { comments: 0 };
+    }
+  }
+
+  async setCommitStatus(sha: string, status: { context: string; state: 'success' | 'failure' | 'pending'; description: string }): Promise<void> {
+    if (!this.client.canWriteStatuses) throw new GitHubError('the App has no "Commit statuses: write" permission: add it on GitHub and accept it on the installation', 403);
+    await this.client.request('POST', `/repos/{repo}/statuses/${sha}`, { context: status.context, state: status.state, description: status.description.slice(0, 140) });
   }
 
   /** GitHub refuses with 405 when main's rules aren't met, and with 409 when the head moved. */

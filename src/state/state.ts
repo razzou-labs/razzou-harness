@@ -1,6 +1,7 @@
 import { mkdirSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { CheckResult } from '../checks/runner.ts';
+import type { ReviewFinding, ReviewerRole } from '../design/schemas.ts';
 import type { AttemptOutcome, CiJob, Finding, HarnessEvent, Ref, Usage } from './events.ts';
 
 export type AttemptStatus = 'starting' | 'running' | 'collecting' | 'checking' | 'reviewing' | 'accepted' | 'failed' | 'interrupted';
@@ -64,7 +65,7 @@ export interface FeatureState {
   /** Since when the Manager owes guidance, after a counted failure. */
   awaitingGuidanceSince?: string;
   /** Set for a fix, which is built like a feature but isn't in the design: after CI failed, or after the deploy. */
-  fix?: { round: number; kind: 'ci' | 'deploy'; failure: string; requestId: string };
+  fix?: { round: number; kind: 'ci' | 'deploy' | 'review'; failure: string; requestId: string; role?: ReviewerRole };
 }
 
 export interface PlanState {
@@ -103,8 +104,33 @@ export interface PlanState {
   leftToOwner?: { head: string; reason: string; at: string };
   /** The cost job's estimate of the monthly cost the PR adds, for the head it was computed on (v3 §5.3). */
   costEstimate?: { head: string; monthlyUsd: number };
+  /** The reviewers' sessions on the PR's heads (v3 §5), oldest first. */
+  reviews?: ReviewState[];
+  /** Fix rounds each reviewer asked for on this PR. */
+  reviewFixRounds?: Partial<Record<ReviewerRole, number>>;
   deploy?: { commit: string; status: 'passed' | 'failed'; jobs?: CiJob[] };
   postDeploy?: { status: 'passed' | 'failed'; results: CheckResult[] };
+}
+
+/** One reviewer's session on one PR head (v3 §5). */
+export interface ReviewState {
+  role: ReviewerRole;
+  head: string;
+  status: 'starting' | 'running' | 'reported' | 'failed';
+  sandbox: string;
+  sessionId: string;
+  startedAt: string;
+  deadline: string;
+  endedAt?: string;
+  verdict?: 'pass' | 'block';
+  summary?: string;
+  findings?: ReviewFinding[];
+  usage?: Usage;
+  /** Why there is no report. */
+  reason?: string;
+  posted?: { status: 'success' | 'failure' | 'error'; comments: number; at: string; problem?: string };
+  /** A fix round was opened for this review's blocking findings. */
+  fixRequested?: boolean;
 }
 
 export interface ManagerState {
@@ -315,9 +341,16 @@ export function apply(state: State, event: HarnessEvent): State {
     }
     case 'REQUEST_FIX': {
       const plan = state.plans[planKey(ref!)]!;
-      const kind = plan.status === 'deploy_failed' || plan.status === 'verify_failed' ? 'deploy' : 'ci';
+      const kind = event.payload.review ? 'review' : plan.status === 'deploy_failed' || plan.status === 'verify_failed' ? 'deploy' : 'ci';
       let round: number;
-      if (kind === 'deploy') {
+      if (kind === 'review') {
+        // A reviewer blocked the PR: its own rounds, on the plan branch like a CI fix (v3 §5.4).
+        const role = event.payload.review!;
+        round = (plan.reviewFixRounds?.[role] ?? 0) + 1;
+        plan.reviewFixRounds = { ...plan.reviewFixRounds, [role]: round };
+        const review = plan.reviews?.findLast((r) => r.role === role && r.head === plan.head && r.status === 'reported');
+        if (review) review.fixRequested = true;
+      } else if (kind === 'deploy') {
         // A Fix PR: a new branch from the merge, and a new pull request (§11.3).
         round = (plan.deployFixRounds ?? 0) + 1;
         Object.assign(plan, { deployFixRounds: round, branch: `fix/${plan.module}/${plan.plan}-${round}`, base: plan.mergeCommit, head: plan.mergeCommit, fixRounds: 0 });
@@ -332,8 +365,33 @@ export function apply(state: State, event: HarnessEvent): State {
       Object.assign(plan, { status: 'fixing', fixes: n });
       state.features[`${planKey(ref!)}/fix${n}`] = {
         module: plan.module, plan: plan.plan, feature: `fix${n}`, status: 'pending', attempts: [], extraAttempts: 0,
-        guidance: event.payload.guidance, fix: { round, kind, failure: event.payload.failure, requestId: event.payload.requestId },
+        guidance: event.payload.guidance,
+        fix: { round, kind, failure: event.payload.failure, requestId: event.payload.requestId, ...(event.payload.review ? { role: event.payload.review } : {}) },
       };
+      break;
+    }
+    case 'REVIEW_STARTING': {
+      const plan = state.plans[planKey(ref!)]!;
+      const { role, head, sandbox, sessionId, deadline } = event.payload;
+      (plan.reviews ??= []).push({ role, head, status: 'starting', sandbox, sessionId, startedAt: event.ts, deadline });
+      break;
+    }
+    case 'REVIEW_STARTED':
+      reviewOf(state, ref!, event.payload).status = 'running';
+      break;
+    case 'REVIEW_ENDED': {
+      const review = reviewOf(state, ref!, event.payload);
+      const { outcome, verdict, summary, findings, usage, reason } = event.payload;
+      review.endedAt = event.ts;
+      if (usage) review.usage = usage;
+      if (outcome === 'done' && verdict) Object.assign(review, { status: 'reported', verdict, summary, findings: findings ?? [] });
+      else Object.assign(review, { status: 'failed', reason: reason ?? outcome });
+      break;
+    }
+    case 'REVIEW_POSTED': {
+      const review = reviewOf(state, ref!, event.payload);
+      const { status, comments, problem } = event.payload;
+      review.posted = { status, comments, at: event.ts, ...(problem ? { problem } : {}) };
       break;
     }
     case 'PLAN_COMPLETED': {
@@ -681,6 +739,13 @@ export function writeSnapshot(file: string, state: State): void {
   const tmp = `${file}.tmp`;
   writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`);
   renameSync(tmp, file);
+}
+
+/** The latest session of a reviewer on a head: the one the event is about. */
+function reviewOf(state: State, ref: Ref, which: { role: ReviewerRole; head: string }): ReviewState {
+  const review = state.plans[planKey(ref)]?.reviews?.findLast((r) => r.role === which.role && r.head === which.head);
+  if (!review) throw new Error(`no ${which.role} review of ${planKey(ref)} on ${which.head.slice(0, 8)}`);
+  return review;
 }
 
 function featureOf(state: State, ref: Ref): FeatureState {
