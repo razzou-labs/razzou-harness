@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { webRead } from '../daemon/web-read.ts';
 import { loadPty } from '../dashboard/terminals.ts';
 import { ConfigSchema, requiredChecks, type Config } from '../design/schemas.ts';
+import { claudeTokenFile, loadClaudeToken, saveClaudeToken } from '../anthropic/usage.ts';
 import { GitHubClient, loadAppCredentials } from '../github/app.ts';
 import { checkApp } from '../github/setup.ts';
 import { BUNDLES } from '../sandbox/allowlist.ts';
@@ -123,7 +124,10 @@ async function claude(options: DoctorOptions, provider: string, report: (c: Chec
     const imported = await run('openshell', ['profile', 'import', '-f', join(options.packageDir, 'templates', 'openshell', 'claude-code-subscription.yaml'), '--global']);
     report(imported.code === 0 ? ok('Claude profile', 'imported') : fail('Claude profile', firstLine(imported.stderr), 'see `openshell profile import --help`'));
   }
-  if (await providerExists(provider)) return report(ok('Claude provider', provider));
+  if (await providerExists(provider)) {
+    report(ok('Claude provider', provider));
+    return claudeToken(options, report);
+  }
   if (!options.interactive) {
     return report(fail('Claude provider', `${provider} is missing`, 'run `claude setup-token`, then `harness doctor` in a terminal: it asks for the token'));
   }
@@ -134,6 +138,22 @@ async function claude(options: DoctorOptions, provider: string, report: (c: Chec
     env: { ...process.env, CLAUDE_CODE_OAUTH_TOKEN: token },
   });
   report(created.code === 0 ? ok('Claude provider', `${provider} created`) : fail('Claude provider', firstLine(created.stderr), 'see `openshell provider create --help`'));
+  // The same token lets the daemon read the subscription's usage before a launch in Swarm (v3 §4.3).
+  if (created.code === 0) report(ok('Claude token', `stored in ${saveClaudeToken(token)}: the daemon reads the subscription's usage with it`));
+}
+
+/** The stored token (v3 §4.3), asked for when Swarm needs it and the provider was created before the harness stored tokens. */
+async function claudeToken(options: DoctorOptions, report: (c: Check) => void): Promise<void> {
+  if (loadClaudeToken()) return report(ok('Claude token', `stored in ${claudeTokenFile()}: the daemon reads the subscription's usage with it`));
+  if (projectMode(options.projectDir) !== 'swarm') {
+    return report({ status: 'skip', name: 'Claude token', detail: "not stored; Swarm reads the subscription's usage with it before a launch" });
+  }
+  if (!options.interactive) {
+    return report(warn('Claude token', "not stored: Swarm can't read the subscription's usage before a launch", 'run `harness doctor` in a terminal: it asks for the token from `claude setup-token`'));
+  }
+  const token = await askSecret("Swarm reads the subscription's usage before a launch. Paste the token from `claude setup-token` (hidden), or press Enter to skip: ");
+  if (!token) return report(warn('Claude token', 'not stored: the daemon learns of a limit only when an attempt hits it', 'run `harness doctor` again to store it'));
+  report(ok('Claude token', `stored in ${saveClaudeToken(token)}`));
 }
 
 async function project(options: DoctorOptions, config: Config, report: (c: Check) => void): Promise<void> {

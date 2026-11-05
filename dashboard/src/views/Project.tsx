@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { post, type Attempt, type DashboardState, type FeatureState, type OwnerTime, type PlanState, type State } from '../api.ts';
+import { post, type Attempt, type DashboardState, type FeatureState, type OwnerTime, type PlanState, type State, type SubscriptionUsage } from '../api.ts';
 import { Action, Badge, GithubLink } from '../components/ui.tsx';
 import { duration } from '../format.ts';
 import { Proposal } from './NeedsYou.tsx';
@@ -11,7 +11,12 @@ export function Project({ data }: { data: DashboardState }) {
   const moduleIds = [...new Set([...Object.keys(state.modules), ...design.modules.map((m) => m.id)])];
   return (
     <div className="stack">
-      <Budgets state={state} {...(data.ownerTime ? { ownerTime: data.ownerTime } : {})} />
+      <Budgets
+        state={state}
+        ceiling={design.swarm?.usageCeilingPercent ?? null}
+        {...(data.ownerTime ? { ownerTime: data.ownerTime } : {})}
+        {...(data.usage ? { usage: data.usage } : {})}
+      />
       <NewModule />
       {moduleIds.length === 0 && <p className="muted">No module yet.</p>}
       {moduleIds.map((id) => {
@@ -75,7 +80,7 @@ function agentMs(state: State, now: number): number {
 }
 
 /** The owner's hours for the whole project, and the agent-hours threshold (v3 §4): set here, recorded by the daemon. */
-function Budgets({ state, ownerTime }: { state: State; ownerTime?: OwnerTime }) {
+function Budgets({ state, ownerTime, usage, ceiling }: { state: State; ownerTime?: OwnerTime; usage?: { at: string; usage: SubscriptionUsage }; ceiling: number | null }) {
   const budgets = state.budgets ?? {};
   const overPlanned = ownerTime !== undefined && ownerTime.committedHours > ownerTime.plannableHours;
   const overUsed = ownerTime !== undefined && ownerTime.usedHours > ownerTime.hours;
@@ -120,6 +125,22 @@ function Budgets({ state, ownerTime }: { state: State; ownerTime?: OwnerTime }) 
           <HoursForm field="agentHours" value={budgets.agentHours} placeholder="threshold" />
           <p className="muted small">The Developers' attempt clocks, summed. Over the threshold the number turns red; nothing stops.</p>
         </div>
+        {usage && (
+          <div className="meter">
+            <h3>Subscription</h3>
+            <p>
+              {usage.usage.limits.map((limit, i) => (
+                <span key={limit.kind}>
+                  {i > 0 && ' · '}
+                  <b className={ceiling !== null && limit.percent >= ceiling ? 'bad' : undefined}>{limit.percent}%</b> {limit.kind.replace(/_/g, ' ')}, resets {new Date(limit.resetsAt).toLocaleString()}
+                </span>
+              ))}
+            </p>
+            <p className="muted small">
+              Read {new Date(usage.at).toLocaleTimeString()}. In Swarm no attempt starts at or above {ceiling === null ? 'the ceiling, which is off' : `${ceiling}%`}; the pipeline waits for the window to reset.
+            </p>
+          </div>
+        )}
       </div>
     </section>
   );

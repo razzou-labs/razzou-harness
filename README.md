@@ -265,6 +265,13 @@ pull requests are yours in both modes. In Swarm, GitHub's rules need no approval
 require the reviewers' statuses, pinned to the App, so even the daemon can't merge
 before they pass.
 
+**Before a launch.** In Swarm the daemon reads your subscription's usage before it
+starts an attempt, and at or above `swarm.usageCeilingPercent` the pipeline waits for
+the window to reset. It reads it with the token `harness doctor` stores in
+`~/.config/harness/claude.token` when it creates the Claude provider; on an older
+setup, the doctor asks for the token again once Swarm is on. Without it, the daemon
+learns of a limit only when an attempt hits it, as in Manual.
+
 **Where it stands.** The reviewers that post `harness/security` and `harness/cost`,
 and the cost estimate, are the next milestones (proposal v3 §5). Until they exist,
 Swarm merges nothing unless you set `swarm.requiredStatuses` to `[]`, which merges
@@ -500,7 +507,10 @@ To report a vulnerability, see `SECURITY.md` in the source repository.
 
 - The agents run on your Claude subscription, so their usage counts against your plan's
   limits. When Claude Code reports that a limit is reached, the attempt under way
-  doesn't count, and the pipeline pauses for an hour, then goes on.
+  doesn't count, and the pipeline pauses for an hour, then goes on. In Swarm mode the
+  daemon also reads the usage before each launch, and waits above
+  `swarm.usageCeilingPercent` until the window resets; the Project view shows the
+  windows.
 - By default, all three roles run Opus 5.5 at a high effort. To try the harness, or to
   use less of your plan, set each role's `model` to Haiku 4.5
   (`claude-haiku-4-5-20251001`) and its `effort` to `null`.

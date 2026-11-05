@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events';
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { claudeCode, mcpConfig, readResult, reportJsonSchema, type AgentAdapter, type AgentRun } from '../agents/claude-code.ts';
+import { loadClaudeToken, readUsage, type SubscriptionUsage } from '../anthropic/usage.ts';
 import { allPassed, initEnvironment, runChecks, type CheckResult, type RunOptions } from '../checks/runner.ts';
 import { protectedChanges } from '../ci/harness-ci.ts';
 import { ownerTime, type OwnerTime } from '../design/owner-time.ts';
@@ -41,6 +42,8 @@ export interface OrchestratorOptions {
   agent?: AgentAdapter;
   /** Tests replace the web; the daemon reads it. */
   webRead?: (url: string) => Promise<WebReadResult>;
+  /** Tests replace the subscription's usage endpoint (v3 §4.3). By default: the endpoint, with the token the doctor stored; undefined without one. */
+  usage?: () => Promise<SubscriptionUsage | undefined>;
   /** Tests replace GitHub. By default: GitHub through the App when the project names a repository, else the project's own folder. */
   forge?: (config: Config) => Forge;
   now?: () => number;
@@ -77,6 +80,9 @@ export class Orchestrator {
   readonly now: () => number;
   readonly log: (message: string) => void;
   readonly webRead: (url: string) => Promise<WebReadResult>;
+  private readonly readUsage: () => Promise<SubscriptionUsage | undefined>;
+  /** The last reading of the subscription's usage, for the dashboard; not state. */
+  usage?: { at: string; usage: SubscriptionUsage };
   forge!: Forge;
 
   private ticking?: Promise<void>;
@@ -94,6 +100,10 @@ export class Orchestrator {
     this.now = options.now ?? Date.now;
     this.log = options.log ?? (() => {});
     this.webRead = options.webRead ?? ((url) => webRead(url));
+    this.readUsage = options.usage ?? (async () => {
+      const token = loadClaudeToken();
+      return token ? readUsage(token) : undefined;
+    });
     this.store = new EventStore(join(options.harnessDir, 'events.jsonl'));
     this.state = project(this.store.readAll());
     this.managers = new Managers(this);
@@ -343,13 +353,13 @@ export class Orchestrator {
             const fix = this.state.features[`${planKey(planRef)}/fix${planState.fixes}`]!;
             // A Fix PR's branch starts from the merge.
             if (!(await this.repo.revParse(`refs/heads/${planState.branch}`))) await this.repo.setRef(`refs/heads/${planState.branch}`, planState.base, '');
-            return this.scheduleWork({ ...planRef, feature: fix.feature }, this.lookup(fix).feature, fix) ?? 'wait';
+            return (await this.scheduleWork({ ...planRef, feature: fix.feature }, this.lookup(fix).feature, fix)) ?? 'wait';
           }
         }
         if (await this.mergeMain(planState)) return 'progress';
         for (const feature of plan.features) {
           const ref = { ...planRef, feature: feature.id };
-          const step = this.scheduleWork(ref, feature, this.state.features[featureKey(ref)]);
+          const step = await this.scheduleWork(ref, feature, this.state.features[featureKey(ref)]);
           if (step) return step;
         }
         this.record({ type: 'PLAN_VALIDATING', ref: planRef, payload: { head: planState.head } });
@@ -360,7 +370,7 @@ export class Orchestrator {
   }
 
   /** The next attempt of a feature or a fix round, or why there can't be one yet. Undefined once it is accepted. */
-  private scheduleWork(ref: Ref, definition: Feature, state: FeatureState | undefined): Step | undefined {
+  private async scheduleWork(ref: Ref, definition: Feature, state: FeatureState | undefined): Promise<Step | undefined> {
     if (state?.status === 'accepted') return undefined;
     const hash = definitionHash(definition);
     // The owner decides about an escalated feature, unless a design change redefined it since (§7.1).
@@ -374,7 +384,42 @@ export class Orchestrator {
     // A second attempt never starts without the Manager's guidance (§7.4).
     if (state?.awaitingGuidanceSince) return 'wait';
     if (this.blockedByOwner(ref.module) || this.designChanging(ref.module) || this.gatesHolding(ref.module, ref.plan, definition).length > 0) return 'wait';
+    if (await this.usagePauses()) return 'progress';
     return this.startAttempt(ref, hash, state);
+  }
+
+  /**
+   * In Swarm, no attempt starts at or above the usage ceiling (v3 §4.3): the pipeline
+   * pauses until the binding window resets, and the existing rule lifts the pause then.
+   * Without a token, or when the endpoint fails, nothing is checked: the pause after a
+   * limit is hit remains the brake.
+   */
+  private async usagePauses(): Promise<boolean> {
+    const ceiling = this.design.config.swarm.usageCeilingPercent;
+    if (this.state.mode !== 'swarm' || ceiling === null) return false;
+    const usage = await this.subscriptionUsage();
+    if (!usage || usage.percent < ceiling) return false;
+    const binding = usage.limits.find((l) => l.percent === usage.percent);
+    const reset = Date.parse(usage.resetsAt);
+    const until = Number.isFinite(reset) && reset > this.now() ? usage.resetsAt : new Date(this.now() + 60 * 60_000).toISOString();
+    this.record({
+      type: 'PIPELINE_PAUSED',
+      payload: { reason: `the subscription's usage is at ${usage.percent}%${binding ? ` (${binding.kind})` : ''}, at or above the ${ceiling}% ceiling (swarm.usageCeilingPercent)`, until },
+    });
+    return true;
+  }
+
+  /** The subscription's usage, read at most every five minutes. */
+  private async subscriptionUsage(): Promise<SubscriptionUsage | undefined> {
+    if (this.usage && this.now() - Date.parse(this.usage.at) < 5 * 60_000) return this.usage.usage;
+    try {
+      const usage = await this.readUsage();
+      if (usage) this.usage = { at: new Date(this.now()).toISOString(), usage };
+      return usage;
+    } catch (error) {
+      this.log(`the subscription's usage could not be read: ${(error as Error).message}`);
+      return undefined;
+    }
   }
 
   /**

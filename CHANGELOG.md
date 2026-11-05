@@ -27,7 +27,10 @@ may change how a project is set up, and its notes say how.
   designs, and `submit_design` refuses a design over what remains. The Architect gets
   `get_owner_time`, and a note when the budget changes.
 - An attempt's deadline is 120 minutes, and the Manager's turn 90, by default.
-- Spike 5 records how the subscription's usage can be read before a launch.
+- In Swarm, the daemon reads the subscription's usage before it starts an attempt, and
+  at or above `swarm.usageCeilingPercent` the pipeline waits for the window to reset.
+  `harness doctor` stores the provider's token in `~/.config/harness/claude.token` for
+  it, and asks for it on an older setup once Swarm is on. Spike 5 records the endpoint.
 
 ## 0.1.3 (2026-10-11)
 

@@ -5,6 +5,7 @@ import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
 import { after, describe, it } from 'node:test';
 import { WebSocket } from 'ws';
+import type { SubscriptionUsage } from '../src/anthropic/usage.ts';
 import { Orchestrator } from '../src/daemon/orchestrator.ts';
 import { handleRequest } from '../src/daemon/requests.ts';
 import { startDashboard } from '../src/dashboard/server.ts';
@@ -34,6 +35,8 @@ interface SetupOptions {
   now?: () => number;
   /** Plays the project on a fake GitHub, with pull requests and CI. */
   github?: boolean;
+  /** Replaces the subscription's usage endpoint (v3 §4.3). */
+  usage?: () => Promise<SubscriptionUsage | undefined>;
   /** Starts with no design: an Architect writes it. */
   design?: boolean;
   architect?: ArchitectBehavior;
@@ -56,6 +59,7 @@ async function setup(decide: Decide, options: SetupOptions = {}) {
       version: 'test',
       agent: stubAgent(decide, options.manager, options.architect),
       webRead: async (url) => ({ ok: true, text: `the page at ${url}`, bytes: 20 }),
+      ...(options.usage ? { usage: options.usage } : {}),
       ...(options.now ? { now: options.now } : {}),
       ...(fake ? { forge: () => fake } : {}),
     });
@@ -384,6 +388,44 @@ describe('pull requests', () => {
     skew += 120_000;
     await until(o, completed(o));
     assert.equal(plan(o)!.mergedBy, 'owner');
+  });
+
+  it('in Swarm, starts no attempt at or above the usage ceiling, and goes on once the window resets', async () => {
+    let skew = 0;
+    let percent = 85;
+    let reads = 0;
+    // Ten minutes away: past the reading's five-minute cache, and well under the Manager's turn, which event times would trip.
+    const resetsAt = new Date(Date.now() + 10 * 60_000).toISOString();
+    const usage = async () => {
+      reads++;
+      return { percent, resetsAt, limits: [{ kind: 'session', percent: 20, resetsAt }, { kind: 'weekly_all', percent, resetsAt }] };
+    };
+    const { orchestrator: o } = await setup((f) => solved(f), { usage, now: () => Date.now() + skew });
+    o.setMode('swarm');
+    await until(o, () => o.state.pipeline.paused !== undefined);
+    assert.equal(o.state.pipeline.paused!.reason, "the subscription's usage is at 85% (weekly_all), at or above the 80% ceiling (swarm.usageCeilingPercent)");
+    assert.equal(o.state.pipeline.paused!.until, resetsAt);
+    assert.equal(Object.keys(o.state.features).length, 0);
+    assert.equal(o.usage!.usage.percent, 85);
+
+    // The window resets: the pause lifts, the usage is read again (the reading is older than five minutes), and the build goes on.
+    percent = 30;
+    skew += 10 * 60_000 + 1000;
+    await until(o, completed(o));
+    assert.ok(reads >= 2, `read ${reads} times`);
+    assert.equal(o.usage!.usage.percent, 30);
+  });
+
+  it('in Manual, never reads the usage', async () => {
+    let reads = 0;
+    const { orchestrator: o } = await setup((f) => solved(f), {
+      usage: async () => {
+        reads++;
+        return { percent: 99, resetsAt: new Date().toISOString(), limits: [] };
+      },
+    });
+    await until(o, completed(o));
+    assert.equal(reads, 0);
   });
 
   it('runs a fix round when CI fails, and the PR passes on the next run', async () => {
