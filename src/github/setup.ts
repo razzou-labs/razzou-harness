@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
+import type { Mode } from '../state/state.ts';
 import { run } from '../util.ts';
 import { APP_PERMISSIONS, configDir, GitHubClient, loadAppCredentials } from './app.ts';
 
@@ -145,8 +146,29 @@ export function installCi(projectDir: string, packageDir: string, owner?: string
   return files.map(([path]) => path);
 }
 
-/** The ruleset on main (§11.4): PRs only, the harness's jobs green, the owner's approval, merge commits, no force push. */
-export function mainRuleset(requiredChecks: string[]): object {
+/** GitHub Actions' integration id: pinned to it, a required job can't be posted by another App. */
+const GITHUB_ACTIONS = 15368;
+
+/** What the ruleset on main enforces, per mode (v3 §3.3). */
+export interface RulesetOptions {
+  mode: Mode;
+  /** The App's id. In Swarm the reviewers' statuses are pinned to it, so nothing else can post them. */
+  appId?: number;
+  /** In Swarm, the App's commit statuses a PR must carry: `swarm.requiredStatuses`. */
+  statuses?: string[];
+}
+
+/**
+ * The ruleset on main (§11.4, v3 §3.3): PRs only, the harness's jobs green, merge commits, no
+ * force push or deletion. Manual needs the owner's approval as a code owner. Swarm needs no
+ * approval, and instead the reviewers' statuses, pinned to the App.
+ */
+export function mainRuleset(requiredChecks: string[], options: RulesetOptions = { mode: 'manual' }): object {
+  const swarm = options.mode === 'swarm';
+  if (swarm && options.appId === undefined) {
+    throw new Error("Swarm pins the reviewers' statuses to the App, whose id is missing: run `harness github-app create --org <org>` first");
+  }
+  const statuses = swarm ? (options.statuses ?? []) : [];
   return {
     name: 'harness: main',
     target: 'branch',
@@ -160,9 +182,9 @@ export function mainRuleset(requiredChecks: string[]): object {
       {
         type: 'pull_request',
         parameters: {
-          required_approving_review_count: 1,
+          required_approving_review_count: swarm ? 0 : 1,
           dismiss_stale_reviews_on_push: true,
-          require_code_owner_review: true,
+          require_code_owner_review: !swarm,
           require_last_push_approval: false,
           required_review_thread_resolution: false,
           allowed_merge_methods: ['merge'],
@@ -172,16 +194,18 @@ export function mainRuleset(requiredChecks: string[]): object {
         type: 'required_status_checks',
         parameters: {
           strict_required_status_checks_policy: false,
-          // 15368 is GitHub Actions: another App can't post a passing "verify".
-          required_status_checks: requiredChecks.map((context) => ({ context, integration_id: 15368 })),
+          required_status_checks: [
+            ...requiredChecks.map((context) => ({ context, integration_id: GITHUB_ACTIONS })),
+            ...statuses.map((context) => ({ context, integration_id: options.appId })),
+          ],
         },
       },
     ],
   };
 }
 
-/** Applies the repository's merge settings and the ruleset with the owner's own `gh` login. */
-export async function applyRepositoryRules(repo: string, requiredChecks: string[]): Promise<string[]> {
+/** Applies the repository's merge settings and the ruleset of the mode with the owner's own `gh` login. */
+export async function applyRepositoryRules(repo: string, requiredChecks: string[], options: RulesetOptions = { mode: 'manual' }): Promise<string[]> {
   const gh = async (args: string[], body?: object) => {
     const result = await run('gh', ['api', ...args, ...(body ? ['--input', '-'] : [])], body ? { input: JSON.stringify(body) } : {});
     if (result.code !== 0) throw new Error(`gh api ${args.join(' ')}: ${(result.stderr || result.stdout).trim()}`);
@@ -197,11 +221,18 @@ export async function applyRepositoryRules(repo: string, requiredChecks: string[
     delete_branch_on_merge: false,
   });
   done.push('merge commits only, titled and described by the PR');
+  const ruleset = mainRuleset(requiredChecks, options);
   const existing = JSON.parse(await gh([`/repos/${repo}/rulesets`])) as Array<{ id: number; name: string }>;
-  const ruleset = mainRuleset(requiredChecks);
   const previous = existing.find((r) => r.name === 'harness: main');
   if (previous) await gh(['--method', 'PUT', `/repos/${repo}/rulesets/${previous.id}`], ruleset);
   else await gh(['--method', 'POST', `/repos/${repo}/rulesets`], ruleset);
-  done.push(`ruleset "harness: main": PRs only, one approval from a code owner, no force push or deletion, and these checks green: ${requiredChecks.join(', ')}`);
+  const checks = `these checks green: ${requiredChecks.join(', ')}`;
+  if (options.mode === 'swarm') {
+    const statuses = options.statuses ?? [];
+    const gate = statuses.length > 0 ? `these statuses from the App: ${statuses.join(', ')}` : 'no status from the App: the daemon merges on CI alone';
+    done.push(`ruleset "harness: main" (Swarm): PRs only, no approval, no force push or deletion, ${checks}, and ${gate}`);
+  } else {
+    done.push(`ruleset "harness: main" (Manual): PRs only, one approval from a code owner, no force push or deletion, and ${checks}`);
+  }
   return done;
 }

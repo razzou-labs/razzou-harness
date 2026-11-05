@@ -6,7 +6,8 @@ import { parseArgs } from 'node:util';
 import { computeLock, directoryReader } from './ci/harness-ci.ts';
 import { isAlive, packageRoot, readDaemonInfo, runDaemon, version } from './daemon/main.ts';
 import { ConfigSchema, requiredChecks } from './design/schemas.ts';
-import { applyRepositoryRules, checkApp, createApp, installCi } from './github/setup.ts';
+import { loadAppCredentials } from './github/app.ts';
+import { applyRepositoryRules, checkApp, createApp, installCi, type RulesetOptions } from './github/setup.ts';
 import { doctor } from './setup/doctor.ts';
 import { CHECKLIST, init } from './setup/init.ts';
 import { recover } from './setup/recover.ts';
@@ -42,8 +43,8 @@ Usage: harness <command> [--dir <project>]
                      Check that the App is installed on the repository and can get a token
   install-ci [--owner <login>]
                      Write the harness workflow, its CI script and CODEOWNERS into the project
-  github-setup --repo <owner/repo>
-                     Apply merge settings and the main ruleset, with your own gh login
+  github-setup --repo <owner/repo> [--mode manual|swarm]
+                     Apply merge settings and the main ruleset of the mode (the daemon's, by default), with your own gh login
   lock               Write harness/lock.json, the hashes of every protected file and field
   doctor [--probe] [--build-images]
                      Check this machine and the project, and set up the providers;
@@ -63,6 +64,7 @@ async function main(): Promise<void> {
       name: { type: 'string' },
       repo: { type: 'string' },
       owner: { type: 'string' },
+      mode: { type: 'string' },
       probe: { type: 'boolean' },
       'build-images': { type: 'boolean' },
       help: { type: 'boolean', short: 'h' },
@@ -128,10 +130,27 @@ async function main(): Promise<void> {
       return;
     }
     case 'github-setup': {
-      if (!values.repo) throw new Error('usage: harness github-setup --repo <owner/repo>');
+      if (!values.repo) throw new Error('usage: harness github-setup --repo <owner/repo> [--mode manual|swarm]');
+      if (values.mode !== undefined && values.mode !== 'manual' && values.mode !== 'swarm') throw new Error('--mode is manual or swarm');
       const configFile = join(projectDir, 'harness', 'config.json');
-      const required = existsSync(configFile) ? requiredChecks(ConfigSchema.parse(JSON.parse(readFileSync(configFile, 'utf8')))) : ['verify', 'checks'];
-      for (const line of await applyRepositoryRules(values.repo, required)) console.log(`set: ${line}`);
+      const config = existsSync(configFile) ? ConfigSchema.parse(JSON.parse(readFileSync(configFile, 'utf8'))) : undefined;
+      const required = config ? requiredChecks(config) : ['verify', 'checks'];
+      // The daemon's mode, from its snapshot, unless --mode says otherwise (v3 §2.1).
+      const stateFile = join(harnessDir, 'state.json');
+      const snapshot = existsSync(stateFile) ? (JSON.parse(readFileSync(stateFile, 'utf8')) as State) : undefined;
+      const mode = values.mode ?? snapshot?.mode ?? 'manual';
+      let options: RulesetOptions = { mode };
+      if (mode === 'swarm') {
+        const statuses = (config?.swarm ?? ConfigSchema.shape.swarm.parse(undefined)).requiredStatuses;
+        let appId: number | undefined;
+        try {
+          appId = loadAppCredentials().appId;
+        } catch {
+          appId = undefined;
+        }
+        options = { mode, statuses, ...(appId !== undefined ? { appId } : {}) };
+      }
+      for (const line of await applyRepositoryRules(values.repo, required, options)) console.log(`set: ${line}`);
       return;
     }
     case 'doctor':
