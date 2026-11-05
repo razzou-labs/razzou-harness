@@ -18,6 +18,10 @@ nav .count { margin-left: 6px; background: var(--warn); color: var(--panel); bor
 main { padding: 16px; max-width: 1400px; margin: 0 auto; }
 .boot, .banner { padding: 16px; }
 .banner { color: var(--bad); }
+.note { padding: 8px 16px; border-bottom: 1px solid var(--line); background: var(--accent); font-size: 13px; }
+.meters { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+.meter { border: 1px solid var(--line); border-radius: 6px; padding: 8px 12px; background: var(--bg); }
+.meter h3 { margin-bottom: 2px; }
 section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; min-width: 0; }
 section.need { border-left: 3px solid var(--warn); }
 h2 { font-size: 15px; margin: 0 0 8px; }

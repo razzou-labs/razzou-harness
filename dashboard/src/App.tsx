@@ -32,12 +32,22 @@ export function App() {
   if (!data) return <div className="boot">{problem ?? 'Connecting to the daemon…'}</div>;
   const needs = collectNeeds(data, go).length;
   const paused = data.state.pipeline.paused;
+  const swarm = (data.state.mode ?? 'manual') === 'swarm';
+  // The switch takes effect at item boundaries; the daemon records it (v3 §2.1).
+  const switchMode = () => {
+    const question = swarm
+      ? 'In Manual you review and merge every pull request yourself. Switch to Manual?'
+      : 'In Swarm the daemon merges plans that pass CI and the reviewers, without your review. Switch to Swarm?';
+    return window.confirm(question) ? post('/api/mode', { mode: swarm ? 'manual' : 'swarm' }) : Promise.resolve({ done: true });
+  };
   return (
     <>
       <header>
         <h1>harness · {data.design.project}</h1>
         <Badge status={paused ? 'paused' : 'running'} />
         {paused ? <Action label="Resume" onClick={() => post('/api/resume')} /> : <Action label="Pause" onClick={() => post('/api/pause')} />}
+        <Badge status={swarm ? 'swarm' : 'manual'} label={swarm ? 'Swarm' : 'Manual'} />
+        <Action label={swarm ? 'Switch to Manual' : 'Switch to Swarm'} onClick={switchMode} />
         <span className="muted small">
           {!connected ? 'reconnecting…' : data.state.daemon ? `daemon ${data.state.daemon.version}, pid ${data.state.daemon.pid}` : 'daemon stopped'}
         </span>
@@ -51,6 +61,13 @@ export function App() {
         </nav>
       </header>
       {problem && <div className="banner">{problem}</div>}
+      {swarm && (
+        <div className="note">
+          {data.design.repo
+            ? <>Swarm: after a switch, run <code>harness github-setup --repo {data.design.repo}</code> once so GitHub's rules match; until then nothing merges.</>
+            : 'Swarm: this project has no GitHub repository, so there is nothing to merge; plans complete locally.'}
+        </div>
+      )}
       <main>
         {current.view === 'needs' && <NeedsYou data={data} go={go} />}
         {current.view === 'project' && <Project data={data} />}

@@ -90,12 +90,26 @@ export function collectNeeds({ state, design }: DashboardState, go: Go): Need[] 
       });
     }
   }
-  for (const plan of Object.values(state.plans).filter((p) => p.status === 'ready_to_merge' && p.pr)) {
-    needs.push({
-      key: `merge:${plan.module}/${plan.plan}`,
-      title: `${plan.module}/${plan.plan} passed CI`,
-      body: <p>Review and merge <GithubLink url={plan.pr!.url}>PR #{plan.pr!.number}</GithubLink> on GitHub, with a merge commit.</p>,
-    });
+  for (const plan of Object.values(state.plans).filter((p) => p.pr && (p.status === 'ready_to_merge' || p.status === 'pr_open'))) {
+    // In Swarm, the merge policy may leave a PR to the owner, with its reason (v3 §3.2).
+    if (plan.leftToOwner) {
+      needs.push({
+        key: `left:${plan.module}/${plan.plan}`,
+        title: `PR #${plan.pr!.number} of ${plan.module}/${plan.plan} waits for you`,
+        body: (
+          <>
+            <p>{plan.leftToOwner.reason}</p>
+            <p>Review and merge <GithubLink url={plan.pr!.url}>PR #{plan.pr!.number}</GithubLink> on GitHub, with a merge commit.</p>
+          </>
+        ),
+      });
+    } else if (plan.status === 'ready_to_merge') {
+      needs.push({
+        key: `merge:${plan.module}/${plan.plan}`,
+        title: `${plan.module}/${plan.plan} passed CI`,
+        body: <p>Review and merge <GithubLink url={plan.pr!.url}>PR #{plan.pr!.number}</GithubLink> on GitHub, with a merge commit.</p>,
+      });
+    }
   }
   for (const feature of Object.values(state.features).filter((f) => f.status === 'escalated')) {
     needs.push({ key: `escalated:${key(feature)}`, title: `${key(feature)} is escalated`, body: <Escalated feature={feature} /> });
