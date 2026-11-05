@@ -23,6 +23,8 @@ Usage: harness <command> [--dir <project>]
   down               Stop the running daemon; sandboxes keep their state
   status             Show plans, features and the pipeline
   resume             Lift a pause of the pipeline
+  mode [manual|swarm]
+                     Show the mode, or switch it: in Swarm the daemon merges plans (docs/architecture/proposal-v3.md)
   retry <m/p/f>      Grant one more attempt to an escalated feature (--note: guidance)
   module new <id> <title>
                      Start a module: its Architect's sandbox and conversation
@@ -80,6 +82,16 @@ async function main(): Promise<void> {
       return status(harnessDir);
     case 'resume':
       return ownerAction(harnessDir, '/api/resume', {});
+    case 'mode': {
+      if (!argument) {
+        const file = join(harnessDir, 'state.json');
+        const state = existsSync(file) ? (JSON.parse(readFileSync(file, 'utf8')) as State) : undefined;
+        console.log(state?.mode ?? 'manual');
+        return;
+      }
+      if (argument !== 'manual' && argument !== 'swarm') throw new Error('usage: harness mode [manual|swarm]');
+      return ownerAction(harnessDir, '/api/mode', { mode: argument });
+    }
     case 'retry':
       if (!argument) throw new Error('usage: harness retry <module/plan/feature>');
       return ownerAction(harnessDir, '/api/retry', { feature: argument, note: values.note });

@@ -124,6 +124,13 @@ export function startDashboard({ orchestrator, port, token, webRoot, terminals }
           return sendJson(res, { done: orchestrator.pause() });
         case 'POST /api/resume':
           return sendJson(res, { done: orchestrator.resume() });
+        case 'POST /api/mode':
+          return sendJson(res, body.mode === 'manual' || body.mode === 'swarm' ? { done: orchestrator.setMode(body.mode) } : { done: false, error: 'the mode is manual or swarm' });
+        case 'POST /api/budgets': {
+          // A positive number sets a budget, null clears it, anything else leaves it alone.
+          const hours = (key: string) => (body[key] === null ? null : typeof body[key] === 'number' && Number.isFinite(body[key]) && (body[key] as number) > 0 ? (body[key] as number) : undefined);
+          return sendJson(res, { done: orchestrator.setBudgets({ ownerHours: hours('ownerHours'), agentHours: hours('agentHours') }) });
+        }
         case 'POST /api/retry':
           return sendJson(res, { done: typeof body.feature === 'string' && orchestrator.retry(body.feature, text('note')) });
         case 'POST /api/message':
@@ -327,6 +334,9 @@ function designSummary(orchestrator: Orchestrator) {
     repo: config.project.repo,
     maxAttempts: config.roles.developer.maxAttempts,
     attemptMinutes: config.roles.developer.attemptTimeoutMinutes,
+    terraform: config.terraform !== undefined,
+    ownerTime: config.ownerTime,
+    swarm: config.swarm,
     modules: modules.map((m) => ({
       id: m.id,
       plans: m.plans.map((p) => ({

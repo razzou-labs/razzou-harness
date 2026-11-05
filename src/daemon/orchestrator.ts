@@ -16,7 +16,7 @@ import { buildPolicy } from '../sandbox/policy.ts';
 import { EventStore, type CiJob, type HarnessEvent, type NewEvent, type Ref } from '../state/events.ts';
 import {
   activeAttempt, apply, countedAttempts, featureKey, interruptions, planKey, project, writeSnapshot,
-  type Attempt, type FeatureState, type PlanState, type State,
+  type Attempt, type FeatureState, type Mode, type PlanState, type State,
 } from '../state/state.ts';
 import { clip, sh, sleep } from '../util.ts';
 import { Architects } from './architects.ts';
@@ -171,6 +171,28 @@ export class Orchestrator {
     this.record({ type: 'PIPELINE_RESUMED', payload: {} });
     this.kick();
     return true;
+  }
+
+  /** The owner switches between Manual and Swarm (v3 §2.1). Running attempts finish under the rules they started with. */
+  setMode(mode: Mode): boolean {
+    if (this.state.mode === mode) return false;
+    this.record({ type: 'MODE_CHANGED', payload: { mode } });
+    this.kick();
+    return true;
+  }
+
+  /** The owner sets their hours for the whole project, or the agent-hours threshold (v3 §4); null clears one. */
+  setBudgets(budgets: { ownerHours?: number | null | undefined; agentHours?: number | null | undefined }): boolean {
+    let changed = false;
+    if (budgets.ownerHours !== undefined && budgets.ownerHours !== (this.state.budgets.ownerHours ?? null)) {
+      this.record({ type: 'OWNER_HOURS_SET', payload: { hours: budgets.ownerHours } });
+      changed = true;
+    }
+    if (budgets.agentHours !== undefined && budgets.agentHours !== (this.state.budgets.agentHours ?? null)) {
+      this.record({ type: 'AGENT_HOURS_SET', payload: { hours: budgets.agentHours } });
+      changed = true;
+    }
+    return changed;
   }
 
   /** The owner grants one more attempt to an escalated feature (`module/plan/feature`). */

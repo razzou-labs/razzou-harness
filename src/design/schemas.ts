@@ -47,6 +47,16 @@ export const PlanSchema = z
   });
 export type Plan = z.infer<typeof PlanSchema>;
 
+/**
+ * A plan's kind follows from its features' (v3 §3.1): it is tagged in the PR's title, and
+ * CI keeps a CODE PR off the Terraform folder. Infrastructure gets plans of its own.
+ */
+export type PlanKind = 'CODE' | 'INFRA' | 'MIXED';
+export function planKind(plan: Pick<Plan, 'features'>): PlanKind {
+  const infra = plan.features.filter((f) => f.kind === 'infra').length;
+  return infra === 0 ? 'CODE' : infra === plan.features.length ? 'INFRA' : 'MIXED';
+}
+
 export const ConfigSchema = z.object({
   harnessVersion: z.string(),
   project: z.object({
@@ -64,7 +74,7 @@ export const ConfigSchema = z.object({
           model: z.string().default('claude-opus-5-5'),
           /** Claude Code's `--effort`; `null` leaves it to Claude Code, for models without effort levels. */
           effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).nullable().default('xhigh'),
-          attemptTimeoutMinutes: z.number().int().positive().max(600).default(90),
+          attemptTimeoutMinutes: z.number().int().positive().max(600).default(120),
           maxAttempts: z.number().int().min(1).max(5).default(2),
         })
         .prefault({}),
@@ -138,11 +148,43 @@ export const ConfigSchema = z.object({
     .object({
       consecutiveFailures: z.number().int().min(1).default(3),
       /** How long an item may wait for the Manager before a reminder; as long again, and the pipeline pauses. */
-      managerTurnMinutes: z.number().int().min(1).max(240).default(20),
+      managerTurnMinutes: z.number().int().min(1).max(240).default(90),
       /** Fix rounds for a pull request whose CI fails, before the owner decides. */
       ciFixRounds: z.number().int().min(0).max(5).default(2),
       /** Fix PRs after a failed apply or failed post-deploy checks, before the owner decides. */
       deployFixRounds: z.number().int().min(0).max(5).default(2),
+    })
+    .prefault({}),
+  /** The owner's time as a design constraint (v3 §4.1), once the owner sets their hours in the dashboard. */
+  ownerTime: z
+    .object({
+      /** How fast the owner reads a proposal. */
+      linesPerHour: z.number().int().positive().default(1000),
+      /** The share of the owner's hours that designs may not plan: escalations, questions and merges come out of it. */
+      reservePercent: z.number().int().min(0).max(90).default(20),
+    })
+    .prefault({}),
+  /** Swarm mode (v3): what the daemon may merge, how many agents run at once, and the subscription's ceiling. */
+  swarm: z
+    .object({
+      maxDevelopers: z.number().int().min(1).max(10).default(3),
+      maxPlans: z.number().int().min(1).max(5).default(2),
+      merge: z
+        .object({
+          /** Who merges a CODE plan's PR once CI and the reviewers pass. */
+          code: z.enum(['daemon', 'owner']).default('daemon'),
+          /** The monthly cost an INFRA or MIXED PR may add and still merge itself; null leaves them all to the owner. */
+          infraMonthlyUsdCeiling: z.number().min(0).nullable().default(50),
+        })
+        .prefault({}),
+      /** The App's commit statuses a PR needs before the daemon merges it; [] merges on CI alone. */
+      requiredStatuses: z.array(z.string().min(1)).default(['harness/security', 'harness/cost']),
+      /** No attempt starts at or above this share of the subscription's limits; null turns the probe off. */
+      usageCeilingPercent: z.number().int().min(1).max(100).nullable().default(80),
+      securityFixRounds: z.number().int().min(0).max(5).default(2),
+      costFixRounds: z.number().int().min(0).max(5).default(2),
+      /** Run the reviewers in Manual mode too, as comments only. */
+      reviewersInManual: z.boolean().default(false),
     })
     .prefault({}),
   dashboard: z.object({ port: z.number().int().min(1024).max(65535).default(4777) }).prefault({}),

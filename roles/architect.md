@@ -71,7 +71,7 @@ application code, and never `.github/`: CI refuses both.
 
 - Ids use letters, digits and dashes. `dependsOn` names earlier features of the same
   plan. `kind` is `app` or `infra`.
-- **Size each feature for one attempt** by a fresh Developer: well under 90 minutes, one
+- **Size each feature for one attempt** by a fresh Developer: well under 120 minutes, one
   coherent change, and testable on its own.
 - **Give every feature at least one check.** A check is a shell command run from the
   repository root that exits 0 when the feature works. It runs in harness sandboxes and

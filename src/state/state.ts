@@ -5,6 +5,9 @@ import type { AttemptOutcome, CiJob, Finding, HarnessEvent, Ref, Usage } from '.
 
 export type AttemptStatus = 'starting' | 'running' | 'collecting' | 'checking' | 'reviewing' | 'accepted' | 'failed' | 'interrupted';
 
+/** Manual: the owner merges every pull request. Swarm: the daemon merges plans under the policy of v3 §3.2. */
+export type Mode = 'manual' | 'swarm';
+
 export interface Question {
   requestId: string;
   text: string;
@@ -94,6 +97,10 @@ export interface PlanState {
   fixes?: number;
   mergeCommit?: string;
   mergedAt?: string;
+  /** Who merged the PR: the daemon under the Swarm policy, or the owner. */
+  mergedBy?: 'owner' | 'daemon';
+  /** In Swarm, the policy left this head's PR to the owner: the reason shows under Needs you. */
+  leftToOwner?: { head: string; reason: string; at: string };
   deploy?: { commit: string; status: 'passed' | 'failed'; jobs?: CiJob[] };
   postDeploy?: { status: 'passed' | 'failed'; results: CheckResult[] };
 }
@@ -158,6 +165,9 @@ export interface State {
   lastEventId?: string;
   daemon?: { pid: number; version: string; startedAt: string };
   pipeline: { paused?: { reason: string; since: string; until?: string }; consecutiveFailures: number };
+  mode: Mode;
+  /** What the owner set in the dashboard (v3 §4): their hours for the whole project, and the agent-hours threshold. */
+  budgets: { ownerHours?: number; ownerHoursSetAt?: string; agentHours?: number };
   plans: Record<string, PlanState>;
   features: Record<string, FeatureState>;
   managers: Record<string, ManagerState>;
@@ -173,7 +183,7 @@ export const planKey = (ref: Ref) => `${ref.module}/${ref.plan}`;
 export const featureKey = (ref: Ref) => `${ref.module}/${ref.plan}/${ref.feature}`;
 
 export function initialState(): State {
-  return { v: 1, pipeline: { consecutiveFailures: 0 }, plans: {}, features: {}, managers: {}, ownerRequests: {}, modules: {}, actions: {}, pendingProgress: [] };
+  return { v: 1, pipeline: { consecutiveFailures: 0 }, mode: 'manual', budgets: {}, plans: {}, features: {}, managers: {}, ownerRequests: {}, modules: {}, actions: {}, pendingProgress: [] };
 }
 
 export function project(events: HarnessEvent[]): State {
@@ -236,9 +246,32 @@ export function apply(state: State, event: HarnessEvent): State {
       if (event.type === 'CI_PASSED') plan.status = 'ready_to_merge';
       break;
     }
+    case 'MODE_CHANGED':
+      state.mode = event.payload.mode;
+      break;
+    case 'OWNER_HOURS_SET':
+      if (event.payload.hours === null) {
+        delete state.budgets.ownerHours;
+        delete state.budgets.ownerHoursSetAt;
+      } else {
+        state.budgets.ownerHours = event.payload.hours;
+        state.budgets.ownerHoursSetAt = event.ts;
+      }
+      break;
+    case 'AGENT_HOURS_SET':
+      if (event.payload.hours === null) delete state.budgets.agentHours;
+      else state.budgets.agentHours = event.payload.hours;
+      break;
+    case 'PR_LEFT_TO_OWNER':
+      state.plans[planKey(ref!)]!.leftToOwner = { head: event.payload.head, reason: event.payload.reason, at: event.ts };
+      break;
+    case 'PR_MERGED_BY_DAEMON':
+      state.plans[planKey(ref!)]!.mergedBy = 'daemon';
+      break;
     case 'PR_MERGED': {
       const plan = state.plans[planKey(ref!)]!;
-      Object.assign(plan, { status: event.payload.next, mergeCommit: event.payload.commit, mergedAt: event.ts, head: event.payload.commit });
+      Object.assign(plan, { status: event.payload.next, mergeCommit: event.payload.commit, mergedAt: event.ts, head: event.payload.commit, mergedBy: plan.mergedBy ?? 'owner' });
+      delete plan.leftToOwner;
       delete plan.deploy;
       delete plan.postDeploy;
       if (event.payload.next === 'completed') {

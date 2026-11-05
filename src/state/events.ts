@@ -2,7 +2,7 @@ import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, tr
 import { dirname } from 'node:path';
 import type { CheckResult } from '../checks/runner.ts';
 import type { Party, Role } from '../roles.ts';
-import type { ActionState, FeatureState, PlanState } from './state.ts';
+import type { ActionState, FeatureState, Mode, PlanState } from './state.ts';
 
 /** What an event is about. Ids repeat across modules, so a feature is always addressed with its module and plan. */
 export interface Ref {
@@ -97,6 +97,16 @@ interface Payloads {
   OWNER_ACTION_CLAIMED: { module: string; action: string; note?: string };
   OWNER_ACTION_DONE: { module: string; action: string; title: string; gate: boolean };
   OWNER_ACTION_REFUSED: { module: string; action: string; reason: string };
+  /** The owner switched the mode (v3 §2.1); it takes effect at item boundaries. */
+  MODE_CHANGED: { mode: Mode };
+  /** The owner set, or cleared with null, the hours the whole project may take of their time (v3 §4.1). */
+  OWNER_HOURS_SET: { hours: number | null };
+  /** The owner set, or cleared, the threshold the agent-hours meter turns red at (v3 §4.2). */
+  AGENT_HOURS_SET: { hours: number | null };
+  /** In Swarm, the merge policy left a plan's PR to the owner, and why (v3 §3.2). */
+  PR_LEFT_TO_OWNER: { number: number; head: string; reason: string };
+  /** The daemon merged a plan's PR under the Swarm policy (v3 §3.2); PR_MERGED follows. */
+  PR_MERGED_BY_DAEMON: { number: number; head: string; commit: string };
 
   // Messages.
   QUESTION: { requestId: string; question: string };
