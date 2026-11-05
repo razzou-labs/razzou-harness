@@ -101,6 +101,8 @@ export interface PlanState {
   mergedBy?: 'owner' | 'daemon';
   /** In Swarm, the policy left this head's PR to the owner: the reason shows under Needs you. */
   leftToOwner?: { head: string; reason: string; at: string };
+  /** The cost job's estimate of the monthly cost the PR adds, for the head it was computed on (v3 §5.3). */
+  costEstimate?: { head: string; monthlyUsd: number };
   deploy?: { commit: string; status: 'passed' | 'failed'; jobs?: CiJob[] };
   postDeploy?: { status: 'passed' | 'failed'; results: CheckResult[] };
 }

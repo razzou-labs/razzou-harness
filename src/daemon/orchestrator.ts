@@ -5,10 +5,10 @@ import { join } from 'node:path';
 import { claudeCode, mcpConfig, readResult, reportJsonSchema, type AgentAdapter, type AgentRun } from '../agents/claude-code.ts';
 import { allPassed, initEnvironment, runChecks, type CheckResult, type RunOptions } from '../checks/runner.ts';
 import { protectedChanges } from '../ci/harness-ci.ts';
-import { definitionHash, loadDesign, requiredChecks, type Check, type Config, type Design, type Feature, type Plan } from '../design/schemas.ts';
+import { definitionHash, loadDesign, planKind, requiredChecks, type Check, type Config, type Design, type Feature, type Plan } from '../design/schemas.ts';
 import { DEVELOPER, HARNESS, Repo } from '../git/repo.ts';
 import { GitHubClient, loadAppCredentials } from '../github/app.ts';
-import { GitHubForge, LocalForge, type CheckRun, type Forge } from '../github/forge.ts';
+import { GitHubForge, LocalForge, type CheckRun, type Forge, type PullRequest } from '../github/forge.ts';
 import { toolsManifest, type Role } from '../roles.ts';
 import type { ExecResult, Follower, SandboxDriver } from '../sandbox/driver.ts';
 import { BUNDLES } from '../sandbox/allowlist.ts';
@@ -669,9 +669,56 @@ export class Orchestrator {
       const step = await this.readCi(plan);
       if (step) return step;
     }
+    if (plan.ci?.status === 'passed' && this.state.mode === 'swarm' && !plan.branch.startsWith('fix/') && (await this.mergeUnderPolicy(plan, pr))) {
+      this.nextPoll.delete(key);
+      return 'progress';
+    }
     const quiet = plan.ci ? this.now() - Date.parse(plan.ci.since) : 0;
     this.nextPoll.set(key, this.now() + (plan.ci?.status === 'pending' ? 30_000 : quiet < 600_000 ? 60_000 : 300_000));
     return 'wait';
+  }
+
+  /**
+   * Swarm's merge policy (v3 §3.2): the daemon merges a plan's PR once CI passed, when
+   * every clause holds; otherwise the PR is left to the owner, with the reason, once per
+   * head and reason. Fix PRs never come here: a failed deploy is the owner's to look at.
+   */
+  private async mergeUnderPolicy(plan: PlanState, pr: PullRequest): Promise<boolean> {
+    const ref = { module: plan.module, plan: plan.plan };
+    const policy = this.design.config.swarm;
+    const definition = this.definitionOf(plan);
+    const kind = definition ? planKind(definition) : 'MIXED';
+    const leave = (reason: string): false => {
+      if (plan.leftToOwner?.head !== pr.head || plan.leftToOwner.reason !== reason) {
+        this.record({ type: 'PR_LEFT_TO_OWNER', ref, payload: { number: pr.number, head: pr.head, reason } });
+      }
+      return false;
+    };
+    if (kind === 'CODE' && policy.merge.code !== 'daemon') return leave('CODE plans are the owner\'s to merge (swarm.merge.code)');
+    if (kind !== 'CODE') {
+      const ceiling = policy.merge.infraMonthlyUsdCeiling;
+      if (ceiling === null) return leave(`${kind} plans are the owner's to merge (swarm.merge.infraMonthlyUsdCeiling is null)`);
+      const estimate = plan.costEstimate;
+      if (estimate === undefined) return leave(`a ${kind} plan merges itself only with the cost job's estimate of the monthly cost it adds, and none was produced`);
+      if (estimate.monthlyUsd > ceiling) return leave(`the PR adds an estimated ${estimate.monthlyUsd} USD a month, over the ceiling of ${ceiling} (swarm.merge.infraMonthlyUsdCeiling)`);
+    }
+    const statuses = await this.forge.commitStatuses(pr.head);
+    const missing = policy.requiredStatuses.filter((context) => statuses.find((s) => s.context === context)?.state !== 'success');
+    if (missing.length > 0) return leave(`waiting for ${missing.join(', ')} to pass on ${pr.head.slice(0, 8)} (swarm.requiredStatuses)`);
+    let commit: string;
+    try {
+      ({ commit } = await this.forge.mergePullRequest(pr.number, pr.head));
+    } catch (error) {
+      const repo = this.design.config.project.repo ?? '<owner/repo>';
+      return leave(`GitHub refused the merge: ${(error as Error).message}. If main's rules are still the Manual ones, run \`harness github-setup --repo ${repo}\``);
+    }
+    this.record({ type: 'PR_MERGED_BY_DAEMON', ref, payload: { number: pr.number, head: pr.head, commit } });
+    this.record({ type: 'PR_MERGED', ref, payload: { commit, next: await this.afterMerge(plan, commit) } });
+    return true;
+  }
+
+  private definitionOf(plan: PlanState): Plan | undefined {
+    return this.design.modules.find((m) => m.id === plan.module)?.plans.find((p) => p.id === plan.plan);
   }
 
   /** After a merge: CI applies the infrastructure it changed, then the plan's post-deploy checks run (§12.6). */
@@ -790,8 +837,9 @@ export class Orchestrator {
 
   private prTitle(plan: PlanState): string {
     if (plan.branch.startsWith('fix/')) return `Fix: ${planKey(plan)} — after the deploy, round ${plan.deployFixRounds}`;
-    const definition = this.design.modules.find((m) => m.id === plan.module)?.plans.find((p) => p.id === plan.plan);
-    return `Plan: ${planKey(plan)} — ${definition?.title ?? plan.plan}`;
+    const definition = this.definitionOf(plan);
+    // The kind's tag is for the owner and the reviewers; CI derives the kind from the design and grants nothing on the tag (v3 §3.1).
+    return `Plan: ${planKey(plan)} -${definition ? planKind(definition) : 'MIXED'}- ${definition?.title ?? plan.plan}`;
   }
 
   private prBody(plan: PlanState): string {

@@ -1,6 +1,6 @@
 import type { Repo } from '../git/repo.ts';
 import { tail } from '../util.ts';
-import type { GitHubClient } from './app.ts';
+import { GitHubError, type GitHubClient } from './app.ts';
 
 export interface PullRequest {
   number: number;
@@ -18,6 +18,12 @@ export interface CheckRun {
   status: string;
   conclusion: string | null;
   url?: string;
+}
+
+/** A commit status, the latest of its context: what the reviewers post as the App (v3 §5.4). */
+export interface CommitStatus {
+  context: string;
+  state: string;
 }
 
 /**
@@ -40,6 +46,13 @@ export interface Forge {
   checkRuns(sha: string): Promise<CheckRun[]>;
   /** The end of a failed job's log. */
   jobLog(run: CheckRun): Promise<string>;
+  /** The commit statuses on a commit, the latest per context. */
+  commitStatuses(sha: string): Promise<CommitStatus[]>;
+  /**
+   * Merges a PR with a merge commit, as the App, under Swarm's policy (v3 §3.2). `head`
+   * is the commit the daemon expects at the PR's head. Throws when GitHub refuses.
+   */
+  mergePullRequest(number: number, head: string): Promise<{ commit: string }>;
 }
 
 export class LocalForge implements Forge {
@@ -80,6 +93,14 @@ export class LocalForge implements Forge {
 
   async jobLog(): Promise<string> {
     return '';
+  }
+
+  async commitStatuses(): Promise<CommitStatus[]> {
+    return [];
+  }
+
+  async mergePullRequest(): Promise<{ commit: string }> {
+    throw new GitHubError('a local project has no pull requests to merge', 0);
   }
 }
 
@@ -154,5 +175,18 @@ export class GitHubForge implements Forge {
     } catch (error) {
       return `(no log: ${(error as Error).message})`;
     }
+  }
+
+  /** The combined status holds the latest status of each context. */
+  async commitStatuses(sha: string): Promise<CommitStatus[]> {
+    const combined = await this.client.request<{ statuses: Array<{ context: string; state: string }> }>('GET', `/repos/{repo}/commits/${sha}/status?per_page=100`);
+    return combined.statuses.map((s) => ({ context: s.context, state: s.state }));
+  }
+
+  /** GitHub refuses with 405 when main's rules aren't met, and with 409 when the head moved. */
+  async mergePullRequest(number: number, head: string): Promise<{ commit: string }> {
+    const result = await this.client.request<{ sha: string; merged: boolean; message: string }>('PUT', `/repos/{repo}/pulls/${number}/merge`, { merge_method: 'merge', sha: head });
+    if (!result.merged) throw new GitHubError(result.message, 0);
+    return { commit: result.sha };
   }
 }

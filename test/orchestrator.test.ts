@@ -250,12 +250,13 @@ describe('manager', () => {
     const { orchestrator: o } = await setup((f) => solved(f), { manager: { ignore: ['REVIEW', 'REMINDER'] }, now: () => Date.now() + skew });
     await until(o, () => o.state.managers.demo?.sent['review:demo/P1/F01#1'] !== undefined);
 
-    skew = 21 * 60_000;
+    // The default turn is 90 minutes (v3 §4.4): a reminder after one, a pause after two.
+    skew = 91 * 60_000;
     await until(o, () => o.state.managers.demo?.sent['review:demo/P1/F01#1']?.reminded !== undefined);
     assert.equal(o.state.pipeline.paused, undefined);
-    skew = 42 * 60_000;
+    skew = 182 * 60_000;
     await until(o, () => o.state.pipeline.paused !== undefined);
-    assert.equal(o.state.pipeline.paused!.reason, 'the Manager has not acted on the review of demo/P1/F01 attempt 1 for 40 minutes');
+    assert.equal(o.state.pipeline.paused!.reason, 'the Manager has not acted on the review of demo/P1/F01 attempt 1 for 180 minutes');
   });
 
   it('refuses tool calls that break the rules, and says why', async () => {
@@ -295,7 +296,7 @@ describe('pull requests', () => {
 
     assert.equal(fake.prs.length, 1);
     const pr = fake.prs[0]!;
-    assert.equal(pr.title, 'Plan: demo/P1 — Greeting and adding');
+    assert.equal(pr.title, 'Plan: demo/P1 -CODE- Greeting and adding');
     assert.equal(pr.branch, 'plan/demo/P1');
     assert.match(pr.body, /^Stub summary of the plan\.\n\n## Features\n\n- \*\*F01\*\* Greet: attempt 1, commit [0-9a-f]{8}\n- \*\*F02\*\* Add/);
     const pushed = (await runOk('git', ['--git-dir', fake.remote, 'rev-parse', 'refs/heads/plan/demo/P1'])).trim();
@@ -307,6 +308,82 @@ describe('pull requests', () => {
     await until(o, completed(o));
     assert.equal(plan(o)!.mergeCommit, merged);
     assert.equal(o.state.managers.demo!.status, 'stopped');
+  });
+
+  it('in Swarm, merges a CODE plan itself once CI and the required statuses pass', async () => {
+    let skew = 0;
+    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true, now: () => Date.now() + skew });
+    assert.equal(o.setMode('swarm'), true);
+    assert.equal(o.setMode('swarm'), false);
+    fake.statuses = () => ({ 'harness/security': 'success', 'harness/cost': 'success' });
+    await until(o, completed(o));
+
+    assert.equal(fake.prs[0]!.title, 'Plan: demo/P1 -CODE- Greeting and adding');
+    assert.equal(plan(o)!.mergedBy, 'daemon');
+    assert.equal(plan(o)!.leftToOwner, undefined);
+    const main = (await runOk('git', ['--git-dir', fake.remote, 'rev-parse', 'refs/heads/main'])).trim();
+    assert.equal(plan(o)!.mergeCommit, main);
+    const merged = o.store.readAll().find((e) => e.type === 'PR_MERGED_BY_DAEMON');
+    assert.ok(merged && merged.type === 'PR_MERGED_BY_DAEMON' && merged.payload.commit === main);
+    assert.equal(o.state.managers.demo!.status, 'stopped');
+  });
+
+  it('in Swarm, leaves the PR to the owner while a required status is missing, and merges once it passes', async () => {
+    let skew = 0;
+    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true, now: () => Date.now() + skew });
+    o.setMode('swarm');
+    await until(o, () => plan(o)?.leftToOwner !== undefined);
+    assert.equal(plan(o)!.status, 'ready_to_merge');
+    assert.match(plan(o)!.leftToOwner!.reason, /^waiting for harness\/security, harness\/cost to pass on [0-9a-f]{8}/);
+    assert.equal(fake.prs[0]!.state, 'open');
+
+    fake.statuses = () => ({ 'harness/security': 'success', 'harness/cost': 'success' });
+    skew += 61_000;
+    await until(o, completed(o));
+    assert.equal(plan(o)!.mergedBy, 'daemon');
+    assert.equal(plan(o)!.leftToOwner, undefined);
+    assert.equal(o.store.readAll().filter((e) => e.type === 'PR_LEFT_TO_OWNER').length, 1);
+  });
+
+  it('in Swarm, a merge GitHub refuses is left to the owner with the setup command, and the owner can still merge', async () => {
+    let skew = 0;
+    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true, config: { swarm: { requiredStatuses: [] } }, now: () => Date.now() + skew });
+    o.setMode('swarm');
+    fake.refuseMerge = 'At least 1 approving review is required by reviewers with write access.';
+    await until(o, () => plan(o)?.leftToOwner !== undefined);
+    assert.match(plan(o)!.leftToOwner!.reason, /GitHub refused the merge: At least 1 approving review.*harness github-setup --repo acme\/toy/);
+
+    await fake.merge(1);
+    skew += 120_000;
+    await until(o, completed(o));
+    assert.equal(plan(o)!.mergedBy, 'owner');
+  });
+
+  it('in Swarm, an INFRA plan waits for the owner without a cost estimate, and in Manual every plan does', async () => {
+    let skew = 0;
+    const infra = async (dir: string) => {
+      const file = join(dir, 'harness/modules/demo/plans/P1.json');
+      const design = JSON.parse(readFileSync(file, 'utf8')) as { features: Array<Record<string, unknown>> };
+      for (const feature of design.features) feature.kind = 'infra';
+      writeFileSync(file, JSON.stringify(design, null, 2));
+      await runOk('git', ['-C', dir, '-c', 'user.name=o', '-c', 'user.email=o@test.invalid', 'commit', '--quiet', '-am', 'infra plan']);
+    };
+    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true, prepare: infra, now: () => Date.now() + skew });
+    o.setMode('swarm');
+    fake.statuses = () => ({ 'harness/security': 'success', 'harness/cost': 'success' });
+    await until(o, () => plan(o)?.leftToOwner !== undefined);
+    assert.equal(fake.prs[0]!.title, 'Plan: demo/P1 -INFRA- Greeting and adding');
+    assert.match(plan(o)!.leftToOwner!.reason, /a INFRA plan merges itself only with the cost job's estimate/);
+
+    o.setMode('manual');
+    skew += 61_000;
+    await until(o, () => o.state.mode === 'manual');
+    await o.tick();
+    assert.equal(fake.prs[0]!.state, 'open');
+    await fake.merge(1);
+    skew += 120_000;
+    await until(o, completed(o));
+    assert.equal(plan(o)!.mergedBy, 'owner');
   });
 
   it('runs a fix round when CI fails, and the PR passes on the next run', async () => {
@@ -439,7 +516,7 @@ describe('architect', () => {
     skew += 120_000;
     await until(o, () => module(o)?.status === 'frozen');
     await until(o, () => o.state.plans['shop/P1']?.status === 'ready_to_merge');
-    assert.equal(fake.prs[1]!.title, 'Plan: shop/P1 — Greeting and adding');
+    assert.equal(fake.prs[1]!.title, 'Plan: shop/P1 -CODE- Greeting and adding');
 
     // The Manager asks the Architect, and the decision comes back to it.
     const asked = await handleRequest(o, { role: 'manager', sandbox: 'mgr-x', module: 'shop' }, {
