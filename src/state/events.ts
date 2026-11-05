@@ -57,6 +57,8 @@ interface Payloads {
   ATTEMPT_ENDED: { outcome: AttemptOutcome; summary?: string; notes?: string; finding?: Finding; usage?: Usage };
   ATTEMPT_INTERRUPTED: { reason: string; counts: boolean };
   CHECKS_STARTED: { head: string; files: string[] };
+  /** Another feature landed first (v3 §6.3): the plan's head was merged into the attempt, and the checks passed again on the result. */
+  ATTEMPT_REBASED: { onto: string; commit: string; results: CheckResult[] };
   CHECKS_PASSED: { results: CheckResult[] };
   CHECKS_FAILED: { results: CheckResult[] };
   FEATURE_ACCEPTED: { commit: string };

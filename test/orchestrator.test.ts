@@ -11,6 +11,7 @@ import { handleRequest } from '../src/daemon/requests.ts';
 import { startDashboard } from '../src/dashboard/server.ts';
 import { Terminals, type Pty } from '../src/dashboard/terminals.ts';
 import { recover } from '../src/setup/recover.ts';
+import { activeAttempts } from '../src/state/state.ts';
 import { runOk, sleep } from '../src/util.ts';
 import { FAKE_BOT, FakeForge } from './helpers/fake-forge.ts';
 import { LocalDriver } from './helpers/local-driver.ts';
@@ -290,6 +291,93 @@ describe('manager', () => {
     assert.equal(aborted.ok, true);
     await until(o, () => feature(o, 'F01')?.attempts[0]?.status === 'failed');
     assert.equal(feature(o, 'F01')!.attempts[0]!.reason, 'stopped by the Manager: It cannot work.');
+  });
+});
+
+describe('parallel features', () => {
+  /** The toy plan with F02 independent of F01, and with a third feature when asked. */
+  const independent = (third = false) => async (dir: string) => {
+    const file = join(dir, 'harness/modules/demo/plans/P1.json');
+    const design = JSON.parse(readFileSync(file, 'utf8')) as { features: Array<Record<string, unknown>> };
+    for (const feature of design.features) delete feature.dependsOn;
+    if (third) {
+      design.features.push({
+        id: 'F03', title: 'Three', description: 'src/three.txt exists.', expected: 'The file exists.',
+        checks: [{ id: 'F03-file', run: 'test -f src/three.txt', phase: 'pre-merge', timeoutSec: 30 }],
+      });
+    }
+    writeFileSync(file, JSON.stringify(design, null, 2));
+    await runOk('git', ['-C', dir, '-c', 'user.name=o', '-c', 'user.email=o@test.invalid', 'commit', '--quiet', '-am', 'independent features']);
+  };
+  const files = (feature: string): Record<string, string> => (feature === 'F03' ? { 'src/three.txt': '3\n' } : SOLUTIONS[feature as keyof typeof SOLUTIONS]);
+
+  /** Ticks until `done`, and reports the most attempts seen under way at once. */
+  async function untilMax(o: Orchestrator, done: () => boolean): Promise<number> {
+    let max = 0;
+    const deadline = Date.now() + 60_000;
+    while (!done()) {
+      if (Date.now() > deadline) throw new Error(`timed out; last events: ${o.store.readAll().slice(-8).map((e) => e.type).join(', ')}`);
+      await o.tick();
+      max = Math.max(max, activeAttempts(o.state).length);
+      await sleep(100);
+    }
+    return max;
+  }
+
+  it('in Swarm, independent features build at once, and the later one lands on the new head once its checks ran again', async () => {
+    const { orchestrator: o } = await setup((f) => ({ files: files(f), sleepSec: f === 'F01' ? 3 : 0 }), { prepare: independent() });
+    o.setMode('swarm');
+    const max = await untilMax(o, completed(o));
+    assert.equal(max, 2);
+
+    const f01 = feature(o, 'F01')!;
+    const f02 = feature(o, 'F02')!;
+    assert.equal(f02.status, 'accepted');
+    assert.equal(f01.status, 'accepted');
+    // F02 landed first; F01 was merged with the new head, checked again, and landed as one commit on it.
+    assert.ok(f01.attempts[0]!.rebased, 'F01 was rebased');
+    assert.equal(f01.attempts[0]!.rebased!.onto, f02.commit);
+    assert.deepEqual(o.store.readAll().filter((e) => e.type === 'ATTEMPT_REBASED').map((e) => e.ref!.feature), ['F01']);
+    const head = o.state.plans['demo/P1']!.head;
+    assert.equal((await o.repo.commitInfo(head)).parents.length, 1);
+    assert.equal(head, f01.commit);
+    const progress = (await o.repo.show(head, 'progress.txt'))!;
+    assert.match(progress, /feature\.accepted demo\/P1\/F02 .*\n.*feature\.accepted demo\/P1\/F01 /);
+    assert.equal(await o.repo.show(head, 'src/greet.sh'), SOLUTIONS.F01['src/greet.sh']);
+    assert.equal(await o.repo.show(head, 'src/add.sh'), SOLUTIONS.F02['src/add.sh']);
+  });
+
+  it('in Swarm, an attempt that conflicts with work landed meanwhile is interrupted, and the next starts from the new head', async () => {
+    const decide = (f: string): StubBehavior => (f === 'F01'
+      ? { files: { ...files('F01'), 'src/shared.txt': 'one\n' }, sleepSec: 3 }
+      : { files: { ...files('F02'), 'src/shared.txt': 'two\n' } });
+    const { orchestrator: o } = await setup(decide, { prepare: independent() });
+    o.setMode('swarm');
+    await until(o, completed(o), 60_000);
+
+    const f01 = feature(o, 'F01')!;
+    assert.equal(f01.attempts.length, 2);
+    assert.equal(f01.attempts[0]!.status, 'interrupted');
+    assert.equal(f01.attempts[0]!.counts, false);
+    assert.match(f01.attempts[0]!.reason!, /^conflicts with work landed on plan\/demo\/P1 meanwhile, in src\/shared\.txt: the next attempt starts from the new head$/);
+    assert.equal(f01.attempts[1]!.status, 'accepted');
+    assert.equal(f01.attempts[1]!.base, feature(o, 'F02')!.commit);
+    assert.equal(await o.repo.show(o.state.plans['demo/P1']!.head, 'src/shared.txt'), 'one\n');
+  });
+
+  it('in Manual, features build one at a time even without dependencies', async () => {
+    const { orchestrator: o } = await setup((f) => ({ files: files(f), sleepSec: 1 }), { prepare: independent() });
+    const max = await untilMax(o, completed(o));
+    assert.equal(max, 1);
+    assert.equal(o.store.readAll().some((e) => e.type === 'ATTEMPT_REBASED'), false);
+  });
+
+  it('in Swarm, swarm.maxDevelopers caps the attempts under way', async () => {
+    const { orchestrator: o } = await setup((f) => ({ files: files(f), sleepSec: 2 }), { prepare: independent(true), config: { swarm: { maxDevelopers: 2 } } });
+    o.setMode('swarm');
+    const max = await untilMax(o, completed(o));
+    assert.equal(max, 2);
+    assert.deepEqual(['F01', 'F02', 'F03'].map((f) => feature(o, f)!.status), ['accepted', 'accepted', 'accepted']);
   });
 });
 

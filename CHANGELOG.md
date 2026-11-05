@@ -27,6 +27,11 @@ may change how a project is set up, and its notes say how.
   designs, and `submit_design` refuses a design over what remains. The Architect gets
   `get_owner_time`, and a note when the budget changes.
 - An attempt's deadline is 120 minutes, and the Manager's turn 90, by default.
+- In Swarm, up to `swarm.maxDevelopers` Developers build a plan's independent features
+  at once. The plan's head is merged into an attempt before its checks when another
+  feature landed first, and the feature lands as one commit on the head; a conflict
+  interrupts the attempt, and the next one starts from the new head. The Architect is
+  told to declare every dependency in `dependsOn`.
 - Two reviewers, security and cost, read every plan's pull request once CI passed, in
   Swarm, or in Manual as comments only with `swarm.reviewersInManual`. Each runs in a
   fresh read-only sandbox with a brief: the features, the files changed, the

@@ -291,10 +291,21 @@ version has read only: give it the permission on GitHub, accept it on the instal
 and `harness doctor` stops warning. Until then, a plan whose reviewer passed waits for
 you with the reason.
 
+**Parallel Developers.** In Swarm, up to `swarm.maxDevelopers` Developers build the
+features of the plan under way at once, each in its own sandbox, as soon as the
+features they depend on are accepted: `dependsOn` in the design decides, so the
+Architect is told to declare every dependency. Each attempt starts from the plan
+branch as it is. When another feature lands first, the daemon merges the new head
+into the attempt before its checks, so they see the accepted work, and the feature
+lands as one commit on the head. A conflict interrupts the attempt, without counting
+it, and the next one starts from the new head. Manual mode builds one feature at a
+time, as before.
+
 **Where it stands.** The monthly cost estimate that lets `INFRA` plans merge under the
 ceiling, and the scanners in CI that the security reviewer would start from, are
-still to come (proposal v3 §5.3, §5.5): `INFRA` and `MIXED` plans wait for you.
-Parallel Developers and plans come last (v3 §6).
+still to come (proposal v3 §5.3, §5.5): `INFRA` and `MIXED` plans wait for you. Plans
+still build one after the other: parallel plans, with a Manager per plan and the
+Architect's digest, are the rest of v3 §6.
 
 **Budgets.** In both modes, the Project view shows two meters you set there:
 - **Your time.** The hours the whole project may take of you. Once set, every owner

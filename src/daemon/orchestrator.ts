@@ -17,7 +17,7 @@ import { BUNDLES } from '../sandbox/allowlist.ts';
 import { buildPolicy } from '../sandbox/policy.ts';
 import { EventStore, type CiJob, type HarnessEvent, type NewEvent, type Ref } from '../state/events.ts';
 import {
-  activeAttempt, apply, countedAttempts, featureKey, interruptions, planKey, project, writeSnapshot,
+  activeAttempt, activeAttempts, apply, countedAttempts, featureKey, interruptions, isActive, planKey, project, writeSnapshot,
   type Attempt, type FeatureState, type Mode, type PlanState, type ReviewState, type State,
 } from '../state/state.ts';
 import { clip, sh, sleep } from '../util.ts';
@@ -92,7 +92,8 @@ export class Orchestrator {
   private again = false;
   private stopping = false;
   private stepErrors = { key: '', count: 0 };
-  private developer?: { sandbox: string; follower: Follower; channel: AgentChannel };
+  /** The Developers under way, by sandbox: their transcripts for the dashboard, and their channels for the harness tools. */
+  private readonly developers = new Map<string, { follower: Follower; channel: AgentChannel }>();
   private reviewer?: { sandbox: string; follower: Follower; channel: AgentChannel };
 
   constructor(options: OrchestratorOptions) {
@@ -131,7 +132,8 @@ export class Orchestrator {
    */
   async stop(graceMs = 10_000): Promise<void> {
     this.stopping = true;
-    this.stopFollowing();
+    for (const sandbox of [...this.developers.keys()]) this.stopFollowing(sandbox);
+    this.stopFollowingReview();
     this.managers.detach();
     this.architects.detach();
     if (this.ticking) await Promise.race([this.ticking, sleep(graceMs)]);
@@ -305,30 +307,48 @@ export class Orchestrator {
       this.record({ type: 'PIPELINE_RESUMED', payload: {} });
       return 'progress';
     }
-    const active = activeAttempt(this.state);
-    if (active) {
-      const { feature, attempt } = active;
+    const active = activeAttempts(this.state);
+    let progressed = false;
+    for (const { feature, attempt } of active) {
+      if ((await this.stepAttempt(feature, attempt)) === 'progress') progressed = true;
+    }
+    if (progressed) return 'progress';
+    if (paused) return 'wait';
+    // Manual builds one feature at a time. Swarm starts more while others run, up to its limit (v3 §6.2).
+    const limit = this.state.mode === 'swarm' ? this.design.config.swarm.maxDevelopers : 1;
+    if (active.length >= limit) return 'wait';
+    return this.scheduleNext(active.length, limit);
+  }
+
+  /** One attempt's next step. An error counts against this attempt alone, and interrupts it past the limit. */
+  private async stepAttempt(feature: FeatureState, attempt: Attempt): Promise<Step> {
+    try {
       switch (attempt.status) {
         case 'starting':
-          return this.prepare(feature, attempt);
+          return await this.prepare(feature, attempt);
         case 'running':
-          return this.poll(feature, attempt);
+          return await this.poll(feature, attempt);
         case 'collecting':
-          return this.collect(feature, attempt);
+          return await this.collect(feature, attempt);
         case 'checking':
-          return this.check(feature, attempt);
+          return await this.check(feature, attempt);
         default:
-          return this.review(feature, attempt);
+          return await this.review(feature, attempt);
       }
+    } catch (error) {
+      await this.onAttemptError(feature, attempt, error as Error);
+      return 'wait';
     }
-    if (paused) return 'wait';
-    return this.scheduleNext();
   }
 
   // ── Choosing work ────────────────────────────────────────────────────────────
 
-  /** The first plan, in module order, that isn't complete; in it, the first feature that isn't accepted. */
-  private async scheduleNext(): Promise<Step> {
+  /**
+   * The first plan, in module order, that isn't complete; in it, the first feature that
+   * isn't accepted. In Swarm, every feature whose dependencies are accepted may start,
+   * `running` attempts already do, and plan steps wait until none runs (v3 §6.2).
+   */
+  private async scheduleNext(running = 0, limit = 1): Promise<Step> {
     await this.refreshDesign();
     for (const module of this.design.modules) {
       for (const plan of module.plans) {
@@ -358,7 +378,8 @@ export class Orchestrator {
             return (await this.scheduleWork({ ...planRef, feature: fix.feature }, this.lookup(fix).feature, fix)) ?? 'wait';
           }
         }
-        if (await this.mergeMain(planState)) return 'progress';
+        if (running === 0 && (await this.mergeMain(planState))) return 'progress';
+        if (limit > 1) return this.scheduleParallel(planRef, plan, planState, running, limit);
         for (const feature of plan.features) {
           const ref = { ...planRef, feature: feature.id };
           const step = await this.scheduleWork(ref, feature, this.state.features[featureKey(ref)]);
@@ -371,9 +392,39 @@ export class Orchestrator {
     return 'wait';
   }
 
+  /**
+   * Swarm's scheduler within a plan (v3 §6.2): starts the next feature whose dependencies
+   * are accepted, while fewer than `limit` attempts run. A feature that can't start, for
+   * guidance, a gate or an escalation, doesn't hold the independent ones back. The plan
+   * validates once every feature is accepted.
+   */
+  private async scheduleParallel(planRef: Ref, plan: Plan, planState: PlanState, running: number, limit: number): Promise<Step> {
+    for (const feature of plan.features) {
+      const ref = { ...planRef, feature: feature.id };
+      const state = this.state.features[featureKey(ref)];
+      if (state?.status === 'accepted' || (state && isActive(state))) continue;
+      if (!this.dependenciesAccepted(planRef, feature)) continue;
+      if (running >= limit) break;
+      const step = await this.scheduleWork(ref, feature, state);
+      if (step === 'progress') return 'progress';
+    }
+    const done = plan.features.every((f) => this.state.features[featureKey({ ...planRef, feature: f.id })]?.status === 'accepted');
+    if (done && running === 0) {
+      this.record({ type: 'PLAN_VALIDATING', ref: planRef, payload: { head: planState.head } });
+      return 'progress';
+    }
+    return 'wait';
+  }
+
+  /** Every feature this one depends on is accepted; features of this plan only, until plans run in parallel. */
+  private dependenciesAccepted(planRef: Ref, feature: Feature): boolean {
+    return feature.dependsOn.every((id) => this.state.features[featureKey({ ...planRef, feature: id })]?.status === 'accepted');
+  }
+
   /** The next attempt of a feature or a fix round, or why there can't be one yet. Undefined once it is accepted. */
   private async scheduleWork(ref: Ref, definition: Feature, state: FeatureState | undefined): Promise<Step | undefined> {
     if (state?.status === 'accepted') return undefined;
+    if (state && isActive(state)) return 'wait';
     const hash = definitionHash(definition);
     // The owner decides about an escalated feature, unless a design change redefined it since (§7.1).
     if (state?.status === 'escalated' && state.attempts.at(-1)?.definitionHash === hash) return 'wait';
@@ -576,7 +627,7 @@ export class Orchestrator {
 
   /** Step 7: take the Developer's commits out as a bundle, whatever the outcome, and refuse changes to protected files. */
   private async collect(state: FeatureState, attempt: Attempt): Promise<Step> {
-    this.stopFollowing();
+    this.stopFollowing(attempt.sandbox);
     const ref = refOf(state, attempt);
     if (attempt.outcome === 'usage_limit') {
       this.record({ type: 'ATTEMPT_INTERRUPTED', ref, payload: { reason: 'the subscription usage limit was reached', counts: false } });
@@ -600,20 +651,47 @@ export class Orchestrator {
   /** Step 8: every check in a fresh sandbox. If they pass, the attempt waits for the Manager's review. */
   private async check(state: FeatureState, attempt: Attempt): Promise<Step> {
     const ref = refOf(state, attempt);
-    const { feature } = this.lookup(state);
     await this.driver.remove(attempt.sandbox);
+    return this.checkMerged(state, attempt, `a${ref.attempt}`);
+  }
+
+  /**
+   * The checks, on the attempt as it would land: when another feature landed meanwhile
+   * (v3 §6.3), the plan's head is merged in first, so the checks of accepted work see
+   * that work, and the attempt lands on the head. A conflict interrupts the attempt.
+   */
+  private async checkMerged(state: FeatureState, attempt: Attempt, suffix: string): Promise<Step> {
+    const ref = refOf(state, attempt);
+    const { feature } = this.lookup(state);
+    const branch = this.state.plans[planKey(ref)]!.branch;
+    const merged = await this.mergeWithHead(ref, attempt, branch);
+    if (merged && 'conflicts' in merged) {
+      return this.interrupt(state, attempt, `conflicts with work landed on ${branch} meanwhile, in ${merged.conflicts.join(', ')}: the next attempt starts from the new head`);
+    }
+    const checkRef = merged ? `${attemptRefName(ref)}-rebased` : attemptRefName(ref);
+    if (merged) await this.repo.setRef(checkRef, merged.commit);
     const results = await this.runChecksIn(
-      sandboxName('chk', this.design.config.project.name, featureKey(ref), `a${ref.attempt}`),
-      attemptRefName(ref),
+      sandboxName('chk', this.design.config.project.name, featureKey(ref), suffix),
+      checkRef,
       this.attemptDir(ref),
       [...this.regressionChecks(), ...preMerge(feature.checks)],
     );
     if (!allPassed(results)) {
       this.record({ type: 'CHECKS_FAILED', ref, payload: { results } });
-      return this.fail(state, attempt, `checks failed: ${results.filter((r) => r.exit !== 0).map((r) => r.id).join(', ')}`);
+      const failing = results.filter((r) => r.exit !== 0).map((r) => r.id).join(', ');
+      return this.fail(state, attempt, `checks failed${merged ? ` once merged with ${branch}'s new head` : ''}: ${failing}`);
     }
-    this.record({ type: 'CHECKS_PASSED', ref, payload: { results } });
+    if (merged) this.record({ type: 'ATTEMPT_REBASED', ref, payload: { onto: merged.onto, commit: merged.commit, results } });
+    if (attempt.status === 'checking') this.record({ type: 'CHECKS_PASSED', ref, payload: { results } });
     return 'progress';
+  }
+
+  /** The plan's head merged into the attempt's work, when the head moved since the attempt's base and the last merge. */
+  private async mergeWithHead(ref: Ref, attempt: Attempt, branch: string): Promise<{ onto: string; commit: string } | { conflicts: string[] } | undefined> {
+    const planHead = (await this.repo.revParse(`refs/heads/${branch}`))!;
+    if (planHead === attempt.base || attempt.rebased?.onto === planHead) return undefined;
+    const merged = await this.repo.merge({ ours: planHead, theirs: attempt.head!, message: `Merge ${branch} into ${featureKey(ref)} attempt ${ref.attempt}\n`, committer: HARNESS });
+    return 'conflicts' in merged ? merged : { onto: planHead, commit: merged.commit };
   }
 
   /** Steps 9–10: the Manager's verdict. Accepted, the feature lands on the plan branch as one commit. */
@@ -626,15 +704,28 @@ export class Orchestrator {
     const { feature } = this.lookup(state);
     const branch = this.state.plans[planKey(ref)]!.branch;
     const landed = await this.alreadyLanded(branch, attempt, ref);
+    let base = attempt.base;
+    let head = attempt.head!;
+    const planHead = (await this.repo.revParse(`refs/heads/${branch}`))!;
+    if (!landed && planHead !== attempt.base) {
+      // The head moved again since the checks, as a third feature landing does: merge and check once more before landing (v3 §6.3).
+      if (attempt.rebased?.onto !== planHead) {
+        const step = await this.checkMerged(state, attempt, `a${ref.attempt}r`);
+        if (attempt.rebased?.onto !== planHead) return step;
+      }
+      // The merge is checked and recorded on the attempt: it lands as one commit on the head.
+      base = planHead;
+      head = attempt.rebased!.commit;
+    }
     const commit = landed ?? (await this.repo.commitFeature({
-      base: attempt.base,
-      head: attempt.head!,
+      base,
+      head,
       progressLine: this.progressLine(ref, attempt, state.fix),
       message: commitMessage(ref, feature, attempt, attempt.checks ?? [], state.fix),
       author: DEVELOPER,
       committer: HARNESS,
     }));
-    if (!landed) await this.repo.setRef(`refs/heads/${branch}`, commit, attempt.base);
+    if (!landed) await this.repo.setRef(`refs/heads/${branch}`, commit, base);
     this.record({ type: 'FEATURE_ACCEPTED', ref, payload: { commit } });
     return 'progress';
   }
@@ -1015,14 +1106,20 @@ export class Orchestrator {
     return 'progress';
   }
 
+  /** An error outside any attempt: logged, and the loop goes on. */
   private async onStepError(error: Error): Promise<void> {
-    const active = activeAttempt(this.state);
-    const key = active ? `${featureKey(refOf(active.feature, active.attempt))}#${active.attempt.n}:${active.attempt.status}` : 'idle';
+    this.stepErrors = { key: 'idle', count: this.stepErrors.key === 'idle' ? this.stepErrors.count + 1 : 1 };
+    this.log(`step failed (idle, ${this.stepErrors.count}): ${error.message}`);
+  }
+
+  /** An error in one attempt's step: counted for that attempt and its status, and past the limit the attempt is interrupted. */
+  private async onAttemptError(feature: FeatureState, attempt: Attempt, error: Error): Promise<void> {
+    const key = `${featureKey(refOf(feature, attempt))}#${attempt.n}:${attempt.status}`;
     this.stepErrors = { key, count: this.stepErrors.key === key ? this.stepErrors.count + 1 : 1 };
     this.log(`step failed (${key}, ${this.stepErrors.count}/${STEP_ERROR_LIMIT}): ${error.message}`);
-    if (active && this.stepErrors.count >= STEP_ERROR_LIMIT) {
+    if (this.stepErrors.count >= STEP_ERROR_LIMIT) {
       this.stepErrors = { key: '', count: 0 };
-      await this.interrupt(active.feature, active.attempt, `infrastructure error: ${error.message}`).catch(() => {});
+      await this.interrupt(feature, attempt, `infrastructure error: ${error.message}`).catch(() => {});
     }
   }
 
@@ -1057,8 +1154,9 @@ export class Orchestrator {
 
   /** Gives the Developer the Manager's answer, as the result of its `ask_manager` call. */
   async replyToDeveloper(sandbox: string, requestId: string, text: string): Promise<boolean> {
-    if (this.developer?.sandbox !== sandbox) return false;
-    await this.developer.channel.reply(requestId, true, text);
+    const developer = this.developers.get(sandbox);
+    if (!developer) return false;
+    await developer.channel.reply(requestId, true, text);
     return true;
   }
 
@@ -1264,18 +1362,18 @@ export class Orchestrator {
   }
 
   private followAttempt(ref: Ref, sandbox: string): void {
-    if (this.developer?.sandbox === sandbox) return;
-    this.stopFollowing();
+    if (this.developers.has(sandbox)) return;
     const agent = `developer:${featureKey(ref)}/a${ref.attempt}`;
     const follower = this.driver.follow(sandbox, this.paths(sandbox).stream, 1, (line) => this.events.emit('transcript', { agent, line }));
     const channel = this.channel({ role: 'developer', sandbox }, join(this.attemptDir(ref), 'replied.txt'));
-    this.developer = { sandbox, follower, channel };
+    this.developers.set(sandbox, { follower, channel });
   }
 
-  private stopFollowing(): void {
-    this.developer?.follower.stop();
-    this.developer?.channel.stop();
-    this.developer = undefined;
+  private stopFollowing(sandbox: string): void {
+    const developer = this.developers.get(sandbox);
+    developer?.follower.stop();
+    developer?.channel.stop();
+    this.developers.delete(sandbox);
   }
 
   /** A reviewer's transcript for the dashboard, and its channel for `web_read` (v3 §5.1). */

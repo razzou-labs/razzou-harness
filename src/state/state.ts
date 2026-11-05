@@ -37,6 +37,8 @@ export interface Attempt {
   head?: string;
   files?: string[];
   checks?: CheckResult[];
+  /** The attempt merged with the plan's head that moved under it, and checked again, ready to land (v3 §6.3). */
+  rebased?: { onto: string; commit: string };
   questions?: Question[];
   reviewSince?: string;
   /** The Manager's verdict after a review. The daemon acts on it in its next step. */
@@ -475,6 +477,9 @@ export function apply(state: State, event: HarnessEvent): State {
         at: event.ts,
       };
       break;
+    case 'ATTEMPT_REBASED':
+      attemptOf(state, ref!).rebased = { onto: event.payload.onto, commit: event.payload.commit };
+      break;
     case 'FEATURE_ACCEPTED': {
       Object.assign(attemptOf(state, ref!), { status: 'accepted', commit: event.payload.commit });
       const feature = featureOf(state, ref!);
@@ -712,11 +717,23 @@ const ACTIVE: AttemptStatus[] = ['starting', 'running', 'collecting', 'checking'
 
 /** The one attempt that hasn't reached a terminal status, if any. There is at most one. */
 export function activeAttempt(state: State): { feature: FeatureState; attempt: Attempt } | undefined {
+  return activeAttempts(state)[0];
+}
+
+/** Every attempt under way, in the features' order: one in Manual, up to `swarm.maxDevelopers` in Swarm (v3 §6.2). */
+export function activeAttempts(state: State): Array<{ feature: FeatureState; attempt: Attempt }> {
+  const active: Array<{ feature: FeatureState; attempt: Attempt }> = [];
   for (const feature of Object.values(state.features)) {
     const attempt = feature.attempts.at(-1);
-    if (attempt && ACTIVE.includes(attempt.status)) return { feature, attempt };
+    if (attempt && ACTIVE.includes(attempt.status)) active.push({ feature, attempt });
   }
-  return undefined;
+  return active;
+}
+
+/** Whether a feature has an attempt under way. */
+export function isActive(feature: FeatureState): boolean {
+  const attempt = feature.attempts.at(-1);
+  return attempt !== undefined && ACTIVE.includes(attempt.status);
 }
 
 /** Attempts that count against the budget of the feature's current definition. */

@@ -73,6 +73,11 @@ application code, and never `.github/`: CI refuses both.
 
 - Ids use letters, digits and dashes. `dependsOn` names earlier features of the same
   plan. `kind` is `app` or `infra`.
+- **In Swarm mode, features of a plan that don't depend on each other are built at the
+  same time, by several Developers**, each landing on the plan branch as it finishes.
+  Declare every dependency in `dependsOn`, including the implicit ones, such as a
+  feature that extends a file another creates; keep features that may run together
+  off the same files; and put infrastructure in plans of its own.
 - **Size each feature for one attempt** by a fresh Developer: well under 120 minutes, one
   coherent change, and testable on its own.
 - **Give every feature at least one check.** A check is a shell command run from the
