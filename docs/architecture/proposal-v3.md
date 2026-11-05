@@ -211,9 +211,11 @@ actions. With a budget, it must design within it.
   reading. **Committed** = planned over the modules whose design is submitted or frozen.
   **Available** for a module = hours × (1 − reserve) − committed by the other modules.
 - **`submit_design` refuses** a design whose planned time exceeds what is available, and
-  says by how much. The Architect's prompt states the hours, the reserve, what the other
-  modules committed and what is available, and asks for the module's owner time in the
-  proposal, so the owner sees it before accepting.
+  says by how much. The Architect reads the hours, the reserve, what the other modules
+  committed and what is available with `get_owner_time`; its welcome and a note when
+  the budget changes point it there, and its prompt asks for the module's owner time
+  in the proposal, so the owner sees it before accepting. A design in review counts as
+  committed, read from the Architect's ref since it isn't on `main` yet.
 - **Used** = the estimates of the actions marked done + the accepted proposals' reading.
   The dashboard shows used, planned and the hours; red when planned exceeds the hours
   minus the reserve, or used exceeds the hours.

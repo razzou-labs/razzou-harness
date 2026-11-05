@@ -270,10 +270,16 @@ and the cost estimate, are the next milestones (proposal v3 §5). Until they exi
 Swarm merges nothing unless you set `swarm.requiredStatuses` to `[]`, which merges
 `CODE` plans on CI alone. Parallel Developers and plans come last (v3 §6).
 
-**Budgets.** In both modes, the Project view shows two meters you set there: your hours
-for the whole project, which become a constraint on the Architect's designs (v3 §4.1),
-and a threshold for the agent hours, the Developers' attempt clocks summed, which
-turns red when over and stops nothing.
+**Budgets.** In both modes, the Project view shows two meters you set there:
+- **Your time.** The hours the whole project may take of you. Once set, every owner
+  action in a design carries the Architect's estimate of how long it takes you,
+  reading a proposal counts at `ownerTime.linesPerHour`, a reserve of
+  `ownerTime.reservePercent` stays out of what designs may plan, and `submit_design`
+  refuses a design that doesn't fit what remains after the other modules. The Architect
+  reads the numbers with `get_owner_time`. The meter shows used, planned and the
+  hours, red when over.
+- **Agent hours.** The Developers' attempt clocks summed, against a threshold: red when
+  over, and nothing stops.
 
 ## Commands
 

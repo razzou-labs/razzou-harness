@@ -259,6 +259,15 @@ export function apply(state: State, event: HarnessEvent): State {
         state.budgets.ownerHours = event.payload.hours;
         state.budgets.ownerHoursSetAt = event.ts;
       }
+      // Every Architect learns of it: the budget bounds the owner actions it may design (v3 §4.1).
+      for (const module of Object.values(state.modules)) {
+        module.notes.push({
+          key: `note:${event.id}`,
+          text: event.payload.hours === null
+            ? 'The owner cleared their time budget: estimatedMinutes on owner actions is welcome, not required.'
+            : `The owner set their time budget: ${event.payload.hours} hours for the whole project. Call get_owner_time for what this module may plan; every owner action needs estimatedMinutes, and submit_design refuses a design over the budget.`,
+        });
+      }
       break;
     case 'AGENT_HOURS_SET':
       if (event.payload.hours === null) delete state.budgets.agentHours;

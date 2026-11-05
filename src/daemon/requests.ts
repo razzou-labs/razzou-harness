@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
+import { describeOwnerTime } from '../design/owner-time.ts';
 import { INPUTS, TOOLS, type Role, type ToolInput, type ToolName } from '../roles.ts';
 import { activeAttempt, attemptInSandbox, featureKey, planKey, type Attempt, type FeatureState } from '../state/state.ts';
 import { clip, sh, sha256, tail } from '../util.ts';
@@ -235,6 +236,12 @@ const HANDLERS: Handlers = {
     const module = o.state.modules[agent.module!]!;
     if (module.notes.length === 0) return ok('No messages.');
     return ok(module.notes.slice(-20).map((n) => n.text).join('\n\n---\n\n'));
+  },
+
+  async get_owner_time({ o, agent }) {
+    const module = o.state.modules[agent.module!]!;
+    const lines = module.accepted === undefined ? 0 : o.proposalLines(module.module, module.accepted);
+    return ok(describeOwnerTime(await o.ownerTime(), module.module, lines, o.design.config));
   },
 
   reply_to_manager({ o, agent, requestId }, { escalation_id, decision }) {

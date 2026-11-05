@@ -1,10 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { claudeCode, mcpConfig, readResult, reportJsonSchema, type AgentAdapter, type AgentRun } from '../agents/claude-code.ts';
 import { allPassed, initEnvironment, runChecks, type CheckResult, type RunOptions } from '../checks/runner.ts';
 import { protectedChanges } from '../ci/harness-ci.ts';
+import { ownerTime, type OwnerTime } from '../design/owner-time.ts';
 import { definitionHash, loadDesign, planKind, requiredChecks, type Check, type Config, type Design, type Feature, type Plan } from '../design/schemas.ts';
 import { DEVELOPER, HARNESS, Repo } from '../git/repo.ts';
 import { GitHubClient, loadAppCredentials } from '../github/app.ts';
@@ -21,6 +22,7 @@ import {
 import { clip, sh, sleep } from '../util.ts';
 import { Architects } from './architects.ts';
 import { AgentChannel, type AgentRequest } from './channel.ts';
+import { architectRef } from './design.ts';
 import { Managers } from './manager.ts';
 import { attemptRefName, preMerge, probeScript, refOf, sandboxName, waitForFile } from './refs.ts';
 import { handleRequest, type AgentIdentity, type Reply } from './requests.ts';
@@ -1082,6 +1084,31 @@ export class Orchestrator {
 
   moduleDir(module: string): string {
     return ensureDir(join(this.options.harnessDir, 'modules', module));
+  }
+
+  /** The length of a proposal the daemon keeps, for the owner's reading time (v3 §4.1); 0 when it is missing. */
+  proposalLines(module: string, version: number): number {
+    const file = join(this.moduleDir(module), 'proposals', `v${version}.md`);
+    if (!existsSync(file)) return 0;
+    return readFileSync(file, 'utf8').split('\n').filter((line) => line.trim() !== '').length;
+  }
+
+  /**
+   * The owner's time, planned and used, or undefined while the owner hasn't set their
+   * hours. A design in review counts as submitted: it is read from the Architect's ref,
+   * not from main, where it isn't yet.
+   */
+  async ownerTime(): Promise<OwnerTime | undefined> {
+    if (this.state.budgets.ownerHours === undefined) return undefined;
+    const modules = [...this.design.modules];
+    for (const module of Object.values(this.state.modules).filter((m) => m.status === 'in_review')) {
+      const submitted = (await loadDesign(this.repo, architectRef(module.module)).catch(() => undefined))?.modules.find((m) => m.id === module.module);
+      if (!submitted) continue;
+      const current = modules.findIndex((m) => m.id === module.module);
+      if (current === -1) modules.push(submitted);
+      else modules[current] = submitted;
+    }
+    return ownerTime(this.design.config, { config: this.design.config, modules }, this.state, (module, version) => this.proposalLines(module, version));
   }
 
   /** The sandbox policy: the project's network bundles, or every bundle for the Architect (§13), and signed AWS endpoints. */

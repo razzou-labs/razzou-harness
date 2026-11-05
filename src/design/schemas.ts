@@ -226,6 +226,8 @@ export const OwnerActionSchema = z.object({
   blocks: z.array(z.string().regex(/^[A-Za-z0-9-]+(\/[A-Za-z0-9-]+)?$/, 'a plan like "P2", or a feature like "P2/F08"')).default([]),
   /** Markdown, shown to the owner as text. */
   instructions: z.string().min(1),
+  /** How long the action takes the owner. Required once the owner budgets their time (v3 §4.1). */
+  estimatedMinutes: z.number().int().positive().optional(),
   /** Run in a check sandbox before the action counts as done. */
   verify: z
     .object({ run: z.string().min(1), timeoutSec: z.number().int().positive().max(3600).default(300), needs: z.array(z.enum(['aws', 'tfplan'])).default([]) })

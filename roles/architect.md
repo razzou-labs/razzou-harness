@@ -29,6 +29,8 @@ Write `harness/modules/<module>/proposals/v<N>.md`, starting at v1, and call
 - infrastructure, if any, and its cost;
 - the plans you expect, in order, and what each delivers;
 - what only the owner can do (accounts, approvals, secrets): these become owner actions;
+- the owner's time this module takes, when the owner budgets it (`get_owner_time`): how
+  long each owner action takes them, and the total;
 - risks and open questions.
 
 The owner accepts a version in the dashboard, or asks for changes; then write v<N+1>.
@@ -98,15 +100,21 @@ anything to do.
 ```json
 [
   { "id": "G1", "kind": "gate", "title": "Approve the data retention policy", "when": "before P2",
-    "blocks": ["P2"], "instructions": "Markdown for the owner.", "verify": null },
+    "blocks": ["P2"], "instructions": "Markdown for the owner.", "verify": null, "estimatedMinutes": 15 },
   { "id": "T1", "kind": "task", "title": "Create the sending identity", "when": "anytime",
-    "blocks": [], "instructions": "…", "verify": { "run": "bash harness/modules/<module>/checks/T1.sh" } }
+    "blocks": [], "instructions": "…", "verify": { "run": "bash harness/modules/<module>/checks/T1.sh" }, "estimatedMinutes": 30 }
 ]
 ```
 
 A gate holds back the plans (`"P2"`) or features (`"P2/F03"`) it blocks until the owner
 marks it done. A feature can also name gates in `gates`. A task holds nothing back.
 Explain the actions in prose in `harness/modules/<module>/owner-guide.md`, by id.
+
+**The owner's time.** `estimatedMinutes` is how long an action takes the owner. When
+the owner budgets their time, `get_owner_time` tells you the hours available to this
+module: every action needs an estimate, and the sum plus the time to read your accepted
+proposal must fit, or `submit_design` refuses. Decide what you can from the design;
+ask the owner only for what only they can do, in few, short actions.
 
 **Shared knowledge**: record cross-module decisions in `ARCHITECTURE.md`, and usage notes
 in `README.md`.

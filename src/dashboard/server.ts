@@ -6,6 +6,7 @@ import { extname, join, normalize, sep } from 'node:path';
 import { WebSocketServer, type WebSocket } from 'ws';
 import type { Orchestrator } from '../daemon/orchestrator.ts';
 import type { HarnessEvent } from '../state/events.ts';
+import type { OwnerTime } from '../design/owner-time.ts';
 import type { State } from '../state/state.ts';
 import { Terminals, type Size } from './terminals.ts';
 
@@ -23,6 +24,8 @@ export interface DashboardOptions {
 export interface DashboardState {
   state: State;
   design: ReturnType<typeof designSummary>;
+  /** The owner's time, planned and used, once they set their hours (v3 §4.1). */
+  ownerTime?: OwnerTime;
   progress: string[];
   /** Whether node-pty loaded: without it, there are no terminals in the dashboard. */
   terminals: boolean;
@@ -95,6 +98,7 @@ export function startDashboard({ orchestrator, port, token, webRoot, terminals }
           return sendJson(res, {
             state: orchestrator.state,
             design: designSummary(orchestrator),
+            ...(orchestrator.state.budgets.ownerHours !== undefined ? { ownerTime: await orchestrator.ownerTime() } : {}),
             progress: await progressTail(orchestrator),
             terminals: terminals.available,
           } satisfies DashboardState);
@@ -345,7 +349,9 @@ function designSummary(orchestrator: Orchestrator) {
         goal: p.goal,
         features: p.features.map((f) => ({ id: f.id, title: f.title, kind: f.kind, checks: f.checks.map((c) => ({ id: c.id, phase: c.phase, needs: c.needs })) })),
       })),
-      actions: m.actions.map((a) => ({ id: a.id, kind: a.kind, title: a.title, when: a.when, blocks: a.blocks, instructions: a.instructions, verify: a.verify !== null })),
+      actions: m.actions.map((a) => ({
+        id: a.id, kind: a.kind, title: a.title, when: a.when, blocks: a.blocks, instructions: a.instructions, verify: a.verify !== null, estimatedMinutes: a.estimatedMinutes,
+      })),
     })),
   };
 }

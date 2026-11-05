@@ -565,6 +565,47 @@ describe('architect', () => {
     await until(o, () => o.state.plans['shop/P1']?.status === 'ready_to_merge');
   });
 
+  it('refuses a design over the owner\'s time once they budget it, and takes one that fits', async () => {
+    const actions = (estimatedMinutes?: number) => ({
+      'harness/modules/shop/owner-actions.json': JSON.stringify([
+        { id: 'T1', kind: 'task', title: 'Create the account', when: 'anytime', blocks: [], instructions: 'Sign up.', verify: null, ...(estimatedMinutes === undefined ? {} : { estimatedMinutes }) },
+      ]),
+    });
+    // Ten hours, a 20% reserve: 8 h are available. An unestimated action is refused, then 600 minutes are too many.
+    const { orchestrator: o } = await setup((f) => solved(f), {
+      github: true, design: false, architect: shop({ design: { ...toyDesign('shop'), ...actions() }, fix: actions(600) }),
+    });
+    o.createModule('shop', 'A tiny shop');
+    await until(o, () => module(o)?.status === 'proposed');
+    // Set once the Architect exists: it hears of the budget in its inbox (a new Architect hears of it in its welcome).
+    assert.equal(o.setBudgets({ ownerHours: 10 }), true);
+    o.acceptProposal('shop', 1);
+    await until(o, () => o.store.readAll().filter((e) => e.type === 'DESIGN_REFUSED').length === 2);
+    const problems = o.store.readAll().flatMap((e) => (e.type === 'DESIGN_REFUSED' ? e.payload.problems : []));
+    assert.equal(problems[0], 'owner-actions.json: T1 needs estimatedMinutes, how long it takes the owner: their time is budgeted (get_owner_time)');
+    // The stub's proposal is two lines: reading it rounds to nothing.
+    assert.match(problems[1]!, /^the design takes 10 h of the owner's time \(10 h of owner actions, 0 h to read the proposal\), but 8 h are available/);
+    assert.equal(module(o)!.status, 'decomposing');
+    assert.ok(module(o)!.notes.some((n) => n.text.startsWith('The owner set their time budget: 10 hours')));
+
+    // Within the budget: the design is submitted, and the numbers are the Architect's to read.
+    const { orchestrator: p, fake } = await setup((f) => solved(f), {
+      github: true, design: false, architect: shop({ design: { ...toyDesign('shop'), ...actions(60) } }),
+    });
+    p.setBudgets({ ownerHours: 10 });
+    p.createModule('shop', 'A tiny shop');
+    await until(p, () => p.state.modules.shop?.status === 'proposed');
+    p.acceptProposal('shop', 1);
+    await until(p, () => p.state.modules.shop?.status === 'in_review');
+    assert.equal(fake.prs.length, 1);
+    const time = (await p.ownerTime())!;
+    assert.equal(time.plannableHours, 8);
+    assert.ok(time.committedHours >= 1 && time.committedHours < 1.1, `committed ${time.committedHours}`);
+    const told = await handleRequest(p, { role: 'architect', sandbox: p.state.modules.shop!.architect.sandbox, module: 'shop' }, { v: 1, id: 'r-time', tool: 'get_owner_time', args: {} });
+    assert.match(told!.text, /^The owner set 10 h for the whole project\. A 20% reserve \(2 h\) stays out of designs/);
+    assert.match(told!.text, /Available to shop: 8 h\./);
+  });
+
   it('refuses a design whose checks run a missing script, and takes the fix', async () => {
     const broken = toyDesign('shop');
     const plan = JSON.parse(broken['harness/modules/shop/plans/P1.json']!) as { features: Array<{ checks: Array<{ run: string }> }> };

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { post, type Attempt, type DashboardState, type FeatureState, type PlanState, type State } from '../api.ts';
+import { post, type Attempt, type DashboardState, type FeatureState, type OwnerTime, type PlanState, type State } from '../api.ts';
 import { Action, Badge, GithubLink } from '../components/ui.tsx';
 import { duration } from '../format.ts';
 import { Proposal } from './NeedsYou.tsx';
@@ -11,7 +11,7 @@ export function Project({ data }: { data: DashboardState }) {
   const moduleIds = [...new Set([...Object.keys(state.modules), ...design.modules.map((m) => m.id)])];
   return (
     <div className="stack">
-      <Budgets state={state} />
+      <Budgets state={state} {...(data.ownerTime ? { ownerTime: data.ownerTime } : {})} />
       <NewModule />
       {moduleIds.length === 0 && <p className="muted">No module yet.</p>}
       {moduleIds.map((id) => {
@@ -75,8 +75,10 @@ function agentMs(state: State, now: number): number {
 }
 
 /** The owner's hours for the whole project, and the agent-hours threshold (v3 §4): set here, recorded by the daemon. */
-function Budgets({ state }: { state: State }) {
+function Budgets({ state, ownerTime }: { state: State; ownerTime?: OwnerTime }) {
   const budgets = state.budgets ?? {};
+  const overPlanned = ownerTime !== undefined && ownerTime.committedHours > ownerTime.plannableHours;
+  const overUsed = ownerTime !== undefined && ownerTime.usedHours > ownerTime.hours;
   const running = Object.values(state.features).some((f) => f.attempts.some((a) => !a.endedAt));
   const now = useNow(running);
   const agentHours = agentMs(state, now) / 3_600_000;
@@ -92,8 +94,21 @@ function Budgets({ state }: { state: State }) {
               ? <><b>{budgets.ownerHours} h</b> for the whole project{budgets.ownerHoursSetAt && <span className="muted">, set {new Date(budgets.ownerHoursSetAt).toLocaleDateString()}</span>}</>
               : <span className="muted">Not set: the Architect designs without a limit on your time.</span>}
           </p>
+          {ownerTime && (
+            <p>
+              <b className={overUsed ? 'bad' : undefined}>{ownerTime.usedHours} h used</b>
+              {' · '}
+              <span className={overPlanned ? 'bad' : undefined}>{ownerTime.committedHours} h planned by the designs</span>
+              {' · '}
+              <span className="muted">{ownerTime.plannableHours} h plannable after the {ownerTime.reservePercent}% reserve</span>
+            </p>
+          )}
           <HoursForm field="ownerHours" value={budgets.ownerHours} placeholder="hours" />
-          <p className="muted small">Planned and used appear once a design states its owner time.</p>
+          <p className="muted small">
+            {ownerTime
+              ? 'Planned: the estimates of the owner actions in submitted designs, and the time to read their proposals. Used: the actions you marked done, and the proposals you accepted.'
+              : 'Once set, the Architect must estimate every owner action and design within your hours; a design over them is refused.'}
+          </p>
         </div>
         <div className="meter">
           <h3>Agent hours</h3>
