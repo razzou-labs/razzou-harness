@@ -3,7 +3,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
 import {
-  computeLock, directoryReader, lockfileProblems, lockMismatches, npmScripts, prKind, protectedChanges, protectionRules, verify,
+  computeLock, directoryReader, lockfileProblems, lockMismatches, npmScripts, planKindOf, prKind, protectedChanges, protectionRules, verify,
 } from '../src/ci/harness-ci.ts';
 import { run, runOk } from '../src/util.ts';
 import { tempDir } from './helpers/toy-repo.ts';
@@ -35,10 +35,15 @@ const BASE: Record<string, string> = {
   'src/app.js': 'export const x = 1;\n',
 };
 
+/** The base's files with `harness/config.json` extended, such as with a `terraform` section. */
+function withConfig(extra: Record<string, unknown>): Record<string, string> {
+  return { ...BASE, 'harness/config.json': JSON.stringify({ ...(JSON.parse(BASE['harness/config.json']!) as object), ...extra }) };
+}
+
 /** A repository with main, and a branch with `changes` on top; returns trees and the changed paths. */
-async function change(changes: Record<string, string>) {
+async function change(changes: Record<string, string>, files: Record<string, string> = BASE) {
   const dir = tempDir('ci');
-  write(dir, BASE);
+  write(dir, files);
   const git = (...args: string[]) => runOk('git', ['-C', dir, '-c', 'user.name=t', '-c', 'user.email=t@test.invalid', ...args]);
   await runOk('git', ['init', '--quiet', '--initial-branch=main', dir]);
   await git('add', '-A');
@@ -138,6 +143,41 @@ describe('verify', () => {
     assert.deepEqual(await verify({ ...input, title: 'Plan: shop/P1 — T' }), ['changes a protected file: harness/modules/shop/plans/P1.json']);
     assert.match((await verify({ ...input, title: 'Owner: sneaky' }))[0]!, /this is a Plan PR .* must start with "Plan: "/);
     assert.deepEqual(await verify({ ...input, author: 'owner', title: 'Owner: design change' }), []);
+  });
+
+  it("tells a plan's kind by its features, and a title's tag must agree", async () => {
+    assert.equal(planKindOf([{ kind: 'app' }, {}]), 'CODE');
+    assert.equal(planKindOf([{ kind: 'infra' }, { kind: 'infra' }]), 'INFRA');
+    assert.equal(planKindOf([{ kind: 'app' }, { kind: 'infra' }]), 'MIXED');
+
+    // P1 on the base has one feature without a kind: a CODE plan.
+    const pr = await change({ 'src/app.js': 'export const x = 2;\n' });
+    const input = { base: pr.baseTree, head: pr.headTree, changedPaths: pr.changed, author: BOT, branch: 'plan/shop/P1' };
+    assert.deepEqual(await verify({ ...input, title: 'Plan: shop/P1 -CODE- T' }), []);
+    assert.deepEqual(await verify({ ...input, title: 'Plan: shop/P1 — T' }), [], 'a title without a tag, from an older daemon, passes');
+    assert.deepEqual(await verify({ ...input, title: 'Plan: shop/P1 -INFRA- T' }), [
+      "the title says -INFRA-, but shop/P1 is a CODE plan on the base branch: its features' kinds decide",
+    ]);
+    assert.match((await verify({ ...input, branch: 'plan/shop/P9', title: 'Plan: shop/P9 -CODE- T' }))[0]!, /plans\/P9\.json is missing or unreadable on the base branch/);
+  });
+
+  it('keeps a CODE plan off the Terraform folder, and lets an INFRA plan change it', async () => {
+    const terraform = { terraform: { dir: 'iac' } };
+    const code = await change({ 'iac/queue.tf': 'resource "aws_sqs_queue" "q" {}\n', 'src/app.js': 'export const x = 3;\n' }, withConfig(terraform));
+    const input = { author: BOT, branch: 'plan/shop/P1', title: 'Plan: shop/P1 -CODE- T' };
+    assert.deepEqual(await verify({ ...input, base: code.baseTree, head: code.headTree, changedPaths: code.changed }), [
+      'a CODE plan may not change iac/: infrastructure gets plans of its own (v3 §3.1); changed: iac/queue.tf',
+    ]);
+
+    const noTerraform = await change({ 'iac/queue.tf': 'resource "aws_sqs_queue" "q" {}\n' });
+    assert.deepEqual(await verify({ ...input, base: noTerraform.baseTree, head: noTerraform.headTree, changedPaths: noTerraform.changed }), [], 'without a terraform section, nothing is checked');
+
+    const infraPlan = JSON.stringify({
+      id: 'P1', module: 'shop', title: 'T', goal: 'G',
+      features: [{ id: 'F01', title: 'A', kind: 'infra', description: 'd', expected: 'e', checks: [{ id: 'F01-plan', run: 'node check.mjs', phase: 'pre-merge', needs: ['tfplan'] }] }],
+    });
+    const infra = await change({ 'iac/queue.tf': 'resource "aws_sqs_queue" "q" {}\n' }, { ...withConfig(terraform), 'harness/modules/shop/plans/P1.json': infraPlan });
+    assert.deepEqual(await verify({ ...input, title: 'Plan: shop/P1 -INFRA- T', base: infra.baseTree, head: infra.headTree, changedPaths: infra.changed }), []);
   });
 
   it('lets an Arch PR change the design with a matching hash list, and nothing else', async () => {
