@@ -298,8 +298,11 @@ Architect is told to declare every dependency. Each attempt starts from the plan
 branch as it is. When another feature lands first, the daemon merges the new head
 into the attempt before its checks, so they see the accepted work, and the feature
 lands as one commit on the head. A conflict interrupts the attempt, without counting
-it, and the next one starts from the new head. Manual mode builds one feature at a
-time, as before.
+it, and the next one starts from the new head. A design change merged while a feature
+is built interrupts its attempt the same way, and the next one builds the new
+definition. Manual mode builds one feature at a time, as before. In both modes, the
+Architect hears in one line when a plan's pull request opens, waits for you, is
+blocked by a reviewer, or merges.
 
 **Where it stands.** The monthly cost estimate that lets `INFRA` plans merge under the
 ceiling, and the scanners in CI that the security reviewer would start from, are

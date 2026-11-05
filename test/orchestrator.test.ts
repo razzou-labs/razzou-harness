@@ -372,6 +372,32 @@ describe('parallel features', () => {
     assert.equal(o.store.readAll().some((e) => e.type === 'ATTEMPT_REBASED'), false);
   });
 
+  it('in Swarm, a design change that redefines a feature under way interrupts its attempt, and the next builds the new definition', async () => {
+    const { orchestrator: o, harnessDir } = await setup((f) => ({ files: files(f), sleepSec: f === 'F01' ? 6 : 0 }), { prepare: independent() });
+    const projectDir = join(harnessDir, '..');
+    o.setMode('swarm');
+    await untilMax(o, () => activeAttempts(o.state).length === 2);
+    const first = feature(o, 'F01')!.attempts[0]!;
+
+    // The owner commits a design change on main while F01 is built: F01's definition changes, F02's doesn't.
+    const file = join(projectDir, 'harness/modules/demo/plans/P1.json');
+    const design = JSON.parse(readFileSync(file, 'utf8')) as { features: Array<Record<string, unknown>> };
+    design.features[0]!.description = 'src/greet.sh prints hello, politely.';
+    writeFileSync(file, JSON.stringify(design, null, 2));
+    await runOk('git', ['-C', projectDir, '-c', 'user.name=o', '-c', 'user.email=o@test.invalid', 'commit', '--quiet', '-am', 'redefine F01']);
+    await until(o, completed(o), 60_000);
+
+    const f01 = feature(o, 'F01')!;
+    assert.equal(f01.attempts.length, 2);
+    assert.equal(f01.attempts[0]!.status, 'interrupted');
+    assert.equal(f01.attempts[0]!.counts, false);
+    assert.equal(f01.attempts[0]!.reason, 'the design changed this feature while it was built: the next attempt builds the new definition');
+    assert.notEqual(f01.attempts[1]!.definitionHash, first.definitionHash);
+    assert.equal(f01.attempts[1]!.status, 'accepted');
+    assert.equal(feature(o, 'F02')!.attempts.length, 1);
+    assert.ok(o.store.readAll().some((e) => e.type === 'PLAN_MAIN_MERGED'));
+  });
+
   it('in Swarm, swarm.maxDevelopers caps the attempts under way', async () => {
     const { orchestrator: o } = await setup((f) => ({ files: files(f), sleepSec: 2 }), { prepare: independent(true), config: { swarm: { maxDevelopers: 2 } } });
     o.setMode('swarm');
@@ -747,6 +773,8 @@ describe('architect', () => {
     await until(o, () => module(o)?.status === 'frozen');
     await until(o, () => o.state.plans['shop/P1']?.status === 'ready_to_merge');
     assert.equal(fake.prs[1]!.title, 'Plan: shop/P1 -CODE- Greeting and adding');
+    // The Architect hears of its plan's pull request in one line (v3 §6.5).
+    assert.ok(module(o)!.notes.some((n) => n.text === "[digest] Plan P1's pull request #2 is open: https://github.test/pull/2."));
 
     // The Manager asks the Architect, and the decision comes back to it.
     const asked = await handleRequest(o, { role: 'manager', sandbox: 'mgr-x', module: 'shop' }, {

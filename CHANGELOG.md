@@ -30,8 +30,10 @@ may change how a project is set up, and its notes say how.
 - In Swarm, up to `swarm.maxDevelopers` Developers build a plan's independent features
   at once. The plan's head is merged into an attempt before its checks when another
   feature landed first, and the feature lands as one commit on the head; a conflict
-  interrupts the attempt, and the next one starts from the new head. The Architect is
-  told to declare every dependency in `dependsOn`.
+  interrupts the attempt, and the next one starts from the new head. A design change
+  merged while a feature is built interrupts its attempt the same way. The Architect is
+  told to declare every dependency in `dependsOn`, and hears in one line when a plan's
+  pull request opens, waits for the owner, is blocked by a reviewer, or merges.
 - Two reviewers, security and cost, read every plan's pull request once CI passed, in
   Swarm, or in Manual as comments only with `swarm.reviewersInManual`. Each runs in a
   fresh read-only sandbox with a brief: the features, the files changed, the

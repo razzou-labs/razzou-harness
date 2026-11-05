@@ -268,6 +268,7 @@ export function apply(state: State, event: HarnessEvent): State {
       break;
     case 'PR_OPENED':
       Object.assign(state.plans[planKey(ref!)]!, { status: 'pr_open', pr: { number: event.payload.number, url: event.payload.url } });
+      digest(state, event.id, ref!, `Plan ${ref!.plan}'s pull request #${event.payload.number} is open: ${event.payload.url}.`);
       break;
     case 'CI_PASSED':
     case 'CI_FAILED': {
@@ -303,6 +304,7 @@ export function apply(state: State, event: HarnessEvent): State {
       break;
     case 'PR_LEFT_TO_OWNER':
       state.plans[planKey(ref!)]!.leftToOwner = { head: event.payload.head, reason: event.payload.reason, at: event.ts };
+      digest(state, event.id, ref!, `Pull request #${event.payload.number} of plan ${ref!.plan} waits for the owner: ${event.payload.reason}`);
       break;
     case 'PR_MERGED_BY_DAEMON':
       state.plans[planKey(ref!)]!.mergedBy = 'daemon';
@@ -317,6 +319,7 @@ export function apply(state: State, event: HarnessEvent): State {
         const manager = state.managers[ref!.module];
         if (manager) manager.sent = {};
       }
+      digest(state, event.id, ref!, `Plan ${ref!.plan} is merged on main${plan.mergedBy === 'daemon' ? ' by the daemon' : ''}${event.payload.next === 'completed' ? ', and complete' : `: it is ${event.payload.next}`}.`);
       break;
     }
     case 'DEPLOYED':
@@ -394,6 +397,10 @@ export function apply(state: State, event: HarnessEvent): State {
       const review = reviewOf(state, ref!, event.payload);
       const { status, comments, problem } = event.payload;
       review.posted = { status, comments, at: event.ts, ...(problem ? { problem } : {}) };
+      if (review.verdict === 'block') {
+        const blocking = (review.findings ?? []).filter((f) => f.severity === 'blocking').map((f) => f.title).join('; ');
+        digest(state, event.id, ref!, `The ${review.role} reviewer blocked plan ${ref!.plan}'s pull request at ${review.head.slice(0, 8)}: ${blocking}`);
+      }
       break;
     }
     case 'PLAN_COMPLETED': {
@@ -756,6 +763,12 @@ export function writeSnapshot(file: string, state: State): void {
   const tmp = `${file}.tmp`;
   writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`);
   renameSync(tmp, file);
+}
+
+/** One line for the module's Architect, when it has one (v3 §6.5): what happens to its plans, without the detail the owner sees. */
+function digest(state: State, eventId: string, ref: Ref, text: string): void {
+  const module = state.modules[ref.module];
+  if (module) module.notes.push({ key: `note:${eventId}`, text: `[digest] ${text}` });
 }
 
 /** The latest session of a reviewer on a head: the one the event is about. */

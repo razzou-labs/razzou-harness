@@ -350,6 +350,7 @@ export class Orchestrator {
    */
   private async scheduleNext(running = 0, limit = 1): Promise<Step> {
     await this.refreshDesign();
+    if (running > 0 && this.state.mode === 'swarm' && (await this.abortRedefined())) return 'progress';
     for (const module of this.design.modules) {
       for (const plan of module.plans) {
         const planRef = { module: module.id, plan: plan.id };
@@ -414,6 +415,31 @@ export class Orchestrator {
       return 'progress';
     }
     return 'wait';
+  }
+
+  /**
+   * A design change merged while attempts run (v3 §6.6): an attempt whose feature it
+   * redefined is interrupted, without counting, and the next one builds the new
+   * definition. Fix rounds have no definition on main, so they go on.
+   */
+  private async abortRedefined(): Promise<boolean> {
+    for (const { feature, attempt } of activeAttempts(this.state)) {
+      if (feature.fix) continue;
+      let hash: string | undefined;
+      try {
+        hash = definitionHash(this.lookup(feature).feature);
+      } catch {
+        hash = undefined;
+      }
+      if (hash === attempt.definitionHash) continue;
+      if (attempt.status === 'running') await this.killAgent(attempt.sandbox).catch(() => {});
+      this.stopFollowing(attempt.sandbox);
+      await this.interrupt(feature, attempt, hash === undefined
+        ? 'the design no longer has this feature: the attempt stops'
+        : 'the design changed this feature while it was built: the next attempt builds the new definition');
+      return true;
+    }
+    return false;
   }
 
   /** Every feature this one depends on is accepted; features of this plan only, until plans run in parallel. */
