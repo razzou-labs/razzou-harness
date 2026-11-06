@@ -275,7 +275,10 @@ three are done; `harness doctor` checks the same.
 once CI passed and every status in `swarm.requiredStatuses` is green on its head:
 - a `CODE` plan, when `swarm.merge.code` is `daemon`;
 - an `INFRA` or `MIXED` plan, when the monthly cost it adds, estimated by CI, is at or
-  under `swarm.merge.infraMonthlyUsdCeiling`.
+  under `swarm.merge.infraMonthlyUsdCeiling`; or, once the header's button **Let the
+  daemon merge infra** is on, like a `CODE` plan, once CI and both reviewers pass, an
+  estimate over the ceiling still waiting for you. The button is off by default, and
+  the choice is recorded in the event log.
 
 Anything else waits for you, under **Needs you** with the reason. `Arch:` and `Fix:`
 pull requests are yours in both modes. In Swarm, GitHub's rules need no approval but

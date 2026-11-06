@@ -22,7 +22,7 @@ import { buildPolicy } from '../sandbox/policy.ts';
 import { EventStore, type CiJob, type HarnessEvent, type NewEvent, type Ref } from '../state/events.ts';
 import {
   activeAttempt, activeAttempts, apply, countedAttempts, featureKey, interruptions, isActive, managersOf, planKey, planMerged, project, writeSnapshot,
-  type Attempt, type FeatureState, type ManagerState, type Mode, type PlanState, type ReviewState, type State,
+  type Attempt, type FeatureState, type InfraMerge, type ManagerState, type Mode, type PlanState, type ReviewState, type State,
 } from '../state/state.ts';
 import { clip, sh, sleep } from '../util.ts';
 import { Architects } from './architects.ts';
@@ -256,6 +256,15 @@ export class Orchestrator {
   setMode(mode: Mode): boolean {
     if (this.state.mode === mode) return false;
     this.record({ type: 'MODE_CHANGED', payload: { mode } });
+    this.kick();
+    return true;
+  }
+
+  /** The owner lets the daemon merge INFRA and MIXED plans like CODE ones, or takes them back (v3 D36). Open PRs are looked at again at once. */
+  setInfraMerge(by: InfraMerge): boolean {
+    if (this.state.infraMerge === by) return false;
+    this.record({ type: 'INFRA_MERGE_SET', payload: { by } });
+    this.nextPoll.clear();
     this.kick();
     return true;
   }
@@ -997,12 +1006,18 @@ export class Orchestrator {
     if (kind === 'CODE' && policy.merge.code !== 'daemon') return leave('CODE plans are the owner\'s to merge (swarm.merge.code)');
     if (kind !== 'CODE') {
       const ceiling = policy.merge.infraMonthlyUsdCeiling;
-      if (ceiling === null) return leave(`${kind} plans are the owner's to merge (swarm.merge.infraMonthlyUsdCeiling is null)`);
       const estimate = plan.costEstimate;
-      if (estimate === undefined) {
-        return leave(`${kind === 'INFRA' ? 'an' : 'a'} ${kind} plan merges itself only with the cost job's estimate of the monthly cost it adds, and none was produced: the cost job needs iac/ and the INFRACOST_API_KEY secret`);
+      if (ceiling !== null && estimate !== undefined && estimate.monthlyUsd > ceiling) {
+        return leave(`the PR adds an estimated ${estimate.monthlyUsd} USD a month, over the ceiling of ${ceiling} (swarm.merge.infraMonthlyUsdCeiling)`);
       }
-      if (estimate.monthlyUsd > ceiling) return leave(`the PR adds an estimated ${estimate.monthlyUsd} USD a month, over the ceiling of ${ceiling} (swarm.merge.infraMonthlyUsdCeiling)`);
+      // Without the owner's button (v3 D36), an estimate under the ceiling is the only way in.
+      if (this.state.infraMerge !== 'daemon') {
+        const button = "the dashboard's button lets the daemon merge infra once CI and the reviewers pass";
+        if (ceiling === null) return leave(`${kind} plans are the owner's to merge (swarm.merge.infraMonthlyUsdCeiling is null); ${button}`);
+        if (estimate === undefined) {
+          return leave(`${kind === 'INFRA' ? 'an' : 'a'} ${kind} plan merges itself only with the cost job's estimate of the monthly cost it adds, and none was produced: the cost job needs iac/ and the INFRACOST_API_KEY secret; ${button}`);
+        }
+      }
     }
     const statuses = await this.forge.commitStatuses(pr.head);
     const missing = policy.requiredStatuses.filter((context) => statuses.find((s) => s.context === context)?.state !== 'success');

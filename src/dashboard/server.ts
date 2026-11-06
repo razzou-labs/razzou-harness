@@ -136,6 +136,8 @@ export function startDashboard({ orchestrator, port, token, webRoot, terminals }
           return sendJson(res, { done: orchestrator.pause() });
         case 'POST /api/resume':
           return sendJson(res, { done: orchestrator.resume() });
+        case 'POST /api/infra-merge':
+          return sendJson(res, body.by === 'daemon' || body.by === 'ceiling' ? { done: orchestrator.setInfraMerge(body.by) } : { done: false, error: 'by is daemon or ceiling' });
         case 'POST /api/mode':
           return sendJson(res, body.mode === 'manual' || body.mode === 'swarm' ? { done: orchestrator.setMode(body.mode) } : { done: false, error: 'the mode is manual or swarm' });
         case 'POST /api/budgets': {

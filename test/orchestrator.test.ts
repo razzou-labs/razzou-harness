@@ -620,7 +620,7 @@ describe('pull requests', () => {
     fake.statuses = () => ({ 'harness/security': 'success', 'harness/cost': 'success' });
     await until(o, () => plan(o)?.leftToOwner !== undefined);
     assert.equal(fake.prs[0]!.title, 'Plan: demo/P1 -INFRA- Greeting and adding');
-    assert.match(plan(o)!.leftToOwner!.reason, /^an INFRA plan merges itself only with the cost job's estimate .* none was produced: the cost job needs iac\/ and the INFRACOST_API_KEY secret$/);
+    assert.match(plan(o)!.leftToOwner!.reason, /^an INFRA plan merges itself only with the cost job's estimate .* none was produced: the cost job needs iac\/ and the INFRACOST_API_KEY secret; the dashboard's button lets the daemon merge infra once CI and the reviewers pass$/);
 
     o.setMode('manual');
     skew += 61_000;
@@ -654,6 +654,28 @@ describe('pull requests', () => {
     // The cost reviewer read the estimate in its brief.
     const brief = readFileSync(join(under.harnessDir, 'modules', 'demo', 'reviews', `P1-cost-${merged.pushed!.slice(0, 8)}`, 'brief.md'), 'utf8');
     assert.match(brief, /Infracost estimates that the change adds 12\.5 USD a month in AWS resources; the merge policy's ceiling is 50 USD/);
+  });
+
+  it("in Swarm, the owner's button lets an INFRA plan merge itself without an estimate, and an estimate over the ceiling still waits", async () => {
+    const without = await setup((f) => solved(f), { github: true, prepare: infraPlan });
+    without.orchestrator.setMode('swarm');
+    assert.equal(without.orchestrator.setInfraMerge('daemon'), true);
+    assert.equal(without.orchestrator.setInfraMerge('daemon'), false);
+    without.fake.statuses = () => ({ 'harness/security': 'success', 'harness/cost': 'success' });
+    await until(without.orchestrator, completed(without.orchestrator));
+    assert.equal(plan(without.orchestrator)!.mergedBy, 'daemon');
+    assert.equal(plan(without.orchestrator)!.costEstimate, undefined);
+
+    const over = await setup((f) => solved(f), { github: true, prepare: infraPlan });
+    over.orchestrator.setMode('swarm');
+    over.orchestrator.setInfraMerge('daemon');
+    over.fake.statuses = () => ({ 'harness/security': 'success', 'harness/cost': 'success' });
+    over.fake.artifacts = () => ({ cost: { 'cost.json': JSON.stringify({ diffTotalMonthlyCost: '99' }) } });
+    await until(over.orchestrator, () => plan(over.orchestrator)?.leftToOwner !== undefined);
+    assert.equal(plan(over.orchestrator)!.leftToOwner!.reason, 'the PR adds an estimated 99 USD a month, over the ceiling of 50 (swarm.merge.infraMonthlyUsdCeiling)');
+    // Taking the merges back lets the plan wait for the owner for the usual reason once the estimate is under the ceiling, too.
+    over.orchestrator.setInfraMerge('ceiling');
+    assert.equal(over.orchestrator.state.infraMerge, 'ceiling');
   });
 
   it('in Swarm, starts no attempt at or above the usage ceiling, and goes on once the window resets', async () => {
@@ -1180,6 +1202,9 @@ describe('dashboard', () => {
     assert.equal((await post('/api/pause', {})).done, true);
     assert.equal(o.state.pipeline.paused?.reason, 'the owner paused the pipeline');
     assert.equal((await post('/api/resume', {})).done, true);
+    assert.equal((await post('/api/infra-merge', { by: 'daemon' })).done, true);
+    assert.equal(o.state.infraMerge, 'daemon');
+    assert.equal((await post('/api/infra-merge', { by: 'elsewhere' })).done, false);
 
     o.events.emit('transcript', { agent: 'manager:demo', line: JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'x'.repeat(5000) }] } }) });
     o.events.emit('transcript', { agent: 'manager:demo', line: 'not json' });

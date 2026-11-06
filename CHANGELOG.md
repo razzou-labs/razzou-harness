@@ -60,6 +60,9 @@ may change how a project is set up, and its notes say how.
   and the dashboard's "Before you use Swarm" note lists only what is left: the rules,
   the App's statuses permission, the usage probe's token; it goes once all are done.
   `harness budget --owner-hours <n>` sets your hours, even with the daemon down.
+- A button in the dashboard's header, in Swarm, that lets the daemon merge `INFRA` and
+  `MIXED` plans like `CODE` ones, once CI and both reviewers pass; an Infracost estimate
+  over the ceiling still waits for the owner. Off by default; the choice is an event.
 - A `cost` job in the CI workflow, written by `harness install-ci`: on a pull request
   with `iac/` and the `INFRACOST_API_KEY` secret, Infracost's estimate of the monthly cost
   the change adds is uploaded as an artifact, which the daemon reads once CI passed.

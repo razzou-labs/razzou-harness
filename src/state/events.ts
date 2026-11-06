@@ -3,7 +3,7 @@ import { dirname } from 'node:path';
 import type { CheckResult } from '../checks/runner.ts';
 import type { ReviewFinding, ReviewerRole } from '../design/schemas.ts';
 import type { Party, Role } from '../roles.ts';
-import type { ActionState, FeatureState, Mode, PlanState } from './state.ts';
+import type { ActionState, FeatureState, InfraMerge, Mode, PlanState } from './state.ts';
 
 /** What an event is about. Ids repeat across modules, so a feature is always addressed with its module and plan. */
 export interface Ref {
@@ -103,6 +103,8 @@ interface Payloads {
   OWNER_ACTION_REFUSED: { module: string; action: string; reason: string };
   /** The owner switched the mode (v3 §2.1); it takes effect at item boundaries. */
   MODE_CHANGED: { mode: Mode };
+  /** The owner's button (v3 D36): the daemon merges INFRA and MIXED plans like CODE ones, or only under the cost ceiling. */
+  INFRA_MERGE_SET: { by: InfraMerge };
   /** The owner set, or cleared with null, the hours the whole project may take of their time (v3 §4.1). */
   OWNER_HOURS_SET: { hours: number | null };
   /** The owner set, or cleared, the threshold the agent-hours meter turns red at (v3 §4.2). */

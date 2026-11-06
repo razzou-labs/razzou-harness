@@ -68,6 +68,14 @@ export function App() {
   const needs = collectNeeds(data, go).length;
   const paused = data.state.pipeline.paused;
   const swarm = (data.state.mode ?? 'manual') === 'swarm';
+  const infraByDaemon = (data.state.infraMerge ?? 'ceiling') === 'daemon';
+  // The owner's button for INFRA and MIXED plans (v3 D36): the reviewers and CI as the gate, the cost ceiling still holding.
+  const switchInfra = () => {
+    const question = infraByDaemon
+      ? 'INFRA and MIXED plans will wait for you again, unless the cost job\'s estimate is under the ceiling. Keep their merges for you?'
+      : 'INFRA and MIXED plans will merge themselves once CI, the security reviewer and the cost reviewer pass, like CODE plans. An estimate over the ceiling still waits for you. Let the daemon merge infra?';
+    return window.confirm(question) ? post('/api/infra-merge', { by: infraByDaemon ? 'ceiling' : 'daemon' }) : Promise.resolve({ done: true });
+  };
   // The switch takes effect at item boundaries; the daemon records it (v3 §2.1).
   const switchMode = () => {
     const question = swarm
@@ -83,6 +91,8 @@ export function App() {
         {paused ? <Action label="Resume" onClick={() => post('/api/resume')} /> : <Action label="Pause" onClick={() => post('/api/pause')} />}
         <Badge status={swarm ? 'swarm' : 'manual'} label={swarm ? 'Swarm' : 'Manual'} />
         <Action label={swarm ? 'Switch to Manual' : 'Switch to Swarm'} onClick={switchMode} />
+        {swarm && <Badge status={infraByDaemon ? 'swarm' : 'waiting'} label={infraByDaemon ? 'Infra: the daemon merges' : 'Infra: yours'} />}
+        {swarm && <Action label={infraByDaemon ? 'Keep infra merges for me' : 'Let the daemon merge infra'} onClick={switchInfra} />}
         <span className="muted small">
           {!connected ? 'reconnecting…' : data.state.daemon ? `daemon ${data.state.daemon.version}, pid ${data.state.daemon.pid}` : 'daemon stopped'}
         </span>

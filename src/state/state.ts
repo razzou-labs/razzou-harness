@@ -9,6 +9,13 @@ export type AttemptStatus = 'starting' | 'running' | 'collecting' | 'checking' |
 /** Manual: the owner merges every pull request. Swarm: the daemon merges plans under the policy of v3 §3.2. */
 export type Mode = 'manual' | 'swarm';
 
+/**
+ * Who merges INFRA and MIXED plans in Swarm (v3 D36): `ceiling`, the daemon only with the
+ * cost job's estimate under the ceiling, else the owner; `daemon`, the daemon once CI and
+ * the reviewers pass, like CODE plans, an estimate over the ceiling still being the owner's.
+ */
+export type InfraMerge = 'ceiling' | 'daemon';
+
 export interface Question {
   requestId: string;
   text: string;
@@ -200,6 +207,8 @@ export interface State {
   daemon?: { pid: number; version: string; startedAt: string };
   pipeline: { paused?: { reason: string; since: string; until?: string }; consecutiveFailures: number };
   mode: Mode;
+  /** The owner's button for INFRA and MIXED plans in Swarm (v3 D36). */
+  infraMerge: InfraMerge;
   /** What the owner set in the dashboard (v3 §4): their hours for the whole project, and the agent-hours threshold. */
   budgets: { ownerHours?: number; ownerHoursSetAt?: string; agentHours?: number };
   plans: Record<string, PlanState>;
@@ -227,7 +236,7 @@ export function managersOf(state: State, module: string, plan?: string): Manager
 export const planMerged = (plan: PlanState | undefined): boolean => plan !== undefined && (plan.mergeCommit !== undefined || plan.status === 'completed');
 
 export function initialState(): State {
-  return { v: 1, pipeline: { consecutiveFailures: 0 }, mode: 'manual', budgets: {}, plans: {}, features: {}, managers: {}, ownerRequests: {}, modules: {}, actions: {}, pendingProgress: [] };
+  return { v: 1, pipeline: { consecutiveFailures: 0 }, mode: 'manual', infraMerge: 'ceiling', budgets: {}, plans: {}, features: {}, managers: {}, ownerRequests: {}, modules: {}, actions: {}, pendingProgress: [] };
 }
 
 export function project(events: HarnessEvent[]): State {
@@ -293,6 +302,9 @@ export function apply(state: State, event: HarnessEvent): State {
     }
     case 'MODE_CHANGED':
       state.mode = event.payload.mode;
+      break;
+    case 'INFRA_MERGE_SET':
+      state.infraMerge = event.payload.by;
       break;
     case 'OWNER_HOURS_SET':
       if (event.payload.hours === null) {
