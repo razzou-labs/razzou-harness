@@ -3,7 +3,13 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
-## Unreleased
+## 0.2.0 (2026-11-06)
+
+**Upgrading a project from 0.1.x:** install the new version, then run `harness setup`
+in the project: it writes the workflow with the new `cost` job (commit it), waits for
+you to give the App "Commit statuses: write", and stores the token the usage probe
+reads. Without Swarm on, nothing else changes: Manual mode works as before, with the
+new attempt clock of 120 minutes and Manager turn of 90.
 
 - **Swarm mode**, designed in `docs/architecture/proposal-v3.md`: a second mode, switched
   in the dashboard or with `harness mode`, in which the daemon merges a plan's pull
