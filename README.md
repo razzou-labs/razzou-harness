@@ -250,9 +250,13 @@ exists today.
 **The switch.** The dashboard's header switches the mode; so do `harness mode swarm`
 and `harness mode manual`. A switch takes effect at item boundaries: what runs
 finishes under the rules it started with. GitHub's rules on `main` differ per mode, and
-only you can change them, so after a switch run
-`harness github-setup --repo <org>/<repo>` once: it applies the ruleset of the daemon's
-mode (`--mode` overrides). Until then nothing merges, and `harness doctor` says so.
+only you can change them: `harness mode` applies the mode's ruleset in the same
+command, with your own `gh`; after a switch from the dashboard, run
+`harness github-setup --repo <org>/<repo>` once. Until the rules match nothing merges.
+The daemon reads the rules in effect on `main` through the App and the dashboard's
+note lists what is still to do, the commands ready to copy: the rules, the App's
+"Commit statuses: write", and the token for the usage probe. The note goes once all
+three are done; `harness doctor` checks the same.
 
 **What merges itself.** In Swarm the daemon merges a plan's pull request, as the App,
 once CI passed and every status in `swarm.requiredStatuses` is green on its head:
@@ -351,6 +355,7 @@ too.
 | `harness github-app create --org <org>` | Creates the harness's GitHub App, once per machine |
 | `harness github-app check --repo <org>/<repo>` | Checks that the App can reach the repository |
 | `harness github-setup --repo <org>/<repo> [--mode manual\|swarm]` | Sets merge commits only, and the ruleset on `main` for the daemon's mode, with your own `gh` |
+| `harness budget --owner-hours <n>` | Sets the hours of your time for the whole project; with the daemon down, it records them when it starts (`--agent-hours` sets the threshold) |
 | `harness install-ci [--owner <login>]` | Writes the workflow, its CI script and `CODEOWNERS` again, after an upgrade |
 | `harness lock` | Writes `harness/lock.json`, the hashes of the protected files |
 | `harness up`, `harness down` | Starts the daemon and the dashboard, or stops the daemon; sandboxes keep running |

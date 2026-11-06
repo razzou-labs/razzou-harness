@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import type { Mode } from '../state/state.ts';
 import { run } from '../util.ts';
 import { APP_PERMISSIONS, configDir, GitHubClient, loadAppCredentials } from './app.ts';
+import type { BranchRules } from './forge.ts';
 
 export interface CreatedApp {
   appId: number;
@@ -202,6 +203,29 @@ export function mainRuleset(requiredChecks: string[], options: RulesetOptions = 
       },
     ],
   };
+}
+
+/**
+ * What the rules in effect on main lack for the mode (v3 §3.3, v4 §6): nothing when they
+ * match. Manual needs a code owner's approval; Swarm needs none, and the reviewers'
+ * statuses pinned to the App; both need the harness's CI jobs.
+ */
+export function rulesProblems(rules: BranchRules | undefined, options: { mode: Mode; requiredChecks: string[]; statuses: string[]; appId?: number }): string[] {
+  if (!rules) return ["main's rules can't be read through the App: check them with `harness doctor`"];
+  const problems: string[] = [];
+  const check = (context: string) => rules.checks.find((c) => c.context === context);
+  for (const context of options.requiredChecks) if (!check(context)) problems.push(`the ${context} job isn't required`);
+  if (options.mode === 'swarm') {
+    if (rules.approvals > 0) problems.push(`${rules.approvals} approval${rules.approvals === 1 ? ' is' : 's are'} required, which the daemon can't give`);
+    for (const status of options.statuses) {
+      const required = check(status);
+      if (!required) problems.push(`the ${status} status isn't required`);
+      else if (options.appId !== undefined && required.integrationId !== options.appId) problems.push(`the ${status} status isn't pinned to the App`);
+    }
+  } else if (rules.approvals < 1 || !rules.codeOwners) {
+    problems.push("a code owner's approval isn't required");
+  }
+  return problems;
 }
 
 /** Applies the repository's merge settings and the ruleset of the mode with the owner's own `gh` login. */

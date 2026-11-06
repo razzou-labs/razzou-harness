@@ -61,6 +61,10 @@ export class GitHubClient {
     return `${this.credentials.slug}[bot]`;
   }
 
+  get appId(): number {
+    return this.credentials.appId;
+  }
+
   /** A REST call as the App's installation on the repository. Paths may contain `{repo}`. */
   async request<T = any>(method: string, path: string, body?: unknown): Promise<T> {
     return this.call<T>(method, path.replaceAll('{repo}', this.repo), `token ${await this.token()}`, body);

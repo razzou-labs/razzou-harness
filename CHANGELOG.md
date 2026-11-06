@@ -48,6 +48,11 @@ may change how a project is set up, and its notes say how.
   round, two per reviewer by default, before the pull request is the owner's. The App
   needs "Commit statuses: write"; an older App's tokens fall back to read, and the
   pull request waits for the owner with the reason.
+- `harness mode` applies the mode's ruleset on `main` in the same command, with your
+  own `gh`. In Swarm the daemon reads the rules in effect on `main` through the App,
+  and the dashboard's "Before you use Swarm" note lists only what is left: the rules,
+  the App's statuses permission, the usage probe's token; it goes once all are done.
+  `harness budget --owner-hours <n>` sets your hours, even with the daemon down.
 - A `cost` job in the CI workflow, written by `harness install-ci`: on a pull request
   with `iac/` and the `INFRACOST_API_KEY` secret, Infracost's estimate of the monthly cost
   the change adds is uploaded as an artifact, which the daemon reads once CI passed.

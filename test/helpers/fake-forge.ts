@@ -1,7 +1,7 @@
 import { join } from 'node:path';
 import type { Repo } from '../../src/git/repo.ts';
 import { GitHubError } from '../../src/github/app.ts';
-import type { CheckRun, CommitStatus, Forge, PullRequest, ReviewPost } from '../../src/github/forge.ts';
+import type { BranchRules, CheckRun, CommitStatus, Forge, PullRequest, ReviewPost } from '../../src/github/forge.ts';
 import { runOk } from '../../src/util.ts';
 import { tempDir } from './toy-repo.ts';
 
@@ -23,7 +23,14 @@ interface FakePullRequest {
 export class FakeForge implements Forge {
   readonly kind = 'github';
   readonly bot = FAKE_BOT;
+  readonly appId = 4242;
   readonly remote: string;
+  /** The rules in effect on main (v4 §6): by default those of Manual, as `harness github-setup` sets them. */
+  rules: BranchRules | undefined = {
+    approvals: 1, codeOwners: true, checks: [{ context: 'verify', integrationId: 15368 }, { context: 'checks', integrationId: 15368 }],
+  };
+  /** False once the App is known not to write statuses. */
+  writable: boolean | undefined = undefined;
   readonly prs: FakePullRequest[] = [];
   ci: (sha: string) => Record<string, string> | undefined = () => ({ verify: 'success', checks: 'success' });
   /** The commit statuses on each commit, by context: what the reviewers would post as the App (v3 §5.4). */
@@ -119,6 +126,14 @@ export class FakeForge implements Forge {
 
   async artifactFile(sha: string, artifact: string, file: string): Promise<string | undefined> {
     return this.artifacts(sha)[artifact]?.[file];
+  }
+
+  async branchRules(): Promise<BranchRules | undefined> {
+    return this.rules;
+  }
+
+  statusesWritable(): boolean | undefined {
+    return this.writable;
   }
 
   /** The daemon merges under Swarm's policy: refused like GitHub when the rules aren't met or the head moved. */

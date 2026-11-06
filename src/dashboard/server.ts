@@ -4,7 +4,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { AddressInfo } from 'node:net';
 import { extname, join, normalize, sep } from 'node:path';
 import { WebSocketServer, type WebSocket } from 'ws';
-import type { Orchestrator } from '../daemon/orchestrator.ts';
+import type { Orchestrator, SetupStatus } from '../daemon/orchestrator.ts';
 import type { HarnessEvent } from '../state/events.ts';
 import type { SubscriptionUsage } from '../anthropic/usage.ts';
 import type { OwnerTime } from '../design/owner-time.ts';
@@ -30,6 +30,8 @@ export interface DashboardState {
   ownerTime?: OwnerTime;
   /** The subscription's usage, as last read before a launch in Swarm (v3 §4.3). */
   usage?: { at: string; usage: SubscriptionUsage };
+  /** In Swarm, where its setup stands, for the note that lists what is left to do (v4 §6). */
+  setup?: SetupStatus;
   progress: string[];
   /** Whether node-pty loaded: without it, there are no terminals in the dashboard. */
   terminals: boolean;
@@ -104,6 +106,7 @@ export function startDashboard({ orchestrator, port, token, webRoot, terminals }
             design: designSummary(orchestrator),
             ...(orchestrator.state.budgets.ownerHours !== undefined ? { ownerTime: await orchestrator.ownerTime() } : {}),
             ...(orchestrator.usage ? { usage: orchestrator.usage } : {}),
+            ...(orchestrator.state.mode === 'swarm' ? { setup: await orchestrator.setupStatus() } : {}),
             progress: await progressTail(orchestrator),
             terminals: terminals.available,
           } satisfies DashboardState);

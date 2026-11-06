@@ -27,6 +27,14 @@ export interface CommitStatus {
   state: string;
 }
 
+/** The rules in effect on a branch, as GitHub lists them for anyone who can read the repository (v4 §6). */
+export interface BranchRules {
+  approvals: number;
+  codeOwners: boolean;
+  /** The required status checks, each with the integration it is pinned to, if any. */
+  checks: Array<{ context: string; integrationId?: number }>;
+}
+
 /** A review the daemon posts on a PR for a reviewer: a body, and comments on lines of the diff. */
 export interface ReviewPost {
   head: string;
@@ -43,6 +51,8 @@ export interface Forge {
   readonly kind: 'local' | 'github';
   /** The App's bot login: the author of the harness's PRs. */
   readonly bot?: string;
+  /** The App's id, which the Swarm ruleset pins the reviewers' statuses to. */
+  readonly appId?: number;
   fetchMain(repo: Repo): Promise<string>;
   /** A branch the harness pushed earlier, if the remote has it. */
   fetchBranch(repo: Repo, branch: string): Promise<string | undefined>;
@@ -67,6 +77,10 @@ export interface Forge {
   setCommitStatus(sha: string, status: { context: string; state: 'success' | 'failure' | 'pending'; description: string }): Promise<void>;
   /** A file out of a named artifact of the commit's workflow run (v3 §5.5), or undefined when no run has one yet. */
   artifactFile(sha: string, artifact: string, file: string): Promise<string | undefined>;
+  /** The rules in effect on a branch (v4 §6), or undefined when they can't be read. */
+  branchRules(branch: string): Promise<BranchRules | undefined>;
+  /** Whether the App may write commit statuses: false once a token had to be minted without it; undefined while unknown. */
+  statusesWritable(): boolean | undefined;
 }
 
 export class LocalForge implements Forge {
@@ -126,6 +140,14 @@ export class LocalForge implements Forge {
   async artifactFile(): Promise<undefined> {
     return undefined;
   }
+
+  async branchRules(): Promise<undefined> {
+    return undefined;
+  }
+
+  statusesWritable(): undefined {
+    return undefined;
+  }
 }
 
 export class GitHubForge implements Forge {
@@ -138,6 +160,14 @@ export class GitHubForge implements Forge {
 
   get bot(): string {
     return this.client.botLogin;
+  }
+
+  get appId(): number {
+    return this.client.appId;
+  }
+
+  statusesWritable(): boolean | undefined {
+    return this.client.canWriteStatuses ? undefined : false;
   }
 
   async fetchMain(repo: Repo): Promise<string> {
@@ -250,5 +280,23 @@ export class GitHubForge implements Forge {
       if (found) return zipEntry(await this.client.downloadBytes(`/repos/{repo}/actions/artifacts/${found.id}/zip`), file);
     }
     return undefined;
+  }
+
+  /** The rules GitHub applies to the branch, from every active ruleset; an empty list when none applies. Unreadable rules are undefined. */
+  async branchRules(branch: string): Promise<BranchRules | undefined> {
+    let rules: Array<{ type: string; parameters?: Record<string, any> }>;
+    try {
+      rules = await this.client.request('GET', `/repos/{repo}/rules/branches/${encodeURIComponent(branch)}`);
+    } catch (error) {
+      if (error instanceof GitHubError && (error.status === 403 || error.status === 404)) return undefined;
+      throw error;
+    }
+    const pr = rules.find((r) => r.type === 'pull_request')?.parameters ?? {};
+    const checks = rules.filter((r) => r.type === 'required_status_checks').flatMap((r) => (r.parameters?.required_status_checks ?? []) as Array<{ context: string; integration_id?: number | null }>);
+    return {
+      approvals: Number(pr.required_approving_review_count ?? 0),
+      codeOwners: pr.require_code_owner_review === true,
+      checks: checks.map((c) => ({ context: c.context, ...(typeof c.integration_id === 'number' ? { integrationId: c.integration_id } : {}) })),
+    };
   }
 }

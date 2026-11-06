@@ -1,8 +1,15 @@
 # Harness: architecture proposal v4 — one setup command
 
-Status: draft of 2026-11-06, for the owner's decision. It amends v2 §17 (package, CLI
-and setup) and folds in the three steps Swarm added (v3 §2.1, §3.4, §4.3). Nothing
-here changes what the agents can do.
+Status: draft of 2026-11-06, taken as accepted with the recommendations of §7 on the
+owner's "ok perfect". It amends v2 §17 (package, CLI and setup) and folds in the three
+steps Swarm added (v3 §2.1, §3.4, §4.3). Nothing here changes what the agents can do.
+
+Built so far (S-C, in part): `harness mode` applies the ruleset; the daemon reads
+main's rules in effect through the App (`GET /repos/{owner}/{repo}/rules/branches/main`,
+which the App's metadata permission allows; a 403 or 404 shows as "can't be read" and
+the full note stays) and the dashboard's note lists only the steps left;
+`harness budget --owner-hours` writes `.harness/setup.json`, which the daemon takes
+once when it starts. The rest of §4, the `harness setup` command, follows.
 
 ## Contents
 

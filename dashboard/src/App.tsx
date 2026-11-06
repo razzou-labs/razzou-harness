@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { post, useHarness } from './api.ts';
+import { post, useHarness, type DashboardState } from './api.ts';
 import { Action, Badge, Command } from './components/ui.tsx';
 import { Agents } from './views/Agents.tsx';
 import { Events } from './views/Events.tsx';
@@ -18,17 +18,38 @@ function route(hash: string): { view: View; detail?: string } {
   return rest.length ? { view: known, detail: decodeURIComponent(rest.join('/')) } : { view: known };
 }
 
-/** What only the owner can do before Swarm merges anything (v3 §2.1, §3.4, §4.3), with the commands ready to copy. */
-function SwarmSetup({ repo }: { repo: string }) {
+/**
+ * What only the owner can do before Swarm merges anything (v3 §2.1, §3.4, §4.3), with the
+ * commands ready to copy: the steps the daemon sees undone (v4 §6), or all three while it
+ * can't tell. Nothing once every step is done.
+ */
+function SwarmSetup({ repo, setup }: { repo: string; setup?: DashboardState['setup'] }) {
+  const rules = setup?.rules;
+  const steps = [
+    ...(!rules || !rules.ok ? [(
+      <li key="rules">
+        Apply the mode's rules on GitHub, with your own <code>gh</code>: <Command text={`harness github-setup --repo ${repo}`} />
+        {rules && rules.problems.length > 0 && <span className="muted"> · now: {rules.problems.join('; ')}</span>}
+      </li>
+    )] : []),
+    ...(setup?.statusesWritable === false || !setup ? [(
+      <li key="statuses">
+        Give the App <b>Commit statuses: write</b> on GitHub, and accept the new permission on its installation.
+        {setup ? ' The daemon could only get a read token.' : ' An App created with this version has it already.'} Without it the reviewers' verdicts can't be posted, and pull requests wait for you with the reason.
+      </li>
+    )] : []),
+    ...(!setup?.tokenStored ? [(
+      <li key="token">
+        Store the token the usage probe reads, in a terminal: <Command text="harness doctor" /> asks for the one from <code>claude setup-token</code>. Without it the daemon learns of a limit only when an attempt hits it.
+      </li>
+    )] : []),
+  ];
+  if (steps.length === 0) return null;
   return (
-    <>
-      <b>Before you use Swarm</b>, three steps, once. Swarm merges only once GitHub's rules match the mode; <code>harness doctor</code> checks all three.
-      <ol>
-        <li>Apply the mode's rules on GitHub, with your own <code>gh</code>: <Command text={`harness github-setup --repo ${repo}`} /></li>
-        <li>Give the App <b>Commit statuses: write</b> on GitHub, and accept the new permission on its installation. An App created with this version has it already; without it the daemon falls back to read, and pull requests wait for you with the reason.</li>
-        <li>Store the token the usage probe reads, in a terminal: <Command text="harness doctor" /> asks for the one from <code>claude setup-token</code>. Without it the daemon learns of a limit only when an attempt hits it.</li>
-      </ol>
-    </>
+    <div className="note">
+      <b>Before you use Swarm</b>{setup ? `, ${steps.length === 1 ? 'one step' : `${steps.length} steps`} left` : ', three steps, once'}. Swarm merges only once GitHub's rules match the mode; <code>harness doctor</code> checks all of it.
+      <ol>{steps}</ol>
+    </div>
   );
 }
 
@@ -75,11 +96,9 @@ export function App() {
         </nav>
       </header>
       {problem && <div className="banner">{problem}</div>}
-      {swarm && (
-        <div className="note">
-          {data.design.repo ? <SwarmSetup repo={data.design.repo} /> : 'Swarm: this project has no GitHub repository, so there is nothing to merge; plans complete locally.'}
-        </div>
-      )}
+      {swarm && (data.design.repo
+        ? <SwarmSetup repo={data.design.repo} {...(data.setup ? { setup: data.setup } : {})} />
+        : <div className="note">Swarm: this project has no GitHub repository, so there is nothing to merge; plans complete locally.</div>)}
       <main>
         {current.view === 'needs' && <NeedsYou data={data} go={go} />}
         {current.view === 'project' && <Project data={data} />}

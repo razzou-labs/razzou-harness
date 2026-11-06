@@ -1,5 +1,5 @@
 import { strict as assert } from 'node:assert';
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { request } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
@@ -8,7 +8,7 @@ import { WebSocket } from 'ws';
 import type { SubscriptionUsage } from '../src/anthropic/usage.ts';
 import { Orchestrator } from '../src/daemon/orchestrator.ts';
 import { handleRequest } from '../src/daemon/requests.ts';
-import { startDashboard } from '../src/dashboard/server.ts';
+import { startDashboard, type DashboardState } from '../src/dashboard/server.ts';
 import { Terminals, type Pty } from '../src/dashboard/terminals.ts';
 import { recover } from '../src/setup/recover.ts';
 import { activeAttempts } from '../src/state/state.ts';
@@ -46,6 +46,8 @@ interface SetupOptions {
   /** Starts with no design: an Architect writes it. */
   design?: boolean;
   architect?: ArchitectBehavior;
+  /** Whether the usage probe's token is stored (v4 §6); never the machine's real file. */
+  tokenStored?: () => boolean;
 }
 
 async function setup(decide: Decide, options: SetupOptions = {}) {
@@ -73,6 +75,7 @@ async function setup(decide: Decide, options: SetupOptions = {}) {
         if (process.env.HARNESS_TEST_LOG) console.error(`[daemon] ${message}`);
       },
       ...(options.usage ? { usage: options.usage } : {}),
+      tokenStored: options.tokenStored ?? (() => false),
       ...(options.now ? { now: options.now } : {}),
       ...(fake ? { forge: () => fake } : {}),
     });
@@ -104,6 +107,24 @@ const feature = (o: Orchestrator, id: string) => o.state.features[`demo/P1/${id}
 const completed = (o: Orchestrator) => () => o.state.plans['demo/P1']?.status === 'completed';
 
 describe('orchestrator', () => {
+  it('takes the owner hours left for it by harness budget when it starts, once', async () => {
+    const pending = async (dir: string) => {
+      mkdirSync(join(dir, '.harness'), { recursive: true });
+      writeFileSync(join(dir, '.harness', 'setup.json'), JSON.stringify({ ownerHours: 12 }));
+    };
+    const { orchestrator: o, harnessDir, make } = await setup((f) => solved(f), { prepare: pending });
+    assert.equal(o.state.budgets.ownerHours, 12);
+    assert.equal(existsSync(join(harnessDir, 'setup.json')), false);
+    // Set again by hand later, the file left behind doesn't override the owner.
+    o.setBudgets({ ownerHours: 20 });
+    writeFileSync(join(harnessDir, 'setup.json'), JSON.stringify({ ownerHours: 5 }));
+    await o.stop(0);
+    const again = make();
+    await again.start();
+    assert.equal(again.state.budgets.ownerHours, 20);
+    assert.equal(existsSync(join(harnessDir, 'setup.json')), false);
+  });
+
   it('lands each accepted feature as one commit with its progress line', async () => {
     const { orchestrator: o } = await setup((f) => solved(f));
     await until(o, completed(o));
@@ -1097,6 +1118,32 @@ describe('dashboard', () => {
     const host = `127.0.0.1:${port}`;
     return { o, port, host, bearer: { host, authorization: `Bearer ${token}` } };
   }
+
+  it('in Swarm, says which setup steps are left, and drops the note once none is', async () => {
+    let skew = 0;
+    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true, now: () => Date.now() + skew });
+    const server = await startDashboard({ orchestrator: o, port: 0, token, webRoot: tempDir('web'), terminals: new Terminals(undefined) });
+    cleanup.push(async () => void server.close());
+    const port = (server.address() as AddressInfo).port;
+    const bearer = { host: `127.0.0.1:${port}`, authorization: `Bearer ${token}` };
+    const read = async () => (JSON.parse((await call(port, '/api/state', bearer)).body) as DashboardState).setup;
+    assert.equal(await read(), undefined, 'Manual has no Swarm setup');
+
+    o.setMode('swarm');
+    const manual = (await read())!;
+    assert.equal(manual.rules!.ok, false);
+    assert.deepEqual(manual.rules!.problems, ["1 approval is required, which the daemon can't give", "the harness/security status isn't required", "the harness/cost status isn't required"]);
+    assert.equal(manual.tokenStored, false);
+    assert.equal(manual.statusesWritable, undefined);
+
+    // The rules are read again after five minutes: now they are Swarm's, the App can't write statuses, and the token is stored.
+    fake.rules = { approvals: 0, codeOwners: false, checks: [...fake.rules!.checks, { context: 'harness/security', integrationId: 4242 }, { context: 'harness/cost', integrationId: 4242 }] };
+    fake.writable = false;
+    skew += 6 * 60_000;
+    const swarm = (await read())!;
+    assert.deepEqual(swarm.rules, { ok: true, problems: [] });
+    assert.equal(swarm.statusesWritable, false);
+  });
 
   it('serves only the token holder on localhost, and survives a malformed request', async () => {
     const { port, host, bearer } = await dashboard();

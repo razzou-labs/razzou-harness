@@ -1,6 +1,7 @@
 import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
-import { mainRuleset } from '../src/github/setup.ts';
+import type { BranchRules } from '../src/github/forge.ts';
+import { mainRuleset, rulesProblems } from '../src/github/setup.ts';
 
 interface Ruleset {
   name: string;
@@ -62,5 +63,31 @@ describe('the ruleset on main', () => {
     const ruleset = mainRuleset(['verify'], { mode: 'manual', appId: 4242, statuses: ['harness/security'] });
     assert.deepEqual(required(ruleset).map((c) => c.context), ['verify']);
     assert.equal(rule(ruleset, 'pull_request').required_approving_review_count, 1);
+  });
+});
+
+describe("the rules in effect on main, read through the App (v4 §6)", () => {
+  const jobs = [{ context: 'verify', integrationId: 15368 }, { context: 'checks', integrationId: 15368 }];
+  const manual: BranchRules = { approvals: 1, codeOwners: true, checks: jobs };
+  const swarm: BranchRules = { approvals: 0, codeOwners: false, checks: [...jobs, { context: 'harness/security', integrationId: 4242 }, { context: 'harness/cost', integrationId: 4242 }] };
+  const options = (mode: 'manual' | 'swarm') => ({ mode, requiredChecks: ['verify', 'checks'], statuses: mode === 'swarm' ? ['harness/security', 'harness/cost'] : [], appId: 4242 });
+
+  it('match the mode they were set for, and say what the other mode lacks', () => {
+    assert.deepEqual(rulesProblems(manual, options('manual')), []);
+    assert.deepEqual(rulesProblems(swarm, options('swarm')), []);
+    assert.deepEqual(rulesProblems(manual, options('swarm')), [
+      "1 approval is required, which the daemon can't give",
+      "the harness/security status isn't required",
+      "the harness/cost status isn't required",
+    ]);
+    assert.deepEqual(rulesProblems(swarm, options('manual')), ["a code owner's approval isn't required"]);
+  });
+
+  it('name a missing job, a status pinned elsewhere, and rules that cannot be read', () => {
+    assert.deepEqual(rulesProblems({ ...manual, checks: [jobs[0]!] }, options('manual')), ["the checks job isn't required"]);
+    const elsewhere = { ...swarm, checks: swarm.checks.map((c) => (c.context === 'harness/cost' ? { context: c.context, integrationId: 1 } : c)) };
+    assert.deepEqual(rulesProblems(elsewhere, options('swarm')), ["the harness/cost status isn't pinned to the App"]);
+    assert.deepEqual(rulesProblems(undefined, options('swarm')), ["main's rules can't be read through the App: check them with `harness doctor`"]);
+    assert.deepEqual(rulesProblems({ approvals: 0, codeOwners: false, checks: [] }, options('manual')), ["the verify job isn't required", "the checks job isn't required", "a code owner's approval isn't required"]);
   });
 });

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { computeLock, directoryReader } from './ci/harness-ci.ts';
@@ -11,7 +11,7 @@ import { applyRepositoryRules, checkApp, createApp, installCi, type RulesetOptio
 import { doctor } from './setup/doctor.ts';
 import { CHECKLIST, init } from './setup/init.ts';
 import { recover } from './setup/recover.ts';
-import type { State } from './state/state.ts';
+import type { Mode, State } from './state/state.ts';
 import { sleep } from './util.ts';
 
 const HELP = `harness ${version}
@@ -25,7 +25,10 @@ Usage: harness <command> [--dir <project>]
   status             Show plans, features and the pipeline
   resume             Lift a pause of the pipeline
   mode [manual|swarm]
-                     Show the mode, or switch it: in Swarm the daemon merges plans (docs/architecture/proposal-v3.md)
+                     Show the mode, or switch it and apply the mode's rules on main with your gh:
+                     in Swarm the daemon merges plans (docs/architecture/proposal-v3.md)
+  budget --owner-hours <n> | --agent-hours <n>
+                     Set the hours of your time for the whole project, or the agent-hours threshold
   retry <m/p/f>      Grant one more attempt to an escalated feature (--note: guidance)
   module new <id> <title>
                      Start a module: its Architect's sandbox and conversation
@@ -65,6 +68,8 @@ async function main(): Promise<void> {
       repo: { type: 'string' },
       owner: { type: 'string' },
       mode: { type: 'string' },
+      'owner-hours': { type: 'string' },
+      'agent-hours': { type: 'string' },
       probe: { type: 'boolean' },
       'build-images': { type: 'boolean' },
       help: { type: 'boolean', short: 'h' },
@@ -83,7 +88,7 @@ async function main(): Promise<void> {
     case 'status':
       return status(harnessDir);
     case 'resume':
-      return ownerAction(harnessDir, '/api/resume', {});
+      return void await ownerAction(harnessDir, '/api/resume', {});
     case 'mode': {
       if (!argument) {
         const file = join(harnessDir, 'state.json');
@@ -92,35 +97,61 @@ async function main(): Promise<void> {
         return;
       }
       if (argument !== 'manual' && argument !== 'swarm') throw new Error('usage: harness mode [manual|swarm]');
-      return ownerAction(harnessDir, '/api/mode', { mode: argument });
+      const result = await ownerAction(harnessDir, '/api/mode', { mode: argument });
+      // GitHub's rules on main differ per mode, and only the owner's gh may change them (v3 §2.1): done here, in the same command.
+      const repo = projectConfig(projectDir)?.project.repo;
+      if (result.error || !repo) return;
+      try {
+        await applyRules(projectDir, harnessDir, repo, argument);
+      } catch (error) {
+        console.log(`GitHub's rules on main were not changed: ${(error as Error).message}\nRun \`harness github-setup --repo ${repo}\` with gh logged in as an admin of the repository.`);
+      }
+      return;
+    }
+    case 'budget': {
+      const hours = (key: 'owner-hours' | 'agent-hours') => (values[key] === undefined ? undefined : Number(values[key]));
+      const budgets = { ownerHours: hours('owner-hours'), agentHours: hours('agent-hours') };
+      if ((budgets.ownerHours === undefined && budgets.agentHours === undefined) || [budgets.ownerHours, budgets.agentHours].some((h) => h !== undefined && (!Number.isFinite(h) || h <= 0))) {
+        throw new Error('usage: harness budget --owner-hours <n> | --agent-hours <n>, with positive numbers');
+      }
+      const info = readDaemonInfo(harnessDir);
+      if (info && isAlive(info.pid)) return void (await ownerAction(harnessDir, '/api/budgets', budgets));
+      // The daemon is down: the hours wait for it in .harness/setup.json (v4 §5).
+      if (budgets.agentHours !== undefined) throw new Error('the agent-hours threshold needs the daemon running: `harness up`');
+      const file = join(harnessDir, 'setup.json');
+      const pending = existsSync(file) ? (JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>) : {};
+      mkdirSync(harnessDir, { recursive: true });
+      writeFileSync(file, `${JSON.stringify({ ...pending, ownerHours: budgets.ownerHours }, null, 2)}\n`);
+      console.log(`${budgets.ownerHours} hours of your time: the daemon records it when it starts (harness up).`);
+      return;
     }
     case 'retry':
       if (!argument) throw new Error('usage: harness retry <module/plan/feature>');
-      return ownerAction(harnessDir, '/api/retry', { feature: argument, note: values.note });
+      return void await ownerAction(harnessDir, '/api/retry', { feature: argument, note: values.note });
     case 'message':
       if (!argument) throw new Error('usage: harness message <text>');
-      return ownerAction(harnessDir, '/api/message', { text: positionals.slice(1).join(' ') });
+      return void await ownerAction(harnessDir, '/api/message', { text: positionals.slice(1).join(' ') });
     case 'answer':
       if (!argument || positionals.length < 3) throw new Error('usage: harness answer <request-id> <text>');
-      return ownerAction(harnessDir, '/api/answer', { id: argument, text: positionals.slice(2).join(' ') });
+      return void await ownerAction(harnessDir, '/api/answer', { id: argument, text: positionals.slice(2).join(' ') });
     case 'module': {
       const [, id, ...title] = positionals.slice(1);
       if (argument !== 'new' || !id) throw new Error('usage: harness module new <id> <title>');
-      return ownerAction(harnessDir, '/api/modules', { id, title: title.join(' ') });
+      return void await ownerAction(harnessDir, '/api/modules', { id, title: title.join(' ') });
     }
     case 'attach':
       return attach(harnessDir, argument);
     case 'accept': {
       const version = Number((positionals[2] ?? '').replace(/^v/, ''));
       if (!argument || !Number.isInteger(version) || version < 1) throw new Error('usage: harness accept <module> <vN>');
-      return ownerAction(harnessDir, '/api/accept', { module: argument, version });
+      return void await ownerAction(harnessDir, '/api/accept', { module: argument, version });
     }
     case 'actions':
       return listActions(harnessDir);
     case 'done': {
       const [module, action] = (argument ?? '').split('/');
       if (!module || !action) throw new Error('usage: harness done <module>/<action> [--note <text>]');
-      return ownerAction(harnessDir, '/api/actions/done', { module, action, note: values.note });
+      return void await ownerAction(harnessDir, '/api/actions/done', { module, action, note: values.note });
     }
     case 'github-app':
       return githubApp(argument, values);
@@ -132,26 +163,7 @@ async function main(): Promise<void> {
     case 'github-setup': {
       if (!values.repo) throw new Error('usage: harness github-setup --repo <owner/repo> [--mode manual|swarm]');
       if (values.mode !== undefined && values.mode !== 'manual' && values.mode !== 'swarm') throw new Error('--mode is manual or swarm');
-      const configFile = join(projectDir, 'harness', 'config.json');
-      const config = existsSync(configFile) ? ConfigSchema.parse(JSON.parse(readFileSync(configFile, 'utf8'))) : undefined;
-      const required = config ? requiredChecks(config) : ['verify', 'checks'];
-      // The daemon's mode, from its snapshot, unless --mode says otherwise (v3 §2.1).
-      const stateFile = join(harnessDir, 'state.json');
-      const snapshot = existsSync(stateFile) ? (JSON.parse(readFileSync(stateFile, 'utf8')) as State) : undefined;
-      const mode = values.mode ?? snapshot?.mode ?? 'manual';
-      let options: RulesetOptions = { mode };
-      if (mode === 'swarm') {
-        const statuses = (config?.swarm ?? ConfigSchema.shape.swarm.parse(undefined)).requiredStatuses;
-        let appId: number | undefined;
-        try {
-          appId = loadAppCredentials().appId;
-        } catch {
-          appId = undefined;
-        }
-        options = { mode, statuses, ...(appId !== undefined ? { appId } : {}) };
-      }
-      for (const line of await applyRepositoryRules(values.repo, required, options)) console.log(`set: ${line}`);
-      return;
+      return applyRules(projectDir, harnessDir, values.repo, values.mode);
     }
     case 'doctor':
       return runDoctor(projectDir, values);
@@ -179,6 +191,33 @@ async function main(): Promise<void> {
     default:
       console.log(HELP);
   }
+}
+
+/** The project's configuration, when the directory has one. */
+function projectConfig(projectDir: string) {
+  const configFile = join(projectDir, 'harness', 'config.json');
+  return existsSync(configFile) ? ConfigSchema.parse(JSON.parse(readFileSync(configFile, 'utf8'))) : undefined;
+}
+
+/** Merge settings and the ruleset of the mode on main, with the owner's own gh: the daemon's mode, unless `mode` says otherwise (v3 §2.1). */
+async function applyRules(projectDir: string, harnessDir: string, repo: string, mode?: Mode): Promise<void> {
+  const config = projectConfig(projectDir);
+  const required = config ? requiredChecks(config) : ['verify', 'checks'];
+  const stateFile = join(harnessDir, 'state.json');
+  const snapshot = existsSync(stateFile) ? (JSON.parse(readFileSync(stateFile, 'utf8')) as State) : undefined;
+  const effective = mode ?? snapshot?.mode ?? 'manual';
+  let options: RulesetOptions = { mode: effective };
+  if (effective === 'swarm') {
+    const statuses = (config?.swarm ?? ConfigSchema.shape.swarm.parse(undefined)).requiredStatuses;
+    let appId: number | undefined;
+    try {
+      appId = loadAppCredentials().appId;
+    } catch {
+      appId = undefined;
+    }
+    options = { mode: effective, statuses, ...(appId !== undefined ? { appId } : {}) };
+  }
+  for (const line of await applyRepositoryRules(repo, required, options)) console.log(`set: ${line}`);
 }
 
 async function githubApp(action: string | undefined, values: { org?: string; name?: string; repo?: string }): Promise<void> {
@@ -256,7 +295,7 @@ function status(harnessDir: string): void {
   if (open.length > 0) console.log('\nAnswer with: harness answer <request-id> <text>');
 }
 
-async function ownerAction(harnessDir: string, path: string, body: unknown): Promise<void> {
+async function ownerAction(harnessDir: string, path: string, body: unknown): Promise<{ done: boolean; error?: string }> {
   const info = readDaemonInfo(harnessDir);
   if (!info || !isAlive(info.pid)) throw new Error('no daemon is running');
   const response = await fetch(`http://127.0.0.1:${info.port}${path}`, {
@@ -266,6 +305,7 @@ async function ownerAction(harnessDir: string, path: string, body: unknown): Pro
   });
   const result = (await response.json()) as { done: boolean; error?: string };
   console.log(result.done ? 'done' : result.error ?? 'nothing to do');
+  return result;
 }
 
 /** The Architect's terminal, attached in this one. Detaching leaves the Architect running. */

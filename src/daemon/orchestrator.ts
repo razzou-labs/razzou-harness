@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { claudeCode, mcpConfig, readResult, reportJsonSchema, type AgentAdapter, type AgentRun } from '../agents/claude-code.ts';
 import { loadClaudeToken, readUsage, type SubscriptionUsage } from '../anthropic/usage.ts';
@@ -14,6 +14,7 @@ import {
 import { DEVELOPER, HARNESS, Repo } from '../git/repo.ts';
 import { GitHubClient, loadAppCredentials } from '../github/app.ts';
 import { GitHubForge, LocalForge, type CheckRun, type Forge, type PullRequest } from '../github/forge.ts';
+import { rulesProblems } from '../github/setup.ts';
 import { toolsManifest, type Role } from '../roles.ts';
 import type { ExecResult, Follower, SandboxDriver } from '../sandbox/driver.ts';
 import { BUNDLES } from '../sandbox/allowlist.ts';
@@ -36,6 +37,8 @@ import { buildTask } from './task.ts';
 import { webRead, type WebReadResult } from './web-read.ts';
 
 export interface OrchestratorOptions {
+  /** Whether the usage probe's token is stored; by default, the token file (v3 §4.3). */
+  tokenStored?: () => boolean;
   /** The project's own repository. In M1 and M2 its main branch is the source of truth. */
   projectDir: string;
   /** The project's `.harness/` directory. */
@@ -67,6 +70,17 @@ const STEP_ERROR_LIMIT = 5;
  * the Manager up to date. Every step records an event before it moves on, so after a
  * restart the same pass picks up where the previous process stopped.
  */
+/** Where the Swarm setup stands, for the dashboard's note (v4 §6): read through the App, at most every five minutes. */
+export interface SetupStatus {
+  at: string;
+  /** Whether main's rules match the mode, and what they lack; undefined when the project has no repository. */
+  rules?: { ok: boolean; problems: string[] };
+  /** False when the App can't write commit statuses; undefined until a token said so. */
+  statusesWritable?: boolean;
+  /** The token the usage probe reads is stored on this machine. */
+  tokenStored: boolean;
+}
+
 export class Orchestrator {
   /**
    * For the dashboard: 'event' (a HarnessEvent), 'transcript' ({ agent, line }: a line of
@@ -89,6 +103,8 @@ export class Orchestrator {
   /** The last reading of the subscription's usage, for the dashboard; not state. */
   usage?: { at: string; usage: SubscriptionUsage };
   forge!: Forge;
+  private readonly tokenStored: () => boolean;
+  private setup?: { at: number; mode: Mode; status: SetupStatus };
 
   private ticking?: Promise<void>;
   /** When each open PR may be polled again. */
@@ -111,6 +127,7 @@ export class Orchestrator {
       const token = loadClaudeToken();
       return token ? readUsage(token) : undefined;
     });
+    this.tokenStored = options.tokenStored ?? (() => loadClaudeToken() !== undefined);
     this.store = new EventStore(join(options.harnessDir, 'events.jsonl'));
     this.state = project(this.store.readAll());
     this.managers = new Managers(this);
@@ -128,6 +145,48 @@ export class Orchestrator {
     }
     await this.refreshDesign();
     this.record({ type: 'DAEMON_STARTED', payload: { version: this.options.version, pid: process.pid } });
+    this.takePendingSetup();
+  }
+
+  /** What `harness setup` or `harness budget` left for the daemon while it was down (v4 §5): the owner's hours, taken once. */
+  private takePendingSetup(): void {
+    const file = join(this.options.harnessDir, 'setup.json');
+    if (!existsSync(file)) return;
+    try {
+      const { ownerHours } = JSON.parse(readFileSync(file, 'utf8')) as { ownerHours?: unknown };
+      if (typeof ownerHours === 'number' && ownerHours > 0 && this.state.budgets.ownerHours === undefined) this.setBudgets({ ownerHours });
+    } catch (error) {
+      this.log(`setup.json: ${(error as Error).message}`);
+    }
+    rmSync(file, { force: true });
+  }
+
+  /**
+   * Where the Swarm setup stands (v4 §6): main's rules against the mode, read through
+   * the App's metadata permission at most every five minutes, whether the App may write
+   * statuses, and whether the usage probe's token is stored.
+   */
+  async setupStatus(): Promise<SetupStatus> {
+    const mode = this.state.mode;
+    if (this.setup && this.setup.mode === mode && this.now() - this.setup.at < 5 * 60_000) return this.setup.status;
+    const config = this.design.config;
+    let rules: SetupStatus['rules'];
+    if (config.project.repo) {
+      let inEffect;
+      try {
+        inEffect = await this.forge.branchRules('main');
+      } catch (error) {
+        this.log(`main's rules could not be read: ${(error as Error).message}`);
+      }
+      const problems = rulesProblems(inEffect, {
+        mode, requiredChecks: requiredChecks(config), statuses: mode === 'swarm' ? config.swarm.requiredStatuses : [], ...(this.forge.appId !== undefined ? { appId: this.forge.appId } : {}),
+      });
+      rules = { ok: problems.length === 0, problems };
+    }
+    const writable = this.forge.statusesWritable();
+    const status: SetupStatus = { at: new Date(this.now()).toISOString(), ...(rules ? { rules } : {}), ...(writable === undefined ? {} : { statusesWritable: writable }), tokenStored: this.tokenStored() };
+    this.setup = { at: this.now(), mode, status };
+    return status;
   }
 
   /**
