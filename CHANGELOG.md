@@ -34,6 +34,11 @@ may change how a project is set up, and its notes say how.
   merged while a feature is built interrupts its attempt the same way. The Architect is
   told to declare every dependency in `dependsOn`, and hears in one line when a plan's
   pull request opens, waits for the owner, is blocked by a reviewer, or merges.
+- Plans in parallel, in Swarm: a plan's `dependsOn` names the plans that must be merged
+  first, or the previous plan without it; up to `swarm.maxPlans` plans build at once,
+  each with its own Manager, keyed `module/plan`; a feature may depend on an earlier
+  plan's feature as `P1/F03`. The Project view draws each module's features as a graph
+  with their dependencies, and the Agents view lists the reviewers' sessions.
 - Two reviewers, security and cost, read every plan's pull request once CI passed, in
   Swarm, or in Manual as comments only with `swarm.reviewersInManual`. Each runs in a
   fresh read-only sandbox with a brief: the features, the files changed, the
@@ -43,6 +48,12 @@ may change how a project is set up, and its notes say how.
   round, two per reviewer by default, before the pull request is the owner's. The App
   needs "Commit statuses: write"; an older App's tokens fall back to read, and the
   pull request waits for the owner with the reason.
+- A `cost` job in the CI workflow, written by `harness install-ci`: on a pull request
+  with `iac/` and the `INFRACOST_API_KEY` secret, Infracost's estimate of the monthly cost
+  the change adds is uploaded as an artifact, which the daemon reads once CI passed.
+  `INFRA` and `MIXED` plans then merge themselves in Swarm under
+  `swarm.merge.infraMonthlyUsdCeiling`, and the cost reviewer gets the estimate in its
+  brief. Without the job's artifact they wait for the owner, with the reason.
 - In Swarm, the daemon reads the subscription's usage before it starts an attempt, and
   at or above `swarm.usageCeilingPercent` the pipeline waits for the window to reset.
   `harness doctor` stores the provider's token in `~/.config/harness/claude.token` for

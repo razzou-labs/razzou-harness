@@ -137,6 +137,8 @@ export interface ReviewState {
 
 export interface ManagerState {
   module: string;
+  /** Set for a plan's Manager, in Swarm (v3 §6.4): its scope is that plan, and its key `module/plan`. */
+  plan?: string;
   sandbox: string;
   sessionId: string;
   status: 'starting' | 'running' | 'exited' | 'stopped';
@@ -169,7 +171,7 @@ export interface ModuleState {
   frozenCommit?: string;
   /** Messages for the Architect, written into its sandbox once and shown with the owner's next prompt. */
   notes: Array<{ key: string; text: string; sent?: boolean }>;
-  escalations: Array<{ id: string; question: string; feature?: string; askedAt: string; decision?: string; decidedAt?: string }>;
+  escalations: Array<{ id: string; question: string; feature?: string; manager?: string; askedAt: string; decision?: string; decidedAt?: string }>;
 }
 
 export interface ActionState {
@@ -182,6 +184,8 @@ export interface ActionState {
 export interface OwnerRequest {
   requestId: string;
   module: string;
+  /** The key of the Manager that asked. */
+  manager?: string;
   question: string;
   blocking: boolean;
   askedAt: string;
@@ -211,6 +215,16 @@ export interface State {
 
 export const planKey = (ref: Ref) => `${ref.module}/${ref.plan}`;
 export const featureKey = (ref: Ref) => `${ref.module}/${ref.plan}/${ref.feature}`;
+/** A Manager's key in `state.managers`: its module, or `module/plan` for a plan's Manager (v3 §6.4). */
+export const managerKey = (scope: { module: string; plan?: string | undefined }) => (scope.plan ? `${scope.module}/${scope.plan}` : scope.module);
+
+/** The Managers that aren't stopped and whose scope covers the module, or one plan of it: the plan's own, and the module's. */
+export function managersOf(state: State, module: string, plan?: string): ManagerState[] {
+  return Object.values(state.managers).filter((m) => m.status !== 'stopped' && m.module === module && (m.plan === undefined || plan === undefined || m.plan === plan));
+}
+
+/** The plan's code is on main: its pull request merged, or, without GitHub, the plan complete (v3 §6.1). */
+export const planMerged = (plan: PlanState | undefined): boolean => plan !== undefined && (plan.mergeCommit !== undefined || plan.status === 'completed');
 
 export function initialState(): State {
   return { v: 1, pipeline: { consecutiveFailures: 0 }, mode: 'manual', budgets: {}, plans: {}, features: {}, managers: {}, ownerRequests: {}, modules: {}, actions: {}, pendingProgress: [] };
@@ -309,16 +323,16 @@ export function apply(state: State, event: HarnessEvent): State {
     case 'PR_MERGED_BY_DAEMON':
       state.plans[planKey(ref!)]!.mergedBy = 'daemon';
       break;
+    case 'COST_ESTIMATED':
+      state.plans[planKey(ref!)]!.costEstimate = { head: event.payload.head, monthlyUsd: event.payload.monthlyUsd };
+      break;
     case 'PR_MERGED': {
       const plan = state.plans[planKey(ref!)]!;
       Object.assign(plan, { status: event.payload.next, mergeCommit: event.payload.commit, mergedAt: event.ts, head: event.payload.commit, mergedBy: plan.mergedBy ?? 'owner' });
       delete plan.leftToOwner;
       delete plan.deploy;
       delete plan.postDeploy;
-      if (event.payload.next === 'completed') {
-        const manager = state.managers[ref!.module];
-        if (manager) manager.sent = {};
-      }
+      if (event.payload.next === 'completed') for (const manager of managersOf(state, ref!.module, ref!.plan)) manager.sent = {};
       digest(state, event.id, ref!, `Plan ${ref!.plan} is merged on main${plan.mergedBy === 'daemon' ? ' by the daemon' : ''}${event.payload.next === 'completed' ? ', and complete' : `: it is ${event.payload.next}`}.`);
       break;
     }
@@ -332,8 +346,7 @@ export function apply(state: State, event: HarnessEvent): State {
       break;
     case 'PLAN_VERIFIED': {
       Object.assign(state.plans[planKey(ref!)]!, { status: 'completed', postDeploy: { status: 'passed', results: event.payload.results } });
-      const manager = state.managers[ref!.module];
-      if (manager) manager.sent = {};
+      for (const manager of managersOf(state, ref!.module, ref!.plan)) manager.sent = {};
       break;
     }
     case 'POST_DEPLOY_CHECKS_FAILED':
@@ -407,8 +420,7 @@ export function apply(state: State, event: HarnessEvent): State {
       const plan = state.plans[planKey(ref!)]!;
       plan.status = 'completed';
       plan.head = event.payload.head;
-      const manager = state.managers[ref!.module];
-      if (manager) manager.sent = {};
+      for (const manager of managersOf(state, ref!.module, ref!.plan)) manager.sent = {};
       break;
     }
     case 'ATTEMPT_STARTING': {
@@ -539,6 +551,7 @@ export function apply(state: State, event: HarnessEvent): State {
       state.ownerRequests[event.payload.requestId] = {
         requestId: event.payload.requestId,
         module: event.payload.module,
+        ...(event.payload.manager ? { manager: event.payload.manager } : {}),
         question: event.payload.question,
         blocking: event.payload.blocking,
         askedAt: event.ts,
@@ -547,37 +560,40 @@ export function apply(state: State, event: HarnessEvent): State {
     case 'OWNER_ANSWER': {
       const request = state.ownerRequests[event.payload.requestId];
       if (request) Object.assign(request, { answer: event.payload.answer, answeredAt: event.ts });
-      state.managers[event.payload.module]?.mail.push({
-        key: `mail:${event.id}`, kind: 'owner_answer', text: event.payload.answer, requestId: event.payload.requestId,
-      });
+      for (const manager of mailTargets(state, event.payload.module, request?.manager)) {
+        manager.mail.push({ key: `mail:${event.id}`, kind: 'owner_answer', text: event.payload.answer, requestId: event.payload.requestId });
+      }
       break;
     }
     case 'OWNER_MESSAGE':
-      state.managers[event.payload.module]?.mail.push({ key: `mail:${event.id}`, kind: 'owner_message', text: event.payload.text });
+      for (const manager of mailTargets(state, event.payload.module, event.payload.manager)) {
+        manager.mail.push({ key: `mail:${event.id}`, kind: 'owner_message', text: event.payload.text });
+      }
       break;
     case 'MANAGER_STARTING': {
-      const { module, sandbox, sessionId } = event.payload;
-      const mail = state.managers[module]?.mail.filter((m) => m.kind !== 'welcome') ?? [];
-      state.managers[module] = {
-        module, sandbox, sessionId, status: 'starting', launch: 0, exits: [], sent: {},
+      const { module, plan, sandbox, sessionId } = event.payload;
+      const key = managerKey(event.payload);
+      const mail = state.managers[key]?.mail.filter((m) => m.kind !== 'welcome') ?? [];
+      state.managers[key] = {
+        module, ...(plan ? { plan } : {}), sandbox, sessionId, status: 'starting', launch: 0, exits: [], sent: {},
         mail: [{ key: `mail:${event.id}`, kind: 'welcome', text: '' }, ...mail],
       };
       break;
     }
     case 'MANAGER_LAUNCHED':
-      Object.assign(state.managers[event.payload.module]!, {
+      Object.assign(state.managers[managerKey(event.payload)]!, {
         status: 'running', launch: event.payload.launch, launchedAt: event.ts, launchedOutputBytes: event.payload.outputBytes,
       });
       break;
     case 'MANAGER_EXITED': {
-      const manager = state.managers[event.payload.module]!;
+      const manager = state.managers[managerKey(event.payload)]!;
       manager.status = 'exited';
       manager.exits = [...manager.exits, event.ts].slice(-5);
       manager.lastExit = { code: event.payload.code, stderr: event.payload.stderr, started: event.payload.started };
       break;
     }
     case 'MANAGER_ITEM_SENT': {
-      const manager = state.managers[event.payload.module]!;
+      const manager = state.managers[managerKey(event.payload)]!;
       const { key, launch, reminder } = event.payload;
       if (key.startsWith('mail:')) manager.mail = manager.mail.filter((m) => m.key !== key);
       else if (reminder) manager.sent[key] = { ...manager.sent[key]!, reminded: event.ts };
@@ -585,7 +601,7 @@ export function apply(state: State, event: HarnessEvent): State {
       break;
     }
     case 'MANAGER_STOPPED':
-      state.managers[event.payload.module]!.status = 'stopped';
+      state.managers[managerKey(event.payload)]!.status = 'stopped';
       break;
     case 'PIPELINE_PAUSED':
       state.pipeline.paused = { reason: event.payload.reason, since: event.ts, until: event.payload.until };
@@ -687,7 +703,10 @@ export function apply(state: State, event: HarnessEvent): State {
     case 'ESCALATION': {
       const module = state.modules[event.payload.module];
       if (!module) break;
-      module.escalations.push({ id: event.payload.requestId, question: event.payload.question, askedAt: event.ts, ...(event.payload.feature ? { feature: event.payload.feature } : {}) });
+      module.escalations.push({
+        id: event.payload.requestId, question: event.payload.question, askedAt: event.ts,
+        ...(event.payload.feature ? { feature: event.payload.feature } : {}), ...(event.payload.manager ? { manager: event.payload.manager } : {}),
+      });
       module.notes.push({
         key: `note:${event.id}`,
         text: `The Manager asks (escalation ${event.payload.requestId}${event.payload.feature ? `, about ${event.payload.feature}` : ''}):\n${event.payload.question}\nDecide with the owner if needed, then call reply_to_manager.`,
@@ -697,7 +716,9 @@ export function apply(state: State, event: HarnessEvent): State {
     case 'DECISION': {
       const escalation = state.modules[event.payload.module]?.escalations.find((e) => e.id === event.payload.escalationId);
       if (escalation) Object.assign(escalation, { decision: event.payload.decision, decidedAt: event.ts });
-      state.managers[event.payload.module]?.mail.push({ key: `mail:${event.id}`, kind: 'decision', text: event.payload.decision, requestId: event.payload.escalationId });
+      for (const manager of mailTargets(state, event.payload.module, escalation?.manager)) {
+        manager.mail.push({ key: `mail:${event.id}`, kind: 'decision', text: event.payload.decision, requestId: event.payload.escalationId });
+      }
       break;
     }
     case 'OWNER_ACTION_CLAIMED':
@@ -763,6 +784,12 @@ export function writeSnapshot(file: string, state: State): void {
   const tmp = `${file}.tmp`;
   writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`);
   renameSync(tmp, file);
+}
+
+/** Who gets a piece of mail: the Manager named, while it runs, or else every Manager of the module. */
+function mailTargets(state: State, module: string, manager?: string): ManagerState[] {
+  const named = manager ? state.managers[manager] : undefined;
+  return named && named.status !== 'stopped' ? [named] : managersOf(state, module);
 }
 
 /** One line for the module's Architect, when it has one (v3 §6.5): what happens to its plans, without the detail the owner sees. */

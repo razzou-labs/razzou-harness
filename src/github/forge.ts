@@ -1,6 +1,7 @@
 import type { Repo } from '../git/repo.ts';
 import { tail } from '../util.ts';
 import { GitHubError, type GitHubClient } from './app.ts';
+import { zipEntry } from './artifacts.ts';
 
 export interface PullRequest {
   number: number;
@@ -64,6 +65,8 @@ export interface Forge {
   createReview(number: number, review: ReviewPost): Promise<{ comments: number }>;
   /** Sets a commit status, the reviewers' verdict, which the Swarm ruleset requires (v3 §3.3). */
   setCommitStatus(sha: string, status: { context: string; state: 'success' | 'failure' | 'pending'; description: string }): Promise<void>;
+  /** A file out of a named artifact of the commit's workflow run (v3 §5.5), or undefined when no run has one yet. */
+  artifactFile(sha: string, artifact: string, file: string): Promise<string | undefined>;
 }
 
 export class LocalForge implements Forge {
@@ -119,6 +122,10 @@ export class LocalForge implements Forge {
   }
 
   async setCommitStatus(): Promise<void> {}
+
+  async artifactFile(): Promise<undefined> {
+    return undefined;
+  }
 }
 
 export class GitHubForge implements Forge {
@@ -229,5 +236,19 @@ export class GitHubForge implements Forge {
     const result = await this.client.request<{ sha: string; merged: boolean; message: string }>('PUT', `/repos/{repo}/pulls/${number}/merge`, { merge_method: 'merge', sha: head });
     if (!result.merged) throw new GitHubError(result.message, 0);
     return { commit: result.sha };
+  }
+
+  /** The newest completed run on the commit that has the artifact: its zip, read for the file. */
+  async artifactFile(sha: string, artifact: string, file: string): Promise<string | undefined> {
+    const runs = await this.client.request<{ workflow_runs: Array<{ id: number; status: string; created_at: string }> }>(
+      'GET', `/repos/{repo}/actions/runs?head_sha=${sha}&per_page=20`,
+    );
+    const completed = runs.workflow_runs.filter((r) => r.status === 'completed').sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
+    for (const run of completed) {
+      const list = await this.client.request<{ artifacts: Array<{ id: number; name: string; expired: boolean }> }>('GET', `/repos/{repo}/actions/runs/${run.id}/artifacts?per_page=100`);
+      const found = list.artifacts.find((a) => a.name === artifact && !a.expired);
+      if (found) return zipEntry(await this.client.downloadBytes(`/repos/{repo}/actions/artifacts/${found.id}/zip`), file);
+    }
+    return undefined;
   }
 }

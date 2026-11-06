@@ -126,7 +126,11 @@ async function prepare(o: Orchestrator, plan: PlanState, review: ReviewState): P
   const baseTree = o.repo.treeReader(base);
   const headTree = o.repo.treeReader(review.head);
   const paid = await paidCallDiff(files, (file) => baseTree.read(file), (file) => headTree.read(file));
-  writeFileSync(join(dir, 'brief.md'), brief(o, plan, review, { base, files, paidCalls: describePaidCalls(paid), ...(plannedAt ? { plannedAt } : {}), ...(planProblem ? { planProblem } : {}) }));
+  const estimate = plan.costEstimate?.head === review.head ? plan.costEstimate.monthlyUsd : undefined;
+  writeFileSync(join(dir, 'brief.md'), brief(o, plan, review, {
+    base, files, paidCalls: describePaidCalls(paid),
+    ...(plannedAt ? { plannedAt } : {}), ...(planProblem ? { planProblem } : {}), ...(estimate === undefined ? {} : { costEstimate: estimate }),
+  }));
   writeFileSync(join(dir, 'review.schema.json'), reviewJsonSchema());
   writeFileSync(join(dir, 'settings.json'), managerSettings());
   copyFileSync(join(o.options.packageDir, 'roles', `${review.role}.md`), join(dir, `${review.role}.md`));
@@ -286,6 +290,8 @@ interface BriefInputs {
   paidCalls: string;
   plannedAt?: string;
   planProblem?: string;
+  /** The cost job's estimate of the monthly cost the head adds, when it ran (v3 §5.3). */
+  costEstimate?: number;
 }
 
 /** The brief: what to review, where, with what the daemon already knows. The role prompt says how. */
@@ -294,6 +300,7 @@ function brief(o: Orchestrator, plan: PlanState, review: ReviewState, inputs: Br
   const kind = definition ? planKind(definition) : 'MIXED';
   const p = o.paths(review.sandbox);
   const rounds = plan.reviewFixRounds?.[review.role] ?? 0;
+  const ceiling = o.design.config.swarm.merge.infraMonthlyUsdCeiling;
   const previous = plan.reviews?.filter((r) => r.role === review.role && r.head !== review.head && r.verdict === 'block').at(-1);
   const features = (definition?.features ?? []).map((f) => `- ${f.id} ${f.title} (${f.kind}): ${f.description}\n  Expected: ${f.expected}`);
   return [
@@ -325,6 +332,12 @@ function brief(o: Orchestrator, plan: PlanState, review: ReviewState, inputs: Br
       : inputs.planProblem
         ? `The project has Terraform, but the plan failed:\n\`\`\`\n${inputs.planProblem}\n\`\`\``
         : 'The project has no Terraform.',
+    '',
+    '## Cost estimate',
+    '',
+    inputs.costEstimate === undefined
+      ? 'No Infracost estimate for this head: the cost job did not run, or the plan has no Terraform. Pay-per-use calls in code are never in it.'
+      : `Infracost estimates that the change adds ${inputs.costEstimate} USD a month in AWS resources${ceiling === null ? '' : `; the merge policy's ceiling is ${ceiling} USD (swarm.merge.infraMonthlyUsdCeiling)`}. Pay-per-use calls in code are not in it.`,
     '',
     '## Fix rounds',
     '',

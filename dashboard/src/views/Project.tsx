@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { post, type Attempt, type DashboardState, type FeatureState, type OwnerTime, type PlanState, type State, type SubscriptionUsage } from '../api.ts';
+import { Graph } from '../components/Graph.tsx';
 import { Action, Badge, GithubLink } from '../components/ui.tsx';
 import { duration } from '../format.ts';
 import { Proposal } from './NeedsYou.tsx';
@@ -21,7 +22,8 @@ export function Project({ data }: { data: DashboardState }) {
       {moduleIds.length === 0 && <p className="muted">No module yet.</p>}
       {moduleIds.map((id) => {
         const module = state.modules[id];
-        const plans = design.modules.find((m) => m.id === id)?.plans ?? [];
+        const designed = design.modules.find((m) => m.id === id);
+        const plans = designed?.plans ?? [];
         return (
           <section key={id}>
             <h2>
@@ -40,6 +42,7 @@ export function Project({ data }: { data: DashboardState }) {
               </div>
             )}
             {reading?.module === id && <Proposal module={id} version={reading.version} />}
+            {designed && plans.length > 0 && <Graph module={designed} state={state} />}
             {plans.map((plan) => (
               <Plan key={plan.id} data={data} module={id} plan={plan} />
             ))}

@@ -73,11 +73,20 @@ export class GitHubClient {
 
   /** A raw GET with the installation token, following redirects: job logs live behind one. */
   async download(path: string): Promise<string> {
+    return (await this.raw(path)).text();
+  }
+
+  /** The same, for a binary body: an artifact's zip, behind a redirect too. */
+  async downloadBytes(path: string): Promise<Buffer> {
+    return Buffer.from(await (await this.raw(path)).arrayBuffer());
+  }
+
+  private async raw(path: string): Promise<Response> {
     const response = await this.fetch(`${API}${path.replaceAll('{repo}', this.repo)}`, {
       headers: { authorization: `token ${await this.token()}`, 'user-agent': 'razzou-harness', 'x-github-api-version': '2022-11-28' },
     });
     if (!response.ok) throw new Error(`GET ${path}: ${response.status} ${(await response.text()).slice(0, 300)}`);
-    return response.text();
+    return response;
   }
 
   /**

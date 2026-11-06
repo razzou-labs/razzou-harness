@@ -35,6 +35,8 @@ export class FakeForge implements Forge {
   readonly statusesSet: Array<{ sha: string; context: string; state: string; description: string }> = [];
   /** When set, setting a status fails with this message, as GitHub does for an App without the permission. */
   refuseStatus?: string;
+  /** The artifacts of each commit's workflow run, by name, then by file: what the cost job uploads (v3 §5.5). */
+  artifacts: (sha: string) => Record<string, Record<string, string>> = () => ({});
   private readonly runs = new Map<string, CheckRun[]>();
   private nextRun = 1;
 
@@ -113,6 +115,10 @@ export class FakeForge implements Forge {
   async setCommitStatus(sha: string, status: { context: string; state: 'success' | 'failure' | 'pending'; description: string }): Promise<void> {
     if (this.refuseStatus) throw new GitHubError(this.refuseStatus, 403);
     this.statusesSet.push({ sha, ...status });
+  }
+
+  async artifactFile(sha: string, artifact: string, file: string): Promise<string | undefined> {
+    return this.artifacts(sha)[artifact]?.[file];
   }
 
   /** The daemon merges under Swarm's policy: refused like GitHub when the rules aren't met or the head moved. */

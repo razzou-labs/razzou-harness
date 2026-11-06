@@ -4,6 +4,8 @@ import { canonicalJson, sha256 } from '../util.ts';
 
 /** Ids end up in branch names, refs and sandbox names, so they stay short and plain. */
 const Id = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9-]{0,39}$/, 'use letters, digits and dashes (at most 40)');
+/** A feature of the same plan, or `P1/F03`: a feature of an earlier plan of the module (v3 §6.1). */
+const FeatureRef = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9-]{0,39}(\/[A-Za-z0-9][A-Za-z0-9-]{0,39})?$/, 'a feature id, or plan/feature for a feature of an earlier plan');
 
 export const CheckSchema = z.object({
   id: Id,
@@ -20,7 +22,7 @@ export const FeatureSchema = z.object({
   kind: z.enum(['app', 'infra']).default('app'),
   description: z.string().min(1),
   expected: z.string().min(1),
-  dependsOn: z.array(Id).default([]),
+  dependsOn: z.array(FeatureRef).default([]),
   gates: z.array(z.string()).default([]),
   resources: z.array(z.string()).default([]),
   checks: z.array(CheckSchema).min(1),
@@ -33,13 +35,21 @@ export const PlanSchema = z
     module: Id,
     title: z.string().min(1),
     goal: z.string().min(1),
+    /**
+     * The plans of the module that must be merged before this one starts (v3 §6.1).
+     * Absent, the previous plan in order, as in v2; empty, none: in Swarm it builds
+     * alongside the others.
+     */
+    dependsOn: z.array(Id).optional(),
     features: z.array(FeatureSchema).min(1),
   })
   .superRefine((plan, ctx) => {
+    if (plan.dependsOn?.includes(plan.id)) ctx.addIssue({ code: 'custom', message: `${plan.id} depends on itself` });
     const seen = new Set<string>();
     for (const feature of plan.features) {
       if (seen.has(feature.id)) ctx.addIssue({ code: 'custom', message: `feature ${feature.id} appears twice` });
-      for (const dep of feature.dependsOn) {
+      // A dependency on another plan's feature is checked against the module (checkReferences).
+      for (const dep of feature.dependsOn.filter((d) => !d.includes('/'))) {
         if (!seen.has(dep)) ctx.addIssue({ code: 'custom', message: `${feature.id} depends on ${dep}, which is not an earlier feature of this plan` });
       }
       seen.add(feature.id);
@@ -55,6 +65,20 @@ export type PlanKind = 'CODE' | 'INFRA' | 'MIXED';
 export function planKind(plan: Pick<Plan, 'features'>): PlanKind {
   const infra = plan.features.filter((f) => f.kind === 'infra').length;
   return infra === 0 ? 'CODE' : infra === plan.features.length ? 'INFRA' : 'MIXED';
+}
+
+/** The plans a plan waits for (v3 §6.1): what it declares, or else the previous plan of its module, which keeps v2's order. */
+export function planDependencies(module: Pick<ModuleDesign, 'plans'>, plan: Pick<Plan, 'id' | 'dependsOn'>): string[] {
+  if (plan.dependsOn) return plan.dependsOn;
+  const i = module.plans.findIndex((p) => p.id === plan.id);
+  const previous = i > 0 ? module.plans[i - 1] : undefined;
+  return previous ? [previous.id] : [];
+}
+
+/** What a feature's dependency names: a feature of its own plan, or of an earlier one as `P1/F03`. */
+export function featureDependency(planId: string, dep: string): { plan: string; feature: string } {
+  const [a, b] = dep.split('/') as [string, string | undefined];
+  return b === undefined ? { plan: planId, feature: a } : { plan: a, feature: b };
 }
 
 export const ConfigSchema = z.object({
@@ -335,8 +359,21 @@ function checkReferences(module: ModuleDesign): void {
       }
     }
   }
+  const order = module.plans.map((p) => p.id);
   for (const plan of module.plans) {
+    const earlier = order.slice(0, order.indexOf(plan.id));
+    for (const dep of plan.dependsOn ?? []) {
+      if (!earlier.includes(dep)) throw new Error(`${where}/plans/${plan.id}.json: it depends on ${dep}, which is not an earlier plan of ${module.id}`);
+    }
     for (const feature of plan.features) {
+      for (const dep of feature.dependsOn) {
+        const target = featureDependency(plan.id, dep);
+        if (target.plan === plan.id) continue;
+        const other = module.plans.find((p) => p.id === target.plan);
+        if (!earlier.includes(target.plan) || !other?.features.some((f) => f.id === target.feature)) {
+          throw new Error(`${where}/plans/${plan.id}.json: ${feature.id} depends on ${dep}, which is not a feature of an earlier plan of ${module.id}`);
+        }
+      }
       for (const gate of feature.gates) {
         if (!module.actions.some((a) => a.id === gate && a.kind === 'gate')) {
           throw new Error(`${where}/plans/${plan.id}.json: ${feature.id} waits for gate ${gate}, which owner-actions.json doesn't define`);

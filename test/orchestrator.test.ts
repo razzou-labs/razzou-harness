@@ -29,6 +29,9 @@ after(async () => {
 
 type Decide = (feature: string, attempt: number) => StubBehavior;
 
+/** The daemon's last log lines per orchestrator: a step that fails silently shows up when a wait times out. */
+const daemonLogs = new WeakMap<Orchestrator, string[]>();
+
 interface SetupOptions {
   config?: Record<string, unknown>;
   manager?: ManagerBehavior;
@@ -54,6 +57,7 @@ async function setup(decide: Decide, options: SetupOptions = {}) {
   const harnessDir = join(projectDir, '.harness');
   const driver = new LocalDriver(tempDir('sandboxes'));
   const make = () => {
+    const logs: string[] = [];
     const made = new Orchestrator({
       projectDir,
       harnessDir,
@@ -62,12 +66,17 @@ async function setup(decide: Decide, options: SetupOptions = {}) {
       version: 'test',
       agent: stubAgent(decide, options.manager, options.architect, options.review),
       webRead: async (url) => ({ ok: true, text: `the page at ${url}`, bytes: 20 }),
-      // HARNESS_TEST_LOG=1 prints the daemon's log, for a step that fails silently.
-      ...(process.env.HARNESS_TEST_LOG ? { log: (message: string) => console.error(`[daemon] ${message}`) } : {}),
+      // The log is kept for the timeout message; HARNESS_TEST_LOG=1 prints it as it comes.
+      log: (message: string) => {
+        logs.push(message);
+        if (logs.length > 30) logs.shift();
+        if (process.env.HARNESS_TEST_LOG) console.error(`[daemon] ${message}`);
+      },
       ...(options.usage ? { usage: options.usage } : {}),
       ...(options.now ? { now: options.now } : {}),
       ...(fake ? { forge: () => fake } : {}),
     });
+    daemonLogs.set(made, logs);
     cleanup.push(() => made.stop(0));
     return made;
   };
@@ -82,7 +91,8 @@ async function until(o: Orchestrator, done: () => boolean, timeoutMs = 30_000): 
   const deadline = Date.now() + timeoutMs;
   while (!done()) {
     if (Date.now() > deadline) {
-      throw new Error(`timed out; last events: ${o.store.readAll().slice(-8).map((e) => e.type).join(', ')}`);
+      const log = (daemonLogs.get(o) ?? []).slice(-6).map((l) => `\n  ${l.slice(0, 300)}`).join('');
+      throw new Error(`timed out; last events: ${o.store.readAll().slice(-8).map((e) => e.type).join(', ')}; daemon log:${log || ' (empty)'}`);
     }
     await o.tick();
     await sleep(100);
@@ -251,7 +261,7 @@ describe('manager', () => {
   it('pauses the pipeline when it never starts', async () => {
     const { orchestrator: o } = await setup((f) => solved(f), { manager: { failStart: true } });
     await until(o, () => o.state.pipeline.paused !== undefined);
-    assert.match(o.state.pipeline.paused!.reason, /^environment: the Manager did not start: Error: unknown option --stub-bad-flag/);
+    assert.match(o.state.pipeline.paused!.reason, /^environment: the Manager of demo did not start: Error: unknown option --stub-bad-flag/);
   });
 
   it('gets a reminder after a turn without a decision, then the pipeline pauses', async () => {
@@ -407,6 +417,93 @@ describe('parallel features', () => {
   });
 });
 
+describe('parallel plans', () => {
+  /** The toy design split in two plans, P1 greets and P2 adds, and a third when asked; `p2` sets P2's dependencies. */
+  const split = (p2: { dependsOn?: string[]; featureDependsOn?: string[] } = {}, third = false) => async (dir: string) => {
+    const plans = join(dir, 'harness/modules/demo/plans');
+    const file = join(plans, 'P1.json');
+    const design = JSON.parse(readFileSync(file, 'utf8')) as { features: Array<Record<string, unknown>>; [key: string]: unknown };
+    const [f01, f02] = design.features as [Record<string, unknown>, Record<string, unknown>];
+    delete f02.dependsOn;
+    if (p2.featureDependsOn) f02.dependsOn = p2.featureDependsOn;
+    writeFileSync(file, JSON.stringify({ ...design, features: [f01] }, null, 2));
+    writeFileSync(join(plans, 'P2.json'), JSON.stringify({ ...design, id: 'P2', title: 'Adding', ...(p2.dependsOn ? { dependsOn: p2.dependsOn } : {}), features: [f02] }, null, 2));
+    if (third) {
+      const f03 = { id: 'F03', title: 'Three', description: 'src/three.txt exists.', expected: 'The file exists.', checks: [{ id: 'F03-file', run: 'test -f src/three.txt', phase: 'pre-merge', timeoutSec: 30 }] };
+      writeFileSync(join(plans, 'P3.json'), JSON.stringify({ ...design, id: 'P3', title: 'Three', dependsOn: [], features: [f03] }, null, 2));
+    }
+    await runOk('git', ['-C', dir, 'add', '-A']);
+    await runOk('git', ['-C', dir, '-c', 'user.name=o', '-c', 'user.email=o@test.invalid', 'commit', '--quiet', '-m', 'plans']);
+  };
+  const files = (feature: string): Record<string, string> => (feature === 'F03' ? { 'src/three.txt': '3\n' } : SOLUTIONS[feature as keyof typeof SOLUTIONS]);
+  const allComplete = (o: Orchestrator, plans: string[]) => () => plans.every((p) => o.state.plans[`demo/${p}`]?.status === 'completed');
+
+  /** Ticks until `done`, and reports the most plans seen in flight at once. */
+  async function untilMaxPlans(o: Orchestrator, done: () => boolean, timeoutMs = 60_000): Promise<number> {
+    let max = 0;
+    const deadline = Date.now() + timeoutMs;
+    while (!done()) {
+      if (Date.now() > deadline) throw new Error(`timed out; last events: ${o.store.readAll().slice(-8).map((e) => e.type).join(', ')}`);
+      await o.tick();
+      max = Math.max(max, Object.values(o.state.plans).filter((p) => p.status !== 'completed').length);
+      await sleep(100);
+    }
+    return max;
+  }
+  const index = (o: Orchestrator, type: string, plan: string) => o.store.readAll().findIndex((e) => e.type === type && e.ref?.plan === plan);
+
+  it('in Swarm, independent plans build at once, each with its own Manager', async () => {
+    const { orchestrator: o } = await setup((f) => ({ files: files(f), sleepSec: f === 'F01' ? 3 : 0 }), { prepare: split({ dependsOn: [] }) });
+    o.setMode('swarm');
+    const max = await untilMaxPlans(o, allComplete(o, ['P1', 'P2']));
+    assert.equal(max, 2);
+    assert.ok(index(o, 'PLAN_STARTED', 'P2') < index(o, 'PLAN_COMPLETED', 'P1'), 'P2 started before P1 was complete');
+    assert.deepEqual(Object.values(o.state.managers).map((m) => [m.module, m.plan, m.status]).sort(), [['demo', 'P1', 'stopped'], ['demo', 'P2', 'stopped']]);
+    assert.deepEqual(Object.keys(o.state.managers).sort(), ['demo/P1', 'demo/P2']);
+  });
+
+  it('in Swarm, a plan waits for the plan it depends on to merge, and starts from the main that holds it', async () => {
+    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true, prepare: split(), config: { swarm: { requiredStatuses: [] } } });
+    o.setMode('swarm');
+    const max = await untilMaxPlans(o, allComplete(o, ['P1', 'P2']), 90_000);
+    assert.equal(max, 1);
+    const merged = index(o, 'PR_MERGED', 'P1');
+    assert.ok(merged !== -1 && merged < index(o, 'PLAN_STARTED', 'P2'), 'P2 started after P1 merged');
+    assert.equal(o.state.plans['demo/P2']!.base, o.state.plans['demo/P1']!.mergeCommit);
+    assert.equal(fake.prs.length, 2);
+    assert.equal(o.state.plans['demo/P2']!.mergedBy, 'daemon');
+  });
+
+  it("in Swarm, a feature that depends on an earlier plan's feature waits for that plan to merge, and builds on it", async () => {
+    const { orchestrator: o } = await setup((f) => ({ files: files(f), sleepSec: f === 'F01' ? 2 : 0 }), {
+      github: true, prepare: split({ dependsOn: [], featureDependsOn: ['P1/F01'] }), config: { swarm: { requiredStatuses: [] } },
+    });
+    o.setMode('swarm');
+    const max = await untilMaxPlans(o, allComplete(o, ['P1', 'P2']), 90_000);
+    assert.equal(max, 2, 'P2 started alongside P1');
+    const merged = index(o, 'PR_MERGED', 'P1');
+    assert.ok(merged !== -1 && merged < index(o, 'ATTEMPT_STARTING', 'P2'), 'F02 started after P1 merged');
+    assert.ok(merged < index(o, 'PLAN_MAIN_MERGED', 'P2'), 'main was merged into P2 after the merge of P1');
+    const f02 = o.state.features['demo/P2/F02']!;
+    assert.equal(await o.repo.show(f02.attempts[0]!.base, 'src/greet.sh'), SOLUTIONS.F01['src/greet.sh']);
+  });
+
+  it('in Swarm, swarm.maxPlans caps the plans in flight', async () => {
+    const { orchestrator: o } = await setup((f) => ({ files: files(f), sleepSec: 1 }), { prepare: split({ dependsOn: [] }, true), config: { swarm: { maxPlans: 2 } } });
+    o.setMode('swarm');
+    const max = await untilMaxPlans(o, allComplete(o, ['P1', 'P2', 'P3']), 90_000);
+    assert.equal(max, 2);
+  });
+
+  it('in Manual, independent plans still build one after the other, with one Manager for the module', async () => {
+    const { orchestrator: o } = await setup((f) => ({ files: files(f) }), { prepare: split({ dependsOn: [] }) });
+    const max = await untilMaxPlans(o, allComplete(o, ['P1', 'P2']));
+    assert.equal(max, 1);
+    assert.deepEqual(Object.keys(o.state.managers), ['demo']);
+    assert.equal(o.state.managers.demo!.status, 'stopped');
+  });
+});
+
 describe('pull requests', () => {
   const plan = (o: Orchestrator) => o.state.plans['demo/P1'];
   const ready = (o: Orchestrator) => () => plan(o)?.status === 'ready_to_merge';
@@ -447,7 +544,8 @@ describe('pull requests', () => {
     assert.equal(plan(o)!.mergeCommit, main);
     const merged = o.store.readAll().find((e) => e.type === 'PR_MERGED_BY_DAEMON');
     assert.ok(merged && merged.type === 'PR_MERGED_BY_DAEMON' && merged.payload.commit === main);
-    assert.equal(o.state.managers.demo!.status, 'stopped');
+    // Switched before the plan started, so its Manager is the plan's (v3 §6.4).
+    assert.equal(o.state.managers['demo/P1']!.status, 'stopped');
   });
 
   it('in Swarm, leaves the PR to the owner while a required status is missing, and merges once it passes', async () => {
@@ -485,21 +583,23 @@ describe('pull requests', () => {
     assert.equal(plan(o)!.mergedBy, 'owner');
   });
 
+  /** The toy plan with both features `infra`: an INFRA plan. */
+  const infraPlan = async (dir: string) => {
+    const file = join(dir, 'harness/modules/demo/plans/P1.json');
+    const design = JSON.parse(readFileSync(file, 'utf8')) as { features: Array<Record<string, unknown>> };
+    for (const feature of design.features) feature.kind = 'infra';
+    writeFileSync(file, JSON.stringify(design, null, 2));
+    await runOk('git', ['-C', dir, '-c', 'user.name=o', '-c', 'user.email=o@test.invalid', 'commit', '--quiet', '-am', 'infra plan']);
+  };
+
   it('in Swarm, an INFRA plan waits for the owner without a cost estimate, and in Manual every plan does', async () => {
     let skew = 0;
-    const infra = async (dir: string) => {
-      const file = join(dir, 'harness/modules/demo/plans/P1.json');
-      const design = JSON.parse(readFileSync(file, 'utf8')) as { features: Array<Record<string, unknown>> };
-      for (const feature of design.features) feature.kind = 'infra';
-      writeFileSync(file, JSON.stringify(design, null, 2));
-      await runOk('git', ['-C', dir, '-c', 'user.name=o', '-c', 'user.email=o@test.invalid', 'commit', '--quiet', '-am', 'infra plan']);
-    };
-    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true, prepare: infra, now: () => Date.now() + skew });
+    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true, prepare: infraPlan, now: () => Date.now() + skew });
     o.setMode('swarm');
     fake.statuses = () => ({ 'harness/security': 'success', 'harness/cost': 'success' });
     await until(o, () => plan(o)?.leftToOwner !== undefined);
     assert.equal(fake.prs[0]!.title, 'Plan: demo/P1 -INFRA- Greeting and adding');
-    assert.match(plan(o)!.leftToOwner!.reason, /a INFRA plan merges itself only with the cost job's estimate/);
+    assert.match(plan(o)!.leftToOwner!.reason, /^an INFRA plan merges itself only with the cost job's estimate .* none was produced: the cost job needs iac\/ and the INFRACOST_API_KEY secret$/);
 
     o.setMode('manual');
     skew += 61_000;
@@ -510,6 +610,29 @@ describe('pull requests', () => {
     skew += 120_000;
     await until(o, completed(o));
     assert.equal(plan(o)!.mergedBy, 'owner');
+  });
+
+  it("in Swarm, an INFRA plan merges itself under the ceiling with the cost job's estimate, and waits for the owner over it", async () => {
+    const costJob = (monthly: string) => () => ({ cost: { 'cost.json': JSON.stringify({ totalMonthlyCost: '212.4', diffTotalMonthlyCost: monthly }) } });
+    const over = await setup((f) => solved(f), { github: true, prepare: infraPlan });
+    over.orchestrator.setMode('swarm');
+    over.fake.statuses = () => ({ 'harness/security': 'success', 'harness/cost': 'success' });
+    over.fake.artifacts = costJob('80.25');
+    await until(over.orchestrator, () => plan(over.orchestrator)?.leftToOwner !== undefined);
+    assert.deepEqual(plan(over.orchestrator)!.costEstimate, { head: plan(over.orchestrator)!.pushed, monthlyUsd: 80.25 });
+    assert.equal(plan(over.orchestrator)!.leftToOwner!.reason, 'the PR adds an estimated 80.25 USD a month, over the ceiling of 50 (swarm.merge.infraMonthlyUsdCeiling)');
+
+    const under = await setup((f) => solved(f), { github: true, prepare: infraPlan });
+    under.orchestrator.setMode('swarm');
+    under.fake.statuses = () => ({ 'harness/security': 'success', 'harness/cost': 'success' });
+    under.fake.artifacts = costJob('12.5');
+    await until(under.orchestrator, completed(under.orchestrator));
+    const merged = plan(under.orchestrator)!;
+    assert.equal(merged.mergedBy, 'daemon');
+    assert.equal(merged.costEstimate!.monthlyUsd, 12.5);
+    // The cost reviewer read the estimate in its brief.
+    const brief = readFileSync(join(under.harnessDir, 'modules', 'demo', 'reviews', `P1-cost-${merged.pushed!.slice(0, 8)}`, 'brief.md'), 'utf8');
+    assert.match(brief, /Infracost estimates that the change adds 12\.5 USD a month in AWS resources; the merge policy's ceiling is 50 USD/);
   });
 
   it('in Swarm, starts no attempt at or above the usage ceiling, and goes on once the window resets', async () => {

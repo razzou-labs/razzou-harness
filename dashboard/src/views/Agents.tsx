@@ -8,7 +8,7 @@ import type { Go } from '../App.tsx';
 
 interface Card {
   id: string;
-  role: 'Architect' | 'Manager' | 'Developer';
+  role: 'Architect' | 'Manager' | 'Developer' | 'Reviewer';
   title: string;
   status: string;
   detail: string;
@@ -64,10 +64,12 @@ function AgentView({ card, data }: { card: Card; data: DashboardState }) {
     );
   }
   if (card.role === 'Manager') {
+    // The message goes to this Manager: in Swarm each plan in flight has its own (v3 §6.4).
+    const manager = card.id.slice('manager:'.length);
     return (
       <>
         <Transcript agent={card.id} />
-        <Reply label="Send to the Manager" placeholder="A message for the Manager" onSend={(text) => post('/api/message', { text })} />
+        <Reply label="Send to the Manager" placeholder="A message for the Manager" onSend={(text) => post('/api/message', { text, manager })} />
       </>
     );
   }
@@ -87,13 +89,31 @@ function agentCards({ state }: DashboardState): Card[] {
     });
   }
   for (const manager of Object.values(state.managers)) {
+    const key = manager.plan ? `${manager.module}/${manager.plan}` : manager.module;
     cards.push({
-      id: `manager:${manager.module}`,
+      id: `manager:${key}`,
       role: 'Manager',
-      title: manager.module,
+      title: key,
       status: manager.status,
       detail: manager.launchedAt ? `launch ${manager.launch}, at ${clock(manager.launchedAt)}` : '',
       ...(manager.status !== 'stopped' ? { sandbox: manager.sandbox } : {}),
+    });
+  }
+  // The reviewers' sessions on the plans' pull requests (v3 §5), newest first.
+  const reviews = Object.values(state.plans)
+    .flatMap((plan) => (plan.reviews ?? []).map((review) => ({ plan, review })))
+    .sort((a, b) => Date.parse(b.review.startedAt) - Date.parse(a.review.startedAt))
+    .slice(0, 6);
+  for (const { plan, review } of reviews) {
+    const live = review.status === 'starting' || review.status === 'running';
+    const blocking = review.findings?.filter((f) => f.severity === 'blocking').length ?? 0;
+    cards.push({
+      id: `${review.role}:${review.head.slice(0, 8)}`,
+      role: 'Reviewer',
+      title: `${plan.module}/${plan.plan} · ${review.role} · ${review.head.slice(0, 8)}`,
+      status: review.status === 'reported' ? review.verdict ?? 'reported' : review.status,
+      detail: review.status === 'reported' ? `${blocking} blocking` : review.status === 'failed' ? review.reason ?? '' : '',
+      ...(live ? { sandbox: review.sandbox, clock: { start: Date.parse(review.startedAt), deadline: Date.parse(review.deadline) } } : {}),
     });
   }
   // The running attempt first, then the last few that ended.

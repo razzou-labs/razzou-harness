@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { z } from 'zod';
 import { describeOwnerTime } from '../design/owner-time.ts';
 import { INPUTS, TOOLS, type Role, type ToolInput, type ToolName } from '../roles.ts';
-import { activeAttempt, attemptInSandbox, featureKey, planKey, type Attempt, type FeatureState } from '../state/state.ts';
+import { activeAttempt, attemptInSandbox, featureKey, managerKey, planKey, type Attempt, type FeatureState } from '../state/state.ts';
 import { clip, sh, sha256, tail } from '../util.ts';
 import type { AgentRequest } from './channel.ts';
 import { attemptsLeft, ciReport, deployReport } from './items.ts';
@@ -14,8 +14,10 @@ import { refOf } from './refs.ts';
 export interface AgentIdentity {
   role: Role;
   sandbox: string;
-  /** The Manager's module. */
+  /** The Manager's or the Architect's module. */
   module?: string;
+  /** The Manager's plan, when it manages one plan of the module (v3 §6.4). */
+  plan?: string;
 }
 
 export interface Reply {
@@ -131,7 +133,7 @@ const HANDLERS: Handlers = {
 
   ask_owner({ o, agent, requestId }, { question, blocking }) {
     if (!o.state.ownerRequests[requestId]) {
-      o.record({ type: 'OWNER_REQUEST', from: 'manager', to: 'owner', payload: { module: agent.module!, requestId, question, blocking } });
+      o.record({ type: 'OWNER_REQUEST', from: 'manager', to: 'owner', payload: { module: agent.module!, requestId, question, blocking, manager: managerKey({ module: agent.module!, plan: agent.plan }) } });
       o.kick();
     }
     return ok(`Asked the owner (request ${requestId}). The answer will arrive as a message.${blocking ? ' No new attempt starts until then.' : ''}`);
@@ -197,7 +199,10 @@ const HANDLERS: Handlers = {
     const module = o.state.modules[agent.module!];
     if (!module) return refuse(`${agent.module} has no Architect: its design was written by hand. Use ask_owner instead.`);
     if (!module.escalations.some((e) => e.id === requestId)) {
-      o.record({ type: 'ESCALATION', from: 'manager', to: 'architect', payload: { module: module.module, requestId, question, ...(feature ? { feature } : {}) } });
+      o.record({
+        type: 'ESCALATION', from: 'manager', to: 'architect',
+        payload: { module: module.module, requestId, question, ...(feature ? { feature } : {}), manager: managerKey({ module: module.module, plan: agent.plan }) },
+      });
       o.kick();
     }
     return ok(`Sent as escalation ${requestId}. The Architect answers when the owner next works with it, so it can take a while; the decision comes to you as a message.`);

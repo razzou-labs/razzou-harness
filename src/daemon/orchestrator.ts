@@ -7,7 +7,10 @@ import { loadClaudeToken, readUsage, type SubscriptionUsage } from '../anthropic
 import { allPassed, initEnvironment, runChecks, type CheckResult, type RunOptions } from '../checks/runner.ts';
 import { protectedChanges } from '../ci/harness-ci.ts';
 import { ownerTime, type OwnerTime } from '../design/owner-time.ts';
-import { definitionHash, loadDesign, planKind, requiredChecks, type Check, type Config, type Design, type Feature, type Plan } from '../design/schemas.ts';
+import {
+  definitionHash, featureDependency, loadDesign, planDependencies, planKind, requiredChecks,
+  type Check, type Config, type Design, type Feature, type ModuleDesign, type Plan,
+} from '../design/schemas.ts';
 import { DEVELOPER, HARNESS, Repo } from '../git/repo.ts';
 import { GitHubClient, loadAppCredentials } from '../github/app.ts';
 import { GitHubForge, LocalForge, type CheckRun, type Forge, type PullRequest } from '../github/forge.ts';
@@ -17,13 +20,14 @@ import { BUNDLES } from '../sandbox/allowlist.ts';
 import { buildPolicy } from '../sandbox/policy.ts';
 import { EventStore, type CiJob, type HarnessEvent, type NewEvent, type Ref } from '../state/events.ts';
 import {
-  activeAttempt, activeAttempts, apply, countedAttempts, featureKey, interruptions, isActive, planKey, project, writeSnapshot,
-  type Attempt, type FeatureState, type Mode, type PlanState, type ReviewState, type State,
+  activeAttempt, activeAttempts, apply, countedAttempts, featureKey, interruptions, isActive, managersOf, planKey, planMerged, project, writeSnapshot,
+  type Attempt, type FeatureState, type ManagerState, type Mode, type PlanState, type ReviewState, type State,
 } from '../state/state.ts';
 import { clip, sh, sleep } from '../util.ts';
 import { Architects } from './architects.ts';
 import { AgentChannel, type AgentRequest } from './channel.ts';
 import { architectRef } from './design.ts';
+import { parseCostEstimate } from '../review/cost-estimate.ts';
 import { activeReview, reviewStep, stepReview } from './review.ts';
 import { Managers } from './manager.ts';
 import { attemptRefName, preMerge, probeScript, refOf, sandboxName, waitForFile } from './refs.ts';
@@ -220,12 +224,13 @@ export class Orchestrator {
     return true;
   }
 
-  /** The owner writes to the Manager of the module being built. */
-  messageManager(text: string): boolean {
-    const module = this.currentModule();
-    const manager = module ? this.state.managers[module] : undefined;
-    if (!module || !manager || manager.status === 'stopped' || text.trim() === '') return false;
-    this.record({ type: 'OWNER_MESSAGE', from: 'owner', to: 'manager', payload: { module, text: text.trim() } });
+  /** The owner writes to a Manager: the one named by its key, or else those of the module being built. */
+  messageManager(text: string, manager?: string): boolean {
+    const named = manager ? this.state.managers[manager] : undefined;
+    const module = manager ? named?.module : this.currentModule();
+    const targets: ManagerState[] = manager ? (named && named.status !== 'stopped' ? [named] : []) : module ? managersOf(this.state, module) : [];
+    if (!module || targets.length === 0 || text.trim() === '') return false;
+    this.record({ type: 'OWNER_MESSAGE', from: 'owner', to: 'manager', payload: { module, text: text.trim(), ...(manager ? { manager } : {}) } });
     this.kick();
     return true;
   }
@@ -314,9 +319,11 @@ export class Orchestrator {
     }
     if (progressed) return 'progress';
     if (paused) return 'wait';
-    // Manual builds one feature at a time. Swarm starts more while others run, up to its limit (v3 §6.2).
-    const limit = this.state.mode === 'swarm' ? this.design.config.swarm.maxDevelopers : 1;
-    if (active.length >= limit) return 'wait';
+    // Manual builds one feature at a time, and looks at nothing else while it runs. Swarm starts
+    // more while others run, up to its limit, and follows its other plans meanwhile (v3 §6.2).
+    const swarm = this.state.mode === 'swarm';
+    const limit = swarm ? this.design.config.swarm.maxDevelopers : 1;
+    if (active.length >= limit && !swarm) return 'wait';
     return this.scheduleNext(active.length, limit);
   }
 
@@ -344,43 +351,37 @@ export class Orchestrator {
   // ── Choosing work ────────────────────────────────────────────────────────────
 
   /**
-   * The first plan, in module order, that isn't complete; in it, the first feature that
-   * isn't accepted. In Swarm, every feature whose dependencies are accepted may start,
-   * `running` attempts already do, and plan steps wait until none runs (v3 §6.2).
+   * What to do besides the attempts under way (v3 §6.2). Every plan past its build gets
+   * its step: the full check run, the pull request, the deploy. Then, while fewer than
+   * `limit` attempts run, one starts in a plan being built, in plan order then file
+   * order. Then a plan whose dependencies are merged starts, while fewer than
+   * `swarm.maxPlans` are in flight. Manual keeps v2's order: it looks only at the first
+   * plan, in module order, that isn't complete.
    */
   private async scheduleNext(running = 0, limit = 1): Promise<Step> {
     await this.refreshDesign();
-    if (running > 0 && this.state.mode === 'swarm' && (await this.abortRedefined())) return 'progress';
+    const swarm = this.state.mode === 'swarm';
+    if (running > 0 && swarm && (await this.abortRedefined())) return 'progress';
+    const first = swarm ? undefined : this.firstUnfinished();
+    const considered = (ref: Ref) => first === undefined || (first.module === ref.module && first.plan === ref.plan);
+    const inFlight = Object.values(this.state.plans).filter((p) => p.status !== 'completed' && considered(p));
+
+    for (const planState of inFlight) {
+      if ((await this.planStep(planState)) === 'progress') return 'progress';
+    }
+    if (running >= limit) return 'wait';
     for (const module of this.design.modules) {
       for (const plan of module.plans) {
         const planRef = { module: module.id, plan: plan.id };
         const planState = this.state.plans[planKey(planRef)];
-        if (planState?.status === 'completed') continue;
-        if (!planState) return this.gatesHolding(module.id, plan.id).length > 0 ? 'wait' : this.startPlan(planRef);
-        switch (planState.status) {
-          case 'validating':
-            return this.validatePlan(planState);
-          case 'pr_open':
-            // A Fix PR has no pull request until its fix lands.
-            return planState.pr ? this.followPullRequest(planState) : this.openPullRequest(planState);
-          case 'ready_to_merge':
-            return this.followPullRequest(planState);
-          case 'deploying':
-            return this.followDeploy(planState);
-          case 'verifying':
-            return this.verifyDeploy(planState);
-          case 'deploy_failed':
-          case 'verify_failed':
-            return 'wait';
-          case 'fixing': {
-            const fix = this.state.features[`${planKey(planRef)}/fix${planState.fixes}`]!;
-            // A Fix PR's branch starts from the merge.
-            if (!(await this.repo.revParse(`refs/heads/${planState.branch}`))) await this.repo.setRef(`refs/heads/${planState.branch}`, planState.base, '');
-            return (await this.scheduleWork({ ...planRef, feature: fix.feature }, this.lookup(fix).feature, fix)) ?? 'wait';
-          }
+        if (planState?.status !== 'active' || !considered(planRef)) continue;
+        // A design change merged meanwhile reaches the plan branch first; attempts under way land on the moved head (§6.3).
+        if (await this.mergeMain(planState)) return 'progress';
+        if (swarm) {
+          const own = activeAttempts(this.state).filter(({ feature }) => feature.module === module.id && feature.plan === plan.id).length;
+          if ((await this.scheduleParallel(planRef, plan, planState, own, running, limit)) === 'progress') return 'progress';
+          continue;
         }
-        if (running === 0 && (await this.mergeMain(planState))) return 'progress';
-        if (limit > 1) return this.scheduleParallel(planRef, plan, planState, running, limit);
         for (const feature of plan.features) {
           const ref = { ...planRef, feature: feature.id };
           const step = await this.scheduleWork(ref, feature, this.state.features[featureKey(ref)]);
@@ -390,27 +391,77 @@ export class Orchestrator {
         return 'progress';
       }
     }
+    if (inFlight.length >= (swarm ? this.design.config.swarm.maxPlans : 1)) return 'wait';
+    for (const module of this.design.modules) {
+      for (const plan of module.plans) {
+        const planRef = { module: module.id, plan: plan.id };
+        if (this.state.plans[planKey(planRef)] || !considered(planRef) || !this.planCanStart(module, plan)) continue;
+        return this.startPlan(planRef);
+      }
+    }
     return 'wait';
+  }
+
+  /** v2's order: the first plan, in module order, that isn't complete. */
+  private firstUnfinished(): Ref | undefined {
+    for (const module of this.design.modules) {
+      for (const plan of module.plans) {
+        if (this.state.plans[`${module.id}/${plan.id}`]?.status !== 'completed') return { module: module.id, plan: plan.id };
+      }
+    }
+    return undefined;
+  }
+
+  /** A plan starts once every plan it depends on is merged, and no gate holds it (v3 §6.1). */
+  private planCanStart(module: ModuleDesign, plan: Plan): boolean {
+    if (this.gatesHolding(module.id, plan.id).length > 0) return false;
+    return planDependencies(module, plan).every((id) => planMerged(this.state.plans[`${module.id}/${id}`]));
+  }
+
+  /** A plan's step past its build; 'wait' while it is being built, or needs the owner or the Manager. */
+  private async planStep(plan: PlanState): Promise<Step> {
+    const planRef = { module: plan.module, plan: plan.plan };
+    switch (plan.status) {
+      case 'validating':
+        return this.validatePlan(plan);
+      case 'pr_open':
+        // A Fix PR has no pull request until its fix lands.
+        return plan.pr ? this.followPullRequest(plan) : this.openPullRequest(plan);
+      case 'ready_to_merge':
+        return this.followPullRequest(plan);
+      case 'deploying':
+        return this.followDeploy(plan);
+      case 'verifying':
+        return this.verifyDeploy(plan);
+      case 'fixing': {
+        const fix = this.state.features[`${planKey(planRef)}/fix${plan.fixes}`]!;
+        // A Fix PR's branch starts from the merge.
+        if (!(await this.repo.revParse(`refs/heads/${plan.branch}`))) await this.repo.setRef(`refs/heads/${plan.branch}`, plan.base, '');
+        return (await this.scheduleWork({ ...planRef, feature: fix.feature }, this.lookup(fix).feature, fix)) ?? 'wait';
+      }
+      default:
+        return 'wait';
+    }
   }
 
   /**
    * Swarm's scheduler within a plan (v3 §6.2): starts the next feature whose dependencies
-   * are accepted, while fewer than `limit` attempts run. A feature that can't start, for
+   * are met, while fewer than `limit` attempts run in all. A feature that can't start, for
    * guidance, a gate or an escalation, doesn't hold the independent ones back. The plan
-   * validates once every feature is accepted.
+   * validates once every feature is accepted and none of its attempts runs.
    */
-  private async scheduleParallel(planRef: Ref, plan: Plan, planState: PlanState, running: number, limit: number): Promise<Step> {
+  private async scheduleParallel(planRef: Ref, plan: Plan, planState: PlanState, own: number, running: number, limit: number): Promise<Step> {
     for (const feature of plan.features) {
       const ref = { ...planRef, feature: feature.id };
       const state = this.state.features[featureKey(ref)];
       if (state?.status === 'accepted' || (state && isActive(state))) continue;
-      if (!this.dependenciesAccepted(planRef, feature)) continue;
+      if (!this.dependenciesMet(planRef, feature)) continue;
       if (running >= limit) break;
       const step = await this.scheduleWork(ref, feature, state);
       if (step === 'progress') return 'progress';
     }
     const done = plan.features.every((f) => this.state.features[featureKey({ ...planRef, feature: f.id })]?.status === 'accepted');
-    if (done && running === 0) {
+    if (done && own === 0) {
       this.record({ type: 'PLAN_VALIDATING', ref: planRef, payload: { head: planState.head } });
       return 'progress';
     }
@@ -442,9 +493,16 @@ export class Orchestrator {
     return false;
   }
 
-  /** Every feature this one depends on is accepted; features of this plan only, until plans run in parallel. */
-  private dependenciesAccepted(planRef: Ref, feature: Feature): boolean {
-    return feature.dependsOn.every((id) => this.state.features[featureKey({ ...planRef, feature: id })]?.status === 'accepted');
+  /**
+   * Every feature this one depends on is accepted; one of an earlier plan counts once that
+   * plan is merged, so that its code is on main and reaches this plan's branch (v3 §6.1).
+   */
+  private dependenciesMet(planRef: Ref, feature: Feature): boolean {
+    return feature.dependsOn.every((dep) => {
+      const target = featureDependency(planRef.plan, dep);
+      if (target.plan === planRef.plan) return this.state.features[featureKey({ ...planRef, feature: target.feature })]?.status === 'accepted';
+      return planMerged(this.state.plans[`${planRef.module}/${target.plan}`]);
+    });
   }
 
   /** The next attempt of a feature or a fix round, or why there can't be one yet. Undefined once it is accepted. */
@@ -566,10 +624,11 @@ export class Orchestrator {
     await this.repo.bundle(`refs/heads/${branch}`, join(dir, 'plan.bundle'));
     const previous = state.attempts.filter((a) => a.n < attempt.n && a.status === 'failed').at(-1);
     const progress = (await this.repo.show(`refs/heads/${branch}`, 'progress.txt')) ?? '';
+    const mustKeep = await this.regressionChecks(attempt.base);
     writeFileSync(join(dir, 'task.md'), buildTask({
       ref, plan, feature, previous,
       ...(attempt.guidance ? { guidance: attempt.guidance } : {}),
-      regressionChecks: this.regressionChecks(),
+      regressionChecks: mustKeep,
       progressTail: progress.split('\n').slice(-21).join('\n'),
     }));
     copyFileSync(join(this.options.packageDir, 'roles', 'developer.md'), join(dir, 'developer.md'));
@@ -590,7 +649,7 @@ export class Orchestrator {
 
     const init = await initEnvironment(this.driver, sandbox, p.work);
     if (init && init.exit !== 0) return this.baselineFailed(state, attempt, 'init.sh failed', [init]);
-    const regression = await runChecks(this.driver, sandbox, p.work, this.regressionChecks(), this.checkOptions(sandbox));
+    const regression = await runChecks(this.driver, sandbox, p.work, mustKeep, this.checkOptions(sandbox));
     if (!allPassed(regression)) {
       return this.baselineFailed(state, attempt, 'checks of accepted work fail before the attempt starts', regression);
     }
@@ -700,7 +759,7 @@ export class Orchestrator {
       sandboxName('chk', this.design.config.project.name, featureKey(ref), suffix),
       checkRef,
       this.attemptDir(ref),
-      [...this.regressionChecks(), ...preMerge(feature.checks)],
+      [...(await this.regressionChecks(checkRef)), ...preMerge(feature.checks)],
     );
     if (!allPassed(results)) {
       this.record({ type: 'CHECKS_FAILED', ref, payload: { results } });
@@ -767,7 +826,7 @@ export class Orchestrator {
         sandboxName('chk', this.design.config.project.name, planKey(ref), 'plan'),
         `refs/heads/${plan.branch}`,
         this.planDir(ref),
-        this.regressionChecks(),
+        await this.regressionChecks(`refs/heads/${plan.branch}`),
       );
       this.record({ type: allPassed(results) ? 'PLAN_CHECKS_PASSED' : 'PLAN_CHECKS_FAILED', ref, payload: { results } });
       return 'progress';
@@ -839,7 +898,11 @@ export class Orchestrator {
       if (step) return step;
     }
     if (plan.ci?.status === 'passed' && !plan.branch.startsWith('fix/')) {
-      // The reviewers first (v3 §5), then the merge policy (v3 §3.2).
+      // The cost job's estimate (v3 §5.3), then the reviewers (v3 §5), then the merge policy (v3 §3.2).
+      if (await this.readCostEstimate(plan, pr)) {
+        this.nextPoll.delete(key);
+        return 'progress';
+      }
       const reviewed = await reviewStep(this, plan, pr);
       if (reviewed === 'progress') {
         this.nextPoll.delete(key);
@@ -877,7 +940,9 @@ export class Orchestrator {
       const ceiling = policy.merge.infraMonthlyUsdCeiling;
       if (ceiling === null) return leave(`${kind} plans are the owner's to merge (swarm.merge.infraMonthlyUsdCeiling is null)`);
       const estimate = plan.costEstimate;
-      if (estimate === undefined) return leave(`a ${kind} plan merges itself only with the cost job's estimate of the monthly cost it adds, and none was produced`);
+      if (estimate === undefined) {
+        return leave(`${kind === 'INFRA' ? 'an' : 'a'} ${kind} plan merges itself only with the cost job's estimate of the monthly cost it adds, and none was produced: the cost job needs iac/ and the INFRACOST_API_KEY secret`);
+      }
       if (estimate.monthlyUsd > ceiling) return leave(`the PR adds an estimated ${estimate.monthlyUsd} USD a month, over the ceiling of ${ceiling} (swarm.merge.infraMonthlyUsdCeiling)`);
     }
     const statuses = await this.forge.commitStatuses(pr.head);
@@ -897,6 +962,33 @@ export class Orchestrator {
     }
     this.record({ type: 'PR_MERGED_BY_DAEMON', ref, payload: { number: pr.number, head: pr.head, commit } });
     this.record({ type: 'PR_MERGED', ref, payload: { commit, next: await this.afterMerge(plan, commit) } });
+    return true;
+  }
+
+  /**
+   * The cost job's estimate of the monthly cost an INFRA or MIXED PR adds (v3 §5.3, §5.5):
+   * the `cost` artifact of the head's workflow run, read once per head. The job isn't a
+   * required check, so it may finish after CI passed: the daemon looks for twenty minutes.
+   * Without an estimate the policy leaves the PR to the owner, with the reason.
+   */
+  private async readCostEstimate(plan: PlanState, pr: PullRequest): Promise<boolean> {
+    const definition = this.definitionOf(plan);
+    if (!definition || planKind(definition) === 'CODE' || plan.costEstimate?.head === pr.head) return false;
+    if (!plan.ci || this.now() - Date.parse(plan.ci.since) > 20 * 60_000) return false;
+    let text: string | undefined;
+    try {
+      text = await this.forge.artifactFile(pr.head, 'cost', 'cost.json');
+    } catch (error) {
+      this.log(`the cost estimate of ${pr.head.slice(0, 8)} could not be read: ${(error as Error).message}`);
+      return false;
+    }
+    if (text === undefined) return false;
+    const estimate = parseCostEstimate(text);
+    if (!estimate) {
+      this.log(`the cost artifact of ${pr.head.slice(0, 8)} holds no monthly cost: is it Infracost's JSON?`);
+      return false;
+    }
+    this.record({ type: 'COST_ESTIMATED', ref: { module: plan.module, plan: plan.plan }, payload: { head: pr.head, ...estimate } });
     return true;
   }
 
@@ -1222,11 +1314,18 @@ export class Orchestrator {
     return { plan, feature };
   }
 
-  /** The project's own pre-merge checks, then those of every accepted feature. They must keep passing. */
-  regressionChecks(): Check[] {
-    const accepted = Object.values(this.state.features)
-      .filter((f) => f.status === 'accepted')
-      .flatMap((f) => preMerge(this.lookup(f).feature.checks));
+  /**
+   * The project's own pre-merge checks, then those of every accepted feature whose
+   * commit `commit` contains: they must keep passing. Work landed on another plan's
+   * branch, or merged on main after this branch last took it, isn't in `commit`, so its
+   * checks aren't asked of it (v3 §6.2).
+   */
+  async regressionChecks(commit: string): Promise<Check[]> {
+    const accepted: Check[] = [];
+    for (const feature of Object.values(this.state.features)) {
+      if (feature.status !== 'accepted' || !feature.commit || !(await this.repo.isAncestor(feature.commit, commit))) continue;
+      accepted.push(...preMerge(this.lookup(feature).feature.checks));
+    }
     return [...preMerge(this.design.config.checks), ...accepted];
   }
 

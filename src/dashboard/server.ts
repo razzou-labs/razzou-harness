@@ -8,6 +8,7 @@ import type { Orchestrator } from '../daemon/orchestrator.ts';
 import type { HarnessEvent } from '../state/events.ts';
 import type { SubscriptionUsage } from '../anthropic/usage.ts';
 import type { OwnerTime } from '../design/owner-time.ts';
+import { planDependencies } from '../design/schemas.ts';
 import type { State } from '../state/state.ts';
 import { Terminals, type Size } from './terminals.ts';
 
@@ -142,7 +143,7 @@ export function startDashboard({ orchestrator, port, token, webRoot, terminals }
         case 'POST /api/retry':
           return sendJson(res, { done: typeof body.feature === 'string' && orchestrator.retry(body.feature, text('note')) });
         case 'POST /api/message':
-          return sendJson(res, { done: text('text') !== undefined && orchestrator.messageManager(text('text')!) });
+          return sendJson(res, { done: text('text') !== undefined && orchestrator.messageManager(text('text')!, text('manager')) });
         case 'POST /api/architect': {
           // The owner writes to an Architect from the dashboard: typed into its terminal, as they would.
           const module = orchestrator.state.modules[typeof body.module === 'string' ? body.module : ''];
@@ -294,9 +295,15 @@ class Transcripts {
       const attempt = state.features[`${module}/${plan}/${feature}`]?.attempts.find((a) => a.n === Number(n));
       return attempt ? join(harnessDir, 'modules', module!, 'attempts', `${plan}-${feature}-a${n}`, 'stream.jsonl') : undefined;
     }
-    const manager = /^manager:([^/]+)$/.exec(agent);
-    const session = manager ? state.managers[manager[1]!]?.sessionId : undefined;
-    return session ? join(harnessDir, 'modules', manager![1]!, 'manager', `transcript-${session}.jsonl`) : undefined;
+    // A module's Manager, or a plan's (v3 §6.4): each keeps its transcripts in its own folder.
+    const manager = /^manager:([^/]+)(?:\/([^/]+))?$/.exec(agent);
+    if (!manager) return undefined;
+    const [, module, plan] = manager;
+    const session = state.managers[plan ? `${module}/${plan}` : module!]?.sessionId;
+    if (!session) return undefined;
+    return plan
+      ? join(harnessDir, 'modules', module!, 'plans', plan, 'manager', `transcript-${session}.jsonl`)
+      : join(harnessDir, 'modules', module!, 'manager', `transcript-${session}.jsonl`);
   }
 }
 
@@ -348,10 +355,12 @@ function designSummary(orchestrator: Orchestrator) {
     modules: modules.map((m) => ({
       id: m.id,
       plans: m.plans.map((p) => ({
+        // What the plan waits for, and each feature's dependencies, for the graph (v3 §6.7).
+        dependsOn: planDependencies(m, p),
         id: p.id,
         title: p.title,
         goal: p.goal,
-        features: p.features.map((f) => ({ id: f.id, title: f.title, kind: f.kind, checks: f.checks.map((c) => ({ id: c.id, phase: c.phase, needs: c.needs })) })),
+        features: p.features.map((f) => ({ id: f.id, title: f.title, kind: f.kind, dependsOn: f.dependsOn, checks: f.checks.map((c) => ({ id: c.id, phase: c.phase, needs: c.needs })) })),
       })),
       actions: m.actions.map((a) => ({
         id: a.id, kind: a.kind, title: a.title, when: a.when, blocks: a.blocks, instructions: a.instructions, verify: a.verify !== null, estimatedMinutes: a.estimatedMinutes,

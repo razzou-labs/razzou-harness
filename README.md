@@ -304,11 +304,29 @@ definition. Manual mode builds one feature at a time, as before. In both modes, 
 Architect hears in one line when a plan's pull request opens, waits for you, is
 blocked by a reviewer, or merges.
 
-**Where it stands.** The monthly cost estimate that lets `INFRA` plans merge under the
-ceiling, and the scanners in CI that the security reviewer would start from, are
-still to come (proposal v3 §5.3, §5.5): `INFRA` and `MIXED` plans wait for you. Plans
-still build one after the other: parallel plans, with a Manager per plan and the
-Architect's digest, are the rest of v3 §6.
+**Parallel plans.** A plan may declare `dependsOn`, the plans of its module that must
+be merged before it starts; without it, it waits for the previous plan, as always. In
+Swarm, up to `swarm.maxPlans` plans whose dependencies are merged build at once, each
+on its own branch with its own Manager, keyed `module/plan` in the Agents view; a
+feature may also depend on a feature of an earlier plan, as `P1/F03`, and then waits
+for that plan's merge. The Project view draws each module's features as a graph, plan
+by plan, with an edge per dependency: green accepted, blue under way, red escalated,
+grey not started. Manual mode builds one plan at a time with one Manager per module,
+as before.
+
+**The cost job.** `harness install-ci` adds a `cost` job to the workflow: on a pull
+request that has `iac/`, it runs [Infracost](https://www.infracost.io) on the base and
+the head and uploads the estimate as the `cost` artifact, which the daemon reads once
+CI passed. It needs the repository secret `INFRACOST_API_KEY`, a free key from
+`infracost auth login`; without it the job does nothing, no estimate exists, and
+`INFRA` and `MIXED` plans wait for you with that reason. Infracost sees your Terraform's
+resource types and sizes, not your code or state. The cost reviewer gets the estimate in
+its brief. The job is not a required check: verify it on your first `INFRA` pull request
+in a real repository, since the harness's tests only fake its artifact.
+
+**Where it stands.** The scanners in CI that the security reviewer would start from,
+gitleaks, semgrep and checkov, are still to come (proposal v3 §5.5): the reviewer reads
+the diff itself.
 
 **Budgets.** In both modes, the Project view shows two meters you set there:
 - **Your time.** The hours the whole project may take of you. Once set, every owner
@@ -390,7 +408,7 @@ through an `Arch:` pull request, or a commit of your own on `main`.
 | `swarm.merge.code` | `daemon` | Who merges a `CODE` plan in Swarm: `daemon`, or `owner` |
 | `swarm.merge.infraMonthlyUsdCeiling` | 50 | The monthly cost an `INFRA` or `MIXED` plan may add and still merge itself in Swarm; `null` leaves them all to you |
 | `swarm.requiredStatuses` | `["harness/security", "harness/cost"]` | The App's statuses a pull request needs before the daemon merges it; `[]` merges on CI alone |
-| `swarm.maxDevelopers`, `swarm.maxPlans` | 3, 2 | Attempts and plans at once in Swarm, once parallel builds exist |
+| `swarm.maxDevelopers`, `swarm.maxPlans` | 3, 2 | Attempts and plans at once in Swarm |
 | `swarm.usageCeilingPercent` | 80 | No launch in Swarm at or above this share of your subscription's limits; `null` turns the probe off |
 | `swarm.securityFixRounds`, `swarm.costFixRounds` | 2, 2 | Fix rounds a reviewer may ask for, before you decide |
 | `swarm.reviewersInManual` | `false` | Run the reviewers in Manual too, as comments only |
