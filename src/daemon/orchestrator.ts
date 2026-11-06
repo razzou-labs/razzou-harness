@@ -128,7 +128,7 @@ export class Orchestrator {
       return token ? readUsage(token) : undefined;
     });
     this.tokenStored = options.tokenStored ?? (() => loadClaudeToken() !== undefined);
-    this.store = new EventStore(join(options.harnessDir, 'events.jsonl'));
+    this.store = new EventStore(join(options.harnessDir, 'events.jsonl'), this.now);
     this.state = project(this.store.readAll());
     this.managers = new Managers(this);
     this.architects = new Architects(this);

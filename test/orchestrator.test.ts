@@ -100,6 +100,9 @@ async function until(o: Orchestrator, done: () => boolean, timeoutMs = 30_000): 
     await o.tick();
     await sleep(100);
   }
+  // A pass that an agent's request kicked off may still run: it finishes here, so that what
+  // the test does next, a merge or a jump of the clock, doesn't land in the middle of it.
+  await o.tick();
 }
 
 const solved = (feature: string): StubBehavior => ({ files: SOLUTIONS[feature as keyof typeof SOLUTIONS] });
@@ -352,6 +355,7 @@ describe('parallel features', () => {
       max = Math.max(max, activeAttempts(o.state).length);
       await sleep(100);
     }
+    await o.tick();
     return max;
   }
 
@@ -469,6 +473,7 @@ describe('parallel plans', () => {
       max = Math.max(max, Object.values(o.state.plans).filter((p) => p.status !== 'completed').length);
       await sleep(100);
     }
+    await o.tick();
     return max;
   }
   const index = (o: Orchestrator, type: string, plan: string) => o.store.readAll().findIndex((e) => e.type === type && e.ref?.plan === plan);

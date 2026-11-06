@@ -63,6 +63,8 @@ may change how a project is set up, and its notes say how.
 - A button in the dashboard's header, in Swarm, that lets the daemon merge `INFRA` and
   `MIXED` plans like `CODE` ones, once CI and both reviewers pass; an Infracost estimate
   over the ceiling still waits for the owner. Off by default; the choice is an event.
+- The dependencies with advisories moved past them: zod 4.6.6 or later, and dompurify
+  3.4.17 or later for the dashboard's Markdown.
 - A `cost` job in the CI workflow, written by `harness install-ci`: on a pull request
   with `iac/` and the `INFRACOST_API_KEY` secret, Infracost's estimate of the monthly cost
   the change adds is uploaded as an artifact, which the daemon reads once CI passed.
