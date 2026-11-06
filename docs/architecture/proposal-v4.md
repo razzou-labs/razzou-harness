@@ -4,12 +4,19 @@ Status: draft of 2026-11-06, taken as accepted with the recommendations of §7 o
 owner's "ok perfect". It amends v2 §17 (package, CLI and setup) and folds in the three
 steps Swarm added (v3 §2.1, §3.4, §4.3). Nothing here changes what the agents can do.
 
-Built so far (S-C, in part): `harness mode` applies the ruleset; the daemon reads
-main's rules in effect through the App (`GET /repos/{owner}/{repo}/rules/branches/main`,
-which the App's metadata permission allows; a 403 or 404 shows as "can't be read" and
-the full note stays) and the dashboard's note lists only the steps left;
-`harness budget --owner-hours` writes `.harness/setup.json`, which the daemon takes
-once when it starts. The rest of §4, the `harness setup` command, follows.
+Built on 2026-11-06: S-A as `src/setup/setup.ts`, with a difference from §4: instead
+of an `apply` on each doctor check, the setup runs the doctor and acts on the checks
+it knows by name (`fixFor`), up to three rounds, which keeps the doctor as it was; the
+commit and push come before the ruleset, which would refuse a push to `main`. S-B's
+prompts for the ARNs, the `staging` environment and the variables through `gh`, and
+the provider through the doctor. S-C: `harness mode` applies the ruleset; the daemon
+reads main's rules in effect through the App (`GET
+/repos/{owner}/{repo}/rules/branches/main`; a 403 or 404 shows as "can't be read" and
+the full note stays) and the dashboard's note lists only the steps left; `harness
+budget --owner-hours` writes `.harness/setup.json`, which the daemon takes once when
+it starts. Not yet tried on a clean machine: the browser waits for the App, the AWS
+prompts, and `gh repo create`; the pure parts have unit tests. S-D waits for M10b's
+scanners, or rather for the first `INFRA` pull request on a real repository.
 
 ## Contents
 

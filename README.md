@@ -126,17 +126,28 @@ without pull requests.
 
 ```sh
 npm install -g razzou-harness --allow-scripts=node-pty
-cd path/to/project && harness init    # then follow the checklist it prints
-harness doctor --build-images         # builds the agents' image
-harness doctor --probe                # everything an agent must not do, tried
-harness up                            # the daemon, and the dashboard
+cd path/to/project && harness setup   # the rest, asking only for what is yours
 ```
 
 The command is also installed as `razzou-harness`, for machines where another `harness`,
 such as the Harness.io CLI, comes first on the PATH.
 
-`harness init` writes the harness's files into the repository, never over existing
-ones, and prints the setup checklist:
+`harness setup` does every step it can and asks only for what is yours: a `gh` login,
+the token from `claude setup-token` at a hidden prompt, two clicks on GitHub for the
+App, since GitHub creates and installs Apps only in the browser, three questions (your
+stack's network bundles, AWS or not, the hours of your time), and, with AWS, the role
+ARNs from your bootstrap and the gateway key. In order, it logs you in to `gh`; creates
+the repository on GitHub if the project has no remote, and writes the harness's files;
+asks the questions and writes `harness/config.json`, with the `staging` environment
+and the variables on GitHub for AWS; commits and pushes the files to `main` with your
+git, once you agree; runs `harness doctor` and fixes what it can (starts the OpenShell
+gateway, builds the agents' image, imports the Claude profile and creates the provider
+with your token, creates the App from its manifest and waits for you to install it,
+applies the ruleset on `main`, creates the AWS provider with your key); runs the probe;
+and offers to start the daemon. Run it again at any time: what is done is skipped.
+
+The same by hand: `harness init` writes the harness's files into the repository, never
+over existing ones, and prints the setup checklist:
 1. Docker, and OpenShell with a running gateway.
 2. The Claude subscription: `claude setup-token`, then `harness doctor` in a terminal
    creates the provider, with the token typed at a hidden prompt.
@@ -148,7 +159,9 @@ ones, and prints the setup checklist:
    may not touch workflows.
 7. `harness doctor --probe`.
 
-`harness doctor` checks each step, and says what to do about what fails. `--probe` tries,
+`harness doctor --build-images` builds the agents' image, `harness doctor --probe` runs
+the probe, and `harness up` starts the daemon. `harness doctor` checks each step, and
+says what to do about what fails. `--probe` tries,
 from a sandbox like an agent's and from outside, everything that must be refused: AWS
 writes and secret reads, other projects' state, `git push`, unlisted hosts and the
 metadata address, a workflow pushed by the App, a merge without your approval.
@@ -356,6 +369,7 @@ too.
 | `harness github-app check --repo <org>/<repo>` | Checks that the App can reach the repository |
 | `harness github-setup --repo <org>/<repo> [--mode manual\|swarm]` | Sets merge commits only, and the ruleset on `main` for the daemon's mode, with your own `gh` |
 | `harness budget --owner-hours <n>` | Sets the hours of your time for the whole project; with the daemon down, it records them when it starts (`--agent-hours` sets the threshold) |
+| `harness setup [--repo <owner/name>] [--owner <login>]` | Sets up this machine and the project, asking only for what is yours; run it again any time |
 | `harness install-ci [--owner <login>]` | Writes the workflow, its CI script and `CODEOWNERS` again, after an upgrade |
 | `harness lock` | Writes `harness/lock.json`, the hashes of the protected files |
 | `harness up`, `harness down` | Starts the daemon and the dashboard, or stops the daemon; sandboxes keep running |

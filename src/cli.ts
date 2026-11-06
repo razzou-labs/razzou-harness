@@ -2,6 +2,7 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { createInterface } from 'node:readline/promises';
 import { parseArgs } from 'node:util';
 import { computeLock, directoryReader } from './ci/harness-ci.ts';
 import { isAlive, packageRoot, readDaemonInfo, runDaemon, version } from './daemon/main.ts';
@@ -11,6 +12,7 @@ import { applyRepositoryRules, checkApp, createApp, installCi, type RulesetOptio
 import { doctor } from './setup/doctor.ts';
 import { CHECKLIST, init } from './setup/init.ts';
 import { recover } from './setup/recover.ts';
+import { setup } from './setup/setup.ts';
 import type { Mode, State } from './state/state.ts';
 import { sleep } from './util.ts';
 
@@ -18,6 +20,9 @@ const HELP = `harness ${version}
 
 Usage: harness <command> [--dir <project>]
 
+  setup [--repo <owner/name>] [--owner <login>]
+                     Set up this machine and the project: every step the harness can do, asking only for
+                     what is yours (a login, a token, a click on GitHub); run it again any time
   init [--repo <owner/name>] [--owner <login>]
                      Write the harness's files into this repository, and print the setup checklist
   up                 Run the daemon for the project (foreground) and open the dashboard
@@ -165,6 +170,24 @@ async function main(): Promise<void> {
       if (values.mode !== undefined && values.mode !== 'manual' && values.mode !== 'swarm') throw new Error('--mode is manual or swarm');
       return applyRules(projectDir, harnessDir, values.repo, values.mode);
     }
+    case 'setup': {
+      if (process.stdin.isTTY !== true) throw new Error('harness setup needs a terminal: it asks for what only you can give. `harness doctor` lists what is missing.');
+      return setup({
+        projectDir,
+        packageDir: packageRoot,
+        version,
+        ...(values.repo ? { repo: values.repo } : {}),
+        ...(values.owner ? { owner: values.owner } : {}),
+        say: (line) => console.log(line),
+        ask: (question) => ask(question),
+        open: (url) => spawn('xdg-open', [url], { stdio: 'ignore', detached: true }).on('error', () => {}).unref(),
+        interactive: (file, args) => spawnSync(file, args, { stdio: 'inherit' }).status ?? 1,
+        up: async () => {
+          await runDaemon(projectDir);
+          process.exit(0);
+        },
+      });
+    }
     case 'doctor':
       return runDoctor(projectDir, values);
     case 'recover':
@@ -190,6 +213,15 @@ async function main(): Promise<void> {
       return;
     default:
       console.log(HELP);
+  }
+}
+
+async function ask(question: string): Promise<string> {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    return (await rl.question(question)).trim();
+  } finally {
+    rl.close();
   }
 }
 

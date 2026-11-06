@@ -15,8 +15,9 @@ export interface InitOptions {
   owner?: string;
 }
 
-/** The setup steps that `harness doctor` checks (§17.3). */
-export const CHECKLIST = `Setup checklist (\`harness doctor\` checks it):
+/** The setup steps: `harness setup` does what it can (v4 §4), and `harness doctor` checks them (§17.3). */
+export const CHECKLIST = `Next: \`harness setup\` does these steps for you, and asks only for what is yours (a login,
+a token, a click on GitHub). \`harness doctor\` checks them at any time. The steps:
   1. Docker, and OpenShell with a running gateway. Containers need outbound network.
   2. Claude subscription: run \`claude setup-token\`, then \`harness doctor\` in a terminal;
      it creates the provider with the token, at a hidden prompt.

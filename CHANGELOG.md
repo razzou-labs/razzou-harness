@@ -48,6 +48,13 @@ may change how a project is set up, and its notes say how.
   round, two per reviewer by default, before the pull request is the owner's. The App
   needs "Commit statuses: write"; an older App's tokens fall back to read, and the
   pull request waits for the owner with the reason.
+- `harness setup`, designed in `docs/architecture/proposal-v4.md`: one command that
+  sets up this machine and the project, does every step the harness can, and asks only
+  for what is the owner's: a `gh` login, the Claude token at a hidden prompt, the
+  clicks GitHub needs for the App, three questions, and with AWS the role ARNs and the
+  gateway key. It commits and pushes the files it wrote once the owner agrees, runs the
+  doctor and fixes what it can, waits for the browser steps, runs the probe, and offers
+  to start the daemon. `harness init` and the checklist stay, for the steps by hand.
 - `harness mode` applies the mode's ruleset on `main` in the same command, with your
   own `gh`. In Swarm the daemon reads the rules in effect on `main` through the App,
   and the dashboard's "Before you use Swarm" note lists only what is left: the rules,
