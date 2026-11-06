@@ -177,10 +177,13 @@ export type NewEvent = { [T in EventType]: { type: T; ref?: Ref; from?: Party; t
  */
 export class EventStore {
   readonly file: string;
+  private readonly now: () => number;
   private seq = 0;
 
-  constructor(file: string) {
+  /** `now` stamps the events: the daemon's clock, so that what it compares them with reads the same time. */
+  constructor(file: string, now: () => number = Date.now) {
     this.file = file;
+    this.now = now;
     mkdirSync(dirname(file), { recursive: true });
     this.dropTornLastLine();
   }
@@ -201,7 +204,7 @@ export class EventStore {
 
   append(event: NewEvent): HarnessEvent {
     const kind = MESSAGES.has(event.type) ? 'message' : 'event';
-    const stamped = { v: 1, kind, id: this.nextId(), ts: new Date().toISOString(), ...event } as HarnessEvent;
+    const stamped = { v: 1, kind, id: this.nextId(), ts: new Date(this.now()).toISOString(), ...event } as HarnessEvent;
     const fd = openSync(this.file, 'a');
     try {
       writeSync(fd, `${JSON.stringify(stamped)}\n`);
