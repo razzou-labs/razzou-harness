@@ -59,10 +59,7 @@ export async function submitDesign(o: Orchestrator, module: ModuleState, summary
     }
   }
   // Once the owner budgets their time, every owner action is estimated, and the module fits what is available (v3 §4.1).
-  if (mine) {
-    const lines = module.accepted === undefined ? 0 : o.proposalLines(module.module, module.accepted);
-    problems.push(...ownerTimeProblems(await o.ownerTime(), moduleOwnerTime(o.design.config, mine, o.state, lines)));
-  }
+  if (mine) problems.push(...ownerTimeProblems(await o.ownerTime(), moduleOwnerTime(mine, o.state)));
   if (problems.length > 0 || !mine) return { ok: false, problems };
 
   // The new checks, run once on the repository as it is: nothing is built yet, so they should fail.

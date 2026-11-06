@@ -239,9 +239,7 @@ const HANDLERS: Handlers = {
   },
 
   async get_owner_time({ o, agent }) {
-    const module = o.state.modules[agent.module!]!;
-    const lines = module.accepted === undefined ? 0 : o.proposalLines(module.module, module.accepted);
-    return ok(describeOwnerTime(await o.ownerTime(), module.module, lines, o.design.config));
+    return ok(describeOwnerTime(await o.ownerTime(), agent.module!));
   },
 
   reply_to_manager({ o, agent, requestId }, { escalation_id, decision }) {

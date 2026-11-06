@@ -49,6 +49,7 @@ document doesn't change: it describes Manual mode, which keeps working as it doe
 | 2026-11-05 | 4.3 | M9. The usage is read at most every five minutes; a reset time in the past or unreadable pauses for an hour instead. |
 | 2026-11-05 | 6.2, 6.3, 6.5, 6.6 | M11, first slice: parallel features within the plan under way, with the landing of §6.3. The merge with the moved head happens before an attempt's checks, not only at landing, so the checks of accepted work see that work; a conflict interrupts the attempt, which doesn't count, instead of a rebase work item. A design change that redefines a feature under way interrupts its attempt (§6.6). The Architect's digest (§6.5) is one note per plan event, in both modes. Plans still build in order: plan dependencies, Managers per plan and the graph remain. |
 | 2026-11-05 | 5.1, 5.3, 5.5 | M10. The reviewers run as one print-mode session each, like a Developer, with the Manager's read-only permissions and model, and answer with a structured report instead of a `report_findings` tool. The daemon makes their inputs itself: the paid-call inventory from the base and head trees, and the Terraform plan's JSON the way a check that needs it gets one. The CI jobs of §5.5, the scanners and Infracost, move to M10b, with the cost estimate in the merge policy. An App created before this version can only read statuses: its tokens fall back to that, and a PR whose reviewer passed waits for the owner with the reason. |
+| 2026-11-06 | 4.1, 9, 12 | M8 amended, at the owner's request: only owner actions count in the owner's time. The proposal's reading no longer does, and `ownerTime.linesPerHour` is gone. The owner also confirmed the landing of §6.3 as built: a conflict interrupts the attempt, and there is no rebase work item. |
 
 ---
 
@@ -211,13 +212,13 @@ actions. With a budget, it must design within it.
   and the meter says since when.
 - **Every owner action carries `estimatedMinutes`**, written by the Architect. When
   hours are set, `submit_design` requires it on every action of the module.
-- **Reading counts** at `ownerTime.linesPerHour` lines an hour, 1000 by default: the
-  accepted proposal's lines. Arch PRs and infra PRs the owner merges don't count (D30).
+- **Only owner actions count** (D30). The proposal, the Arch PRs and the infra PRs the
+  owner reads are their own reading, which the harness doesn't measure.
 - **A reserve** of `ownerTime.reservePercent`, 20 by default, stays out of what designs
   may use: escalations, questions and merges the policy sends to the owner come out of
   it.
-- **Planned** for a module = the sum of its actions' estimates + its accepted proposal's
-  reading. **Committed** = planned over the modules whose design is submitted or frozen.
+- **Planned** for a module = the sum of its actions' estimates. **Committed** = planned
+  over the modules whose design is submitted or frozen.
   **Available** for a module = hours × (1 − reserve) − committed by the other modules.
 - **`submit_design` refuses** a design whose planned time exceeds what is available, and
   says by how much. The Architect reads the hours, the reserve, what the other modules
@@ -225,7 +226,7 @@ actions. With a budget, it must design within it.
   the budget changes point it there, and its prompt asks for the module's owner time
   in the proposal, so the owner sees it before accepting. A design in review counts as
   committed, read from the Architect's ref since it isn't on `main` yet.
-- **Used** = the estimates of the actions marked done + the accepted proposals' reading.
+- **Used** = the estimates of the actions marked done.
   The dashboard shows used, planned and the hours; red when planned exceeds the hours
   minus the reserve, or used exceeds the hours.
 
@@ -480,7 +481,7 @@ Additions to `harness/config.json`, all optional:
 
 ```json
 {
-  "ownerTime": { "linesPerHour": 1000, "reservePercent": 20 },
+  "ownerTime": { "reservePercent": 20 },
   "swarm": {
     "maxDevelopers": 3,
     "maxPlans": 2,
@@ -496,7 +497,6 @@ Additions to `harness/config.json`, all optional:
 
 | Field | Default | What it sets |
 |---|---|---|
-| `ownerTime.linesPerHour` | 1000 | How fast the owner reads, for the proposals |
 | `ownerTime.reservePercent` | 20 | The share of the owner's hours designs may not plan |
 | `swarm.maxDevelopers` | 3 | Attempts at once |
 | `swarm.maxPlans` | 2 | Plans in flight at once |
@@ -574,7 +574,7 @@ Settled in the design chat of 2026-11-05.
 | D27 | One PR per plan stays. Parallelism comes from plans and features, not from PRs. |
 | D28 | In Swarm the daemon merges `CODE` plans when CI and both reviewers pass, and `INFRA` plans when the monthly cost the PR adds is under a ceiling, 50 USD by default. `Arch:` and `Fix:` PRs stay the owner's. |
 | D29 | No cost monitoring after a merge in the harness: the owner's account-wide AWS alarms cover it, and the daemon keeps no write permission on AWS. |
-| D30 | The owner's time is a design constraint: hours set at the start, 1000 lines an hour for reading proposals, a 20% reserve, estimates on every owner action, and `submit_design` refuses what doesn't fit. Arch PRs and infra PRs don't count. In both modes, once hours are set. No check for third-party paid APIs. |
+| D30 | The owner's time is a design constraint: hours set at the start, a 20% reserve, estimates on every owner action, gates and tasks, and `submit_design` refuses what doesn't fit. Only owner actions count: the proposals, Arch PRs and infra PRs the owner reads don't (amended 2026-11-06; until then the proposal counted at 1000 lines an hour). In both modes, once hours are set. No check for third-party paid APIs. |
 | D31 | Agent hours are a meter with a threshold: red when over, nothing stops. |
 | D32 | Before a launch in Swarm, the subscription's usage must be under 80%; above it the pipeline waits for the window's reset. The doctor stores the token. When the endpoint fails, v2's pause after a hit remains. |
 | D33 | Attempt clock 120 minutes and Manager turn 90 minutes, in both modes. No token cap, no progress detector. |

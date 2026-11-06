@@ -312,12 +312,12 @@ Architect's digest, are the rest of v3 §6.
 
 **Budgets.** In both modes, the Project view shows two meters you set there:
 - **Your time.** The hours the whole project may take of you. Once set, every owner
-  action in a design carries the Architect's estimate of how long it takes you,
-  reading a proposal counts at `ownerTime.linesPerHour`, a reserve of
-  `ownerTime.reservePercent` stays out of what designs may plan, and `submit_design`
-  refuses a design that doesn't fit what remains after the other modules. The Architect
-  reads the numbers with `get_owner_time`. The meter shows used, planned and the
-  hours, red when over.
+  action in a design, gate or task, carries the Architect's estimate of how long it
+  takes you, a reserve of `ownerTime.reservePercent` stays out of what designs may
+  plan, and `submit_design` refuses a design whose actions don't fit what remains
+  after the other modules. Only owner actions count: the proposals and pull requests
+  you read don't. The Architect reads the numbers with `get_owner_time`. The meter
+  shows used, planned and the hours, red when over.
 - **Agent hours.** The Developers' attempt clocks summed, against a threshold: red when
   over, and nothing stops.
 
@@ -386,7 +386,7 @@ through an `Arch:` pull request, or a commit of your own on `main`.
 | `brakes.consecutiveFailures` | 3 | Failed attempts in a row that pause the pipeline |
 | `brakes.managerTurnMinutes` | 90 | How long an item waits for the Manager before a reminder; as long again, and the pipeline pauses |
 | `brakes.ciFixRounds`, `brakes.deployFixRounds` | 2, 2 | Fix rounds after CI fails, and `Fix:` pull requests after a deploy fails |
-| `ownerTime.linesPerHour`, `ownerTime.reservePercent` | 1000, 20 | How fast you read a proposal, and the share of your hours designs may not plan |
+| `ownerTime.reservePercent` | 20 | The share of your hours designs may not plan for owner actions |
 | `swarm.merge.code` | `daemon` | Who merges a `CODE` plan in Swarm: `daemon`, or `owner` |
 | `swarm.merge.infraMonthlyUsdCeiling` | 50 | The monthly cost an `INFRA` or `MIXED` plan may add and still merge itself in Swarm; `null` leaves them all to you |
 | `swarm.requiredStatuses` | `["harness/security", "harness/cost"]` | The App's statuses a pull request needs before the daemon merges it; `[]` merges on CI alone |

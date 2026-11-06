@@ -117,9 +117,9 @@ Explain the actions in prose in `harness/modules/<module>/owner-guide.md`, by id
 
 **The owner's time.** `estimatedMinutes` is how long an action takes the owner. When
 the owner budgets their time, `get_owner_time` tells you the hours available to this
-module: every action needs an estimate, and the sum plus the time to read your accepted
-proposal must fit, or `submit_design` refuses. Decide what you can from the design;
-ask the owner only for what only they can do, in few, short actions.
+module: every action needs an estimate, and their sum must fit, or `submit_design`
+refuses. Only owner actions count, not what the owner reads. Decide what you can from
+the design; ask the owner only for what only they can do, in few, short actions.
 
 **Shared knowledge**: record cross-module decisions in `ARCHITECTURE.md`, and usage notes
 in `README.md`.

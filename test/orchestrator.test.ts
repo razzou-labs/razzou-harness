@@ -841,8 +841,7 @@ describe('architect', () => {
     await until(o, () => o.store.readAll().filter((e) => e.type === 'DESIGN_REFUSED').length === 2);
     const problems = o.store.readAll().flatMap((e) => (e.type === 'DESIGN_REFUSED' ? e.payload.problems : []));
     assert.equal(problems[0], 'owner-actions.json: T1 needs estimatedMinutes, how long it takes the owner: their time is budgeted (get_owner_time)');
-    // The stub's proposal is two lines: reading it rounds to nothing.
-    assert.match(problems[1]!, /^the design takes 10 h of the owner's time \(10 h of owner actions, 0 h to read the proposal\), but 8 h are available/);
+    assert.match(problems[1]!, /^the design takes 10 h of the owner's time in owner actions, but 8 h are available/);
     assert.equal(module(o)!.status, 'decomposing');
     assert.ok(module(o)!.notes.some((n) => n.text.startsWith('The owner set their time budget: 10 hours')));
 

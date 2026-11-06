@@ -111,7 +111,7 @@ function Budgets({ state, ownerTime, usage, ceiling }: { state: State; ownerTime
           <HoursForm field="ownerHours" value={budgets.ownerHours} placeholder="hours" />
           <p className="muted small">
             {ownerTime
-              ? 'Planned: the estimates of the owner actions in submitted designs, and the time to read their proposals. Used: the actions you marked done, and the proposals you accepted.'
+              ? 'Planned: the estimates of the owner actions in submitted designs, gates and tasks. Used: the actions you marked done. What you read, proposals and pull requests, doesn\'t count.'
               : 'Once set, the Architect must estimate every owner action and design within your hours; a design over them is refused.'}
           </p>
         </div>

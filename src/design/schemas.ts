@@ -155,11 +155,9 @@ export const ConfigSchema = z.object({
       deployFixRounds: z.number().int().min(0).max(5).default(2),
     })
     .prefault({}),
-  /** The owner's time as a design constraint (v3 §4.1), once the owner sets their hours in the dashboard. */
+  /** The owner's time as a design constraint (v3 §4.1), once the owner sets their hours in the dashboard: only owner actions count. */
   ownerTime: z
     .object({
-      /** How fast the owner reads a proposal. */
-      linesPerHour: z.number().int().positive().default(1000),
       /** The share of the owner's hours that designs may not plan: escalations, questions and merges come out of it. */
       reservePercent: z.number().int().min(0).max(90).default(20),
     })

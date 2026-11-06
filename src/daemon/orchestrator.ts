@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { claudeCode, mcpConfig, readResult, reportJsonSchema, type AgentAdapter, type AgentRun } from '../agents/claude-code.ts';
 import { loadClaudeToken, readUsage, type SubscriptionUsage } from '../anthropic/usage.ts';
@@ -1274,13 +1274,6 @@ export class Orchestrator {
     return ensureDir(join(this.options.harnessDir, 'modules', module));
   }
 
-  /** The length of a proposal the daemon keeps, for the owner's reading time (v3 §4.1); 0 when it is missing. */
-  proposalLines(module: string, version: number): number {
-    const file = join(this.moduleDir(module), 'proposals', `v${version}.md`);
-    if (!existsSync(file)) return 0;
-    return readFileSync(file, 'utf8').split('\n').filter((line) => line.trim() !== '').length;
-  }
-
   /**
    * The owner's time, planned and used, or undefined while the owner hasn't set their
    * hours. A design in review counts as submitted: it is read from the Architect's ref,
@@ -1296,7 +1289,7 @@ export class Orchestrator {
       if (current === -1) modules.push(submitted);
       else modules[current] = submitted;
     }
-    return ownerTime(this.design.config, { config: this.design.config, modules }, this.state, (module, version) => this.proposalLines(module, version));
+    return ownerTime(this.design.config, { config: this.design.config, modules }, this.state);
   }
 
   /** The sandbox policy: the project's network bundles, or every bundle for the Architect (§13), and signed AWS endpoints. */

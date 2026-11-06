@@ -22,10 +22,10 @@ may change how a project is set up, and its notes say how.
 - Budgets in the Project view: your hours for the whole project, and a threshold for
   the agent hours, the Developers' attempt clocks summed, red when over.
 - Your time as a design constraint, in both modes, once you set your hours: owner
-  actions carry `estimatedMinutes`, reading a proposal counts at
-  `ownerTime.linesPerHour`, a reserve of `ownerTime.reservePercent` stays out of
-  designs, and `submit_design` refuses a design over what remains. The Architect gets
-  `get_owner_time`, and a note when the budget changes.
+  actions carry `estimatedMinutes`, a reserve of `ownerTime.reservePercent` stays out
+  of designs, and `submit_design` refuses a design whose actions take more than what
+  remains. Only owner actions count, not the proposals or pull requests you read. The
+  Architect gets `get_owner_time`, and a note when the budget changes.
 - An attempt's deadline is 120 minutes, and the Manager's turn 90, by default.
 - In Swarm, up to `swarm.maxDevelopers` Developers build a plan's independent features
   at once. The plan's head is merged into an attempt before its checks when another
