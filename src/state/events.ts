@@ -1,8 +1,9 @@
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, truncateSync, writeSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { CheckResult } from '../checks/runner.ts';
+import type { ReviewFinding, ReviewerRole } from '../design/schemas.ts';
 import type { Party, Role } from '../roles.ts';
-import type { ActionState, FeatureState, PlanState } from './state.ts';
+import type { ActionState, FeatureState, InfraMerge, Mode, PlanState } from './state.ts';
 
 /** What an event is about. Ids repeat across modules, so a feature is always addressed with its module and plan. */
 export interface Ref {
@@ -56,6 +57,8 @@ interface Payloads {
   ATTEMPT_ENDED: { outcome: AttemptOutcome; summary?: string; notes?: string; finding?: Finding; usage?: Usage };
   ATTEMPT_INTERRUPTED: { reason: string; counts: boolean };
   CHECKS_STARTED: { head: string; files: string[] };
+  /** Another feature landed first (v3 §6.3): the plan's head was merged into the attempt, and the checks passed again on the result. */
+  ATTEMPT_REBASED: { onto: string; commit: string; results: CheckResult[] };
   CHECKS_PASSED: { results: CheckResult[] };
   CHECKS_FAILED: { results: CheckResult[] };
   FEATURE_ACCEPTED: { commit: string };
@@ -67,11 +70,12 @@ interface Payloads {
   PLAN_VALIDATING: { head: string };
   PLAN_CHECKS_PASSED: { results: CheckResult[] };
   PLAN_CHECKS_FAILED: { results: CheckResult[] };
-  MANAGER_STARTING: { module: string; sandbox: string; sessionId: string };
-  MANAGER_LAUNCHED: { module: string; launch: number; outputBytes: number };
-  MANAGER_EXITED: { module: string; launch: number; code: number | null; stderr: string; started: boolean };
-  MANAGER_ITEM_SENT: { module: string; key: string; launch: number; reminder: boolean };
-  MANAGER_STOPPED: { module: string; reason: string };
+  /** A Manager's scope is its module, or one plan of it in Swarm (v3 §6.4): `plan` names it. */
+  MANAGER_STARTING: { module: string; plan?: string; sandbox: string; sessionId: string };
+  MANAGER_LAUNCHED: { module: string; plan?: string; launch: number; outputBytes: number };
+  MANAGER_EXITED: { module: string; plan?: string; launch: number; code: number | null; stderr: string; started: boolean };
+  MANAGER_ITEM_SENT: { module: string; plan?: string; key: string; launch: number; reminder: boolean };
+  MANAGER_STOPPED: { module: string; plan?: string; reason: string };
   WEB_READ: { role: Role; sandbox: string; url: string; finalUrl?: string; status?: number; bytes: number; ok: boolean };
   PLAN_PUSHED: { head: string };
   PR_OPENED: { number: number; url: string };
@@ -97,6 +101,29 @@ interface Payloads {
   OWNER_ACTION_CLAIMED: { module: string; action: string; note?: string };
   OWNER_ACTION_DONE: { module: string; action: string; title: string; gate: boolean };
   OWNER_ACTION_REFUSED: { module: string; action: string; reason: string };
+  /** The owner switched the mode (v3 §2.1); it takes effect at item boundaries. */
+  MODE_CHANGED: { mode: Mode };
+  /** The owner's button (v3 D36): the daemon merges INFRA and MIXED plans like CODE ones, or only under the cost ceiling. */
+  INFRA_MERGE_SET: { by: InfraMerge };
+  /** The owner set, or cleared with null, the hours the whole project may take of their time (v3 §4.1). */
+  OWNER_HOURS_SET: { hours: number | null };
+  /** The owner set, or cleared, the threshold the agent-hours meter turns red at (v3 §4.2). */
+  AGENT_HOURS_SET: { hours: number | null };
+  /** In Swarm, the merge policy left a plan's PR to the owner, and why (v3 §3.2). */
+  PR_LEFT_TO_OWNER: { number: number; head: string; reason: string };
+  /** The cost job's estimate of the monthly cost the PR's head adds, read from its artifact (v3 §5.3); `source` names the field it came from. */
+  COST_ESTIMATED: { head: string; monthlyUsd: number; source: string };
+  /** The daemon merged a plan's PR under the Swarm policy (v3 §3.2); PR_MERGED follows. */
+  PR_MERGED_BY_DAEMON: { number: number; head: string; commit: string };
+  /** A reviewer's session on a PR head (v3 §5): starting, started, and ended with its report or why there is none. */
+  REVIEW_STARTING: { role: ReviewerRole; head: string; sandbox: string; sessionId: string; deadline: string };
+  REVIEW_STARTED: { role: ReviewerRole; head: string };
+  REVIEW_ENDED: {
+    role: ReviewerRole; head: string; outcome: AttemptOutcome;
+    verdict?: 'pass' | 'block'; summary?: string; findings?: ReviewFinding[]; usage?: Usage; reason?: string;
+  };
+  /** The review posted on the PR as comments, and the commit status set, or what went wrong. */
+  REVIEW_POSTED: { role: ReviewerRole; head: string; status: 'success' | 'failure' | 'error'; comments: number; problem?: string };
 
   // Messages.
   QUESTION: { requestId: string; question: string };
@@ -105,16 +132,18 @@ interface Payloads {
   REJECT: { requestId: string; guidance: string };
   RETRY: { requestId: string; guidance: string };
   ABORT: { requestId: string; reason: string };
-  OWNER_REQUEST: { module: string; requestId: string; question: string; blocking: boolean };
+  /** `manager` is the key of the Manager that asked, so the answer reaches it when several manage the module (v3 §6.4). */
+  OWNER_REQUEST: { module: string; requestId: string; question: string; blocking: boolean; manager?: string };
   OWNER_ANSWER: { module: string; requestId: string; answer: string };
-  OWNER_MESSAGE: { module: string; text: string };
+  /** `manager` names one Manager by key; without it, every Manager of the module hears it. */
+  OWNER_MESSAGE: { module: string; text: string; manager?: string };
   PLAN_SUBMITTED: { requestId: string; summary: string };
-  /** The Manager asks for a fix round after CI failed; `failure` is what CI reported. */
-  REQUEST_FIX: { requestId: string; guidance: string; failure: string };
+  /** The Manager asks for a fix round after CI failed, or the daemon after a reviewer blocked (`review`); `failure` is what was reported. */
+  REQUEST_FIX: { requestId: string; guidance: string; failure: string; review?: ReviewerRole };
   PROPOSAL: { module: string; requestId: string; version: number; sha256: string };
   /** The Architect submits its design; `head` is its commit, now in the daemon's repository. */
   DESIGN: { module: string; requestId: string; summary: string; head: string };
-  ESCALATION: { module: string; requestId: string; question: string; feature?: string };
+  ESCALATION: { module: string; requestId: string; question: string; feature?: string; manager?: string };
   DECISION: { module: string; requestId: string; escalationId: string; decision: string };
 }
 

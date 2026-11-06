@@ -1,7 +1,7 @@
 import { z } from 'zod';
 
 /** The agents the harness runs. */
-export type Role = 'developer' | 'manager' | 'architect';
+export type Role = 'developer' | 'manager' | 'architect' | 'reviewer';
 
 /** Who says something, in a message. */
 export type Party = Role | 'owner' | 'daemon';
@@ -30,6 +30,7 @@ export const INPUTS = {
   submit_proposal: z.object({ version: z.number().int().positive() }),
   submit_design: z.object({ summary: z.string().trim().min(1).max(8000) }),
   get_inbox: z.object({}),
+  get_owner_time: z.object({}),
   reply_to_manager: z.object({ escalation_id: z.string().min(1), decision: z.string().trim().min(1).max(8000) }),
 };
 
@@ -134,9 +135,16 @@ export const TOOLS: Record<Role, ToolSpec[]> = {
     },
     { name: 'get_state', description: "Your module: its status, proposals, design PR, plans and features, and open questions from the Manager.", waitSec: 60 },
     { name: 'get_inbox', description: 'Your messages: questions from the Manager and notes from the harness, newest last.', waitSec: 60 },
+    {
+      name: 'get_owner_time',
+      description: "The owner's time budget, if they set one: the hours available to this module for its owner actions and the reading of its proposal. A design over it is refused.",
+      waitSec: 60,
+    },
     { name: 'reply_to_manager', description: "Answers one of the Manager's escalations. Your decision reaches it at once.", waitSec: 120 },
     webRead,
   ],
+  /** The reviewers (v3 §5) read a diff and answer with their structured report: the web is their only harness tool. */
+  reviewer: [webRead],
 };
 
 /** `tools.json` for the shim: names, descriptions, JSON Schemas and waits. */

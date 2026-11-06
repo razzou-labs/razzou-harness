@@ -18,6 +18,25 @@ nav .count { margin-left: 6px; background: var(--warn); color: var(--panel); bor
 main { padding: 16px; max-width: 1400px; margin: 0 auto; }
 .boot, .banner { padding: 16px; }
 .banner { color: var(--bad); }
+.note { padding: 8px 16px; border-bottom: 1px solid var(--line); background: var(--accent); font-size: 13px; }
+.note ol { margin: 4px 0 0 20px; padding: 0; }
+.note li { margin: 2px 0; }
+.command { white-space: nowrap; }
+.command code { background: var(--bg); padding: 1px 6px; border-radius: 4px; user-select: all; }
+.command button { padding: 0 8px; margin-left: 4px; font-size: 12px; }
+/* The module's graph (v3 §6.7): tones set the color, the shapes take it from currentColor. */
+.graph-wrap { overflow-x: auto; margin: 8px 0; }
+.graph { display: block; font-size: 12px; }
+.graph .plan-box > rect { fill: var(--bg); stroke: currentColor; stroke-width: 1; }
+.graph .plan-title { font-weight: 600; fill: var(--text); }
+.graph .plan-status { fill: currentColor; font-size: 11px; }
+.graph .node rect { fill: color-mix(in srgb, currentColor 16%, var(--panel)); stroke: currentColor; stroke-width: 1; }
+.graph .node text { fill: var(--text); }
+.graph .edge { fill: none; stroke: var(--text); stroke-opacity: .45; stroke-width: 1.2; }
+.graph marker path { fill: var(--text); fill-opacity: .6; }
+.meters { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+.meter { border: 1px solid var(--line); border-radius: 6px; padding: 8px 12px; background: var(--bg); }
+.meter h3 { margin-bottom: 2px; }
 section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; min-width: 0; }
 section.need { border-left: 3px solid var(--warn); }
 h2 { font-size: 15px; margin: 0 0 8px; }

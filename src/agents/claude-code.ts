@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { ReportSchema } from '../design/schemas.ts';
+import { ReportSchema, ReviewReportSchema, type ReviewReport } from '../design/schemas.ts';
 import type { AttemptOutcome, Finding, Usage } from '../state/events.ts';
 import { sh, tail } from '../util.ts';
 
@@ -8,6 +8,8 @@ export interface AgentRun {
   workDir: string;
   /** Role text, appended to the agent's own system prompt; never replacing it. */
   promptFile: string;
+  /** A reviewer's permissions: read-only files and `git log/diff/show`, like the Manager's (v3 §5.1). */
+  settingsFile?: string;
   /** The task, given on stdin. */
   taskFile: string;
   /** JSON Schema of the final report. */
@@ -63,6 +65,8 @@ export interface AgentAdapter {
    * outlives the `exec` that started it, and so the daemon, which follows its files instead.
    */
   launch(run: AgentRun): string;
+  /** A reviewer: one print-mode session like a Developer's, with the Manager's read-only permissions (v3 §5.1). */
+  launchReviewer(run: AgentRun): string;
   launchManager(run: ManagerRun): string;
   /** The Architect's launcher script: the sandbox's main command runs it in its terminal. */
   architectLauncher(run: ArchitectRun): string;
@@ -96,6 +100,31 @@ export const claudeCode: AgentAdapter = {
       '--session-id', run.sessionId,
       '--permission-mode', 'bypassPermissions',
       '--tools', DEVELOPER_TOOLS,
+      '--mcp-config', run.mcpConfigFile,
+      '--strict-mcp-config',
+      '--output-format', 'stream-json',
+      '--verbose',
+    ];
+    const claude = `${args.map(sh).join(' ')} --json-schema "$(cat ${sh(run.schemaFile)})"`;
+    const body = [
+      `echo $$ > ${sh(run.pidFile)}`,
+      `${claude} < ${sh(run.taskFile)} > ${sh(run.streamFile)} 2> ${sh(run.stderrFile)}`,
+      `echo $? > ${sh(run.exitFile)}`,
+    ].join('\n');
+    return detach(run.workDir, body);
+  },
+
+  launchReviewer(run) {
+    const args = [
+      'claude', '-p',
+      '--model', run.model,
+      ...(run.effort ? ['--effort', run.effort] : []),
+      '--append-system-prompt-file', run.promptFile,
+      '--session-id', run.sessionId,
+      '--restricted',
+      '--tools', MANAGER_TOOLS,
+      ...(run.settingsFile ? ['--settings', run.settingsFile] : []),
+      '--permission-mode', 'dontAsk',
       '--mcp-config', run.mcpConfigFile,
       '--strict-mcp-config',
       '--output-format', 'stream-json',
@@ -230,21 +259,40 @@ export function reportJsonSchema(): string {
   return JSON.stringify(schema);
 }
 
+/** The reviewers' report schema (v3 §5.4), the same way. */
+export function reviewJsonSchema(): string {
+  const { $schema: _, ...schema } = z.toJSONSchema(ReviewReportSchema, { target: 'draft-7' });
+  return JSON.stringify(schema);
+}
+
+export interface ReviewResult {
+  outcome: AttemptOutcome;
+  report?: ReviewReport;
+  usage?: Usage;
+  detail?: string;
+}
+
+/** A reviewer's session: its report, or why there is none, read like a Developer's. */
+export function readReview(stream: string, exitCode: number, stderr = ''): ReviewResult {
+  const result = lastResult(stream);
+  if (!result) {
+    const why = stderr.trim() === '' ? '' : `: ${tail(stderr.trim(), 500)}`;
+    return { outcome: exitCode === 0 ? 'no_report' : 'error', detail: `the session ended without a result${why}` };
+  }
+  const usage = toUsage(result.usage, result.total_cost_usd);
+  const text = typeof result.result === 'string' ? result.result : '';
+  if (result.is_error === true && /usage limit|limit reached|rate.?limit/i.test(text)) return { outcome: 'usage_limit', detail: text.slice(0, 500), usage };
+  const report = ReviewReportSchema.safeParse(result.structured_output);
+  if (!report.success) return { outcome: result.is_error === true ? 'error' : 'no_report', detail: text.slice(0, 500), usage };
+  return { outcome: 'done', report: report.data, usage };
+}
+
 /**
  * Reads the outcome from the stream's final `result` event and its structured output.
  * Without one, the end of stderr says why: Claude Code reports a bad flag there.
  */
 export function readResult(stream: string, exitCode: number, stderr = ''): AgentResult {
-  let result: Record<string, unknown> | undefined;
-  for (const line of stream.split('\n')) {
-    if (!line.includes('"type":"result"')) continue;
-    try {
-      const event = JSON.parse(line) as Record<string, unknown>;
-      if (event.type === 'result') result = event;
-    } catch {
-      // A partial line from a killed process.
-    }
-  }
+  const result = lastResult(stream);
   if (!result) {
     const why = stderr.trim() === '' ? '' : `: ${tail(stderr.trim(), 500)}`;
     return { outcome: exitCode === 0 ? 'no_report' : 'error', detail: `the session ended without a result${why}` };
@@ -258,6 +306,21 @@ export function readResult(stream: string, exitCode: number, stderr = ''): Agent
   const report = ReportSchema.safeParse(result.structured_output);
   if (!report.success) return { outcome: result.is_error === true ? 'error' : 'no_report', detail: text.slice(0, 500), usage };
   return { outcome: report.data.outcome, summary: report.data.summary, finding: report.data.finding, notes: report.data.notes, usage };
+}
+
+/** The stream's final `result` event, if the session wrote one. */
+function lastResult(stream: string): Record<string, unknown> | undefined {
+  let result: Record<string, unknown> | undefined;
+  for (const line of stream.split('\n')) {
+    if (!line.includes('"type":"result"')) continue;
+    try {
+      const event = JSON.parse(line) as Record<string, unknown>;
+      if (event.type === 'result') result = event;
+    } catch {
+      // A partial line from a killed process.
+    }
+  }
+  return result;
 }
 
 function toUsage(usage: unknown, cost: unknown): Usage | undefined {

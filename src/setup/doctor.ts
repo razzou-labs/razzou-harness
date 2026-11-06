@@ -6,10 +6,12 @@ import { randomUUID } from 'node:crypto';
 import { webRead } from '../daemon/web-read.ts';
 import { loadPty } from '../dashboard/terminals.ts';
 import { ConfigSchema, requiredChecks, type Config } from '../design/schemas.ts';
+import { claudeTokenFile, loadClaudeToken, saveClaudeToken } from '../anthropic/usage.ts';
 import { GitHubClient, loadAppCredentials } from '../github/app.ts';
 import { checkApp } from '../github/setup.ts';
 import { BUNDLES } from '../sandbox/allowlist.ts';
 import { OpenShellDriver } from '../sandbox/openshell.ts';
+import type { Mode } from '../state/state.ts';
 import { run } from '../util.ts';
 import { probe, stateLocation } from './probe.ts';
 
@@ -122,7 +124,10 @@ async function claude(options: DoctorOptions, provider: string, report: (c: Chec
     const imported = await run('openshell', ['profile', 'import', '-f', join(options.packageDir, 'templates', 'openshell', 'claude-code-subscription.yaml'), '--global']);
     report(imported.code === 0 ? ok('Claude profile', 'imported') : fail('Claude profile', firstLine(imported.stderr), 'see `openshell profile import --help`'));
   }
-  if (await providerExists(provider)) return report(ok('Claude provider', provider));
+  if (await providerExists(provider)) {
+    report(ok('Claude provider', provider));
+    return claudeToken(options, report);
+  }
   if (!options.interactive) {
     return report(fail('Claude provider', `${provider} is missing`, 'run `claude setup-token`, then `harness doctor` in a terminal: it asks for the token'));
   }
@@ -133,17 +138,38 @@ async function claude(options: DoctorOptions, provider: string, report: (c: Chec
     env: { ...process.env, CLAUDE_CODE_OAUTH_TOKEN: token },
   });
   report(created.code === 0 ? ok('Claude provider', `${provider} created`) : fail('Claude provider', firstLine(created.stderr), 'see `openshell provider create --help`'));
+  // The same token lets the daemon read the subscription's usage before a launch in Swarm (v3 §4.3).
+  if (created.code === 0) report(ok('Claude token', `stored in ${saveClaudeToken(token)}: the daemon reads the subscription's usage with it`));
+}
+
+/** The stored token (v3 §4.3), asked for when Swarm needs it and the provider was created before the harness stored tokens. */
+async function claudeToken(options: DoctorOptions, report: (c: Check) => void): Promise<void> {
+  if (loadClaudeToken()) return report(ok('Claude token', `stored in ${claudeTokenFile()}: the daemon reads the subscription's usage with it`));
+  if (projectMode(options.projectDir) !== 'swarm') {
+    return report({ status: 'skip', name: 'Claude token', detail: "not stored; Swarm reads the subscription's usage with it before a launch" });
+  }
+  if (!options.interactive) {
+    return report(warn('Claude token', "not stored: Swarm can't read the subscription's usage before a launch", 'run `harness doctor` in a terminal: it asks for the token from `claude setup-token`'));
+  }
+  const token = await askSecret("Swarm reads the subscription's usage before a launch. Paste the token from `claude setup-token` (hidden), or press Enter to skip: ");
+  if (!token) return report(warn('Claude token', 'not stored: the daemon learns of a limit only when an attempt hits it', 'run `harness doctor` again to store it'));
+  report(ok('Claude token', `stored in ${saveClaudeToken(token)}`));
 }
 
 async function project(options: DoctorOptions, config: Config, report: (c: Check) => void): Promise<void> {
   report(ok('harness/config.json', `project ${config.project.name}`));
   const repo = config.project.repo;
+  const mode = projectMode(options.projectDir);
   if (!repo) {
     report({ status: 'skip', name: 'GitHub', detail: 'no project.repo: the project stays local' });
   } else {
     try {
       const lines = await checkApp(repo);
       report(ok('GitHub App', lines.find((l) => l.startsWith('App:'))?.slice(5) ?? 'installed'));
+      // In Swarm the reviewers' verdicts are commit statuses the App posts (v3 §3.4).
+      if (mode === 'swarm' && !/\bstatuses=write\b/.test(lines.find((l) => l.startsWith('Permissions:')) ?? '')) {
+        report(warn('GitHub App', "can't write commit statuses, which the reviewers' verdicts need in Swarm", 'give the App "Commit statuses: write" on GitHub, and accept the new permission on its installation'));
+      }
     } catch (error) {
       report(fail('GitHub App', firstLine((error as Error).message), 'create it with `harness github-app create --org <org>`, and install it on the repository'));
     }
@@ -151,7 +177,9 @@ async function project(options: DoctorOptions, config: Config, report: (c: Check
     if (!ruleset) {
       report(warn('ruleset', 'not readable with your gh login', 'install and log in to gh to check it, or apply it with `harness github-setup`'));
     } else {
-      const missing = requiredChecks(config).filter((c) => !ruleset.checks.includes(c));
+      // In Swarm the reviewers' statuses are required too (v3 §3.3); the probe checks the rest.
+      const wanted = [...requiredChecks(config), ...(mode === 'swarm' ? config.swarm.requiredStatuses : [])];
+      const missing = wanted.filter((c) => !ruleset.checks.includes(c));
       report(missing.length === 0 && ruleset.active ? ok('ruleset', `requires ${ruleset.checks.join(', ')}`) : fail('ruleset', missing.length ? `doesn't require ${missing.join(', ')}` : 'not active', `run \`harness github-setup --repo ${repo}\``));
     }
     for (const file of ['.github/workflows/harness.yml', '.github/harness/harness-ci.ts']) {
@@ -227,11 +255,46 @@ async function probes(options: DoctorOptions, config: Config, report: (c: Check)
   const refused = await webRead('http://192.168.1.1/');
   report(!refused.ok ? ok('probe (outside)', `web_read refuses a private address: ${refused.text}`) : fail('probe (outside)', 'web_read read a private address'));
   if (config.project.repo) {
-    report(await workflowPushRefused(config.project.repo));
-    const ruleset = await mainRuleset(config.project.repo);
-    report(ruleset
-      ? (ruleset.approvals >= 1 && ruleset.codeOwners && ruleset.active ? ok('probe (outside)', `main needs ${ruleset.approvals} code owner approval to merge`) : fail('probe (outside)', 'main can be merged without the owner\'s approval', `run \`harness github-setup --repo ${config.project.repo}\``))
-      : warn('probe (outside)', 'the ruleset is not readable with your gh login', 'install and log in to gh'));
+    const repo = config.project.repo;
+    report(await workflowPushRefused(repo));
+    const ruleset = await mainRuleset(repo);
+    if (!ruleset) report(warn('probe (outside)', 'the ruleset is not readable with your gh login', 'install and log in to gh'));
+    else if (projectMode(options.projectDir) === 'swarm') report(swarmRuleset(ruleset, config, repo));
+    else {
+      report(ruleset.approvals >= 1 && ruleset.codeOwners && ruleset.active
+        ? ok('probe (outside)', `main needs ${ruleset.approvals} code owner approval to merge`)
+        : fail('probe (outside)', "main can be merged without the owner's approval", `run \`harness github-setup --repo ${repo}\``));
+    }
+  }
+}
+
+/** In Swarm, main needs no approval, and the reviewers' statuses, each pinned to the App (v3 §3.3). */
+function swarmRuleset(ruleset: Ruleset, config: Config, repo: string): Check {
+  const statuses = config.swarm.requiredStatuses;
+  const fix = `run \`harness github-setup --repo ${repo}\``;
+  if (!ruleset.active) return fail('probe (outside)', 'the ruleset on main is not active', fix);
+  if (ruleset.approvals > 0) return fail('probe (outside)', "main's rules are the Manual ones: they need an approval the daemon can't give", fix);
+  const missing = statuses.filter((s) => !ruleset.checks.includes(s));
+  if (missing.length > 0) return fail('probe (outside)', `main's rules miss the statuses ${missing.join(', ')}`, fix);
+  let appId: number | undefined;
+  try {
+    appId = loadAppCredentials().appId;
+  } catch {
+    appId = undefined;
+  }
+  const unpinned = appId === undefined ? [] : statuses.filter((s) => ruleset.integrations[s] !== appId);
+  if (unpinned.length > 0) return fail('probe (outside)', `the statuses ${unpinned.join(', ')} are not pinned to the App: anything could post them`, fix);
+  return ok('probe (outside)', statuses.length > 0 ? `main needs no approval, and the App's statuses: ${statuses.join(', ')}` : 'main needs no approval, and the daemon merges on CI alone');
+}
+
+/** The daemon's mode, from its state snapshot (v3 §2.1); Manual when there is none. */
+function projectMode(projectDir: string): Mode {
+  const file = join(projectDir, '.harness', 'state.json');
+  if (!existsSync(file)) return 'manual';
+  try {
+    return (JSON.parse(readFileSync(file, 'utf8')) as { mode?: Mode }).mode ?? 'manual';
+  } catch {
+    return 'manual';
   }
 }
 
@@ -264,19 +327,30 @@ async function workflowPushRefused(repo: string): Promise<Check> {
   }
 }
 
+interface Ruleset {
+  /** The required checks' contexts: CI jobs, and in Swarm the App's statuses. */
+  checks: string[];
+  /** The integration each required check is pinned to, by context. */
+  integrations: Record<string, number | undefined>;
+  approvals: number;
+  codeOwners: boolean;
+  active: boolean;
+}
+
 /** The ruleset on main, read with the owner's own `gh` login: the App may not read administration settings. */
-async function mainRuleset(repo: string): Promise<{ checks: string[]; approvals: number; codeOwners: boolean; active: boolean } | undefined> {
+async function mainRuleset(repo: string): Promise<Ruleset | undefined> {
   const list = await run('gh', ['api', `repos/${repo}/rulesets`]).catch(() => undefined);
   if (list?.code !== 0) return undefined;
   const id = (JSON.parse(list.stdout) as Array<{ id: number; name: string }>).find((r) => r.name === 'harness: main')?.id;
-  if (id === undefined) return { checks: [], approvals: 0, codeOwners: false, active: false };
+  if (id === undefined) return { checks: [], integrations: {}, approvals: 0, codeOwners: false, active: false };
   const detail = await run('gh', ['api', `repos/${repo}/rulesets/${id}`]);
   if (detail.code !== 0) return undefined;
   const ruleset = JSON.parse(detail.stdout) as { enforcement: string; rules: Array<{ type: string; parameters?: Record<string, any> }> };
   const pr = ruleset.rules.find((r) => r.type === 'pull_request')?.parameters ?? {};
-  const checks = ruleset.rules.find((r) => r.type === 'required_status_checks')?.parameters?.required_status_checks ?? [];
+  const checks = (ruleset.rules.find((r) => r.type === 'required_status_checks')?.parameters?.required_status_checks ?? []) as Array<{ context: string; integration_id?: number }>;
   return {
-    checks: (checks as Array<{ context: string }>).map((c) => c.context),
+    checks: checks.map((c) => c.context),
+    integrations: Object.fromEntries(checks.map((c) => [c.context, c.integration_id])),
     approvals: Number(pr.required_approving_review_count ?? 0),
     codeOwners: pr.require_code_owner_review === true,
     active: ruleset.enforcement === 'active',

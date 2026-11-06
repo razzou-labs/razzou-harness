@@ -3,26 +3,33 @@ import { copyFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { managerSettings, userMessage, type ManagerRun } from '../agents/claude-code.ts';
 import type { Follower } from '../sandbox/driver.ts';
-import type { ManagerState } from '../state/state.ts';
+import { managerKey, type ManagerState } from '../state/state.ts';
 import { clip, sh } from '../util.ts';
 import type { AgentChannel } from './channel.ts';
 import { mailText, pendingItems, type Item } from './items.ts';
 import type { Orchestrator } from './orchestrator.ts';
 import { attemptRefName, probeScript, sandboxName, waitForFile } from './refs.ts';
 
-/** After this many failed passes in a row, the Manager's sandbox is considered broken and the pipeline pauses. */
+/** After this many failed passes in a row, a Manager's sandbox is considered broken and the pipeline pauses. */
 const ERROR_LIMIT = 5;
 const HOUR = 3_600_000;
 
+/** What a Manager is in charge of: a module, or one plan of it in Swarm (v3 §6.4). */
+export interface ManagerScope {
+  module: string;
+  plan?: string;
+}
+
 /**
- * The Managers (proposal v2 §7.5): one long-lived Claude Code session per module, in its
- * own sandbox, fed from a file so that it outlives the daemon. On each pass the daemon
- * starts or relaunches the one for the module being built, keeps its channel and
- * transcript attached, and delivers what waits for it.
+ * The Managers (proposal v2 §7.5, v3 §6.4): long-lived Claude Code sessions, each in its
+ * own sandbox, fed from a file so that they outlive the daemon. In Manual there is one
+ * per module being built; in Swarm one per plan in flight. On each pass the daemon
+ * starts or relaunches the ones wanted, keeps their channels and transcripts attached,
+ * and delivers what waits for each.
  */
 export class Managers {
   private readonly o: Orchestrator;
-  private attached?: { sandbox: string; sessionId: string; channel: AgentChannel; transcript: Follower };
+  private readonly attached = new Map<string, { sandbox: string; sessionId: string; channel: AgentChannel; transcript: Follower }>();
   private errors = 0;
 
   constructor(o: Orchestrator) {
@@ -39,47 +46,84 @@ export class Managers {
       this.o.log(`manager: ${message} (${this.errors}/${ERROR_LIMIT})`);
       if (this.errors >= ERROR_LIMIT && !this.o.state.pipeline.paused) {
         this.errors = 0;
-        this.o.record({ type: 'PIPELINE_PAUSED', payload: { reason: `the Manager's sandbox keeps failing: ${clip(message, 300)}` } });
+        this.o.record({ type: 'PIPELINE_PAUSED', payload: { reason: `a Manager's sandbox keeps failing: ${clip(message, 300)}` } });
       }
     }
   }
 
-  /** Stops following the Manager's files; the Manager itself keeps running. */
+  /** Stops following the Managers' files; the Managers themselves keep running. */
   detach(): void {
-    this.attached?.transcript.stop();
-    this.attached?.channel.stop();
-    this.attached = undefined;
+    for (const key of [...this.attached.keys()]) this.detachOne(key);
+  }
+
+  private detachOne(key: string): void {
+    const attached = this.attached.get(key);
+    attached?.transcript.stop();
+    attached?.channel.stop();
+    this.attached.delete(key);
   }
 
   private async syncOnce(): Promise<void> {
     const o = this.o;
     for (const manager of Object.values(o.state.managers)) {
-      if (manager.status !== 'stopped' && this.done(manager.module)) await this.stop(manager, 'every plan of its module is complete');
+      if (manager.status !== 'stopped' && this.done(manager)) await this.stop(manager, manager.plan ? 'its plan is complete' : 'every plan of its module is complete');
     }
-    const module = o.currentModule();
-    if (!module) return;
-    const manager = o.state.managers[module];
-    if (!manager || manager.status === 'stopped') return this.start(module);
-    if (manager.status === 'starting') return this.start(module, manager);
-    if ((await o.driver.status(manager.sandbox)) === 'missing') return this.start(module);
-    if (manager.status === 'running' && (await this.alive(manager))) {
-      this.attach(manager);
-      return this.deliver(manager);
+    for (const scope of this.wanted()) {
+      const key = managerKey(scope);
+      const manager = o.state.managers[key];
+      if (!manager || manager.status === 'stopped') {
+        await this.start(scope);
+      } else if (manager.status === 'starting') {
+        await this.start(scope, manager);
+      } else if ((await o.driver.status(manager.sandbox)) === 'missing') {
+        await this.start(scope);
+      } else if (manager.status === 'running' && (await this.alive(manager))) {
+        this.attach(manager);
+        await this.deliver(manager);
+      } else {
+        await this.relaunch(o.state.managers[key]!);
+      }
     }
-    return this.relaunch(o.state.managers[module]!);
+  }
+
+  /**
+   * Who should be running: in Manual, one Manager for the module being built, as in v2;
+   * in Swarm, one per plan in flight (v3 §6.4). A Manager started under the other mode
+   * keeps its scope until it stops, so no item is ever delivered twice: a module's
+   * Manager serves every plan of its module, and a plan's Manager its plan.
+   */
+  private wanted(): ManagerScope[] {
+    const o = this.o;
+    const alive = (key: string) => o.state.managers[key] !== undefined && o.state.managers[key]!.status !== 'stopped';
+    const scopes = new Map<string, ManagerScope>();
+    const inFlight = Object.values(o.state.plans).filter((p) => p.status !== 'completed');
+    if (o.state.mode === 'swarm') {
+      for (const plan of inFlight) {
+        const scope: ManagerScope = alive(plan.module) ? { module: plan.module } : { module: plan.module, plan: plan.plan };
+        scopes.set(managerKey(scope), scope);
+      }
+    } else {
+      const module = o.currentModule();
+      if (module) {
+        const ofPlans = inFlight.filter((p) => p.module === module && alive(managerKey(p))).map((p): ManagerScope => ({ module, plan: p.plan }));
+        for (const scope of ofPlans.length > 0 ? ofPlans : [{ module }]) scopes.set(managerKey(scope), scope);
+      }
+    }
+    return [...scopes.values()];
   }
 
   /** A fresh sandbox and conversation. `existing` resumes a start that was cut short. */
-  private async start(module: string, existing?: ManagerState): Promise<void> {
+  private async start(scope: ManagerScope, existing?: ManagerState): Promise<void> {
     const o = this.o;
+    const key = managerKey(scope);
     if (!existing) {
-      const sandbox = sandboxName('mgr', o.design.config.project.name, module);
-      o.record({ type: 'MANAGER_STARTING', payload: { module, sandbox, sessionId: randomUUID() } });
+      const sandbox = sandboxName('mgr', o.design.config.project.name, key);
+      o.record({ type: 'MANAGER_STARTING', payload: { ...identity(scope), sandbox, sessionId: randomUUID() } });
     }
-    const manager = o.state.managers[module]!;
-    this.detach();
+    const manager = o.state.managers[key]!;
+    this.detachOne(key);
     const p = this.paths(manager);
-    const dir = this.localDir(module);
+    const dir = this.localDir(manager);
     await o.driver.remove(manager.sandbox);
     await o.driver.create({
       name: manager.sandbox,
@@ -88,7 +132,7 @@ export class Managers {
       command: ['sleep', 'infinity'],
     });
 
-    const branch = this.branch(module);
+    const branch = this.branch(manager);
     await o.repo.bundle(`refs/heads/${branch}`, join(dir, 'clone.bundle'));
     copyFileSync(join(o.options.packageDir, 'roles', 'manager.md'), join(dir, 'manager.md'));
     writeFileSync(join(dir, 'settings.json'), managerSettings());
@@ -109,7 +153,7 @@ export class Managers {
     if (size.code !== 0) throw new Error(`could not prepare the Manager's launch: ${size.stderr.trim()}`);
     const result = await o.exec(manager.sandbox, [o.agent.launchManager(run), waitForFile(run.pidFile)].join('\n'));
     if (result.code !== 0) throw new Error(`could not start the Manager: ${(result.stderr || result.stdout).trim()}`);
-    o.record({ type: 'MANAGER_LAUNCHED', payload: { module: manager.module, launch: n, outputBytes: Number(size.stdout.trim()) || 0 } });
+    o.record({ type: 'MANAGER_LAUNCHED', payload: { ...identity(manager), launch: n, outputBytes: Number(size.stdout.trim()) || 0 } });
   }
 
   /** Whether the current launch still runs. If not, its exit is recorded. */
@@ -125,7 +169,7 @@ export class Managers {
     o.record({
       type: 'MANAGER_EXITED',
       payload: {
-        module: manager.module,
+        ...identity(manager),
         launch: manager.launch,
         code: status === 'gone' ? null : Number(status),
         stderr: stderr.join('\n').trim(),
@@ -146,7 +190,7 @@ export class Managers {
     if (manager.lastExit && (!manager.lastExit.started || recent >= 3)) {
       const why = manager.lastExit.started ? `stopped ${recent} times within an hour` : 'did not start';
       const detail = clip(manager.lastExit.stderr.replace(/\s+/g, ' ') || 'it wrote nothing', 400);
-      o.record({ type: 'PIPELINE_PAUSED', payload: { reason: `environment: the Manager ${why}: ${detail}` } });
+      o.record({ type: 'PIPELINE_PAUSED', payload: { reason: `environment: the Manager of ${managerKey(manager)} ${why}: ${detail}` } });
       return;
     }
     await this.launch(manager, manager.launch + 1);
@@ -154,16 +198,18 @@ export class Managers {
   }
 
   private attach(manager: ManagerState): void {
-    if (this.attached?.sandbox === manager.sandbox && this.attached.sessionId === manager.sessionId) return;
-    this.detach();
+    const key = managerKey(manager);
+    const current = this.attached.get(key);
+    if (current?.sandbox === manager.sandbox && current.sessionId === manager.sessionId) return;
+    this.detachOne(key);
     const o = this.o;
-    const agent = `manager:${manager.module}`;
+    const agent = `manager:${key}`;
     const transcript = o.driver.follow(manager.sandbox, this.paths(manager).output, 1, (line) => o.events.emit('transcript', { agent, line }));
     const channel = o.channel(
-      { role: 'manager', sandbox: manager.sandbox, module: manager.module },
-      join(this.localDir(manager.module), `replied-${manager.sessionId}.txt`),
+      { role: 'manager', sandbox: manager.sandbox, ...identity(manager) },
+      join(this.localDir(manager), `replied-${manager.sessionId}.txt`),
     );
-    this.attached = { sandbox: manager.sandbox, sessionId: manager.sessionId, channel, transcript };
+    this.attached.set(key, { sandbox: manager.sandbox, sessionId: manager.sessionId, channel, transcript });
   }
 
   /**
@@ -175,21 +221,21 @@ export class Managers {
     const o = this.o;
     for (const mail of [...manager.mail]) {
       await this.send(manager, mailText(o, manager, mail));
-      o.record({ type: 'MANAGER_ITEM_SENT', payload: { module: manager.module, key: mail.key, launch: manager.launch, reminder: false } });
+      o.record({ type: 'MANAGER_ITEM_SENT', payload: { ...identity(manager), key: mail.key, launch: manager.launch, reminder: false } });
     }
     const turnMs = o.design.config.brakes.managerTurnMinutes * 60_000;
     const waitingForOwner = Object.values(o.state.ownerRequests).some((r) => r.module === manager.module && r.answer === undefined);
-    for (const item of pendingItems(o, manager.module)) {
+    for (const item of pendingItems(o, manager)) {
       const sent = manager.sent[item.key];
       if (!sent || sent.launch !== manager.launch) {
         if (item.show) await this.show(manager, item);
         await this.send(manager, await item.text());
-        o.record({ type: 'MANAGER_ITEM_SENT', payload: { module: manager.module, key: item.key, launch: manager.launch, reminder: false } });
+        o.record({ type: 'MANAGER_ITEM_SENT', payload: { ...identity(manager), key: item.key, launch: manager.launch, reminder: false } });
       } else if (waitingForOwner) {
         continue;
       } else if (!sent.reminded && o.now() - Date.parse(sent.at) >= turnMs) {
         await this.send(manager, `[harness] REMINDER: ${item.title} is still waiting for you. ${item.ask}`);
-        o.record({ type: 'MANAGER_ITEM_SENT', payload: { module: manager.module, key: item.key, launch: manager.launch, reminder: true } });
+        o.record({ type: 'MANAGER_ITEM_SENT', payload: { ...identity(manager), key: item.key, launch: manager.launch, reminder: true } });
       } else if (sent.reminded && o.now() - Date.parse(sent.reminded) >= turnMs && !o.state.pipeline.paused) {
         const minutes = o.design.config.brakes.managerTurnMinutes * 2;
         o.record({ type: 'PIPELINE_PAUSED', payload: { reason: `the Manager has not acted on ${item.title} for ${minutes} minutes` } });
@@ -209,7 +255,7 @@ export class Managers {
     const { attempt, branch } = item.show!;
     const attemptRef = attempt ? attemptRefName(attempt) : undefined;
     const head = attemptRef ? await o.repo.revParse(attemptRef) : undefined;
-    const local = join(this.localDir(manager.module), 'review.bundle');
+    const local = join(this.localDir(manager), 'review.bundle');
     await o.repo.bundle([`refs/heads/${branch}`, ...(head && attemptRef ? [attemptRef] : [])], local);
     const p = this.paths(manager);
     await o.driver.upload(manager.sandbox, local, p.harness);
@@ -223,25 +269,29 @@ export class Managers {
 
   private async stop(manager: ManagerState, reason: string): Promise<void> {
     const o = this.o;
-    if (this.attached?.sandbox === manager.sandbox) this.detach();
-    const backup = join(this.localDir(manager.module), `transcript-${manager.sessionId}.jsonl`);
+    this.detachOne(managerKey(manager));
+    const backup = join(this.localDir(manager), `transcript-${manager.sessionId}.jsonl`);
     await o.driver.download(manager.sandbox, this.paths(manager).output, backup).catch(() => {});
     await o.driver.remove(manager.sandbox);
-    o.record({ type: 'MANAGER_STOPPED', payload: { module: manager.module, reason } });
+    o.record({ type: 'MANAGER_STOPPED', payload: { ...identity(manager), reason } });
   }
 
-  private done(module: string): boolean {
-    const design = this.o.design.modules.find((m) => m.id === module);
-    return !design || design.plans.every((p) => this.o.state.plans[`${module}/${p.id}`]?.status === 'completed');
+  /** A plan's Manager is done with its plan complete, or gone from the design; a module's, with every plan of the module complete. */
+  private done(manager: ManagerState): boolean {
+    const design = this.o.design.modules.find((m) => m.id === manager.module);
+    if (manager.plan) return !design?.plans.some((p) => p.id === manager.plan) || this.o.state.plans[managerKey(manager)]?.status === 'completed';
+    return !design || design.plans.every((p) => this.o.state.plans[`${manager.module}/${p.id}`]?.status === 'completed');
   }
 
-  /** The branch the Manager's clone starts from: its module's plan under way, or main. */
-  private branch(module: string): string {
-    return Object.values(this.o.state.plans).find((p) => p.module === module && p.status !== 'completed')?.branch ?? 'main';
+  /** The branch the Manager's clone starts from: its plan's, or its module's plan under way, or main. */
+  private branch(manager: ManagerState): string {
+    if (manager.plan) return this.o.state.plans[managerKey(manager)]?.branch ?? 'main';
+    return Object.values(this.o.state.plans).find((p) => p.module === manager.module && p.status !== 'completed')?.branch ?? 'main';
   }
 
-  private localDir(module: string): string {
-    const dir = join(this.o.moduleDir(module), 'manager');
+  /** The daemon's files for a Manager, where the dashboard also finds its transcripts after it stops. */
+  private localDir(manager: ManagerState): string {
+    const dir = manager.plan ? join(this.o.planDir({ module: manager.module, plan: manager.plan }), 'manager') : join(this.o.moduleDir(manager.module), 'manager');
     mkdirSync(dir, { recursive: true });
     return dir;
   }
@@ -272,3 +322,6 @@ export class Managers {
     };
   }
 }
+
+/** A Manager's scope, as events carry it. */
+const identity = (scope: ManagerScope): { module: string; plan?: string } => ({ module: scope.module, ...(scope.plan ? { plan: scope.plan } : {}) });

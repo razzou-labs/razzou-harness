@@ -217,9 +217,49 @@ export interface VerifyInput {
   title: string;
 }
 
+/** What `verify` reads from the base branch's `harness/config.json`. */
+interface BaseConfig {
+  project?: { bot?: string };
+  terraform?: { dir?: string } | null;
+}
+
+/**
+ * A plan's kind, from its features' (v3 §3.1): CODE with no `infra` feature, INFRA with
+ * only `infra` features, MIXED otherwise. A feature without a kind is an `app` one. The
+ * same rule as the daemon's `planKind`, kept here so this file stands alone.
+ */
+export function planKindOf(features: Array<{ kind?: string }>): 'CODE' | 'INFRA' | 'MIXED' {
+  const infra = features.filter((f) => f.kind === 'infra').length;
+  return infra === 0 ? 'CODE' : infra === features.length ? 'INFRA' : 'MIXED';
+}
+
+/**
+ * The plan-kind rules of a Plan PR (v3 §3.1), from the plan file on the base branch: a
+ * tag in the title must be the plan's kind, and a CODE plan stays off the Terraform
+ * folder, so infrastructure can't reach main as code. The tag grants nothing, and a
+ * title without one, from an older daemon, passes.
+ */
+async function planKindProblems(input: VerifyInput, config: BaseConfig | undefined): Promise<string[]> {
+  const [, module, plan] = /^plan\/([^/]+)\/([^/]+)$/.exec(input.branch) ?? [];
+  if (!module || !plan) return [];
+  const file = `harness/modules/${module}/plans/${plan}.json`;
+  const definition = parseJson(await input.base.read(file)) as { features?: unknown } | undefined;
+  if (!definition || !Array.isArray(definition.features)) return [`${file} is missing or unreadable on the base branch, so the plan's kind is unknown`];
+  const kind = planKindOf(definition.features as Array<{ kind?: string }>);
+  const problems: string[] = [];
+  const tag = /(?:^|\s)-(CODE|INFRA|MIXED)-(?:\s|$)/.exec(input.title)?.[1];
+  if (tag && tag !== kind) problems.push(`the title says -${tag}-, but ${module}/${plan} is a ${kind} plan on the base branch: its features' kinds decide`);
+  if (kind === 'CODE' && config?.terraform && typeof config.terraform === 'object') {
+    const dir = (config.terraform.dir || 'iac').replace(/\/+$/, '');
+    const touched = input.changedPaths.filter((p) => p === dir || p.startsWith(`${dir}/`));
+    if (touched.length > 0) problems.push(`a CODE plan may not change ${dir}/: infrastructure gets plans of its own (v3 §3.1); changed: ${touched.join(', ')}`);
+  }
+  return problems;
+}
+
 /** The `verify` job: the problems that make a PR fail, or none. */
 export async function verify(input: VerifyInput): Promise<string[]> {
-  const config = parseJson(await input.base.read('harness/config.json')) as { project?: { bot?: string } } | undefined;
+  const config = parseJson(await input.base.read('harness/config.json')) as BaseConfig | undefined;
   const kind = prKind(input.author, input.branch, config?.project?.bot);
   const problems: string[] = [];
   if (!input.title.startsWith(`${kind}: `)) problems.push(`this is a ${kind} PR (from ${input.author}, branch ${input.branch}), so its title must start with "${kind}: "`);
@@ -229,6 +269,7 @@ export async function verify(input: VerifyInput): Promise<string[]> {
     }
     for (const problem of await lockfileProblems(input.head)) problems.push(`package-lock.json: ${problem}`);
   }
+  if (kind === 'Plan') problems.push(...(await planKindProblems(input, config)));
   if (kind === 'Arch') {
     const rules = await protectionRules(input.head);
     for (const path of input.changedPaths.filter((p) => !archMayChange(p, rules))) {

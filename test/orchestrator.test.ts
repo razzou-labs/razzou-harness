@@ -1,19 +1,21 @@
 import { strict as assert } from 'node:assert';
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { request } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
 import { after, describe, it } from 'node:test';
 import { WebSocket } from 'ws';
+import type { SubscriptionUsage } from '../src/anthropic/usage.ts';
 import { Orchestrator } from '../src/daemon/orchestrator.ts';
 import { handleRequest } from '../src/daemon/requests.ts';
-import { startDashboard } from '../src/dashboard/server.ts';
+import { startDashboard, type DashboardState } from '../src/dashboard/server.ts';
 import { Terminals, type Pty } from '../src/dashboard/terminals.ts';
 import { recover } from '../src/setup/recover.ts';
+import { activeAttempts } from '../src/state/state.ts';
 import { runOk, sleep } from '../src/util.ts';
 import { FAKE_BOT, FakeForge } from './helpers/fake-forge.ts';
 import { LocalDriver } from './helpers/local-driver.ts';
-import { stubAgent, type StubBehavior } from './helpers/stub-agent.ts';
+import { stubAgent, type ReviewBehavior, type StubBehavior } from './helpers/stub-agent.ts';
 import type { ArchitectBehavior } from './helpers/stub-architect.ts';
 import type { ManagerBehavior } from './helpers/stub-manager.ts';
 import { createToyRepo, SOLUTIONS, tempDir, toyDesign } from './helpers/toy-repo.ts';
@@ -27,6 +29,9 @@ after(async () => {
 
 type Decide = (feature: string, attempt: number) => StubBehavior;
 
+/** The daemon's last log lines per orchestrator: a step that fails silently shows up when a wait times out. */
+const daemonLogs = new WeakMap<Orchestrator, string[]>();
+
 interface SetupOptions {
   config?: Record<string, unknown>;
   manager?: ManagerBehavior;
@@ -34,9 +39,15 @@ interface SetupOptions {
   now?: () => number;
   /** Plays the project on a fake GitHub, with pull requests and CI. */
   github?: boolean;
+  /** Replaces the subscription's usage endpoint (v3 §4.3). */
+  usage?: () => Promise<SubscriptionUsage | undefined>;
+  /** What the stub reviewers answer (v3 §5); every review passes by default. */
+  review?: ReviewBehavior;
   /** Starts with no design: an Architect writes it. */
   design?: boolean;
   architect?: ArchitectBehavior;
+  /** Whether the usage probe's token is stored (v4 §6); never the machine's real file. */
+  tokenStored?: () => boolean;
 }
 
 async function setup(decide: Decide, options: SetupOptions = {}) {
@@ -48,17 +59,27 @@ async function setup(decide: Decide, options: SetupOptions = {}) {
   const harnessDir = join(projectDir, '.harness');
   const driver = new LocalDriver(tempDir('sandboxes'));
   const make = () => {
+    const logs: string[] = [];
     const made = new Orchestrator({
       projectDir,
       harnessDir,
       driver,
       packageDir,
       version: 'test',
-      agent: stubAgent(decide, options.manager, options.architect),
+      agent: stubAgent(decide, options.manager, options.architect, options.review),
       webRead: async (url) => ({ ok: true, text: `the page at ${url}`, bytes: 20 }),
+      // The log is kept for the timeout message; HARNESS_TEST_LOG=1 prints it as it comes.
+      log: (message: string) => {
+        logs.push(message);
+        if (logs.length > 30) logs.shift();
+        if (process.env.HARNESS_TEST_LOG) console.error(`[daemon] ${message}`);
+      },
+      ...(options.usage ? { usage: options.usage } : {}),
+      tokenStored: options.tokenStored ?? (() => false),
       ...(options.now ? { now: options.now } : {}),
       ...(fake ? { forge: () => fake } : {}),
     });
+    daemonLogs.set(made, logs);
     cleanup.push(() => made.stop(0));
     return made;
   };
@@ -73,7 +94,8 @@ async function until(o: Orchestrator, done: () => boolean, timeoutMs = 30_000): 
   const deadline = Date.now() + timeoutMs;
   while (!done()) {
     if (Date.now() > deadline) {
-      throw new Error(`timed out; last events: ${o.store.readAll().slice(-8).map((e) => e.type).join(', ')}`);
+      const log = (daemonLogs.get(o) ?? []).slice(-6).map((l) => `\n  ${l.slice(0, 300)}`).join('');
+      throw new Error(`timed out; last events: ${o.store.readAll().slice(-8).map((e) => e.type).join(', ')}; daemon log:${log || ' (empty)'}`);
     }
     await o.tick();
     await sleep(100);
@@ -85,6 +107,24 @@ const feature = (o: Orchestrator, id: string) => o.state.features[`demo/P1/${id}
 const completed = (o: Orchestrator) => () => o.state.plans['demo/P1']?.status === 'completed';
 
 describe('orchestrator', () => {
+  it('takes the owner hours left for it by harness budget when it starts, once', async () => {
+    const pending = async (dir: string) => {
+      mkdirSync(join(dir, '.harness'), { recursive: true });
+      writeFileSync(join(dir, '.harness', 'setup.json'), JSON.stringify({ ownerHours: 12 }));
+    };
+    const { orchestrator: o, harnessDir, make } = await setup((f) => solved(f), { prepare: pending });
+    assert.equal(o.state.budgets.ownerHours, 12);
+    assert.equal(existsSync(join(harnessDir, 'setup.json')), false);
+    // Set again by hand later, the file left behind doesn't override the owner.
+    o.setBudgets({ ownerHours: 20 });
+    writeFileSync(join(harnessDir, 'setup.json'), JSON.stringify({ ownerHours: 5 }));
+    await o.stop(0);
+    const again = make();
+    await again.start();
+    assert.equal(again.state.budgets.ownerHours, 20);
+    assert.equal(existsSync(join(harnessDir, 'setup.json')), false);
+  });
+
   it('lands each accepted feature as one commit with its progress line', async () => {
     const { orchestrator: o } = await setup((f) => solved(f));
     await until(o, completed(o));
@@ -242,7 +282,7 @@ describe('manager', () => {
   it('pauses the pipeline when it never starts', async () => {
     const { orchestrator: o } = await setup((f) => solved(f), { manager: { failStart: true } });
     await until(o, () => o.state.pipeline.paused !== undefined);
-    assert.match(o.state.pipeline.paused!.reason, /^environment: the Manager did not start: Error: unknown option --stub-bad-flag/);
+    assert.match(o.state.pipeline.paused!.reason, /^environment: the Manager of demo did not start: Error: unknown option --stub-bad-flag/);
   });
 
   it('gets a reminder after a turn without a decision, then the pipeline pauses', async () => {
@@ -250,12 +290,13 @@ describe('manager', () => {
     const { orchestrator: o } = await setup((f) => solved(f), { manager: { ignore: ['REVIEW', 'REMINDER'] }, now: () => Date.now() + skew });
     await until(o, () => o.state.managers.demo?.sent['review:demo/P1/F01#1'] !== undefined);
 
-    skew = 21 * 60_000;
+    // The default turn is 90 minutes (v3 §4.4): a reminder after one, a pause after two.
+    skew = 91 * 60_000;
     await until(o, () => o.state.managers.demo?.sent['review:demo/P1/F01#1']?.reminded !== undefined);
     assert.equal(o.state.pipeline.paused, undefined);
-    skew = 42 * 60_000;
+    skew = 182 * 60_000;
     await until(o, () => o.state.pipeline.paused !== undefined);
-    assert.equal(o.state.pipeline.paused!.reason, 'the Manager has not acted on the review of demo/P1/F01 attempt 1 for 40 minutes');
+    assert.equal(o.state.pipeline.paused!.reason, 'the Manager has not acted on the review of demo/P1/F01 attempt 1 for 180 minutes');
   });
 
   it('refuses tool calls that break the rules, and says why', async () => {
@@ -284,6 +325,206 @@ describe('manager', () => {
   });
 });
 
+describe('parallel features', () => {
+  /** The toy plan with F02 independent of F01, and with a third feature when asked. */
+  const independent = (third = false) => async (dir: string) => {
+    const file = join(dir, 'harness/modules/demo/plans/P1.json');
+    const design = JSON.parse(readFileSync(file, 'utf8')) as { features: Array<Record<string, unknown>> };
+    for (const feature of design.features) delete feature.dependsOn;
+    if (third) {
+      design.features.push({
+        id: 'F03', title: 'Three', description: 'src/three.txt exists.', expected: 'The file exists.',
+        checks: [{ id: 'F03-file', run: 'test -f src/three.txt', phase: 'pre-merge', timeoutSec: 30 }],
+      });
+    }
+    writeFileSync(file, JSON.stringify(design, null, 2));
+    await runOk('git', ['-C', dir, '-c', 'user.name=o', '-c', 'user.email=o@test.invalid', 'commit', '--quiet', '-am', 'independent features']);
+  };
+  const files = (feature: string): Record<string, string> => (feature === 'F03' ? { 'src/three.txt': '3\n' } : SOLUTIONS[feature as keyof typeof SOLUTIONS]);
+
+  /** Ticks until `done`, and reports the most attempts seen under way at once. */
+  async function untilMax(o: Orchestrator, done: () => boolean): Promise<number> {
+    let max = 0;
+    const deadline = Date.now() + 60_000;
+    while (!done()) {
+      if (Date.now() > deadline) throw new Error(`timed out; last events: ${o.store.readAll().slice(-8).map((e) => e.type).join(', ')}`);
+      await o.tick();
+      max = Math.max(max, activeAttempts(o.state).length);
+      await sleep(100);
+    }
+    return max;
+  }
+
+  it('in Swarm, independent features build at once, and the later one lands on the new head once its checks ran again', async () => {
+    const { orchestrator: o } = await setup((f) => ({ files: files(f), sleepSec: f === 'F01' ? 3 : 0 }), { prepare: independent() });
+    o.setMode('swarm');
+    const max = await untilMax(o, completed(o));
+    assert.equal(max, 2);
+
+    const f01 = feature(o, 'F01')!;
+    const f02 = feature(o, 'F02')!;
+    assert.equal(f02.status, 'accepted');
+    assert.equal(f01.status, 'accepted');
+    // F02 landed first; F01 was merged with the new head, checked again, and landed as one commit on it.
+    assert.ok(f01.attempts[0]!.rebased, 'F01 was rebased');
+    assert.equal(f01.attempts[0]!.rebased!.onto, f02.commit);
+    assert.deepEqual(o.store.readAll().filter((e) => e.type === 'ATTEMPT_REBASED').map((e) => e.ref!.feature), ['F01']);
+    const head = o.state.plans['demo/P1']!.head;
+    assert.equal((await o.repo.commitInfo(head)).parents.length, 1);
+    assert.equal(head, f01.commit);
+    const progress = (await o.repo.show(head, 'progress.txt'))!;
+    assert.match(progress, /feature\.accepted demo\/P1\/F02 .*\n.*feature\.accepted demo\/P1\/F01 /);
+    assert.equal(await o.repo.show(head, 'src/greet.sh'), SOLUTIONS.F01['src/greet.sh']);
+    assert.equal(await o.repo.show(head, 'src/add.sh'), SOLUTIONS.F02['src/add.sh']);
+  });
+
+  it('in Swarm, an attempt that conflicts with work landed meanwhile is interrupted, and the next starts from the new head', async () => {
+    const decide = (f: string): StubBehavior => (f === 'F01'
+      ? { files: { ...files('F01'), 'src/shared.txt': 'one\n' }, sleepSec: 3 }
+      : { files: { ...files('F02'), 'src/shared.txt': 'two\n' } });
+    const { orchestrator: o } = await setup(decide, { prepare: independent() });
+    o.setMode('swarm');
+    await until(o, completed(o), 60_000);
+
+    const f01 = feature(o, 'F01')!;
+    assert.equal(f01.attempts.length, 2);
+    assert.equal(f01.attempts[0]!.status, 'interrupted');
+    assert.equal(f01.attempts[0]!.counts, false);
+    assert.match(f01.attempts[0]!.reason!, /^conflicts with work landed on plan\/demo\/P1 meanwhile, in src\/shared\.txt: the next attempt starts from the new head$/);
+    assert.equal(f01.attempts[1]!.status, 'accepted');
+    assert.equal(f01.attempts[1]!.base, feature(o, 'F02')!.commit);
+    assert.equal(await o.repo.show(o.state.plans['demo/P1']!.head, 'src/shared.txt'), 'one\n');
+  });
+
+  it('in Manual, features build one at a time even without dependencies', async () => {
+    const { orchestrator: o } = await setup((f) => ({ files: files(f), sleepSec: 1 }), { prepare: independent() });
+    const max = await untilMax(o, completed(o));
+    assert.equal(max, 1);
+    assert.equal(o.store.readAll().some((e) => e.type === 'ATTEMPT_REBASED'), false);
+  });
+
+  it('in Swarm, a design change that redefines a feature under way interrupts its attempt, and the next builds the new definition', async () => {
+    const { orchestrator: o, harnessDir } = await setup((f) => ({ files: files(f), sleepSec: f === 'F01' ? 6 : 0 }), { prepare: independent() });
+    const projectDir = join(harnessDir, '..');
+    o.setMode('swarm');
+    await untilMax(o, () => activeAttempts(o.state).length === 2);
+    const first = feature(o, 'F01')!.attempts[0]!;
+
+    // The owner commits a design change on main while F01 is built: F01's definition changes, F02's doesn't.
+    const file = join(projectDir, 'harness/modules/demo/plans/P1.json');
+    const design = JSON.parse(readFileSync(file, 'utf8')) as { features: Array<Record<string, unknown>> };
+    design.features[0]!.description = 'src/greet.sh prints hello, politely.';
+    writeFileSync(file, JSON.stringify(design, null, 2));
+    await runOk('git', ['-C', projectDir, '-c', 'user.name=o', '-c', 'user.email=o@test.invalid', 'commit', '--quiet', '-am', 'redefine F01']);
+    await until(o, completed(o), 60_000);
+
+    const f01 = feature(o, 'F01')!;
+    assert.equal(f01.attempts.length, 2);
+    assert.equal(f01.attempts[0]!.status, 'interrupted');
+    assert.equal(f01.attempts[0]!.counts, false);
+    assert.equal(f01.attempts[0]!.reason, 'the design changed this feature while it was built: the next attempt builds the new definition');
+    assert.notEqual(f01.attempts[1]!.definitionHash, first.definitionHash);
+    assert.equal(f01.attempts[1]!.status, 'accepted');
+    assert.equal(feature(o, 'F02')!.attempts.length, 1);
+    assert.ok(o.store.readAll().some((e) => e.type === 'PLAN_MAIN_MERGED'));
+  });
+
+  it('in Swarm, swarm.maxDevelopers caps the attempts under way', async () => {
+    const { orchestrator: o } = await setup((f) => ({ files: files(f), sleepSec: 2 }), { prepare: independent(true), config: { swarm: { maxDevelopers: 2 } } });
+    o.setMode('swarm');
+    const max = await untilMax(o, completed(o));
+    assert.equal(max, 2);
+    assert.deepEqual(['F01', 'F02', 'F03'].map((f) => feature(o, f)!.status), ['accepted', 'accepted', 'accepted']);
+  });
+});
+
+describe('parallel plans', () => {
+  /** The toy design split in two plans, P1 greets and P2 adds, and a third when asked; `p2` sets P2's dependencies. */
+  const split = (p2: { dependsOn?: string[]; featureDependsOn?: string[] } = {}, third = false) => async (dir: string) => {
+    const plans = join(dir, 'harness/modules/demo/plans');
+    const file = join(plans, 'P1.json');
+    const design = JSON.parse(readFileSync(file, 'utf8')) as { features: Array<Record<string, unknown>>; [key: string]: unknown };
+    const [f01, f02] = design.features as [Record<string, unknown>, Record<string, unknown>];
+    delete f02.dependsOn;
+    if (p2.featureDependsOn) f02.dependsOn = p2.featureDependsOn;
+    writeFileSync(file, JSON.stringify({ ...design, features: [f01] }, null, 2));
+    writeFileSync(join(plans, 'P2.json'), JSON.stringify({ ...design, id: 'P2', title: 'Adding', ...(p2.dependsOn ? { dependsOn: p2.dependsOn } : {}), features: [f02] }, null, 2));
+    if (third) {
+      const f03 = { id: 'F03', title: 'Three', description: 'src/three.txt exists.', expected: 'The file exists.', checks: [{ id: 'F03-file', run: 'test -f src/three.txt', phase: 'pre-merge', timeoutSec: 30 }] };
+      writeFileSync(join(plans, 'P3.json'), JSON.stringify({ ...design, id: 'P3', title: 'Three', dependsOn: [], features: [f03] }, null, 2));
+    }
+    await runOk('git', ['-C', dir, 'add', '-A']);
+    await runOk('git', ['-C', dir, '-c', 'user.name=o', '-c', 'user.email=o@test.invalid', 'commit', '--quiet', '-m', 'plans']);
+  };
+  const files = (feature: string): Record<string, string> => (feature === 'F03' ? { 'src/three.txt': '3\n' } : SOLUTIONS[feature as keyof typeof SOLUTIONS]);
+  const allComplete = (o: Orchestrator, plans: string[]) => () => plans.every((p) => o.state.plans[`demo/${p}`]?.status === 'completed');
+
+  /** Ticks until `done`, and reports the most plans seen in flight at once. */
+  async function untilMaxPlans(o: Orchestrator, done: () => boolean, timeoutMs = 60_000): Promise<number> {
+    let max = 0;
+    const deadline = Date.now() + timeoutMs;
+    while (!done()) {
+      if (Date.now() > deadline) throw new Error(`timed out; last events: ${o.store.readAll().slice(-8).map((e) => e.type).join(', ')}`);
+      await o.tick();
+      max = Math.max(max, Object.values(o.state.plans).filter((p) => p.status !== 'completed').length);
+      await sleep(100);
+    }
+    return max;
+  }
+  const index = (o: Orchestrator, type: string, plan: string) => o.store.readAll().findIndex((e) => e.type === type && e.ref?.plan === plan);
+
+  it('in Swarm, independent plans build at once, each with its own Manager', async () => {
+    const { orchestrator: o } = await setup((f) => ({ files: files(f), sleepSec: f === 'F01' ? 3 : 0 }), { prepare: split({ dependsOn: [] }) });
+    o.setMode('swarm');
+    const max = await untilMaxPlans(o, allComplete(o, ['P1', 'P2']));
+    assert.equal(max, 2);
+    assert.ok(index(o, 'PLAN_STARTED', 'P2') < index(o, 'PLAN_COMPLETED', 'P1'), 'P2 started before P1 was complete');
+    assert.deepEqual(Object.values(o.state.managers).map((m) => [m.module, m.plan, m.status]).sort(), [['demo', 'P1', 'stopped'], ['demo', 'P2', 'stopped']]);
+    assert.deepEqual(Object.keys(o.state.managers).sort(), ['demo/P1', 'demo/P2']);
+  });
+
+  it('in Swarm, a plan waits for the plan it depends on to merge, and starts from the main that holds it', async () => {
+    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true, prepare: split(), config: { swarm: { requiredStatuses: [] } } });
+    o.setMode('swarm');
+    const max = await untilMaxPlans(o, allComplete(o, ['P1', 'P2']), 90_000);
+    assert.equal(max, 1);
+    const merged = index(o, 'PR_MERGED', 'P1');
+    assert.ok(merged !== -1 && merged < index(o, 'PLAN_STARTED', 'P2'), 'P2 started after P1 merged');
+    assert.equal(o.state.plans['demo/P2']!.base, o.state.plans['demo/P1']!.mergeCommit);
+    assert.equal(fake.prs.length, 2);
+    assert.equal(o.state.plans['demo/P2']!.mergedBy, 'daemon');
+  });
+
+  it("in Swarm, a feature that depends on an earlier plan's feature waits for that plan to merge, and builds on it", async () => {
+    const { orchestrator: o } = await setup((f) => ({ files: files(f), sleepSec: f === 'F01' ? 2 : 0 }), {
+      github: true, prepare: split({ dependsOn: [], featureDependsOn: ['P1/F01'] }), config: { swarm: { requiredStatuses: [] } },
+    });
+    o.setMode('swarm');
+    const max = await untilMaxPlans(o, allComplete(o, ['P1', 'P2']), 90_000);
+    assert.equal(max, 2, 'P2 started alongside P1');
+    const merged = index(o, 'PR_MERGED', 'P1');
+    assert.ok(merged !== -1 && merged < index(o, 'ATTEMPT_STARTING', 'P2'), 'F02 started after P1 merged');
+    assert.ok(merged < index(o, 'PLAN_MAIN_MERGED', 'P2'), 'main was merged into P2 after the merge of P1');
+    const f02 = o.state.features['demo/P2/F02']!;
+    assert.equal(await o.repo.show(f02.attempts[0]!.base, 'src/greet.sh'), SOLUTIONS.F01['src/greet.sh']);
+  });
+
+  it('in Swarm, swarm.maxPlans caps the plans in flight', async () => {
+    const { orchestrator: o } = await setup((f) => ({ files: files(f), sleepSec: 1 }), { prepare: split({ dependsOn: [] }, true), config: { swarm: { maxPlans: 2 } } });
+    o.setMode('swarm');
+    const max = await untilMaxPlans(o, allComplete(o, ['P1', 'P2', 'P3']), 90_000);
+    assert.equal(max, 2);
+  });
+
+  it('in Manual, independent plans still build one after the other, with one Manager for the module', async () => {
+    const { orchestrator: o } = await setup((f) => ({ files: files(f) }), { prepare: split({ dependsOn: [] }) });
+    const max = await untilMaxPlans(o, allComplete(o, ['P1', 'P2']));
+    assert.equal(max, 1);
+    assert.deepEqual(Object.keys(o.state.managers), ['demo']);
+    assert.equal(o.state.managers.demo!.status, 'stopped');
+  });
+});
+
 describe('pull requests', () => {
   const plan = (o: Orchestrator) => o.state.plans['demo/P1'];
   const ready = (o: Orchestrator) => () => plan(o)?.status === 'ready_to_merge';
@@ -295,7 +536,7 @@ describe('pull requests', () => {
 
     assert.equal(fake.prs.length, 1);
     const pr = fake.prs[0]!;
-    assert.equal(pr.title, 'Plan: demo/P1 — Greeting and adding');
+    assert.equal(pr.title, 'Plan: demo/P1 -CODE- Greeting and adding');
     assert.equal(pr.branch, 'plan/demo/P1');
     assert.match(pr.body, /^Stub summary of the plan\.\n\n## Features\n\n- \*\*F01\*\* Greet: attempt 1, commit [0-9a-f]{8}\n- \*\*F02\*\* Add/);
     const pushed = (await runOk('git', ['--git-dir', fake.remote, 'rev-parse', 'refs/heads/plan/demo/P1'])).trim();
@@ -307,6 +548,264 @@ describe('pull requests', () => {
     await until(o, completed(o));
     assert.equal(plan(o)!.mergeCommit, merged);
     assert.equal(o.state.managers.demo!.status, 'stopped');
+  });
+
+  it('in Swarm, merges a CODE plan itself once CI and the required statuses pass', async () => {
+    let skew = 0;
+    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true, now: () => Date.now() + skew });
+    assert.equal(o.setMode('swarm'), true);
+    assert.equal(o.setMode('swarm'), false);
+    fake.statuses = () => ({ 'harness/security': 'success', 'harness/cost': 'success' });
+    await until(o, completed(o));
+
+    assert.equal(fake.prs[0]!.title, 'Plan: demo/P1 -CODE- Greeting and adding');
+    assert.equal(plan(o)!.mergedBy, 'daemon');
+    assert.equal(plan(o)!.leftToOwner, undefined);
+    const main = (await runOk('git', ['--git-dir', fake.remote, 'rev-parse', 'refs/heads/main'])).trim();
+    assert.equal(plan(o)!.mergeCommit, main);
+    const merged = o.store.readAll().find((e) => e.type === 'PR_MERGED_BY_DAEMON');
+    assert.ok(merged && merged.type === 'PR_MERGED_BY_DAEMON' && merged.payload.commit === main);
+    // Switched before the plan started, so its Manager is the plan's (v3 §6.4).
+    assert.equal(o.state.managers['demo/P1']!.status, 'stopped');
+  });
+
+  it('in Swarm, leaves the PR to the owner while a required status is missing, and merges once it passes', async () => {
+    // A status no reviewer of the harness posts, such as an external scanner's: the daemon can only wait for it.
+    let skew = 0;
+    const { orchestrator: o, fake } = await setup((f) => solved(f), {
+      github: true, config: { swarm: { requiredStatuses: ['harness/security', 'external/scan'] } }, now: () => Date.now() + skew,
+    });
+    o.setMode('swarm');
+    await until(o, () => plan(o)?.leftToOwner !== undefined);
+    assert.equal(plan(o)!.status, 'ready_to_merge');
+    assert.match(plan(o)!.leftToOwner!.reason, /^waiting for external\/scan to pass on [0-9a-f]{8}/);
+    assert.deepEqual(plan(o)!.reviews!.map((r) => [r.role, r.verdict]), [['security', 'pass']]);
+    assert.equal(fake.prs[0]!.state, 'open');
+
+    fake.statuses = () => ({ 'external/scan': 'success' });
+    skew += 61_000;
+    await until(o, completed(o));
+    assert.equal(plan(o)!.mergedBy, 'daemon');
+    assert.equal(plan(o)!.leftToOwner, undefined);
+    assert.equal(o.store.readAll().filter((e) => e.type === 'PR_LEFT_TO_OWNER').length, 1);
+  });
+
+  it('in Swarm, a merge GitHub refuses is left to the owner with the setup command, and the owner can still merge', async () => {
+    let skew = 0;
+    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true, config: { swarm: { requiredStatuses: [] } }, now: () => Date.now() + skew });
+    o.setMode('swarm');
+    fake.refuseMerge = 'At least 1 approving review is required by reviewers with write access.';
+    await until(o, () => plan(o)?.leftToOwner !== undefined);
+    assert.match(plan(o)!.leftToOwner!.reason, /GitHub refused the merge: At least 1 approving review.*harness github-setup --repo acme\/toy/);
+
+    await fake.merge(1);
+    skew += 120_000;
+    await until(o, completed(o));
+    assert.equal(plan(o)!.mergedBy, 'owner');
+  });
+
+  /** The toy plan with both features `infra`: an INFRA plan. */
+  const infraPlan = async (dir: string) => {
+    const file = join(dir, 'harness/modules/demo/plans/P1.json');
+    const design = JSON.parse(readFileSync(file, 'utf8')) as { features: Array<Record<string, unknown>> };
+    for (const feature of design.features) feature.kind = 'infra';
+    writeFileSync(file, JSON.stringify(design, null, 2));
+    await runOk('git', ['-C', dir, '-c', 'user.name=o', '-c', 'user.email=o@test.invalid', 'commit', '--quiet', '-am', 'infra plan']);
+  };
+
+  it('in Swarm, an INFRA plan waits for the owner without a cost estimate, and in Manual every plan does', async () => {
+    let skew = 0;
+    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true, prepare: infraPlan, now: () => Date.now() + skew });
+    o.setMode('swarm');
+    fake.statuses = () => ({ 'harness/security': 'success', 'harness/cost': 'success' });
+    await until(o, () => plan(o)?.leftToOwner !== undefined);
+    assert.equal(fake.prs[0]!.title, 'Plan: demo/P1 -INFRA- Greeting and adding');
+    assert.match(plan(o)!.leftToOwner!.reason, /^an INFRA plan merges itself only with the cost job's estimate .* none was produced: the cost job needs iac\/ and the INFRACOST_API_KEY secret; the dashboard's button lets the daemon merge infra once CI and the reviewers pass$/);
+
+    o.setMode('manual');
+    skew += 61_000;
+    await until(o, () => o.state.mode === 'manual');
+    await o.tick();
+    assert.equal(fake.prs[0]!.state, 'open');
+    await fake.merge(1);
+    skew += 120_000;
+    await until(o, completed(o));
+    assert.equal(plan(o)!.mergedBy, 'owner');
+  });
+
+  it("in Swarm, an INFRA plan merges itself under the ceiling with the cost job's estimate, and waits for the owner over it", async () => {
+    const costJob = (monthly: string) => () => ({ cost: { 'cost.json': JSON.stringify({ totalMonthlyCost: '212.4', diffTotalMonthlyCost: monthly }) } });
+    const over = await setup((f) => solved(f), { github: true, prepare: infraPlan });
+    over.orchestrator.setMode('swarm');
+    over.fake.statuses = () => ({ 'harness/security': 'success', 'harness/cost': 'success' });
+    over.fake.artifacts = costJob('80.25');
+    await until(over.orchestrator, () => plan(over.orchestrator)?.leftToOwner !== undefined);
+    assert.deepEqual(plan(over.orchestrator)!.costEstimate, { head: plan(over.orchestrator)!.pushed, monthlyUsd: 80.25 });
+    assert.equal(plan(over.orchestrator)!.leftToOwner!.reason, 'the PR adds an estimated 80.25 USD a month, over the ceiling of 50 (swarm.merge.infraMonthlyUsdCeiling)');
+
+    const under = await setup((f) => solved(f), { github: true, prepare: infraPlan });
+    under.orchestrator.setMode('swarm');
+    under.fake.statuses = () => ({ 'harness/security': 'success', 'harness/cost': 'success' });
+    under.fake.artifacts = costJob('12.5');
+    await until(under.orchestrator, completed(under.orchestrator));
+    const merged = plan(under.orchestrator)!;
+    assert.equal(merged.mergedBy, 'daemon');
+    assert.equal(merged.costEstimate!.monthlyUsd, 12.5);
+    // The cost reviewer read the estimate in its brief.
+    const brief = readFileSync(join(under.harnessDir, 'modules', 'demo', 'reviews', `P1-cost-${merged.pushed!.slice(0, 8)}`, 'brief.md'), 'utf8');
+    assert.match(brief, /Infracost estimates that the change adds 12\.5 USD a month in AWS resources; the merge policy's ceiling is 50 USD/);
+  });
+
+  it("in Swarm, the owner's button lets an INFRA plan merge itself without an estimate, and an estimate over the ceiling still waits", async () => {
+    const without = await setup((f) => solved(f), { github: true, prepare: infraPlan });
+    without.orchestrator.setMode('swarm');
+    assert.equal(without.orchestrator.setInfraMerge('daemon'), true);
+    assert.equal(without.orchestrator.setInfraMerge('daemon'), false);
+    without.fake.statuses = () => ({ 'harness/security': 'success', 'harness/cost': 'success' });
+    await until(without.orchestrator, completed(without.orchestrator));
+    assert.equal(plan(without.orchestrator)!.mergedBy, 'daemon');
+    assert.equal(plan(without.orchestrator)!.costEstimate, undefined);
+
+    const over = await setup((f) => solved(f), { github: true, prepare: infraPlan });
+    over.orchestrator.setMode('swarm');
+    over.orchestrator.setInfraMerge('daemon');
+    over.fake.statuses = () => ({ 'harness/security': 'success', 'harness/cost': 'success' });
+    over.fake.artifacts = () => ({ cost: { 'cost.json': JSON.stringify({ diffTotalMonthlyCost: '99' }) } });
+    await until(over.orchestrator, () => plan(over.orchestrator)?.leftToOwner !== undefined);
+    assert.equal(plan(over.orchestrator)!.leftToOwner!.reason, 'the PR adds an estimated 99 USD a month, over the ceiling of 50 (swarm.merge.infraMonthlyUsdCeiling)');
+    // Taking the merges back lets the plan wait for the owner for the usual reason once the estimate is under the ceiling, too.
+    over.orchestrator.setInfraMerge('ceiling');
+    assert.equal(over.orchestrator.state.infraMerge, 'ceiling');
+  });
+
+  it('in Swarm, starts no attempt at or above the usage ceiling, and goes on once the window resets', async () => {
+    let skew = 0;
+    let percent = 85;
+    let reads = 0;
+    // Ten minutes away: past the reading's five-minute cache, and well under the Manager's turn, which event times would trip.
+    const resetsAt = new Date(Date.now() + 10 * 60_000).toISOString();
+    const usage = async () => {
+      reads++;
+      return { percent, resetsAt, limits: [{ kind: 'session', percent: 20, resetsAt }, { kind: 'weekly_all', percent, resetsAt }] };
+    };
+    const { orchestrator: o } = await setup((f) => solved(f), { usage, now: () => Date.now() + skew });
+    o.setMode('swarm');
+    await until(o, () => o.state.pipeline.paused !== undefined);
+    assert.equal(o.state.pipeline.paused!.reason, "the subscription's usage is at 85% (weekly_all), at or above the 80% ceiling (swarm.usageCeilingPercent)");
+    assert.equal(o.state.pipeline.paused!.until, resetsAt);
+    assert.equal(Object.keys(o.state.features).length, 0);
+    assert.equal(o.usage!.usage.percent, 85);
+
+    // The window resets: the pause lifts, the usage is read again (the reading is older than five minutes), and the build goes on.
+    percent = 30;
+    skew += 10 * 60_000 + 1000;
+    await until(o, completed(o));
+    assert.ok(reads >= 2, `read ${reads} times`);
+    assert.equal(o.usage!.usage.percent, 30);
+  });
+
+  it('in Manual, never reads the usage', async () => {
+    let reads = 0;
+    const { orchestrator: o } = await setup((f) => solved(f), {
+      usage: async () => {
+        reads++;
+        return { percent: 99, resetsAt: new Date().toISOString(), limits: [] };
+      },
+    });
+    await until(o, completed(o));
+    assert.equal(reads, 0);
+  });
+
+  it('in Swarm, both reviewers read the head, their verdicts are posted and set as statuses, and the plan merges itself', async () => {
+    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true });
+    o.setMode('swarm');
+    await until(o, completed(o));
+
+    const head = plan(o)!.pushed!;
+    assert.deepEqual(plan(o)!.reviews!.map((r) => [r.role, r.head === head, r.status, r.verdict, r.posted?.status]), [
+      ['security', true, 'reported', 'pass', 'success'],
+      ['cost', true, 'reported', 'pass', 'success'],
+    ]);
+    assert.deepEqual(fake.reviews.map((r) => [r.number, r.body.split('\n')[0], r.comments.length]), [
+      [1, `## Security review of ${head.slice(0, 8)}: pass`, 0],
+      [1, `## Cost review of ${head.slice(0, 8)}: pass`, 0],
+    ]);
+    assert.deepEqual(fake.statusesSet.map((s) => [s.sha === head, s.context, s.state, s.description]), [
+      [true, 'harness/security', 'success', 'passed'],
+      [true, 'harness/cost', 'success', 'passed'],
+    ]);
+    assert.equal(plan(o)!.mergedBy, 'daemon');
+  });
+
+  it('in Swarm, a blocking review opens a fix round with the findings, and the next head passes and merges', async () => {
+    const finding = { file: 'src/greet.sh', line: 1, severity: 'blocking' as const, title: 'Shell injection', detail: 'Quote the argument before it reaches the shell.' };
+    const review: ReviewBehavior = (role, rounds) => (role === 'security' && rounds === 0
+      ? { verdict: 'block', summary: 'One injection.', findings: [finding, { severity: 'advisory', title: 'No tests', detail: 'Add one.' }] }
+      : { verdict: 'pass', summary: 'Fixed.', findings: [] });
+    const { orchestrator: o, fake } = await setup((f) => (f === 'fix1' ? { files: { 'src/greet.sh': 'echo "hello"\n' } } : solved(f)), { github: true, review });
+    o.setMode('swarm');
+    await until(o, completed(o));
+
+    const fix = o.state.features['demo/P1/fix1']!;
+    assert.deepEqual([fix.fix!.kind, fix.fix!.role, fix.fix!.round, fix.status], ['review', 'security', 1, 'accepted']);
+    assert.match(fix.attempts[0]!.guidance!, /^- Shell injection \(src\/greet\.sh:1\): Quote the argument/);
+    assert.match(fix.fix!.failure, /^The security reviewer blocked PR #1 \(https:\/\/github\.test\/pull\/1\) at [0-9a-f]{8}: One injection\./);
+    assert.deepEqual(plan(o)!.reviewFixRounds, { security: 1 });
+
+    const first = fake.reviews[0]!;
+    assert.match(first.body, /^## Security review of [0-9a-f]{8}: block\n\nOne injection\.\n\n- \*\*\[advisory\] No tests\*\*: Add one\./);
+    assert.deepEqual(first.comments, [{ path: 'src/greet.sh', line: 1, body: '**[blocking] Shell injection**\n\nQuote the argument before it reaches the shell.' }]);
+    assert.deepEqual(fake.statusesSet.map((s) => [s.context, s.state, s.description]), [
+      ['harness/security', 'failure', '1 blocking finding'],
+      ['harness/security', 'success', 'passed'],
+      ['harness/cost', 'success', 'passed'],
+    ]);
+    const heads = [...new Set(plan(o)!.reviews!.map((r) => r.head))];
+    assert.equal(heads.length, 2);
+    const log = await runOk('git', ['--git-dir', fake.remote, 'log', '--format=%s', 'main']);
+    assert.match(log, /fix\(demo\/P1\): the security review, round 1/);
+    assert.equal(plan(o)!.mergedBy, 'daemon');
+  });
+
+  it('in Swarm, a reviewer that keeps blocking leaves the PR to the owner once its rounds are spent', async () => {
+    const review: ReviewBehavior = (role) => (role === 'security'
+      ? { verdict: 'block', summary: 'Still bad.', findings: [{ severity: 'blocking', title: 'Injection', detail: 'Quote it.' }] }
+      : { verdict: 'pass', summary: 'Fine.', findings: [] });
+    const { orchestrator: o, fake } = await setup((f) => (f.startsWith('fix') ? { files: { 'src/note.txt': f } } : solved(f)), {
+      github: true, review, config: { swarm: { securityFixRounds: 1 } },
+    });
+    o.setMode('swarm');
+    await until(o, () => plan(o)?.leftToOwner !== undefined);
+    assert.equal(plan(o)!.leftToOwner!.reason, 'the security reviewer still blocks PR #1 after 1 fix round(s): the owner decides');
+    assert.match(o.state.pipeline.paused!.reason, /still blocks PR #1 after 1 fix round/);
+    assert.deepEqual(plan(o)!.reviewFixRounds, { security: 1 });
+    assert.equal(fake.prs[0]!.state, 'open');
+  });
+
+  it('in Manual with reviewersInManual, the reviewers comment and gate nothing', async () => {
+    let skew = 0;
+    const review: ReviewBehavior = (role) => (role === 'cost'
+      ? { verdict: 'block', summary: 'A loop around Bedrock.', findings: [{ severity: 'blocking', title: 'Unbounded calls', detail: 'Cap it.' }] }
+      : { verdict: 'pass', summary: 'Fine.', findings: [] });
+    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true, review, config: { swarm: { reviewersInManual: true } }, now: () => Date.now() + skew });
+    await until(o, () => plan(o)?.reviews?.filter((r) => r.posted).length === 2);
+    assert.equal(plan(o)!.status, 'ready_to_merge');
+    assert.equal(plan(o)!.reviewFixRounds, undefined);
+    assert.deepEqual(fake.statusesSet.map((s) => [s.context, s.state]), [['harness/security', 'success'], ['harness/cost', 'failure']]);
+    await fake.merge(1);
+    skew += 120_000;
+    await until(o, completed(o));
+    assert.equal(plan(o)!.mergedBy, 'owner');
+  });
+
+  it('in Swarm, a status the App cannot set leaves the PR to the owner with the reason', async () => {
+    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true });
+    o.setMode('swarm');
+    fake.refuseStatus = 'Resource not accessible by integration';
+    await until(o, () => plan(o)?.leftToOwner !== undefined);
+    assert.match(plan(o)!.leftToOwner!.reason, /^could not set harness\/security: Resource not accessible by integration/);
+    assert.equal(fake.reviews.length >= 1, true);
+    assert.equal(plan(o)!.reviews![0]!.posted!.status, 'error');
   });
 
   it('runs a fix round when CI fails, and the PR passes on the next run', async () => {
@@ -439,7 +938,9 @@ describe('architect', () => {
     skew += 120_000;
     await until(o, () => module(o)?.status === 'frozen');
     await until(o, () => o.state.plans['shop/P1']?.status === 'ready_to_merge');
-    assert.equal(fake.prs[1]!.title, 'Plan: shop/P1 — Greeting and adding');
+    assert.equal(fake.prs[1]!.title, 'Plan: shop/P1 -CODE- Greeting and adding');
+    // The Architect hears of its plan's pull request in one line (v3 §6.5).
+    assert.ok(module(o)!.notes.some((n) => n.text === "[digest] Plan P1's pull request #2 is open: https://github.test/pull/2."));
 
     // The Manager asks the Architect, and the decision comes back to it.
     const asked = await handleRequest(o, { role: 'manager', sandbox: 'mgr-x', module: 'shop' }, {
@@ -486,6 +987,46 @@ describe('architect', () => {
     assert.notEqual(second!.definitionHash, first!.definitionHash, 'the fixed check redefines F02, with a fresh budget');
     assert.equal(second!.guidance, 'The Architect says: The check was wrong; Arch PR #2 fixes it.');
     await until(o, () => o.state.plans['shop/P1']?.status === 'ready_to_merge');
+  });
+
+  it('refuses a design over the owner\'s time once they budget it, and takes one that fits', async () => {
+    const actions = (estimatedMinutes?: number) => ({
+      'harness/modules/shop/owner-actions.json': JSON.stringify([
+        { id: 'T1', kind: 'task', title: 'Create the account', when: 'anytime', blocks: [], instructions: 'Sign up.', verify: null, ...(estimatedMinutes === undefined ? {} : { estimatedMinutes }) },
+      ]),
+    });
+    // Ten hours, a 20% reserve: 8 h are available. An unestimated action is refused, then 600 minutes are too many.
+    const { orchestrator: o } = await setup((f) => solved(f), {
+      github: true, design: false, architect: shop({ design: { ...toyDesign('shop'), ...actions() }, fix: actions(600) }),
+    });
+    o.createModule('shop', 'A tiny shop');
+    await until(o, () => module(o)?.status === 'proposed');
+    // Set once the Architect exists: it hears of the budget in its inbox (a new Architect hears of it in its welcome).
+    assert.equal(o.setBudgets({ ownerHours: 10 }), true);
+    o.acceptProposal('shop', 1);
+    await until(o, () => o.store.readAll().filter((e) => e.type === 'DESIGN_REFUSED').length === 2);
+    const problems = o.store.readAll().flatMap((e) => (e.type === 'DESIGN_REFUSED' ? e.payload.problems : []));
+    assert.equal(problems[0], 'owner-actions.json: T1 needs estimatedMinutes, how long it takes the owner: their time is budgeted (get_owner_time)');
+    assert.match(problems[1]!, /^the design takes 10 h of the owner's time in owner actions, but 8 h are available/);
+    assert.equal(module(o)!.status, 'decomposing');
+    assert.ok(module(o)!.notes.some((n) => n.text.startsWith('The owner set their time budget: 10 hours')));
+
+    // Within the budget: the design is submitted, and the numbers are the Architect's to read.
+    const { orchestrator: p, fake } = await setup((f) => solved(f), {
+      github: true, design: false, architect: shop({ design: { ...toyDesign('shop'), ...actions(60) } }),
+    });
+    p.setBudgets({ ownerHours: 10 });
+    p.createModule('shop', 'A tiny shop');
+    await until(p, () => p.state.modules.shop?.status === 'proposed');
+    p.acceptProposal('shop', 1);
+    await until(p, () => p.state.modules.shop?.status === 'in_review');
+    assert.equal(fake.prs.length, 1);
+    const time = (await p.ownerTime())!;
+    assert.equal(time.plannableHours, 8);
+    assert.ok(time.committedHours >= 1 && time.committedHours < 1.1, `committed ${time.committedHours}`);
+    const told = await handleRequest(p, { role: 'architect', sandbox: p.state.modules.shop!.architect.sandbox, module: 'shop' }, { v: 1, id: 'r-time', tool: 'get_owner_time', args: {} });
+    assert.match(told!.text, /^The owner set 10 h for the whole project\. A 20% reserve \(2 h\) stays out of designs/);
+    assert.match(told!.text, /Available to shop: 8 h\./);
   });
 
   it('refuses a design whose checks run a missing script, and takes the fix', async () => {
@@ -600,6 +1141,32 @@ describe('dashboard', () => {
     return { o, port, host, bearer: { host, authorization: `Bearer ${token}` } };
   }
 
+  it('in Swarm, says which setup steps are left, and drops the note once none is', async () => {
+    let skew = 0;
+    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true, now: () => Date.now() + skew });
+    const server = await startDashboard({ orchestrator: o, port: 0, token, webRoot: tempDir('web'), terminals: new Terminals(undefined) });
+    cleanup.push(async () => void server.close());
+    const port = (server.address() as AddressInfo).port;
+    const bearer = { host: `127.0.0.1:${port}`, authorization: `Bearer ${token}` };
+    const read = async () => (JSON.parse((await call(port, '/api/state', bearer)).body) as DashboardState).setup;
+    assert.equal(await read(), undefined, 'Manual has no Swarm setup');
+
+    o.setMode('swarm');
+    const manual = (await read())!;
+    assert.equal(manual.rules!.ok, false);
+    assert.deepEqual(manual.rules!.problems, ["1 approval is required, which the daemon can't give", "the harness/security status isn't required", "the harness/cost status isn't required"]);
+    assert.equal(manual.tokenStored, false);
+    assert.equal(manual.statusesWritable, undefined);
+
+    // The rules are read again after five minutes: now they are Swarm's, the App can't write statuses, and the token is stored.
+    fake.rules = { approvals: 0, codeOwners: false, checks: [...fake.rules!.checks, { context: 'harness/security', integrationId: 4242 }, { context: 'harness/cost', integrationId: 4242 }] };
+    fake.writable = false;
+    skew += 6 * 60_000;
+    const swarm = (await read())!;
+    assert.deepEqual(swarm.rules, { ok: true, problems: [] });
+    assert.equal(swarm.statusesWritable, false);
+  });
+
   it('serves only the token holder on localhost, and survives a malformed request', async () => {
     const { port, host, bearer } = await dashboard();
     assert.equal((await call(port, '/api/state', { host })).status, 401);
@@ -635,6 +1202,9 @@ describe('dashboard', () => {
     assert.equal((await post('/api/pause', {})).done, true);
     assert.equal(o.state.pipeline.paused?.reason, 'the owner paused the pipeline');
     assert.equal((await post('/api/resume', {})).done, true);
+    assert.equal((await post('/api/infra-merge', { by: 'daemon' })).done, true);
+    assert.equal(o.state.infraMerge, 'daemon');
+    assert.equal((await post('/api/infra-merge', { by: 'elsewhere' })).done, false);
 
     o.events.emit('transcript', { agent: 'manager:demo', line: JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'x'.repeat(5000) }] } }) });
     o.events.emit('transcript', { agent: 'manager:demo', line: 'not json' });

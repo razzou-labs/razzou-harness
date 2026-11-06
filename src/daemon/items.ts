@@ -21,10 +21,12 @@ export interface Item {
   text: () => Promise<string>;
 }
 
-export function pendingItems(o: Orchestrator, module: string): Item[] {
+/** What waits for a Manager: the items of its module, or of its plan alone for a plan's Manager (v3 §6.4). */
+export function pendingItems(o: Orchestrator, scope: { module: string; plan?: string | undefined }): Item[] {
+  const { module, plan: only } = scope;
   const questions: Item[] = [];
   const others: Item[] = [];
-  for (const feature of Object.values(o.state.features).filter((f) => f.module === module)) {
+  for (const feature of Object.values(o.state.features).filter((f) => f.module === module && (only === undefined || f.plan === only))) {
     const last = feature.attempts.at(-1);
     if (!last) continue;
     if (last.status === 'running') {
@@ -39,7 +41,7 @@ export function pendingItems(o: Orchestrator, module: string): Item[] {
   }
   const rounds = o.design.config.brakes.ciFixRounds;
   const deployRounds = o.design.config.brakes.deployFixRounds;
-  for (const plan of Object.values(o.state.plans).filter((p) => p.module === module)) {
+  for (const plan of Object.values(o.state.plans).filter((p) => p.module === module && (only === undefined || p.plan === only))) {
     if ((plan.status === 'deploy_failed' || plan.status === 'verify_failed') && (plan.deployFixRounds ?? 0) < deployRounds) {
       const key = planKey(plan);
       const what = plan.status === 'deploy_failed' ? 'DEPLOY FAILED' : 'POST-DEPLOY CHECKS FAILED';
@@ -222,7 +224,25 @@ export function mailText(o: Orchestrator, manager: ManagerState, mail: ManagerSt
     return [`[harness] ANSWER from the owner (request ${mail.requestId})`, '', `You asked: ${clip(question, 800)}`, '', `Answer: ${mail.text}`].join('\n');
   }
   const module = o.design.modules.find((m) => m.id === manager.module);
-  const plans = (module?.plans ?? []).map((p) => `- ${p.id} "${p.title}": ${p.features.map((f) => `${f.id} "${f.title}"`).join(', ')}`);
+  const features = (p: { features: Array<{ id: string; title: string }> }) => p.features.map((f) => `${f.id} "${f.title}"`).join(', ');
+  if (manager.plan) {
+    // A plan's Manager, in Swarm (v3 §6.4): its plan, and where the module's other plans stand.
+    const mine = module?.plans.find((p) => p.id === manager.plan);
+    const others = (module?.plans ?? []).filter((p) => p.id !== manager.plan).map((p) => {
+      const status = o.state.plans[`${manager.module}/${p.id}`]?.status;
+      const where = status === 'completed' ? 'complete' : status ? `${status.replace(/_/g, ' ')}, with its own Manager` : 'not started';
+      return `- ${p.id} "${p.title}": ${where}`;
+    });
+    return [
+      `[harness] WELCOME: you are the Manager of plan ${manager.plan} "${mine?.title ?? ''}" of module "${manager.module}".`,
+      '',
+      `Its features: ${mine ? features(mine) : '(none)'}.`,
+      ...(others.length > 0 ? ['', "The module's other plans, which are not yours:", ...others] : []),
+      '',
+      `The plan is harness/modules/${manager.module}/plans/${manager.plan}.json in your clone, next to the others. Read it now, with ARCHITECTURE.md and README.md if they exist, so you're ready for questions and reviews. Then reply in one line and wait for the next item.`,
+    ].join('\n');
+  }
+  const plans = (module?.plans ?? []).map((p) => `- ${p.id} "${p.title}": ${features(p)}`);
   return [
     `[harness] WELCOME: you are the Manager of module "${manager.module}".`,
     '',

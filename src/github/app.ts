@@ -30,7 +30,8 @@ export const APP_PERMISSIONS = {
   pull_requests: 'write',
   checks: 'read',
   actions: 'read',
-  statuses: 'read',
+  /** The reviewers' verdicts are commit statuses (v3 §3.4). An App created before this has read: its tokens fall back to it. */
+  statuses: 'write',
   metadata: 'read',
 } as const;
 
@@ -46,6 +47,8 @@ export class GitHubClient {
   private readonly credentials: AppCredentials;
   private readonly fetch: typeof fetch;
   private cached?: { token: string; expires: number };
+  /** False once a token had to be minted without the statuses permission: the App predates it. */
+  canWriteStatuses = true;
 
   constructor(credentials: AppCredentials, repo: string, fetchImpl: typeof fetch = fetch) {
     this.credentials = credentials;
@@ -56,6 +59,10 @@ export class GitHubClient {
   /** The bot's login, the author of every PR and push the harness makes. */
   get botLogin(): string {
     return `${this.credentials.slug}[bot]`;
+  }
+
+  get appId(): number {
+    return this.credentials.appId;
   }
 
   /** A REST call as the App's installation on the repository. Paths may contain `{repo}`. */
@@ -70,11 +77,20 @@ export class GitHubClient {
 
   /** A raw GET with the installation token, following redirects: job logs live behind one. */
   async download(path: string): Promise<string> {
+    return (await this.raw(path)).text();
+  }
+
+  /** The same, for a binary body: an artifact's zip, behind a redirect too. */
+  async downloadBytes(path: string): Promise<Buffer> {
+    return Buffer.from(await (await this.raw(path)).arrayBuffer());
+  }
+
+  private async raw(path: string): Promise<Response> {
     const response = await this.fetch(`${API}${path.replaceAll('{repo}', this.repo)}`, {
       headers: { authorization: `token ${await this.token()}`, 'user-agent': 'razzou-harness', 'x-github-api-version': '2022-11-28' },
     });
     if (!response.ok) throw new Error(`GET ${path}: ${response.status} ${(await response.text()).slice(0, 300)}`);
-    return response.text();
+    return response;
   }
 
   /**
@@ -99,10 +115,19 @@ export class GitHubClient {
     if (this.cached && this.cached.expires - Date.now() > 5 * 60_000) return this.cached.token;
     const installation = await this.appRequest<{ id: number }>('GET', '/repos/{repo}/installation');
     const name = this.repo.split('/')[1];
-    const minted = await this.appRequest<{ token: string; expires_at: string }>('POST', `/app/installations/${installation.id}/access_tokens`, {
+    const mint = (permissions: Record<string, string>) => this.appRequest<{ token: string; expires_at: string }>('POST', `/app/installations/${installation.id}/access_tokens`, {
       repositories: [name],
-      permissions: APP_PERMISSIONS,
+      permissions,
     });
+    let minted: { token: string; expires_at: string };
+    try {
+      minted = await mint(this.canWriteStatuses ? APP_PERMISSIONS : { ...APP_PERMISSIONS, statuses: 'read' });
+    } catch (error) {
+      // GitHub refuses a token with more than the App has: an App from before the reviewers can only read statuses.
+      if (!this.canWriteStatuses || !(error instanceof GitHubError) || error.status !== 422) throw error;
+      this.canWriteStatuses = false;
+      minted = await mint({ ...APP_PERMISSIONS, statuses: 'read' });
+    }
     this.cached = { token: minted.token, expires: Date.parse(minted.expires_at) };
     return minted.token;
   }

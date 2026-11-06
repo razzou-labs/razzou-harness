@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { detach, type AgentAdapter, type AgentRun, type ArchitectRun, type ManagerRun } from '../../src/agents/claude-code.ts';
+import type { ReviewerRole, ReviewReport } from '../../src/design/schemas.ts';
 import { sh } from '../../src/util.ts';
 import type { ArchitectBehavior } from './stub-architect.ts';
 import type { ManagerBehavior } from './stub-manager.ts';
@@ -26,13 +27,31 @@ export interface StubBehavior {
  * a `result` line shaped like Claude Code's stream-json output. The Manager is
  * `stub-manager.ts`, run with `behavior`.
  */
+/** What a stub reviewer answers, by role and by the fix rounds the brief reports; every review passes by default. */
+export type ReviewBehavior = (role: ReviewerRole, rounds: number) => ReviewReport;
+
 export function stubAgent(
   decide: (feature: string, attempt: number) => StubBehavior,
   manager: ManagerBehavior = {},
   architect?: ArchitectBehavior,
+  review: ReviewBehavior = () => ({ verdict: 'pass', summary: 'stub: nothing to report', findings: [] }),
 ): AgentAdapter {
   return {
     id: 'stub',
+
+    launchReviewer(run: AgentRun) {
+      const brief = readFileSync(run.taskFile, 'utf8');
+      const role = (/as the (security|cost) reviewer/.exec(brief)?.[1] ?? 'security') as ReviewerRole;
+      const rounds = Number(/Fix rounds so far: (\d+)\./.exec(brief)?.[1] ?? 0);
+      const report = review(role, rounds);
+      const result = { type: 'result', subtype: 'success', is_error: false, result: `stub ${report.verdict}`, structured_output: report, usage: { input_tokens: 10, output_tokens: 5 } };
+      const steps = [
+        `echo $$ > ${sh(run.pidFile)}`,
+        `printf '%s\\n' ${sh(JSON.stringify(result))} > ${sh(run.streamFile)}`,
+        `echo 0 > ${sh(run.exitFile)}`,
+      ];
+      return detach(run.workDir, steps.join('\n'));
+    },
     launch(run: AgentRun) {
       const task = readFileSync(run.taskFile, 'utf8');
       const feature = /^# Feature [^/]+\/[^/]+\/([^:]+):/m.exec(task)?.[1] ?? '?';

@@ -1,9 +1,20 @@
 import { mkdirSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { CheckResult } from '../checks/runner.ts';
+import type { ReviewFinding, ReviewerRole } from '../design/schemas.ts';
 import type { AttemptOutcome, CiJob, Finding, HarnessEvent, Ref, Usage } from './events.ts';
 
 export type AttemptStatus = 'starting' | 'running' | 'collecting' | 'checking' | 'reviewing' | 'accepted' | 'failed' | 'interrupted';
+
+/** Manual: the owner merges every pull request. Swarm: the daemon merges plans under the policy of v3 §3.2. */
+export type Mode = 'manual' | 'swarm';
+
+/**
+ * Who merges INFRA and MIXED plans in Swarm (v3 D36): `ceiling`, the daemon only with the
+ * cost job's estimate under the ceiling, else the owner; `daemon`, the daemon once CI and
+ * the reviewers pass, like CODE plans, an estimate over the ceiling still being the owner's.
+ */
+export type InfraMerge = 'ceiling' | 'daemon';
 
 export interface Question {
   requestId: string;
@@ -33,6 +44,8 @@ export interface Attempt {
   head?: string;
   files?: string[];
   checks?: CheckResult[];
+  /** The attempt merged with the plan's head that moved under it, and checked again, ready to land (v3 §6.3). */
+  rebased?: { onto: string; commit: string };
   questions?: Question[];
   reviewSince?: string;
   /** The Manager's verdict after a review. The daemon acts on it in its next step. */
@@ -61,7 +74,7 @@ export interface FeatureState {
   /** Since when the Manager owes guidance, after a counted failure. */
   awaitingGuidanceSince?: string;
   /** Set for a fix, which is built like a feature but isn't in the design: after CI failed, or after the deploy. */
-  fix?: { round: number; kind: 'ci' | 'deploy'; failure: string; requestId: string };
+  fix?: { round: number; kind: 'ci' | 'deploy' | 'review'; failure: string; requestId: string; role?: ReviewerRole };
 }
 
 export interface PlanState {
@@ -94,12 +107,45 @@ export interface PlanState {
   fixes?: number;
   mergeCommit?: string;
   mergedAt?: string;
+  /** Who merged the PR: the daemon under the Swarm policy, or the owner. */
+  mergedBy?: 'owner' | 'daemon';
+  /** In Swarm, the policy left this head's PR to the owner: the reason shows under Needs you. */
+  leftToOwner?: { head: string; reason: string; at: string };
+  /** The cost job's estimate of the monthly cost the PR adds, for the head it was computed on (v3 §5.3). */
+  costEstimate?: { head: string; monthlyUsd: number };
+  /** The reviewers' sessions on the PR's heads (v3 §5), oldest first. */
+  reviews?: ReviewState[];
+  /** Fix rounds each reviewer asked for on this PR. */
+  reviewFixRounds?: Partial<Record<ReviewerRole, number>>;
   deploy?: { commit: string; status: 'passed' | 'failed'; jobs?: CiJob[] };
   postDeploy?: { status: 'passed' | 'failed'; results: CheckResult[] };
 }
 
+/** One reviewer's session on one PR head (v3 §5). */
+export interface ReviewState {
+  role: ReviewerRole;
+  head: string;
+  status: 'starting' | 'running' | 'reported' | 'failed';
+  sandbox: string;
+  sessionId: string;
+  startedAt: string;
+  deadline: string;
+  endedAt?: string;
+  verdict?: 'pass' | 'block';
+  summary?: string;
+  findings?: ReviewFinding[];
+  usage?: Usage;
+  /** Why there is no report. */
+  reason?: string;
+  posted?: { status: 'success' | 'failure' | 'error'; comments: number; at: string; problem?: string };
+  /** A fix round was opened for this review's blocking findings. */
+  fixRequested?: boolean;
+}
+
 export interface ManagerState {
   module: string;
+  /** Set for a plan's Manager, in Swarm (v3 §6.4): its scope is that plan, and its key `module/plan`. */
+  plan?: string;
   sandbox: string;
   sessionId: string;
   status: 'starting' | 'running' | 'exited' | 'stopped';
@@ -132,7 +178,7 @@ export interface ModuleState {
   frozenCommit?: string;
   /** Messages for the Architect, written into its sandbox once and shown with the owner's next prompt. */
   notes: Array<{ key: string; text: string; sent?: boolean }>;
-  escalations: Array<{ id: string; question: string; feature?: string; askedAt: string; decision?: string; decidedAt?: string }>;
+  escalations: Array<{ id: string; question: string; feature?: string; manager?: string; askedAt: string; decision?: string; decidedAt?: string }>;
 }
 
 export interface ActionState {
@@ -145,6 +191,8 @@ export interface ActionState {
 export interface OwnerRequest {
   requestId: string;
   module: string;
+  /** The key of the Manager that asked. */
+  manager?: string;
   question: string;
   blocking: boolean;
   askedAt: string;
@@ -158,6 +206,11 @@ export interface State {
   lastEventId?: string;
   daemon?: { pid: number; version: string; startedAt: string };
   pipeline: { paused?: { reason: string; since: string; until?: string }; consecutiveFailures: number };
+  mode: Mode;
+  /** The owner's button for INFRA and MIXED plans in Swarm (v3 D36). */
+  infraMerge: InfraMerge;
+  /** What the owner set in the dashboard (v3 §4): their hours for the whole project, and the agent-hours threshold. */
+  budgets: { ownerHours?: number; ownerHoursSetAt?: string; agentHours?: number };
   plans: Record<string, PlanState>;
   features: Record<string, FeatureState>;
   managers: Record<string, ManagerState>;
@@ -171,9 +224,19 @@ export interface State {
 
 export const planKey = (ref: Ref) => `${ref.module}/${ref.plan}`;
 export const featureKey = (ref: Ref) => `${ref.module}/${ref.plan}/${ref.feature}`;
+/** A Manager's key in `state.managers`: its module, or `module/plan` for a plan's Manager (v3 §6.4). */
+export const managerKey = (scope: { module: string; plan?: string | undefined }) => (scope.plan ? `${scope.module}/${scope.plan}` : scope.module);
+
+/** The Managers that aren't stopped and whose scope covers the module, or one plan of it: the plan's own, and the module's. */
+export function managersOf(state: State, module: string, plan?: string): ManagerState[] {
+  return Object.values(state.managers).filter((m) => m.status !== 'stopped' && m.module === module && (m.plan === undefined || plan === undefined || m.plan === plan));
+}
+
+/** The plan's code is on main: its pull request merged, or, without GitHub, the plan complete (v3 §6.1). */
+export const planMerged = (plan: PlanState | undefined): boolean => plan !== undefined && (plan.mergeCommit !== undefined || plan.status === 'completed');
 
 export function initialState(): State {
-  return { v: 1, pipeline: { consecutiveFailures: 0 }, plans: {}, features: {}, managers: {}, ownerRequests: {}, modules: {}, actions: {}, pendingProgress: [] };
+  return { v: 1, pipeline: { consecutiveFailures: 0 }, mode: 'manual', infraMerge: 'ceiling', budgets: {}, plans: {}, features: {}, managers: {}, ownerRequests: {}, modules: {}, actions: {}, pendingProgress: [] };
 }
 
 export function project(events: HarnessEvent[]): State {
@@ -228,6 +291,7 @@ export function apply(state: State, event: HarnessEvent): State {
       break;
     case 'PR_OPENED':
       Object.assign(state.plans[planKey(ref!)]!, { status: 'pr_open', pr: { number: event.payload.number, url: event.payload.url } });
+      digest(state, event.id, ref!, `Plan ${ref!.plan}'s pull request #${event.payload.number} is open: ${event.payload.url}.`);
       break;
     case 'CI_PASSED':
     case 'CI_FAILED': {
@@ -236,15 +300,52 @@ export function apply(state: State, event: HarnessEvent): State {
       if (event.type === 'CI_PASSED') plan.status = 'ready_to_merge';
       break;
     }
+    case 'MODE_CHANGED':
+      state.mode = event.payload.mode;
+      break;
+    case 'INFRA_MERGE_SET':
+      state.infraMerge = event.payload.by;
+      break;
+    case 'OWNER_HOURS_SET':
+      if (event.payload.hours === null) {
+        delete state.budgets.ownerHours;
+        delete state.budgets.ownerHoursSetAt;
+      } else {
+        state.budgets.ownerHours = event.payload.hours;
+        state.budgets.ownerHoursSetAt = event.ts;
+      }
+      // Every Architect learns of it: the budget bounds the owner actions it may design (v3 §4.1).
+      for (const module of Object.values(state.modules)) {
+        module.notes.push({
+          key: `note:${event.id}`,
+          text: event.payload.hours === null
+            ? 'The owner cleared their time budget: estimatedMinutes on owner actions is welcome, not required.'
+            : `The owner set their time budget: ${event.payload.hours} hours for the whole project. Call get_owner_time for what this module may plan; every owner action needs estimatedMinutes, and submit_design refuses a design over the budget.`,
+        });
+      }
+      break;
+    case 'AGENT_HOURS_SET':
+      if (event.payload.hours === null) delete state.budgets.agentHours;
+      else state.budgets.agentHours = event.payload.hours;
+      break;
+    case 'PR_LEFT_TO_OWNER':
+      state.plans[planKey(ref!)]!.leftToOwner = { head: event.payload.head, reason: event.payload.reason, at: event.ts };
+      digest(state, event.id, ref!, `Pull request #${event.payload.number} of plan ${ref!.plan} waits for the owner: ${event.payload.reason}`);
+      break;
+    case 'PR_MERGED_BY_DAEMON':
+      state.plans[planKey(ref!)]!.mergedBy = 'daemon';
+      break;
+    case 'COST_ESTIMATED':
+      state.plans[planKey(ref!)]!.costEstimate = { head: event.payload.head, monthlyUsd: event.payload.monthlyUsd };
+      break;
     case 'PR_MERGED': {
       const plan = state.plans[planKey(ref!)]!;
-      Object.assign(plan, { status: event.payload.next, mergeCommit: event.payload.commit, mergedAt: event.ts, head: event.payload.commit });
+      Object.assign(plan, { status: event.payload.next, mergeCommit: event.payload.commit, mergedAt: event.ts, head: event.payload.commit, mergedBy: plan.mergedBy ?? 'owner' });
+      delete plan.leftToOwner;
       delete plan.deploy;
       delete plan.postDeploy;
-      if (event.payload.next === 'completed') {
-        const manager = state.managers[ref!.module];
-        if (manager) manager.sent = {};
-      }
+      if (event.payload.next === 'completed') for (const manager of managersOf(state, ref!.module, ref!.plan)) manager.sent = {};
+      digest(state, event.id, ref!, `Plan ${ref!.plan} is merged on main${plan.mergedBy === 'daemon' ? ' by the daemon' : ''}${event.payload.next === 'completed' ? ', and complete' : `: it is ${event.payload.next}`}.`);
       break;
     }
     case 'DEPLOYED':
@@ -257,8 +358,7 @@ export function apply(state: State, event: HarnessEvent): State {
       break;
     case 'PLAN_VERIFIED': {
       Object.assign(state.plans[planKey(ref!)]!, { status: 'completed', postDeploy: { status: 'passed', results: event.payload.results } });
-      const manager = state.managers[ref!.module];
-      if (manager) manager.sent = {};
+      for (const manager of managersOf(state, ref!.module, ref!.plan)) manager.sent = {};
       break;
     }
     case 'POST_DEPLOY_CHECKS_FAILED':
@@ -271,9 +371,16 @@ export function apply(state: State, event: HarnessEvent): State {
     }
     case 'REQUEST_FIX': {
       const plan = state.plans[planKey(ref!)]!;
-      const kind = plan.status === 'deploy_failed' || plan.status === 'verify_failed' ? 'deploy' : 'ci';
+      const kind = event.payload.review ? 'review' : plan.status === 'deploy_failed' || plan.status === 'verify_failed' ? 'deploy' : 'ci';
       let round: number;
-      if (kind === 'deploy') {
+      if (kind === 'review') {
+        // A reviewer blocked the PR: its own rounds, on the plan branch like a CI fix (v3 §5.4).
+        const role = event.payload.review!;
+        round = (plan.reviewFixRounds?.[role] ?? 0) + 1;
+        plan.reviewFixRounds = { ...plan.reviewFixRounds, [role]: round };
+        const review = plan.reviews?.findLast((r) => r.role === role && r.head === plan.head && r.status === 'reported');
+        if (review) review.fixRequested = true;
+      } else if (kind === 'deploy') {
         // A Fix PR: a new branch from the merge, and a new pull request (§11.3).
         round = (plan.deployFixRounds ?? 0) + 1;
         Object.assign(plan, { deployFixRounds: round, branch: `fix/${plan.module}/${plan.plan}-${round}`, base: plan.mergeCommit, head: plan.mergeCommit, fixRounds: 0 });
@@ -288,16 +395,44 @@ export function apply(state: State, event: HarnessEvent): State {
       Object.assign(plan, { status: 'fixing', fixes: n });
       state.features[`${planKey(ref!)}/fix${n}`] = {
         module: plan.module, plan: plan.plan, feature: `fix${n}`, status: 'pending', attempts: [], extraAttempts: 0,
-        guidance: event.payload.guidance, fix: { round, kind, failure: event.payload.failure, requestId: event.payload.requestId },
+        guidance: event.payload.guidance,
+        fix: { round, kind, failure: event.payload.failure, requestId: event.payload.requestId, ...(event.payload.review ? { role: event.payload.review } : {}) },
       };
+      break;
+    }
+    case 'REVIEW_STARTING': {
+      const plan = state.plans[planKey(ref!)]!;
+      const { role, head, sandbox, sessionId, deadline } = event.payload;
+      (plan.reviews ??= []).push({ role, head, status: 'starting', sandbox, sessionId, startedAt: event.ts, deadline });
+      break;
+    }
+    case 'REVIEW_STARTED':
+      reviewOf(state, ref!, event.payload).status = 'running';
+      break;
+    case 'REVIEW_ENDED': {
+      const review = reviewOf(state, ref!, event.payload);
+      const { outcome, verdict, summary, findings, usage, reason } = event.payload;
+      review.endedAt = event.ts;
+      if (usage) review.usage = usage;
+      if (outcome === 'done' && verdict) Object.assign(review, { status: 'reported', verdict, summary, findings: findings ?? [] });
+      else Object.assign(review, { status: 'failed', reason: reason ?? outcome });
+      break;
+    }
+    case 'REVIEW_POSTED': {
+      const review = reviewOf(state, ref!, event.payload);
+      const { status, comments, problem } = event.payload;
+      review.posted = { status, comments, at: event.ts, ...(problem ? { problem } : {}) };
+      if (review.verdict === 'block') {
+        const blocking = (review.findings ?? []).filter((f) => f.severity === 'blocking').map((f) => f.title).join('; ');
+        digest(state, event.id, ref!, `The ${review.role} reviewer blocked plan ${ref!.plan}'s pull request at ${review.head.slice(0, 8)}: ${blocking}`);
+      }
       break;
     }
     case 'PLAN_COMPLETED': {
       const plan = state.plans[planKey(ref!)]!;
       plan.status = 'completed';
       plan.head = event.payload.head;
-      const manager = state.managers[ref!.module];
-      if (manager) manager.sent = {};
+      for (const manager of managersOf(state, ref!.module, ref!.plan)) manager.sent = {};
       break;
     }
     case 'ATTEMPT_STARTING': {
@@ -373,6 +508,9 @@ export function apply(state: State, event: HarnessEvent): State {
         at: event.ts,
       };
       break;
+    case 'ATTEMPT_REBASED':
+      attemptOf(state, ref!).rebased = { onto: event.payload.onto, commit: event.payload.commit };
+      break;
     case 'FEATURE_ACCEPTED': {
       Object.assign(attemptOf(state, ref!), { status: 'accepted', commit: event.payload.commit });
       const feature = featureOf(state, ref!);
@@ -425,6 +563,7 @@ export function apply(state: State, event: HarnessEvent): State {
       state.ownerRequests[event.payload.requestId] = {
         requestId: event.payload.requestId,
         module: event.payload.module,
+        ...(event.payload.manager ? { manager: event.payload.manager } : {}),
         question: event.payload.question,
         blocking: event.payload.blocking,
         askedAt: event.ts,
@@ -433,37 +572,40 @@ export function apply(state: State, event: HarnessEvent): State {
     case 'OWNER_ANSWER': {
       const request = state.ownerRequests[event.payload.requestId];
       if (request) Object.assign(request, { answer: event.payload.answer, answeredAt: event.ts });
-      state.managers[event.payload.module]?.mail.push({
-        key: `mail:${event.id}`, kind: 'owner_answer', text: event.payload.answer, requestId: event.payload.requestId,
-      });
+      for (const manager of mailTargets(state, event.payload.module, request?.manager)) {
+        manager.mail.push({ key: `mail:${event.id}`, kind: 'owner_answer', text: event.payload.answer, requestId: event.payload.requestId });
+      }
       break;
     }
     case 'OWNER_MESSAGE':
-      state.managers[event.payload.module]?.mail.push({ key: `mail:${event.id}`, kind: 'owner_message', text: event.payload.text });
+      for (const manager of mailTargets(state, event.payload.module, event.payload.manager)) {
+        manager.mail.push({ key: `mail:${event.id}`, kind: 'owner_message', text: event.payload.text });
+      }
       break;
     case 'MANAGER_STARTING': {
-      const { module, sandbox, sessionId } = event.payload;
-      const mail = state.managers[module]?.mail.filter((m) => m.kind !== 'welcome') ?? [];
-      state.managers[module] = {
-        module, sandbox, sessionId, status: 'starting', launch: 0, exits: [], sent: {},
+      const { module, plan, sandbox, sessionId } = event.payload;
+      const key = managerKey(event.payload);
+      const mail = state.managers[key]?.mail.filter((m) => m.kind !== 'welcome') ?? [];
+      state.managers[key] = {
+        module, ...(plan ? { plan } : {}), sandbox, sessionId, status: 'starting', launch: 0, exits: [], sent: {},
         mail: [{ key: `mail:${event.id}`, kind: 'welcome', text: '' }, ...mail],
       };
       break;
     }
     case 'MANAGER_LAUNCHED':
-      Object.assign(state.managers[event.payload.module]!, {
+      Object.assign(state.managers[managerKey(event.payload)]!, {
         status: 'running', launch: event.payload.launch, launchedAt: event.ts, launchedOutputBytes: event.payload.outputBytes,
       });
       break;
     case 'MANAGER_EXITED': {
-      const manager = state.managers[event.payload.module]!;
+      const manager = state.managers[managerKey(event.payload)]!;
       manager.status = 'exited';
       manager.exits = [...manager.exits, event.ts].slice(-5);
       manager.lastExit = { code: event.payload.code, stderr: event.payload.stderr, started: event.payload.started };
       break;
     }
     case 'MANAGER_ITEM_SENT': {
-      const manager = state.managers[event.payload.module]!;
+      const manager = state.managers[managerKey(event.payload)]!;
       const { key, launch, reminder } = event.payload;
       if (key.startsWith('mail:')) manager.mail = manager.mail.filter((m) => m.key !== key);
       else if (reminder) manager.sent[key] = { ...manager.sent[key]!, reminded: event.ts };
@@ -471,7 +613,7 @@ export function apply(state: State, event: HarnessEvent): State {
       break;
     }
     case 'MANAGER_STOPPED':
-      state.managers[event.payload.module]!.status = 'stopped';
+      state.managers[managerKey(event.payload)]!.status = 'stopped';
       break;
     case 'PIPELINE_PAUSED':
       state.pipeline.paused = { reason: event.payload.reason, since: event.ts, until: event.payload.until };
@@ -573,7 +715,10 @@ export function apply(state: State, event: HarnessEvent): State {
     case 'ESCALATION': {
       const module = state.modules[event.payload.module];
       if (!module) break;
-      module.escalations.push({ id: event.payload.requestId, question: event.payload.question, askedAt: event.ts, ...(event.payload.feature ? { feature: event.payload.feature } : {}) });
+      module.escalations.push({
+        id: event.payload.requestId, question: event.payload.question, askedAt: event.ts,
+        ...(event.payload.feature ? { feature: event.payload.feature } : {}), ...(event.payload.manager ? { manager: event.payload.manager } : {}),
+      });
       module.notes.push({
         key: `note:${event.id}`,
         text: `The Manager asks (escalation ${event.payload.requestId}${event.payload.feature ? `, about ${event.payload.feature}` : ''}):\n${event.payload.question}\nDecide with the owner if needed, then call reply_to_manager.`,
@@ -583,7 +728,9 @@ export function apply(state: State, event: HarnessEvent): State {
     case 'DECISION': {
       const escalation = state.modules[event.payload.module]?.escalations.find((e) => e.id === event.payload.escalationId);
       if (escalation) Object.assign(escalation, { decision: event.payload.decision, decidedAt: event.ts });
-      state.managers[event.payload.module]?.mail.push({ key: `mail:${event.id}`, kind: 'decision', text: event.payload.decision, requestId: event.payload.escalationId });
+      for (const manager of mailTargets(state, event.payload.module, escalation?.manager)) {
+        manager.mail.push({ key: `mail:${event.id}`, kind: 'decision', text: event.payload.decision, requestId: event.payload.escalationId });
+      }
       break;
     }
     case 'OWNER_ACTION_CLAIMED':
@@ -610,11 +757,23 @@ const ACTIVE: AttemptStatus[] = ['starting', 'running', 'collecting', 'checking'
 
 /** The one attempt that hasn't reached a terminal status, if any. There is at most one. */
 export function activeAttempt(state: State): { feature: FeatureState; attempt: Attempt } | undefined {
+  return activeAttempts(state)[0];
+}
+
+/** Every attempt under way, in the features' order: one in Manual, up to `swarm.maxDevelopers` in Swarm (v3 §6.2). */
+export function activeAttempts(state: State): Array<{ feature: FeatureState; attempt: Attempt }> {
+  const active: Array<{ feature: FeatureState; attempt: Attempt }> = [];
   for (const feature of Object.values(state.features)) {
     const attempt = feature.attempts.at(-1);
-    if (attempt && ACTIVE.includes(attempt.status)) return { feature, attempt };
+    if (attempt && ACTIVE.includes(attempt.status)) active.push({ feature, attempt });
   }
-  return undefined;
+  return active;
+}
+
+/** Whether a feature has an attempt under way. */
+export function isActive(feature: FeatureState): boolean {
+  const attempt = feature.attempts.at(-1);
+  return attempt !== undefined && ACTIVE.includes(attempt.status);
 }
 
 /** Attempts that count against the budget of the feature's current definition. */
@@ -637,6 +796,25 @@ export function writeSnapshot(file: string, state: State): void {
   const tmp = `${file}.tmp`;
   writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`);
   renameSync(tmp, file);
+}
+
+/** Who gets a piece of mail: the Manager named, while it runs, or else every Manager of the module. */
+function mailTargets(state: State, module: string, manager?: string): ManagerState[] {
+  const named = manager ? state.managers[manager] : undefined;
+  return named && named.status !== 'stopped' ? [named] : managersOf(state, module);
+}
+
+/** One line for the module's Architect, when it has one (v3 §6.5): what happens to its plans, without the detail the owner sees. */
+function digest(state: State, eventId: string, ref: Ref, text: string): void {
+  const module = state.modules[ref.module];
+  if (module) module.notes.push({ key: `note:${eventId}`, text: `[digest] ${text}` });
+}
+
+/** The latest session of a reviewer on a head: the one the event is about. */
+function reviewOf(state: State, ref: Ref, which: { role: ReviewerRole; head: string }): ReviewState {
+  const review = state.plans[planKey(ref)]?.reviews?.findLast((r) => r.role === which.role && r.head === which.head);
+  if (!review) throw new Error(`no ${which.role} review of ${planKey(ref)} on ${which.head.slice(0, 8)}`);
+  return review;
 }
 
 function featureOf(state: State, ref: Ref): FeatureState {

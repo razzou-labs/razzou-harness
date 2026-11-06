@@ -29,6 +29,8 @@ Write `harness/modules/<module>/proposals/v<N>.md`, starting at v1, and call
 - infrastructure, if any, and its cost;
 - the plans you expect, in order, and what each delivers;
 - what only the owner can do (accounts, approvals, secrets): these become owner actions;
+- the owner's time this module takes, when the owner budgets it (`get_owner_time`): how
+  long each owner action takes them, and the total;
 - risks and open questions.
 
 The owner accepts a version in the dashboard, or asks for changes; then write v<N+1>.
@@ -69,9 +71,20 @@ application code, and never `.github/`: CI refuses both.
 }
 ```
 
-- Ids use letters, digits and dashes. `dependsOn` names earlier features of the same
-  plan. `kind` is `app` or `infra`.
-- **Size each feature for one attempt** by a fresh Developer: well under 90 minutes, one
+- Ids use letters, digits and dashes. A feature's `dependsOn` names earlier features
+  of the same plan, or features of earlier plans as `"P1/F03"`. `kind` is `app` or
+  `infra`.
+- **A plan's `dependsOn`** lists the plans of the module that must be merged before it
+  starts. Without it, a plan waits for the previous one, as always. With `[]`, or only
+  the plans it really needs, it may build alongside the others in Swarm mode: put
+  shared decisions in earlier plans, keep plans that may run together off the same
+  files, and give infrastructure plans of its own.
+- **In Swarm mode, features of a plan that don't depend on each other are built at the
+  same time, by several Developers**, each landing on the plan branch as it finishes,
+  and independent plans are built at the same time, each with its own Manager.
+  Declare every dependency in `dependsOn`, including the implicit ones, such as a
+  feature that extends a file another creates.
+- **Size each feature for one attempt** by a fresh Developer: well under 120 minutes, one
   coherent change, and testable on its own.
 - **Give every feature at least one check.** A check is a shell command run from the
   repository root that exits 0 when the feature works. It runs in harness sandboxes and
@@ -98,15 +111,21 @@ anything to do.
 ```json
 [
   { "id": "G1", "kind": "gate", "title": "Approve the data retention policy", "when": "before P2",
-    "blocks": ["P2"], "instructions": "Markdown for the owner.", "verify": null },
+    "blocks": ["P2"], "instructions": "Markdown for the owner.", "verify": null, "estimatedMinutes": 15 },
   { "id": "T1", "kind": "task", "title": "Create the sending identity", "when": "anytime",
-    "blocks": [], "instructions": "…", "verify": { "run": "bash harness/modules/<module>/checks/T1.sh" } }
+    "blocks": [], "instructions": "…", "verify": { "run": "bash harness/modules/<module>/checks/T1.sh" }, "estimatedMinutes": 30 }
 ]
 ```
 
 A gate holds back the plans (`"P2"`) or features (`"P2/F03"`) it blocks until the owner
 marks it done. A feature can also name gates in `gates`. A task holds nothing back.
 Explain the actions in prose in `harness/modules/<module>/owner-guide.md`, by id.
+
+**The owner's time.** `estimatedMinutes` is how long an action takes the owner. When
+the owner budgets their time, `get_owner_time` tells you the hours available to this
+module: every action needs an estimate, and their sum must fit, or `submit_design`
+refuses. Only owner actions count, not what the owner reads. Decide what you can from
+the design; ask the owner only for what only they can do, in few, short actions.
 
 **Shared knowledge**: record cross-module decisions in `ARCHITECTURE.md`, and usage notes
 in `README.md`.

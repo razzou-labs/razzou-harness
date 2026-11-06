@@ -1,26 +1,35 @@
 import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { claudeCode, mcpConfig, readResult, reportJsonSchema, type AgentAdapter, type AgentRun } from '../agents/claude-code.ts';
+import { loadClaudeToken, readUsage, type SubscriptionUsage } from '../anthropic/usage.ts';
 import { allPassed, initEnvironment, runChecks, type CheckResult, type RunOptions } from '../checks/runner.ts';
 import { protectedChanges } from '../ci/harness-ci.ts';
-import { definitionHash, loadDesign, requiredChecks, type Check, type Config, type Design, type Feature, type Plan } from '../design/schemas.ts';
+import { ownerTime, type OwnerTime } from '../design/owner-time.ts';
+import {
+  definitionHash, featureDependency, loadDesign, planDependencies, planKind, requiredChecks,
+  type Check, type Config, type Design, type Feature, type ModuleDesign, type Plan,
+} from '../design/schemas.ts';
 import { DEVELOPER, HARNESS, Repo } from '../git/repo.ts';
 import { GitHubClient, loadAppCredentials } from '../github/app.ts';
-import { GitHubForge, LocalForge, type CheckRun, type Forge } from '../github/forge.ts';
+import { GitHubForge, LocalForge, type CheckRun, type Forge, type PullRequest } from '../github/forge.ts';
+import { rulesProblems } from '../github/setup.ts';
 import { toolsManifest, type Role } from '../roles.ts';
 import type { ExecResult, Follower, SandboxDriver } from '../sandbox/driver.ts';
 import { BUNDLES } from '../sandbox/allowlist.ts';
 import { buildPolicy } from '../sandbox/policy.ts';
 import { EventStore, type CiJob, type HarnessEvent, type NewEvent, type Ref } from '../state/events.ts';
 import {
-  activeAttempt, apply, countedAttempts, featureKey, interruptions, planKey, project, writeSnapshot,
-  type Attempt, type FeatureState, type PlanState, type State,
+  activeAttempt, activeAttempts, apply, countedAttempts, featureKey, interruptions, isActive, managersOf, planKey, planMerged, project, writeSnapshot,
+  type Attempt, type FeatureState, type InfraMerge, type ManagerState, type Mode, type PlanState, type ReviewState, type State,
 } from '../state/state.ts';
 import { clip, sh, sleep } from '../util.ts';
 import { Architects } from './architects.ts';
 import { AgentChannel, type AgentRequest } from './channel.ts';
+import { architectRef } from './design.ts';
+import { parseCostEstimate } from '../review/cost-estimate.ts';
+import { activeReview, reviewStep, stepReview } from './review.ts';
 import { Managers } from './manager.ts';
 import { attemptRefName, preMerge, probeScript, refOf, sandboxName, waitForFile } from './refs.ts';
 import { handleRequest, type AgentIdentity, type Reply } from './requests.ts';
@@ -28,6 +37,8 @@ import { buildTask } from './task.ts';
 import { webRead, type WebReadResult } from './web-read.ts';
 
 export interface OrchestratorOptions {
+  /** Whether the usage probe's token is stored; by default, the token file (v3 §4.3). */
+  tokenStored?: () => boolean;
   /** The project's own repository. In M1 and M2 its main branch is the source of truth. */
   projectDir: string;
   /** The project's `.harness/` directory. */
@@ -39,6 +50,8 @@ export interface OrchestratorOptions {
   agent?: AgentAdapter;
   /** Tests replace the web; the daemon reads it. */
   webRead?: (url: string) => Promise<WebReadResult>;
+  /** Tests replace the subscription's usage endpoint (v3 §4.3). By default: the endpoint, with the token the doctor stored; undefined without one. */
+  usage?: () => Promise<SubscriptionUsage | undefined>;
   /** Tests replace GitHub. By default: GitHub through the App when the project names a repository, else the project's own folder. */
   forge?: (config: Config) => Forge;
   now?: () => number;
@@ -57,6 +70,17 @@ const STEP_ERROR_LIMIT = 5;
  * the Manager up to date. Every step records an event before it moves on, so after a
  * restart the same pass picks up where the previous process stopped.
  */
+/** Where the Swarm setup stands, for the dashboard's note (v4 §6): read through the App, at most every five minutes. */
+export interface SetupStatus {
+  at: string;
+  /** Whether main's rules match the mode, and what they lack; undefined when the project has no repository. */
+  rules?: { ok: boolean; problems: string[] };
+  /** False when the App can't write commit statuses; undefined until a token said so. */
+  statusesWritable?: boolean;
+  /** The token the usage probe reads is stored on this machine. */
+  tokenStored: boolean;
+}
+
 export class Orchestrator {
   /**
    * For the dashboard: 'event' (a HarnessEvent), 'transcript' ({ agent, line }: a line of
@@ -75,7 +99,12 @@ export class Orchestrator {
   readonly now: () => number;
   readonly log: (message: string) => void;
   readonly webRead: (url: string) => Promise<WebReadResult>;
+  private readonly readUsage: () => Promise<SubscriptionUsage | undefined>;
+  /** The last reading of the subscription's usage, for the dashboard; not state. */
+  usage?: { at: string; usage: SubscriptionUsage };
   forge!: Forge;
+  private readonly tokenStored: () => boolean;
+  private setup?: { at: number; mode: Mode; status: SetupStatus };
 
   private ticking?: Promise<void>;
   /** When each open PR may be polled again. */
@@ -83,7 +112,9 @@ export class Orchestrator {
   private again = false;
   private stopping = false;
   private stepErrors = { key: '', count: 0 };
-  private developer?: { sandbox: string; follower: Follower; channel: AgentChannel };
+  /** The Developers under way, by sandbox: their transcripts for the dashboard, and their channels for the harness tools. */
+  private readonly developers = new Map<string, { follower: Follower; channel: AgentChannel }>();
+  private reviewer?: { sandbox: string; follower: Follower; channel: AgentChannel };
 
   constructor(options: OrchestratorOptions) {
     this.options = options;
@@ -92,6 +123,11 @@ export class Orchestrator {
     this.now = options.now ?? Date.now;
     this.log = options.log ?? (() => {});
     this.webRead = options.webRead ?? ((url) => webRead(url));
+    this.readUsage = options.usage ?? (async () => {
+      const token = loadClaudeToken();
+      return token ? readUsage(token) : undefined;
+    });
+    this.tokenStored = options.tokenStored ?? (() => loadClaudeToken() !== undefined);
     this.store = new EventStore(join(options.harnessDir, 'events.jsonl'));
     this.state = project(this.store.readAll());
     this.managers = new Managers(this);
@@ -109,6 +145,48 @@ export class Orchestrator {
     }
     await this.refreshDesign();
     this.record({ type: 'DAEMON_STARTED', payload: { version: this.options.version, pid: process.pid } });
+    this.takePendingSetup();
+  }
+
+  /** What `harness setup` or `harness budget` left for the daemon while it was down (v4 §5): the owner's hours, taken once. */
+  private takePendingSetup(): void {
+    const file = join(this.options.harnessDir, 'setup.json');
+    if (!existsSync(file)) return;
+    try {
+      const { ownerHours } = JSON.parse(readFileSync(file, 'utf8')) as { ownerHours?: unknown };
+      if (typeof ownerHours === 'number' && ownerHours > 0 && this.state.budgets.ownerHours === undefined) this.setBudgets({ ownerHours });
+    } catch (error) {
+      this.log(`setup.json: ${(error as Error).message}`);
+    }
+    rmSync(file, { force: true });
+  }
+
+  /**
+   * Where the Swarm setup stands (v4 §6): main's rules against the mode, read through
+   * the App's metadata permission at most every five minutes, whether the App may write
+   * statuses, and whether the usage probe's token is stored.
+   */
+  async setupStatus(): Promise<SetupStatus> {
+    const mode = this.state.mode;
+    if (this.setup && this.setup.mode === mode && this.now() - this.setup.at < 5 * 60_000) return this.setup.status;
+    const config = this.design.config;
+    let rules: SetupStatus['rules'];
+    if (config.project.repo) {
+      let inEffect;
+      try {
+        inEffect = await this.forge.branchRules('main');
+      } catch (error) {
+        this.log(`main's rules could not be read: ${(error as Error).message}`);
+      }
+      const problems = rulesProblems(inEffect, {
+        mode, requiredChecks: requiredChecks(config), statuses: mode === 'swarm' ? config.swarm.requiredStatuses : [], ...(this.forge.appId !== undefined ? { appId: this.forge.appId } : {}),
+      });
+      rules = { ok: problems.length === 0, problems };
+    }
+    const writable = this.forge.statusesWritable();
+    const status: SetupStatus = { at: new Date(this.now()).toISOString(), ...(rules ? { rules } : {}), ...(writable === undefined ? {} : { statusesWritable: writable }), tokenStored: this.tokenStored() };
+    this.setup = { at: this.now(), mode, status };
+    return status;
   }
 
   /**
@@ -117,7 +195,8 @@ export class Orchestrator {
    */
   async stop(graceMs = 10_000): Promise<void> {
     this.stopping = true;
-    this.stopFollowing();
+    for (const sandbox of [...this.developers.keys()]) this.stopFollowing(sandbox);
+    this.stopFollowingReview();
     this.managers.detach();
     this.architects.detach();
     if (this.ticking) await Promise.race([this.ticking, sleep(graceMs)]);
@@ -173,6 +252,37 @@ export class Orchestrator {
     return true;
   }
 
+  /** The owner switches between Manual and Swarm (v3 §2.1). Running attempts finish under the rules they started with. */
+  setMode(mode: Mode): boolean {
+    if (this.state.mode === mode) return false;
+    this.record({ type: 'MODE_CHANGED', payload: { mode } });
+    this.kick();
+    return true;
+  }
+
+  /** The owner lets the daemon merge INFRA and MIXED plans like CODE ones, or takes them back (v3 D36). Open PRs are looked at again at once. */
+  setInfraMerge(by: InfraMerge): boolean {
+    if (this.state.infraMerge === by) return false;
+    this.record({ type: 'INFRA_MERGE_SET', payload: { by } });
+    this.nextPoll.clear();
+    this.kick();
+    return true;
+  }
+
+  /** The owner sets their hours for the whole project, or the agent-hours threshold (v3 §4); null clears one. */
+  setBudgets(budgets: { ownerHours?: number | null | undefined; agentHours?: number | null | undefined }): boolean {
+    let changed = false;
+    if (budgets.ownerHours !== undefined && budgets.ownerHours !== (this.state.budgets.ownerHours ?? null)) {
+      this.record({ type: 'OWNER_HOURS_SET', payload: { hours: budgets.ownerHours } });
+      changed = true;
+    }
+    if (budgets.agentHours !== undefined && budgets.agentHours !== (this.state.budgets.agentHours ?? null)) {
+      this.record({ type: 'AGENT_HOURS_SET', payload: { hours: budgets.agentHours } });
+      changed = true;
+    }
+    return changed;
+  }
+
   /** The owner grants one more attempt to an escalated feature (`module/plan/feature`). */
   retry(key: string, note?: string): boolean {
     const feature = this.state.features[key];
@@ -182,12 +292,13 @@ export class Orchestrator {
     return true;
   }
 
-  /** The owner writes to the Manager of the module being built. */
-  messageManager(text: string): boolean {
-    const module = this.currentModule();
-    const manager = module ? this.state.managers[module] : undefined;
-    if (!module || !manager || manager.status === 'stopped' || text.trim() === '') return false;
-    this.record({ type: 'OWNER_MESSAGE', from: 'owner', to: 'manager', payload: { module, text: text.trim() } });
+  /** The owner writes to a Manager: the one named by its key, or else those of the module being built. */
+  messageManager(text: string, manager?: string): boolean {
+    const named = manager ? this.state.managers[manager] : undefined;
+    const module = manager ? named?.module : this.currentModule();
+    const targets: ManagerState[] = manager ? (named && named.status !== 'stopped' ? [named] : []) : module ? managersOf(this.state, module) : [];
+    if (!module || targets.length === 0 || text.trim() === '') return false;
+    this.record({ type: 'OWNER_MESSAGE', from: 'owner', to: 'manager', payload: { module, text: text.trim(), ...(manager ? { manager } : {}) } });
     this.kick();
     return true;
   }
@@ -269,75 +380,203 @@ export class Orchestrator {
       this.record({ type: 'PIPELINE_RESUMED', payload: {} });
       return 'progress';
     }
-    const active = activeAttempt(this.state);
-    if (active) {
-      const { feature, attempt } = active;
+    const active = activeAttempts(this.state);
+    let progressed = false;
+    for (const { feature, attempt } of active) {
+      if ((await this.stepAttempt(feature, attempt)) === 'progress') progressed = true;
+    }
+    if (progressed) return 'progress';
+    if (paused) return 'wait';
+    // Manual builds one feature at a time, and looks at nothing else while it runs. Swarm starts
+    // more while others run, up to its limit, and follows its other plans meanwhile (v3 §6.2).
+    const swarm = this.state.mode === 'swarm';
+    const limit = swarm ? this.design.config.swarm.maxDevelopers : 1;
+    if (active.length >= limit && !swarm) return 'wait';
+    return this.scheduleNext(active.length, limit);
+  }
+
+  /** One attempt's next step. An error counts against this attempt alone, and interrupts it past the limit. */
+  private async stepAttempt(feature: FeatureState, attempt: Attempt): Promise<Step> {
+    try {
       switch (attempt.status) {
         case 'starting':
-          return this.prepare(feature, attempt);
+          return await this.prepare(feature, attempt);
         case 'running':
-          return this.poll(feature, attempt);
+          return await this.poll(feature, attempt);
         case 'collecting':
-          return this.collect(feature, attempt);
+          return await this.collect(feature, attempt);
         case 'checking':
-          return this.check(feature, attempt);
+          return await this.check(feature, attempt);
         default:
-          return this.review(feature, attempt);
+          return await this.review(feature, attempt);
       }
+    } catch (error) {
+      await this.onAttemptError(feature, attempt, error as Error);
+      return 'wait';
     }
-    if (paused) return 'wait';
-    return this.scheduleNext();
   }
 
   // ── Choosing work ────────────────────────────────────────────────────────────
 
-  /** The first plan, in module order, that isn't complete; in it, the first feature that isn't accepted. */
-  private async scheduleNext(): Promise<Step> {
+  /**
+   * What to do besides the attempts under way (v3 §6.2). Every plan past its build gets
+   * its step: the full check run, the pull request, the deploy. Then, while fewer than
+   * `limit` attempts run, one starts in a plan being built, in plan order then file
+   * order. Then a plan whose dependencies are merged starts, while fewer than
+   * `swarm.maxPlans` are in flight. Manual keeps v2's order: it looks only at the first
+   * plan, in module order, that isn't complete.
+   */
+  private async scheduleNext(running = 0, limit = 1): Promise<Step> {
     await this.refreshDesign();
+    const swarm = this.state.mode === 'swarm';
+    if (running > 0 && swarm && (await this.abortRedefined())) return 'progress';
+    const first = swarm ? undefined : this.firstUnfinished();
+    const considered = (ref: Ref) => first === undefined || (first.module === ref.module && first.plan === ref.plan);
+    const inFlight = Object.values(this.state.plans).filter((p) => p.status !== 'completed' && considered(p));
+
+    for (const planState of inFlight) {
+      if ((await this.planStep(planState)) === 'progress') return 'progress';
+    }
+    if (running >= limit) return 'wait';
     for (const module of this.design.modules) {
       for (const plan of module.plans) {
         const planRef = { module: module.id, plan: plan.id };
         const planState = this.state.plans[planKey(planRef)];
-        if (planState?.status === 'completed') continue;
-        if (!planState) return this.gatesHolding(module.id, plan.id).length > 0 ? 'wait' : this.startPlan(planRef);
-        switch (planState.status) {
-          case 'validating':
-            return this.validatePlan(planState);
-          case 'pr_open':
-            // A Fix PR has no pull request until its fix lands.
-            return planState.pr ? this.followPullRequest(planState) : this.openPullRequest(planState);
-          case 'ready_to_merge':
-            return this.followPullRequest(planState);
-          case 'deploying':
-            return this.followDeploy(planState);
-          case 'verifying':
-            return this.verifyDeploy(planState);
-          case 'deploy_failed':
-          case 'verify_failed':
-            return 'wait';
-          case 'fixing': {
-            const fix = this.state.features[`${planKey(planRef)}/fix${planState.fixes}`]!;
-            // A Fix PR's branch starts from the merge.
-            if (!(await this.repo.revParse(`refs/heads/${planState.branch}`))) await this.repo.setRef(`refs/heads/${planState.branch}`, planState.base, '');
-            return this.scheduleWork({ ...planRef, feature: fix.feature }, this.lookup(fix).feature, fix) ?? 'wait';
-          }
-        }
+        if (planState?.status !== 'active' || !considered(planRef)) continue;
+        // A design change merged meanwhile reaches the plan branch first; attempts under way land on the moved head (§6.3).
         if (await this.mergeMain(planState)) return 'progress';
+        if (swarm) {
+          const own = activeAttempts(this.state).filter(({ feature }) => feature.module === module.id && feature.plan === plan.id).length;
+          if ((await this.scheduleParallel(planRef, plan, planState, own, running, limit)) === 'progress') return 'progress';
+          continue;
+        }
         for (const feature of plan.features) {
           const ref = { ...planRef, feature: feature.id };
-          const step = this.scheduleWork(ref, feature, this.state.features[featureKey(ref)]);
+          const step = await this.scheduleWork(ref, feature, this.state.features[featureKey(ref)]);
           if (step) return step;
         }
         this.record({ type: 'PLAN_VALIDATING', ref: planRef, payload: { head: planState.head } });
         return 'progress';
       }
     }
+    if (inFlight.length >= (swarm ? this.design.config.swarm.maxPlans : 1)) return 'wait';
+    for (const module of this.design.modules) {
+      for (const plan of module.plans) {
+        const planRef = { module: module.id, plan: plan.id };
+        if (this.state.plans[planKey(planRef)] || !considered(planRef) || !this.planCanStart(module, plan)) continue;
+        return this.startPlan(planRef);
+      }
+    }
     return 'wait';
   }
 
+  /** v2's order: the first plan, in module order, that isn't complete. */
+  private firstUnfinished(): Ref | undefined {
+    for (const module of this.design.modules) {
+      for (const plan of module.plans) {
+        if (this.state.plans[`${module.id}/${plan.id}`]?.status !== 'completed') return { module: module.id, plan: plan.id };
+      }
+    }
+    return undefined;
+  }
+
+  /** A plan starts once every plan it depends on is merged, and no gate holds it (v3 §6.1). */
+  private planCanStart(module: ModuleDesign, plan: Plan): boolean {
+    if (this.gatesHolding(module.id, plan.id).length > 0) return false;
+    return planDependencies(module, plan).every((id) => planMerged(this.state.plans[`${module.id}/${id}`]));
+  }
+
+  /** A plan's step past its build; 'wait' while it is being built, or needs the owner or the Manager. */
+  private async planStep(plan: PlanState): Promise<Step> {
+    const planRef = { module: plan.module, plan: plan.plan };
+    switch (plan.status) {
+      case 'validating':
+        return this.validatePlan(plan);
+      case 'pr_open':
+        // A Fix PR has no pull request until its fix lands.
+        return plan.pr ? this.followPullRequest(plan) : this.openPullRequest(plan);
+      case 'ready_to_merge':
+        return this.followPullRequest(plan);
+      case 'deploying':
+        return this.followDeploy(plan);
+      case 'verifying':
+        return this.verifyDeploy(plan);
+      case 'fixing': {
+        const fix = this.state.features[`${planKey(planRef)}/fix${plan.fixes}`]!;
+        // A Fix PR's branch starts from the merge.
+        if (!(await this.repo.revParse(`refs/heads/${plan.branch}`))) await this.repo.setRef(`refs/heads/${plan.branch}`, plan.base, '');
+        return (await this.scheduleWork({ ...planRef, feature: fix.feature }, this.lookup(fix).feature, fix)) ?? 'wait';
+      }
+      default:
+        return 'wait';
+    }
+  }
+
+  /**
+   * Swarm's scheduler within a plan (v3 §6.2): starts the next feature whose dependencies
+   * are met, while fewer than `limit` attempts run in all. A feature that can't start, for
+   * guidance, a gate or an escalation, doesn't hold the independent ones back. The plan
+   * validates once every feature is accepted and none of its attempts runs.
+   */
+  private async scheduleParallel(planRef: Ref, plan: Plan, planState: PlanState, own: number, running: number, limit: number): Promise<Step> {
+    for (const feature of plan.features) {
+      const ref = { ...planRef, feature: feature.id };
+      const state = this.state.features[featureKey(ref)];
+      if (state?.status === 'accepted' || (state && isActive(state))) continue;
+      if (!this.dependenciesMet(planRef, feature)) continue;
+      if (running >= limit) break;
+      const step = await this.scheduleWork(ref, feature, state);
+      if (step === 'progress') return 'progress';
+    }
+    const done = plan.features.every((f) => this.state.features[featureKey({ ...planRef, feature: f.id })]?.status === 'accepted');
+    if (done && own === 0) {
+      this.record({ type: 'PLAN_VALIDATING', ref: planRef, payload: { head: planState.head } });
+      return 'progress';
+    }
+    return 'wait';
+  }
+
+  /**
+   * A design change merged while attempts run (v3 §6.6): an attempt whose feature it
+   * redefined is interrupted, without counting, and the next one builds the new
+   * definition. Fix rounds have no definition on main, so they go on.
+   */
+  private async abortRedefined(): Promise<boolean> {
+    for (const { feature, attempt } of activeAttempts(this.state)) {
+      if (feature.fix) continue;
+      let hash: string | undefined;
+      try {
+        hash = definitionHash(this.lookup(feature).feature);
+      } catch {
+        hash = undefined;
+      }
+      if (hash === attempt.definitionHash) continue;
+      if (attempt.status === 'running') await this.killAgent(attempt.sandbox).catch(() => {});
+      this.stopFollowing(attempt.sandbox);
+      await this.interrupt(feature, attempt, hash === undefined
+        ? 'the design no longer has this feature: the attempt stops'
+        : 'the design changed this feature while it was built: the next attempt builds the new definition');
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Every feature this one depends on is accepted; one of an earlier plan counts once that
+   * plan is merged, so that its code is on main and reaches this plan's branch (v3 §6.1).
+   */
+  private dependenciesMet(planRef: Ref, feature: Feature): boolean {
+    return feature.dependsOn.every((dep) => {
+      const target = featureDependency(planRef.plan, dep);
+      if (target.plan === planRef.plan) return this.state.features[featureKey({ ...planRef, feature: target.feature })]?.status === 'accepted';
+      return planMerged(this.state.plans[`${planRef.module}/${target.plan}`]);
+    });
+  }
+
   /** The next attempt of a feature or a fix round, or why there can't be one yet. Undefined once it is accepted. */
-  private scheduleWork(ref: Ref, definition: Feature, state: FeatureState | undefined): Step | undefined {
+  private async scheduleWork(ref: Ref, definition: Feature, state: FeatureState | undefined): Promise<Step | undefined> {
     if (state?.status === 'accepted') return undefined;
+    if (state && isActive(state)) return 'wait';
     const hash = definitionHash(definition);
     // The owner decides about an escalated feature, unless a design change redefined it since (§7.1).
     if (state?.status === 'escalated' && state.attempts.at(-1)?.definitionHash === hash) return 'wait';
@@ -350,7 +589,42 @@ export class Orchestrator {
     // A second attempt never starts without the Manager's guidance (§7.4).
     if (state?.awaitingGuidanceSince) return 'wait';
     if (this.blockedByOwner(ref.module) || this.designChanging(ref.module) || this.gatesHolding(ref.module, ref.plan, definition).length > 0) return 'wait';
+    if (await this.usagePauses()) return 'progress';
     return this.startAttempt(ref, hash, state);
+  }
+
+  /**
+   * In Swarm, no attempt starts at or above the usage ceiling (v3 §4.3): the pipeline
+   * pauses until the binding window resets, and the existing rule lifts the pause then.
+   * Without a token, or when the endpoint fails, nothing is checked: the pause after a
+   * limit is hit remains the brake.
+   */
+  private async usagePauses(): Promise<boolean> {
+    const ceiling = this.design.config.swarm.usageCeilingPercent;
+    if (this.state.mode !== 'swarm' || ceiling === null) return false;
+    const usage = await this.subscriptionUsage();
+    if (!usage || usage.percent < ceiling) return false;
+    const binding = usage.limits.find((l) => l.percent === usage.percent);
+    const reset = Date.parse(usage.resetsAt);
+    const until = Number.isFinite(reset) && reset > this.now() ? usage.resetsAt : new Date(this.now() + 60 * 60_000).toISOString();
+    this.record({
+      type: 'PIPELINE_PAUSED',
+      payload: { reason: `the subscription's usage is at ${usage.percent}%${binding ? ` (${binding.kind})` : ''}, at or above the ${ceiling}% ceiling (swarm.usageCeilingPercent)`, until },
+    });
+    return true;
+  }
+
+  /** The subscription's usage, read at most every five minutes. */
+  private async subscriptionUsage(): Promise<SubscriptionUsage | undefined> {
+    if (this.usage && this.now() - Date.parse(this.usage.at) < 5 * 60_000) return this.usage.usage;
+    try {
+      const usage = await this.readUsage();
+      if (usage) this.usage = { at: new Date(this.now()).toISOString(), usage };
+      return usage;
+    } catch (error) {
+      this.log(`the subscription's usage could not be read: ${(error as Error).message}`);
+      return undefined;
+    }
   }
 
   /**
@@ -418,10 +692,11 @@ export class Orchestrator {
     await this.repo.bundle(`refs/heads/${branch}`, join(dir, 'plan.bundle'));
     const previous = state.attempts.filter((a) => a.n < attempt.n && a.status === 'failed').at(-1);
     const progress = (await this.repo.show(`refs/heads/${branch}`, 'progress.txt')) ?? '';
+    const mustKeep = await this.regressionChecks(attempt.base);
     writeFileSync(join(dir, 'task.md'), buildTask({
       ref, plan, feature, previous,
       ...(attempt.guidance ? { guidance: attempt.guidance } : {}),
-      regressionChecks: this.regressionChecks(),
+      regressionChecks: mustKeep,
       progressTail: progress.split('\n').slice(-21).join('\n'),
     }));
     copyFileSync(join(this.options.packageDir, 'roles', 'developer.md'), join(dir, 'developer.md'));
@@ -442,7 +717,7 @@ export class Orchestrator {
 
     const init = await initEnvironment(this.driver, sandbox, p.work);
     if (init && init.exit !== 0) return this.baselineFailed(state, attempt, 'init.sh failed', [init]);
-    const regression = await runChecks(this.driver, sandbox, p.work, this.regressionChecks(), this.checkOptions(sandbox));
+    const regression = await runChecks(this.driver, sandbox, p.work, mustKeep, this.checkOptions(sandbox));
     if (!allPassed(regression)) {
       return this.baselineFailed(state, attempt, 'checks of accepted work fail before the attempt starts', regression);
     }
@@ -505,7 +780,7 @@ export class Orchestrator {
 
   /** Step 7: take the Developer's commits out as a bundle, whatever the outcome, and refuse changes to protected files. */
   private async collect(state: FeatureState, attempt: Attempt): Promise<Step> {
-    this.stopFollowing();
+    this.stopFollowing(attempt.sandbox);
     const ref = refOf(state, attempt);
     if (attempt.outcome === 'usage_limit') {
       this.record({ type: 'ATTEMPT_INTERRUPTED', ref, payload: { reason: 'the subscription usage limit was reached', counts: false } });
@@ -529,20 +804,47 @@ export class Orchestrator {
   /** Step 8: every check in a fresh sandbox. If they pass, the attempt waits for the Manager's review. */
   private async check(state: FeatureState, attempt: Attempt): Promise<Step> {
     const ref = refOf(state, attempt);
-    const { feature } = this.lookup(state);
     await this.driver.remove(attempt.sandbox);
+    return this.checkMerged(state, attempt, `a${ref.attempt}`);
+  }
+
+  /**
+   * The checks, on the attempt as it would land: when another feature landed meanwhile
+   * (v3 §6.3), the plan's head is merged in first, so the checks of accepted work see
+   * that work, and the attempt lands on the head. A conflict interrupts the attempt.
+   */
+  private async checkMerged(state: FeatureState, attempt: Attempt, suffix: string): Promise<Step> {
+    const ref = refOf(state, attempt);
+    const { feature } = this.lookup(state);
+    const branch = this.state.plans[planKey(ref)]!.branch;
+    const merged = await this.mergeWithHead(ref, attempt, branch);
+    if (merged && 'conflicts' in merged) {
+      return this.interrupt(state, attempt, `conflicts with work landed on ${branch} meanwhile, in ${merged.conflicts.join(', ')}: the next attempt starts from the new head`);
+    }
+    const checkRef = merged ? `${attemptRefName(ref)}-rebased` : attemptRefName(ref);
+    if (merged) await this.repo.setRef(checkRef, merged.commit);
     const results = await this.runChecksIn(
-      sandboxName('chk', this.design.config.project.name, featureKey(ref), `a${ref.attempt}`),
-      attemptRefName(ref),
+      sandboxName('chk', this.design.config.project.name, featureKey(ref), suffix),
+      checkRef,
       this.attemptDir(ref),
-      [...this.regressionChecks(), ...preMerge(feature.checks)],
+      [...(await this.regressionChecks(checkRef)), ...preMerge(feature.checks)],
     );
     if (!allPassed(results)) {
       this.record({ type: 'CHECKS_FAILED', ref, payload: { results } });
-      return this.fail(state, attempt, `checks failed: ${results.filter((r) => r.exit !== 0).map((r) => r.id).join(', ')}`);
+      const failing = results.filter((r) => r.exit !== 0).map((r) => r.id).join(', ');
+      return this.fail(state, attempt, `checks failed${merged ? ` once merged with ${branch}'s new head` : ''}: ${failing}`);
     }
-    this.record({ type: 'CHECKS_PASSED', ref, payload: { results } });
+    if (merged) this.record({ type: 'ATTEMPT_REBASED', ref, payload: { onto: merged.onto, commit: merged.commit, results } });
+    if (attempt.status === 'checking') this.record({ type: 'CHECKS_PASSED', ref, payload: { results } });
     return 'progress';
+  }
+
+  /** The plan's head merged into the attempt's work, when the head moved since the attempt's base and the last merge. */
+  private async mergeWithHead(ref: Ref, attempt: Attempt, branch: string): Promise<{ onto: string; commit: string } | { conflicts: string[] } | undefined> {
+    const planHead = (await this.repo.revParse(`refs/heads/${branch}`))!;
+    if (planHead === attempt.base || attempt.rebased?.onto === planHead) return undefined;
+    const merged = await this.repo.merge({ ours: planHead, theirs: attempt.head!, message: `Merge ${branch} into ${featureKey(ref)} attempt ${ref.attempt}\n`, committer: HARNESS });
+    return 'conflicts' in merged ? merged : { onto: planHead, commit: merged.commit };
   }
 
   /** Steps 9–10: the Manager's verdict. Accepted, the feature lands on the plan branch as one commit. */
@@ -555,15 +857,28 @@ export class Orchestrator {
     const { feature } = this.lookup(state);
     const branch = this.state.plans[planKey(ref)]!.branch;
     const landed = await this.alreadyLanded(branch, attempt, ref);
+    let base = attempt.base;
+    let head = attempt.head!;
+    const planHead = (await this.repo.revParse(`refs/heads/${branch}`))!;
+    if (!landed && planHead !== attempt.base) {
+      // The head moved again since the checks, as a third feature landing does: merge and check once more before landing (v3 §6.3).
+      if (attempt.rebased?.onto !== planHead) {
+        const step = await this.checkMerged(state, attempt, `a${ref.attempt}r`);
+        if (attempt.rebased?.onto !== planHead) return step;
+      }
+      // The merge is checked and recorded on the attempt: it lands as one commit on the head.
+      base = planHead;
+      head = attempt.rebased!.commit;
+    }
     const commit = landed ?? (await this.repo.commitFeature({
-      base: attempt.base,
-      head: attempt.head!,
+      base,
+      head,
       progressLine: this.progressLine(ref, attempt, state.fix),
       message: commitMessage(ref, feature, attempt, attempt.checks ?? [], state.fix),
       author: DEVELOPER,
       committer: HARNESS,
     }));
-    if (!landed) await this.repo.setRef(`refs/heads/${branch}`, commit, attempt.base);
+    if (!landed) await this.repo.setRef(`refs/heads/${branch}`, commit, base);
     this.record({ type: 'FEATURE_ACCEPTED', ref, payload: { commit } });
     return 'progress';
   }
@@ -579,7 +894,7 @@ export class Orchestrator {
         sandboxName('chk', this.design.config.project.name, planKey(ref), 'plan'),
         `refs/heads/${plan.branch}`,
         this.planDir(ref),
-        this.regressionChecks(),
+        await this.regressionChecks(`refs/heads/${plan.branch}`),
       );
       this.record({ type: allPassed(results) ? 'PLAN_CHECKS_PASSED' : 'PLAN_CHECKS_FAILED', ref, payload: { results } });
       return 'progress';
@@ -631,6 +946,9 @@ export class Orchestrator {
       this.nextPoll.delete(key);
       return 'progress';
     }
+    // A reviewer's session on the pushed head is stepped without reading GitHub (v3 §5).
+    const review = activeReview(plan);
+    if (review) return stepReview(this, plan, review);
     if (this.now() < (this.nextPoll.get(key) ?? 0)) return 'wait';
     const pr = await this.forge.pullRequest(plan.pr!.number);
     if (pr.merged) {
@@ -647,9 +965,109 @@ export class Orchestrator {
       const step = await this.readCi(plan);
       if (step) return step;
     }
+    if (plan.ci?.status === 'passed' && !plan.branch.startsWith('fix/')) {
+      // The cost job's estimate (v3 §5.3), then the reviewers (v3 §5), then the merge policy (v3 §3.2).
+      if (await this.readCostEstimate(plan, pr)) {
+        this.nextPoll.delete(key);
+        return 'progress';
+      }
+      const reviewed = await reviewStep(this, plan, pr);
+      if (reviewed === 'progress') {
+        this.nextPoll.delete(key);
+        return 'progress';
+      }
+      if (reviewed === 'busy') return 'wait';
+      if (reviewed === 'ready' && this.state.mode === 'swarm' && (await this.mergeUnderPolicy(plan, pr))) {
+        this.nextPoll.delete(key);
+        return 'progress';
+      }
+    }
     const quiet = plan.ci ? this.now() - Date.parse(plan.ci.since) : 0;
     this.nextPoll.set(key, this.now() + (plan.ci?.status === 'pending' ? 30_000 : quiet < 600_000 ? 60_000 : 300_000));
     return 'wait';
+  }
+
+  /**
+   * Swarm's merge policy (v3 §3.2): the daemon merges a plan's PR once CI passed, when
+   * every clause holds; otherwise the PR is left to the owner, with the reason, once per
+   * head and reason. Fix PRs never come here: a failed deploy is the owner's to look at.
+   */
+  private async mergeUnderPolicy(plan: PlanState, pr: PullRequest): Promise<boolean> {
+    const ref = { module: plan.module, plan: plan.plan };
+    const policy = this.design.config.swarm;
+    const definition = this.definitionOf(plan);
+    const kind = definition ? planKind(definition) : 'MIXED';
+    const leave = (reason: string): false => {
+      if (plan.leftToOwner?.head !== pr.head || plan.leftToOwner.reason !== reason) {
+        this.record({ type: 'PR_LEFT_TO_OWNER', ref, payload: { number: pr.number, head: pr.head, reason } });
+      }
+      return false;
+    };
+    if (kind === 'CODE' && policy.merge.code !== 'daemon') return leave('CODE plans are the owner\'s to merge (swarm.merge.code)');
+    if (kind !== 'CODE') {
+      const ceiling = policy.merge.infraMonthlyUsdCeiling;
+      const estimate = plan.costEstimate;
+      if (ceiling !== null && estimate !== undefined && estimate.monthlyUsd > ceiling) {
+        return leave(`the PR adds an estimated ${estimate.monthlyUsd} USD a month, over the ceiling of ${ceiling} (swarm.merge.infraMonthlyUsdCeiling)`);
+      }
+      // Without the owner's button (v3 D36), an estimate under the ceiling is the only way in.
+      if (this.state.infraMerge !== 'daemon') {
+        const button = "the dashboard's button lets the daemon merge infra once CI and the reviewers pass";
+        if (ceiling === null) return leave(`${kind} plans are the owner's to merge (swarm.merge.infraMonthlyUsdCeiling is null); ${button}`);
+        if (estimate === undefined) {
+          return leave(`${kind === 'INFRA' ? 'an' : 'a'} ${kind} plan merges itself only with the cost job's estimate of the monthly cost it adds, and none was produced: the cost job needs iac/ and the INFRACOST_API_KEY secret; ${button}`);
+        }
+      }
+    }
+    const statuses = await this.forge.commitStatuses(pr.head);
+    const missing = policy.requiredStatuses.filter((context) => statuses.find((s) => s.context === context)?.state !== 'success');
+    if (missing.length > 0) {
+      // A reviewer that passed but whose status the App couldn't set says why, instead of a wait that never ends.
+      const unposted = (plan.reviews ?? []).find((r) => r.head === pr.head && r.posted?.status === 'error' && r.posted.problem);
+      if (unposted) return leave(`${unposted.posted!.problem}`);
+      return leave(`waiting for ${missing.join(', ')} to pass on ${pr.head.slice(0, 8)} (swarm.requiredStatuses)`);
+    }
+    let commit: string;
+    try {
+      ({ commit } = await this.forge.mergePullRequest(pr.number, pr.head));
+    } catch (error) {
+      const repo = this.design.config.project.repo ?? '<owner/repo>';
+      return leave(`GitHub refused the merge: ${(error as Error).message}. If main's rules are still the Manual ones, run \`harness github-setup --repo ${repo}\``);
+    }
+    this.record({ type: 'PR_MERGED_BY_DAEMON', ref, payload: { number: pr.number, head: pr.head, commit } });
+    this.record({ type: 'PR_MERGED', ref, payload: { commit, next: await this.afterMerge(plan, commit) } });
+    return true;
+  }
+
+  /**
+   * The cost job's estimate of the monthly cost an INFRA or MIXED PR adds (v3 §5.3, §5.5):
+   * the `cost` artifact of the head's workflow run, read once per head. The job isn't a
+   * required check, so it may finish after CI passed: the daemon looks for twenty minutes.
+   * Without an estimate the policy leaves the PR to the owner, with the reason.
+   */
+  private async readCostEstimate(plan: PlanState, pr: PullRequest): Promise<boolean> {
+    const definition = this.definitionOf(plan);
+    if (!definition || planKind(definition) === 'CODE' || plan.costEstimate?.head === pr.head) return false;
+    if (!plan.ci || this.now() - Date.parse(plan.ci.since) > 20 * 60_000) return false;
+    let text: string | undefined;
+    try {
+      text = await this.forge.artifactFile(pr.head, 'cost', 'cost.json');
+    } catch (error) {
+      this.log(`the cost estimate of ${pr.head.slice(0, 8)} could not be read: ${(error as Error).message}`);
+      return false;
+    }
+    if (text === undefined) return false;
+    const estimate = parseCostEstimate(text);
+    if (!estimate) {
+      this.log(`the cost artifact of ${pr.head.slice(0, 8)} holds no monthly cost: is it Infracost's JSON?`);
+      return false;
+    }
+    this.record({ type: 'COST_ESTIMATED', ref: { module: plan.module, plan: plan.plan }, payload: { head: pr.head, ...estimate } });
+    return true;
+  }
+
+  private definitionOf(plan: PlanState): Plan | undefined {
+    return this.design.modules.find((m) => m.id === plan.module)?.plans.find((p) => p.id === plan.plan);
   }
 
   /** After a merge: CI applies the infrastructure it changed, then the plan's post-deploy checks run (§12.6). */
@@ -768,8 +1186,9 @@ export class Orchestrator {
 
   private prTitle(plan: PlanState): string {
     if (plan.branch.startsWith('fix/')) return `Fix: ${planKey(plan)} — after the deploy, round ${plan.deployFixRounds}`;
-    const definition = this.design.modules.find((m) => m.id === plan.module)?.plans.find((p) => p.id === plan.plan);
-    return `Plan: ${planKey(plan)} — ${definition?.title ?? plan.plan}`;
+    const definition = this.definitionOf(plan);
+    // The kind's tag is for the owner and the reviewers; CI derives the kind from the design and grants nothing on the tag (v3 §3.1).
+    return `Plan: ${planKey(plan)} -${definition ? planKind(definition) : 'MIXED'}- ${definition?.title ?? plan.plan}`;
   }
 
   private prBody(plan: PlanState): string {
@@ -879,14 +1298,20 @@ export class Orchestrator {
     return 'progress';
   }
 
+  /** An error outside any attempt: logged, and the loop goes on. */
   private async onStepError(error: Error): Promise<void> {
-    const active = activeAttempt(this.state);
-    const key = active ? `${featureKey(refOf(active.feature, active.attempt))}#${active.attempt.n}:${active.attempt.status}` : 'idle';
+    this.stepErrors = { key: 'idle', count: this.stepErrors.key === 'idle' ? this.stepErrors.count + 1 : 1 };
+    this.log(`step failed (idle, ${this.stepErrors.count}): ${error.message}`);
+  }
+
+  /** An error in one attempt's step: counted for that attempt and its status, and past the limit the attempt is interrupted. */
+  private async onAttemptError(feature: FeatureState, attempt: Attempt, error: Error): Promise<void> {
+    const key = `${featureKey(refOf(feature, attempt))}#${attempt.n}:${attempt.status}`;
     this.stepErrors = { key, count: this.stepErrors.key === key ? this.stepErrors.count + 1 : 1 };
     this.log(`step failed (${key}, ${this.stepErrors.count}/${STEP_ERROR_LIMIT}): ${error.message}`);
-    if (active && this.stepErrors.count >= STEP_ERROR_LIMIT) {
+    if (this.stepErrors.count >= STEP_ERROR_LIMIT) {
       this.stepErrors = { key: '', count: 0 };
-      await this.interrupt(active.feature, active.attempt, `infrastructure error: ${error.message}`).catch(() => {});
+      await this.interrupt(feature, attempt, `infrastructure error: ${error.message}`).catch(() => {});
     }
   }
 
@@ -921,8 +1346,9 @@ export class Orchestrator {
 
   /** Gives the Developer the Manager's answer, as the result of its `ask_manager` call. */
   async replyToDeveloper(sandbox: string, requestId: string, text: string): Promise<boolean> {
-    if (this.developer?.sandbox !== sandbox) return false;
-    await this.developer.channel.reply(requestId, true, text);
+    const developer = this.developers.get(sandbox);
+    if (!developer) return false;
+    await developer.channel.reply(requestId, true, text);
     return true;
   }
 
@@ -962,11 +1388,18 @@ export class Orchestrator {
     return { plan, feature };
   }
 
-  /** The project's own pre-merge checks, then those of every accepted feature. They must keep passing. */
-  regressionChecks(): Check[] {
-    const accepted = Object.values(this.state.features)
-      .filter((f) => f.status === 'accepted')
-      .flatMap((f) => preMerge(this.lookup(f).feature.checks));
+  /**
+   * The project's own pre-merge checks, then those of every accepted feature whose
+   * commit `commit` contains: they must keep passing. Work landed on another plan's
+   * branch, or merged on main after this branch last took it, isn't in `commit`, so its
+   * checks aren't asked of it (v3 §6.2).
+   */
+  async regressionChecks(commit: string): Promise<Check[]> {
+    const accepted: Check[] = [];
+    for (const feature of Object.values(this.state.features)) {
+      if (feature.status !== 'accepted' || !feature.commit || !(await this.repo.isAncestor(feature.commit, commit))) continue;
+      accepted.push(...preMerge(this.lookup(feature).feature.checks));
+    }
     return [...preMerge(this.design.config.checks), ...accepted];
   }
 
@@ -1012,6 +1445,24 @@ export class Orchestrator {
 
   moduleDir(module: string): string {
     return ensureDir(join(this.options.harnessDir, 'modules', module));
+  }
+
+  /**
+   * The owner's time, planned and used, or undefined while the owner hasn't set their
+   * hours. A design in review counts as submitted: it is read from the Architect's ref,
+   * not from main, where it isn't yet.
+   */
+  async ownerTime(): Promise<OwnerTime | undefined> {
+    if (this.state.budgets.ownerHours === undefined) return undefined;
+    const modules = [...this.design.modules];
+    for (const module of Object.values(this.state.modules).filter((m) => m.status === 'in_review')) {
+      const submitted = (await loadDesign(this.repo, architectRef(module.module)).catch(() => undefined))?.modules.find((m) => m.id === module.module);
+      if (!submitted) continue;
+      const current = modules.findIndex((m) => m.id === module.module);
+      if (current === -1) modules.push(submitted);
+      else modules[current] = submitted;
+    }
+    return ownerTime(this.design.config, { config: this.design.config, modules }, this.state);
   }
 
   /** The sandbox policy: the project's network bundles, or every bundle for the Architect (§13), and signed AWS endpoints. */
@@ -1087,7 +1538,7 @@ export class Orchestrator {
     return this.repo.fetchBundle(local, attemptRefName(ref));
   }
 
-  private async killAgent(sandbox: string): Promise<void> {
+  async killAgent(sandbox: string): Promise<void> {
     const p = this.paths(sandbox);
     await this.exec(sandbox, `pid="$(cat ${sh(p.pid)})"; kill -TERM -- "-$pid" 2>/dev/null; sleep 5; kill -KILL -- "-$pid" 2>/dev/null; true`);
   }
@@ -1103,18 +1554,34 @@ export class Orchestrator {
   }
 
   private followAttempt(ref: Ref, sandbox: string): void {
-    if (this.developer?.sandbox === sandbox) return;
-    this.stopFollowing();
+    if (this.developers.has(sandbox)) return;
     const agent = `developer:${featureKey(ref)}/a${ref.attempt}`;
     const follower = this.driver.follow(sandbox, this.paths(sandbox).stream, 1, (line) => this.events.emit('transcript', { agent, line }));
     const channel = this.channel({ role: 'developer', sandbox }, join(this.attemptDir(ref), 'replied.txt'));
-    this.developer = { sandbox, follower, channel };
+    this.developers.set(sandbox, { follower, channel });
   }
 
-  private stopFollowing(): void {
-    this.developer?.follower.stop();
-    this.developer?.channel.stop();
-    this.developer = undefined;
+  private stopFollowing(sandbox: string): void {
+    const developer = this.developers.get(sandbox);
+    developer?.follower.stop();
+    developer?.channel.stop();
+    this.developers.delete(sandbox);
+  }
+
+  /** A reviewer's transcript for the dashboard, and its channel for `web_read` (v3 §5.1). */
+  followReview(review: ReviewState): void {
+    if (this.reviewer?.sandbox === review.sandbox) return;
+    this.stopFollowingReview();
+    const agent = `${review.role}:${review.head.slice(0, 8)}`;
+    const follower = this.driver.follow(review.sandbox, this.paths(review.sandbox).stream, 1, (line) => this.events.emit('transcript', { agent, line }));
+    const channel = this.channel({ role: 'reviewer', sandbox: review.sandbox }, join(this.options.harnessDir, 'reviews', `${review.sandbox}.replied.txt`));
+    this.reviewer = { sandbox: review.sandbox, follower, channel };
+  }
+
+  stopFollowingReview(): void {
+    this.reviewer?.follower.stop();
+    this.reviewer?.channel.stop();
+    this.reviewer = undefined;
   }
 
   private agentRun(sandbox: string, attempt: Attempt): AgentRun {
@@ -1149,8 +1616,21 @@ export function makeForge(config: Config, projectDir: string): Forge {
   return config.project.repo ? new GitHubForge(new GitHubClient(loadAppCredentials(), config.project.repo)) : new LocalForge(projectDir);
 }
 
-/** A fix round, described as a feature so that it runs like one. It has no checks of its own: CI is its check. */
-function fixDefinition(id: string, plan: string, fix: { round: number; kind: 'ci' | 'deploy'; failure: string }): Feature {
+/** A fix round, described as a feature so that it runs like one. It has no checks of its own: CI, or the reviewer, is its check. */
+function fixDefinition(id: string, plan: string, fix: NonNullable<FeatureState['fix']>): Feature {
+  if (fix.kind === 'review') {
+    return {
+      id,
+      title: `Fix the ${fix.role} review, round ${fix.round}`,
+      kind: 'app',
+      description: `The ${fix.role} reviewer blocked the pull request of plan ${plan}. Fix every blocking finding below, without touching protected files. Advisory findings are yours to judge.\n\n${fix.failure}`,
+      expected: 'The reviewer passes the next head of the pull request, and every check listed below still passes.',
+      dependsOn: [],
+      gates: [],
+      resources: [],
+      checks: [],
+    };
+  }
   const what = fix.kind === 'ci' ? `CI failed on the pull request of plan ${plan}` : `After plan ${plan} was merged, its deploy failed`;
   return {
     id,
@@ -1182,7 +1662,7 @@ function outcomeReason(attempt: Attempt): string {
 
 function commitMessage(ref: Ref, feature: Feature, attempt: Attempt, results: CheckResult[], fix?: FeatureState['fix']): string {
   return [
-    fix ? `fix(${ref.module}/${ref.plan}): ${fix.kind === 'ci' ? 'CI' : 'the deploy'}, round ${fix.round}` : `feat(${featureKey(ref)}): ${feature.title}`,
+    fix ? `fix(${ref.module}/${ref.plan}): ${fix.kind === 'ci' ? 'CI' : fix.kind === 'review' ? `the ${fix.role} review` : 'the deploy'}, round ${fix.round}` : `feat(${featureKey(ref)}): ${feature.title}`,
     ...(fix ? [] : ['', feature.description]),
     ...(attempt.summary ? ['', attempt.summary] : []),
     '',

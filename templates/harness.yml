@@ -100,6 +100,70 @@ jobs:
           path: iac/plan.json
           retention-days: 7
 
+  # Estimates the monthly cost a pull request adds to iac/, with Infracost, for Swarm's merge
+  # policy (razzou-harness v3 §5.3): an INFRA or MIXED plan merges itself only under the
+  # ceiling. It runs on pull requests that have iac/ when the INFRACOST_API_KEY secret is set,
+  # a free key from infracost.io, and writes Infracost's JSON as the `cost` artifact, which
+  # the daemon reads. It is not a required check, and fails only when Infracost itself does.
+  cost:
+    name: cost
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
+      INFRACOST_SKIP_UPDATE_CHECK: 'true'
+    steps:
+      - name: Check out the base branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+          persist-credentials: false
+      - name: Check out the pull request
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: head
+          persist-credentials: false
+      - name: Look for iac/ and the key
+        id: cost
+        run: if [ -d head/iac ] && [ -n "$INFRACOST_API_KEY" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; fi
+      - name: Install Infracost
+        if: steps.cost.outputs.run == 'true'
+        env:
+          VERSION: v0.10.47
+          SHA256: df098d5565b78cc23de57e1dac9f2a02491691322cbd690dca9b197e3e02fe93
+        run: |
+          curl -fsSL -o infracost.tar.gz "https://github.com/infracost/infracost/releases/download/${VERSION}/infracost-linux-amd64.tar.gz"
+          echo "${SHA256}  infracost.tar.gz" | sha256sum -c -
+          tar -xzf infracost.tar.gz infracost-linux-amd64
+          sudo install -m 0755 infracost-linux-amd64 /usr/local/bin/infracost
+      - name: Estimate
+        if: steps.cost.outputs.run == 'true'
+        run: |
+          # Runs Infracost in a Terraform folder, with the staging variables when the folder has them.
+          estimate() {
+            dir=$1; shift
+            if [ -f "$dir/env/staging.tfvars" ]; then set -- "$@" --terraform-var-file env/staging.tfvars; fi
+            (cd "$dir" && infracost "$@" --path .)
+          }
+          if [ -d base/iac ]; then
+            estimate base/iac breakdown --format json --out-file "$GITHUB_WORKSPACE/base.json"
+            estimate head/iac diff --compare-to "$GITHUB_WORKSPACE/base.json" --format json --out-file "$GITHUB_WORKSPACE/cost.json"
+          else
+            estimate head/iac breakdown --format json --out-file "$GITHUB_WORKSPACE/cost.json"
+          fi
+          node -e 'const c = JSON.parse(require("fs").readFileSync("cost.json", "utf8")); console.log(`### Monthly cost\n\nAdds ${c.diffTotalMonthlyCost ?? c.totalMonthlyCost} USD a month; ${c.totalMonthlyCost} USD in all.`)' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.cost.outputs.run == 'true'
+        with:
+          name: cost
+          path: cost.json
+          retention-days: 7
+
   # Runs init.sh, the project's checks and those of every accepted feature. No secrets.
   checks:
     name: checks

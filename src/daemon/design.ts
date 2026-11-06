@@ -1,4 +1,5 @@
 import { archMayChange, computeLock, protectionRules, type Lock } from '../ci/harness-ci.ts';
+import { moduleOwnerTime, ownerTimeProblems } from '../design/owner-time.ts';
 import { checkScripts, definitionHash, loadDesign, type ModuleDesign } from '../design/schemas.ts';
 import { HARNESS } from '../git/repo.ts';
 import type { ModuleState } from '../state/state.ts';
@@ -57,6 +58,8 @@ export async function submitDesign(o: Orchestrator, module: ModuleState, summary
       }
     }
   }
+  // Once the owner budgets their time, every owner action is estimated, and the module fits what is available (v3 §4.1).
+  if (mine) problems.push(...ownerTimeProblems(await o.ownerTime(), moduleOwnerTime(mine, o.state)));
   if (problems.length > 0 || !mine) return { ok: false, problems };
 
   // The new checks, run once on the repository as it is: nothing is built yet, so they should fail.

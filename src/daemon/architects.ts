@@ -123,7 +123,7 @@ export class Architects {
       return folder;
     };
     copyFileSync(join(o.options.packageDir, 'roles', 'architect.md'), join(staging('harness'), 'architect.md'));
-    writeFileSync(join(staging('harness'), 'welcome.md'), welcome(module));
+    writeFileSync(join(staging('harness'), 'welcome.md'), welcome(module, o.state.budgets.ownerHours !== undefined));
     for (const file of ['architect.md', 'welcome.md']) await o.driver.upload(sandbox, join(staging('harness'), file), p.harness);
     await o.uploadAgentFiles(sandbox, 'architect', dir);
     writeFileSync(join(staging('home'), '.claude.json'), claudeJson(p.work));
@@ -272,13 +272,16 @@ export class Architects {
 }
 
 /** The first prompt of a session: a new module, or one whose sandbox was recreated without its conversation. */
-function welcome(module: ModuleState): string {
+function welcome(module: ModuleState, budgeted: boolean): string {
   const latest = module.proposals.at(-1);
+  // The owner's time is budgeted: the Architect designs owner actions within it (v3 §4.1).
+  const budget = budgeted ? ['The owner budgets their time: call get_owner_time before you propose, and estimate every owner action.'] : [];
   if (!latest) {
     return clip([
       `[harness] You are the Architect of the new module "${module.module}": ${module.title}.`,
       'Read README.md, ARCHITECTURE.md and the other modules\' designs in harness/modules/ first.',
       'Then greet the owner in two lines and wait: they will tell you what this module is for. Then use the grill-me skill.',
+      ...budget,
     ].join('\n'), 2000);
   }
   const where = {
@@ -293,5 +296,6 @@ function welcome(module: ModuleState): string {
     'Your sandbox was recreated, and your earlier conversation is gone.',
     `Your proposals are in harness/modules/${module.module}/proposals/. ${where}`,
     'Read them, README.md and ARCHITECTURE.md, then greet the owner in two lines and wait.',
+    ...budget,
   ].join('\n'), 2000);
 }

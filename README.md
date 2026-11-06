@@ -8,6 +8,8 @@ Every agent works in its own [OpenShell](https://github.com/NVIDIA/OpenShell) sa
 with no credentials, every feature is checked in a fresh one, and nothing reaches `main`
 until you merge its pull request. A small daemon runs the loop, following Anthropic's
 [Effective harnesses for long-running agents](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents).
+That is Manual mode. For a project too large to read in full, [Swarm mode](#swarm-mode)
+lets the daemon merge the plans that pass CI and two reviewers.
 
 - [How it works](#how-it-works)
 - [Requirements](#requirements)
@@ -15,6 +17,7 @@ until you merge its pull request. A small daemon runs the loop, following Anthro
 - [Your first module](#your-first-module)
 - [Concepts](#concepts)
 - [The dashboard](#the-dashboard)
+- [Swarm mode](#swarm-mode)
 - [Commands](#commands)
 - [Configuration](#configuration)
 - [AWS and Terraform](#aws-and-terraform)
@@ -84,7 +87,8 @@ daemon builds the module, feature by feature:
   and the Manager submits it;
 - the daemon pushes the plan branch and opens one pull request for it, as a GitHub App
   with no access to workflows. CI checks the PR with the rules of the base branch. If CI
-  fails, the Manager diagnoses it and a Developer fixes it, twice at most. You merge.
+  fails, the Manager diagnoses it and a Developer fixes it, twice at most. You merge,
+  or the daemon does in [Swarm mode](#swarm-mode).
 
 Infrastructure features take the same path. Agents see AWS through a read-only role
 whose requests the OpenShell proxy signs, so they plan against the real state but never
@@ -122,17 +126,28 @@ without pull requests.
 
 ```sh
 npm install -g razzou-harness --allow-scripts=node-pty
-cd path/to/project && harness init    # then follow the checklist it prints
-harness doctor --build-images         # builds the agents' image
-harness doctor --probe                # everything an agent must not do, tried
-harness up                            # the daemon, and the dashboard
+cd path/to/project && harness setup   # the rest, asking only for what is yours
 ```
 
 The command is also installed as `razzou-harness`, for machines where another `harness`,
 such as the Harness.io CLI, comes first on the PATH.
 
-`harness init` writes the harness's files into the repository, never over existing
-ones, and prints the setup checklist:
+`harness setup` does every step it can and asks only for what is yours: a `gh` login,
+the token from `claude setup-token` at a hidden prompt, two clicks on GitHub for the
+App, since GitHub creates and installs Apps only in the browser, three questions (your
+stack's network bundles, AWS or not, the hours of your time), and, with AWS, the role
+ARNs from your bootstrap and the gateway key. In order, it logs you in to `gh`; creates
+the repository on GitHub if the project has no remote, and writes the harness's files;
+asks the questions and writes `harness/config.json`, with the `staging` environment
+and the variables on GitHub for AWS; commits and pushes the files to `main` with your
+git, once you agree; runs `harness doctor` and fixes what it can (starts the OpenShell
+gateway, builds the agents' image, imports the Claude profile and creates the provider
+with your token, creates the App from its manifest and waits for you to install it,
+applies the ruleset on `main`, creates the AWS provider with your key); runs the probe;
+and offers to start the daemon. Run it again at any time: what is done is skipped.
+
+The same by hand: `harness init` writes the harness's files into the repository, never
+over existing ones, and prints the setup checklist:
 1. Docker, and OpenShell with a running gateway.
 2. The Claude subscription: `claude setup-token`, then `harness doctor` in a terminal
    creates the provider, with the token typed at a hidden prompt.
@@ -144,7 +159,9 @@ ones, and prints the setup checklist:
    may not touch workflows.
 7. `harness doctor --probe`.
 
-`harness doctor` checks each step, and says what to do about what fails. `--probe` tries,
+`harness doctor --build-images` builds the agents' image, `harness doctor --probe` runs
+the probe, and `harness up` starts the daemon. `harness doctor` checks each step, and
+says what to do about what fails. `--probe` tries,
 from a sandbox like an agent's and from outside, everything that must be refused: AWS
 writes and secret reads, other projects' state, `git push`, unlisted hosts and the
 metadata address, a workflow pushed by the App, a merge without your approval.
@@ -193,14 +210,16 @@ plans it finds there (see [Configuration](#configuration)).
 - **Proposal:** the Architect's design document, in versions v1, v2 and so on. You
   accept one.
 - **Plan:** features that ship together as one pull request. A module's plans are built
-  in order.
+  in order. A plan is `CODE`, `INFRA` or `MIXED`, from its features' kinds: the kind is
+  tagged in the pull request's title, and a `CODE` plan's pull request may not touch
+  the Terraform folder. Give infrastructure plans of its own.
 - **Feature:** one change that a Developer can make in one attempt, with at least one
   check. Its definition is frozen once its design is merged.
 - **Check:** a shell command, run from the repository root, that exits 0 when the feature
   works. `pre-merge` checks run on every attempt and in CI; `post-deploy` checks run
   after an infrastructure deploy.
 - **Attempt:** one Developer session on one feature, in a fresh sandbox, with a deadline
-  (90 minutes) and a budget (2 attempts per feature). A failed attempt's successor
+  (120 minutes) and a budget (2 attempts per feature). A failed attempt's successor
   starts with the Manager's guidance. Once the budget is spent, the feature is escalated
   to you.
 - **Owner actions:** what only you can do, such as creating an account, approving a
@@ -215,7 +234,7 @@ plans it finds there (see [Configuration](#configuration)).
 - **`progress.txt`:** one line per accepted feature and satisfied gate, committed with
   the work. It only grows.
 - **Brakes:** counters and deadlines, not judgment. Three failed attempts in a row, a
-  Manager that leaves an item waiting for 40 minutes, or CI still failing after two fix
+  Manager that leaves an item waiting for 180 minutes, or CI still failing after two fix
   rounds pause the pipeline until you resume it.
 
 ## The dashboard
@@ -231,7 +250,114 @@ behind a token. Its views:
 - **Events:** the event log, live, with a filter.
 
 The header pauses and resumes the pipeline: a pause lets what runs finish, and starts
-nothing new.
+nothing new. It also shows the mode, Manual or Swarm, and switches it.
+
+## Swarm mode
+
+Manual mode, the default, is what the rest of this README describes: you review and
+merge every pull request. Past a certain size you become the bottleneck. Swarm mode
+gives the agents more autonomy and you less to read. Its design is
+`docs/architecture/proposal-v3.md` in the source repository; this section says what
+exists today.
+
+**The switch.** The dashboard's header switches the mode; so do `harness mode swarm`
+and `harness mode manual`. A switch takes effect at item boundaries: what runs
+finishes under the rules it started with. GitHub's rules on `main` differ per mode, and
+only you can change them: `harness mode` applies the mode's ruleset in the same
+command, with your own `gh`; after a switch from the dashboard, run
+`harness github-setup --repo <org>/<repo>` once. Until the rules match nothing merges.
+The daemon reads the rules in effect on `main` through the App and the dashboard's
+note lists what is still to do, the commands ready to copy: the rules, the App's
+"Commit statuses: write", and the token for the usage probe. The note goes once all
+three are done; `harness doctor` checks the same.
+
+**What merges itself.** In Swarm the daemon merges a plan's pull request, as the App,
+once CI passed and every status in `swarm.requiredStatuses` is green on its head:
+- a `CODE` plan, when `swarm.merge.code` is `daemon`;
+- an `INFRA` or `MIXED` plan, when the monthly cost it adds, estimated by CI, is at or
+  under `swarm.merge.infraMonthlyUsdCeiling`; or, once the header's button **Let the
+  daemon merge infra** is on, like a `CODE` plan, once CI and both reviewers pass, an
+  estimate over the ceiling still waiting for you. The button is off by default, and
+  the choice is recorded in the event log.
+
+Anything else waits for you, under **Needs you** with the reason. `Arch:` and `Fix:`
+pull requests are yours in both modes. In Swarm, GitHub's rules need no approval but
+require the reviewers' statuses, pinned to the App, so even the daemon can't merge
+before they pass.
+
+**Before a launch.** In Swarm the daemon reads your subscription's usage before it
+starts an attempt, and at or above `swarm.usageCeilingPercent` the pipeline waits for
+the window to reset. It reads it with the token `harness doctor` stores in
+`~/.config/harness/claude.token` when it creates the Claude provider; on an older
+setup, the doctor asks for the token again once Swarm is on. Without it, the daemon
+learns of a limit only when an attempt hits it, as in Manual.
+
+**The reviewers.** Once CI passed on a plan's pull request, two reviewers read it, one
+after the other, each in a fresh read-only sandbox with the Manager's permissions: a
+security reviewer and a cost reviewer, with `roles/security.md` and `roles/cost.md`
+as their prompts and the Manager's model. Each gets a brief: the plan's features, the
+files changed, the pay-per-use AWS calls the change adds or removes, found by pattern
+in the code, and the Terraform plan's JSON when the project has one. Each answers
+with a verdict and findings. The daemon posts the findings on the pull request as a
+review, with comments on the lines of the diff, and sets the reviewer's commit status,
+`harness/security` or `harness/cost`. A blocking verdict opens a fix round on the
+plan branch, like a CI failure: a Developer fixes with the findings as guidance, the
+Manager reviews, CI and the reviewers run again on the new head. After
+`swarm.securityFixRounds` or `swarm.costFixRounds`, the pull request is yours. In
+Manual, `swarm.reviewersInManual` runs them as comments only.
+
+The App needs **Commit statuses: write** for the verdicts. An App created before this
+version has read only: give it the permission on GitHub, accept it on the installation,
+and `harness doctor` stops warning. Until then, a plan whose reviewer passed waits for
+you with the reason.
+
+**Parallel Developers.** In Swarm, up to `swarm.maxDevelopers` Developers build the
+features of the plan under way at once, each in its own sandbox, as soon as the
+features they depend on are accepted: `dependsOn` in the design decides, so the
+Architect is told to declare every dependency. Each attempt starts from the plan
+branch as it is. When another feature lands first, the daemon merges the new head
+into the attempt before its checks, so they see the accepted work, and the feature
+lands as one commit on the head. A conflict interrupts the attempt, without counting
+it, and the next one starts from the new head. A design change merged while a feature
+is built interrupts its attempt the same way, and the next one builds the new
+definition. Manual mode builds one feature at a time, as before. In both modes, the
+Architect hears in one line when a plan's pull request opens, waits for you, is
+blocked by a reviewer, or merges.
+
+**Parallel plans.** A plan may declare `dependsOn`, the plans of its module that must
+be merged before it starts; without it, it waits for the previous plan, as always. In
+Swarm, up to `swarm.maxPlans` plans whose dependencies are merged build at once, each
+on its own branch with its own Manager, keyed `module/plan` in the Agents view; a
+feature may also depend on a feature of an earlier plan, as `P1/F03`, and then waits
+for that plan's merge. The Project view draws each module's features as a graph, plan
+by plan, with an edge per dependency: green accepted, blue under way, red escalated,
+grey not started. Manual mode builds one plan at a time with one Manager per module,
+as before.
+
+**The cost job.** `harness install-ci` adds a `cost` job to the workflow: on a pull
+request that has `iac/`, it runs [Infracost](https://www.infracost.io) on the base and
+the head and uploads the estimate as the `cost` artifact, which the daemon reads once
+CI passed. It needs the repository secret `INFRACOST_API_KEY`, a free key from
+`infracost auth login`; without it the job does nothing, no estimate exists, and
+`INFRA` and `MIXED` plans wait for you with that reason. Infracost sees your Terraform's
+resource types and sizes, not your code or state. The cost reviewer gets the estimate in
+its brief. The job is not a required check: verify it on your first `INFRA` pull request
+in a real repository, since the harness's tests only fake its artifact.
+
+**Where it stands.** The scanners in CI that the security reviewer would start from,
+gitleaks, semgrep and checkov, are still to come (proposal v3 §5.5): the reviewer reads
+the diff itself.
+
+**Budgets.** In both modes, the Project view shows two meters you set there:
+- **Your time.** The hours the whole project may take of you. Once set, every owner
+  action in a design, gate or task, carries the Architect's estimate of how long it
+  takes you, a reserve of `ownerTime.reservePercent` stays out of what designs may
+  plan, and `submit_design` refuses a design whose actions don't fit what remains
+  after the other modules. Only owner actions count: the proposals and pull requests
+  you read don't. The Architect reads the numbers with `get_owner_time`. The meter
+  shows used, planned and the hours, red when over.
+- **Agent hours.** The Developers' attempt clocks summed, against a threshold: red when
+  over, and nothing stops.
 
 ## Commands
 
@@ -244,7 +370,9 @@ too.
 | `harness doctor [--build-images] [--probe]` | Checks the machine and the project, builds the agents' image, and tries what agents must not do |
 | `harness github-app create --org <org>` | Creates the harness's GitHub App, once per machine |
 | `harness github-app check --repo <org>/<repo>` | Checks that the App can reach the repository |
-| `harness github-setup --repo <org>/<repo>` | Sets merge commits only, and the ruleset on `main`, with your own `gh` |
+| `harness github-setup --repo <org>/<repo> [--mode manual\|swarm]` | Sets merge commits only, and the ruleset on `main` for the daemon's mode, with your own `gh` |
+| `harness budget --owner-hours <n>` | Sets the hours of your time for the whole project; with the daemon down, it records them when it starts (`--agent-hours` sets the threshold) |
+| `harness setup [--repo <owner/name>] [--owner <login>]` | Sets up this machine and the project, asking only for what is yours; run it again any time |
 | `harness install-ci [--owner <login>]` | Writes the workflow, its CI script and `CODEOWNERS` again, after an upgrade |
 | `harness lock` | Writes `harness/lock.json`, the hashes of the protected files |
 | `harness up`, `harness down` | Starts the daemon and the dashboard, or stops the daemon; sandboxes keep running |
@@ -257,6 +385,7 @@ too.
 | `harness message <text>` | Writes to the Manager of the module being built |
 | `harness retry <module>/<plan>/<feature>` | Gives an escalated feature one more attempt; `--note` adds guidance |
 | `harness resume` | Lifts a pause |
+| `harness mode [manual\|swarm]` | Shows the mode, or switches it |
 | `harness recover` | Rebuilds a lost `.harness/` from `main` and GitHub |
 
 ## Configuration
@@ -284,7 +413,7 @@ through an `Arch:` pull request, or a commit of your own on `main`.
 | `project.repo`, `project.bot` | none | The GitHub repository, and the App's bot login. Without them, the project stays local. |
 | `roles.<role>.model` | `claude-opus-5-5` | The model of the Architect, the Manager and the Developers |
 | `roles.<role>.effort` | `max`, `high`, `xhigh` | Claude Code's `--effort`; `null` for a model without effort levels, such as Haiku |
-| `roles.developer.attemptTimeoutMinutes` | 90 | An attempt's deadline |
+| `roles.developer.attemptTimeoutMinutes` | 120 | An attempt's deadline |
 | `roles.developer.maxAttempts` | 2 | Attempts per feature before it is escalated to you |
 | `network.bundles` | `["core"]` | The hosts sandboxes reach, by bundle: `core`, `node`, `python`, `aws`, `terraform`, `go`, `rust`, `jvm`, `opentofu`, `browsers`. The Architect gets them all. |
 | `network.extraHosts` | `[]` | More hosts, read-only |
@@ -295,8 +424,16 @@ through an `Arch:` pull request, or a commit of your own on `main`.
 | `sandbox.env` | `{}` | Environment variables for every sandbox |
 | `github.requiredChecks` | `["verify", "checks"]` | The CI jobs a pull request must pass; `tf-plan` is added with Terraform |
 | `brakes.consecutiveFailures` | 3 | Failed attempts in a row that pause the pipeline |
-| `brakes.managerTurnMinutes` | 20 | How long an item waits for the Manager before a reminder; as long again, and the pipeline pauses |
+| `brakes.managerTurnMinutes` | 90 | How long an item waits for the Manager before a reminder; as long again, and the pipeline pauses |
 | `brakes.ciFixRounds`, `brakes.deployFixRounds` | 2, 2 | Fix rounds after CI fails, and `Fix:` pull requests after a deploy fails |
+| `ownerTime.reservePercent` | 20 | The share of your hours designs may not plan for owner actions |
+| `swarm.merge.code` | `daemon` | Who merges a `CODE` plan in Swarm: `daemon`, or `owner` |
+| `swarm.merge.infraMonthlyUsdCeiling` | 50 | The monthly cost an `INFRA` or `MIXED` plan may add and still merge itself in Swarm; `null` leaves them all to you |
+| `swarm.requiredStatuses` | `["harness/security", "harness/cost"]` | The App's statuses a pull request needs before the daemon merges it; `[]` merges on CI alone |
+| `swarm.maxDevelopers`, `swarm.maxPlans` | 3, 2 | Attempts and plans at once in Swarm |
+| `swarm.usageCeilingPercent` | 80 | No launch in Swarm at or above this share of your subscription's limits; `null` turns the probe off |
+| `swarm.securityFixRounds`, `swarm.costFixRounds` | 2, 2 | Fix rounds a reviewer may ask for, before you decide |
+| `swarm.reviewersInManual` | `false` | Run the reviewers in Manual too, as comments only |
 | `dashboard.port` | 4777 | The dashboard's port, or the next free one |
 | `aws`, `terraform` | none | See [AWS and Terraform](#aws-and-terraform) |
 
@@ -412,7 +549,9 @@ What agents can't do, and what stops them:
   code moves in and out as git bundles. The host never runs code or git hooks that an
   agent wrote.
 - **Write to GitHub.** Only the daemon talks to GitHub, as an App with no access to
-  workflows or settings. Sandboxes may clone and fetch, never push.
+  workflows or settings. Sandboxes may clone and fetch, never push. In Swarm mode the
+  daemon also merges plans, under the policy above, and GitHub requires the reviewers'
+  statuses, pinned to the App, before it can.
 - **Change the rules.** Checks, CI and the agents' instructions are protected files: a
   Developer's work can't change them, and CI checks that with the base branch's rules.
   They change only through an Arch PR you merge, or your own commits.
@@ -422,7 +561,8 @@ What agents can't do, and what stops them:
   through `web_read`: GET only, public addresses only, checked again after every
   redirect.
 - **Decide alone.** Code runs the loop: deadlines, attempt budgets, checks in fresh
-  sandboxes and your merges are enforced by the daemon, not left to the agents.
+  sandboxes and the merges, yours or the Swarm policy's, are enforced by the daemon,
+  not left to the agents.
 
 What remains possible, by design:
 - an agent could send code out in the URL of an allowed GET request;
@@ -440,7 +580,10 @@ To report a vulnerability, see `SECURITY.md` in the source repository.
 
 - The agents run on your Claude subscription, so their usage counts against your plan's
   limits. When Claude Code reports that a limit is reached, the attempt under way
-  doesn't count, and the pipeline pauses for an hour, then goes on.
+  doesn't count, and the pipeline pauses for an hour, then goes on. In Swarm mode the
+  daemon also reads the usage before each launch, and waits above
+  `swarm.usageCeilingPercent` until the window resets; the Project view shows the
+  windows.
 - By default, all three roles run Opus 5.5 at a high effort. To try the harness, or to
   use less of your plan, set each role's `model` to Haiku 4.5
   (`claude-haiku-4-5-20251001`) and its `effort` to `null`.

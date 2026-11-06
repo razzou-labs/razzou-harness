@@ -1,6 +1,7 @@
 import { join } from 'node:path';
 import type { Repo } from '../../src/git/repo.ts';
-import type { CheckRun, Forge, PullRequest } from '../../src/github/forge.ts';
+import { GitHubError } from '../../src/github/app.ts';
+import type { BranchRules, CheckRun, CommitStatus, Forge, PullRequest, ReviewPost } from '../../src/github/forge.ts';
 import { runOk } from '../../src/util.ts';
 import { tempDir } from './toy-repo.ts';
 
@@ -22,9 +23,27 @@ interface FakePullRequest {
 export class FakeForge implements Forge {
   readonly kind = 'github';
   readonly bot = FAKE_BOT;
+  readonly appId = 4242;
   readonly remote: string;
+  /** The rules in effect on main (v4 §6): by default those of Manual, as `harness github-setup` sets them. */
+  rules: BranchRules | undefined = {
+    approvals: 1, codeOwners: true, checks: [{ context: 'verify', integrationId: 15368 }, { context: 'checks', integrationId: 15368 }],
+  };
+  /** False once the App is known not to write statuses. */
+  writable: boolean | undefined = undefined;
   readonly prs: FakePullRequest[] = [];
   ci: (sha: string) => Record<string, string> | undefined = () => ({ verify: 'success', checks: 'success' });
+  /** The commit statuses on each commit, by context: what the reviewers would post as the App (v3 §5.4). */
+  statuses: (sha: string) => Record<string, string> = () => ({});
+  /** When set, the daemon's merge is refused with this message, as GitHub does under rules the merge doesn't meet. */
+  refuseMerge?: string;
+  /** What the daemon posted for the reviewers (v3 §5.4), and the statuses it set. */
+  readonly reviews: Array<{ number: number } & ReviewPost> = [];
+  readonly statusesSet: Array<{ sha: string; context: string; state: string; description: string }> = [];
+  /** When set, setting a status fails with this message, as GitHub does for an App without the permission. */
+  refuseStatus?: string;
+  /** The artifacts of each commit's workflow run, by name, then by file: what the cost job uploads (v3 §5.5). */
+  artifacts: (sha: string) => Record<string, Record<string, string>> = () => ({});
   private readonly runs = new Map<string, CheckRun[]>();
   private nextRun = 1;
 
@@ -88,13 +107,51 @@ export class FakeForge implements Forge {
     return `the ${run.name} job failed: expected 5, got 4`;
   }
 
-  /** The owner merges: a merge commit on main with the branch as second parent. */
-  async merge(number: number): Promise<string> {
+  /** The statuses a test declares, and the latest the daemon set, per context. */
+  async commitStatuses(sha: string): Promise<CommitStatus[]> {
+    const latest = new Map<string, string>(Object.entries(this.statuses(sha)));
+    for (const status of this.statusesSet) if (status.sha === sha) latest.set(status.context, status.state);
+    return [...latest].map(([context, state]) => ({ context, state }));
+  }
+
+  async createReview(number: number, review: ReviewPost): Promise<{ comments: number }> {
+    this.reviews.push({ number, ...review });
+    return { comments: review.comments.length };
+  }
+
+  async setCommitStatus(sha: string, status: { context: string; state: 'success' | 'failure' | 'pending'; description: string }): Promise<void> {
+    if (this.refuseStatus) throw new GitHubError(this.refuseStatus, 403);
+    this.statusesSet.push({ sha, ...status });
+  }
+
+  async artifactFile(sha: string, artifact: string, file: string): Promise<string | undefined> {
+    return this.artifacts(sha)[artifact]?.[file];
+  }
+
+  async branchRules(): Promise<BranchRules | undefined> {
+    return this.rules;
+  }
+
+  statusesWritable(): boolean | undefined {
+    return this.writable;
+  }
+
+  /** The daemon merges under Swarm's policy: refused like GitHub when the rules aren't met or the head moved. */
+  async mergePullRequest(number: number, head: string): Promise<{ commit: string }> {
+    if (this.refuseMerge) throw new GitHubError(this.refuseMerge, 405);
+    const pr = this.prs[number - 1]!;
+    if (pr.state !== 'open') throw new GitHubError('Pull Request is not mergeable', 405);
+    if ((await this.head(pr.branch)) !== head) throw new GitHubError('Head branch was modified. Review and try the merge again.', 409);
+    return { commit: await this.merge(number, FAKE_BOT) };
+  }
+
+  /** The owner merges, or the daemon as the App: a merge commit on main with the branch as second parent. */
+  async merge(number: number, by = 'owner'): Promise<string> {
     const pr = this.prs[number - 1]!;
     const head = await this.head(pr.branch);
     const main = await this.head('main');
     const tree = (await runOk('git', ['--git-dir', this.remote, 'rev-parse', `${head}^{tree}`])).trim();
-    const env = { ...process.env, GIT_AUTHOR_NAME: 'owner', GIT_AUTHOR_EMAIL: 'owner@test.invalid', GIT_COMMITTER_NAME: 'owner', GIT_COMMITTER_EMAIL: 'owner@test.invalid' };
+    const env = { ...process.env, GIT_AUTHOR_NAME: by, GIT_AUTHOR_EMAIL: `${by}@test.invalid`, GIT_COMMITTER_NAME: by, GIT_COMMITTER_EMAIL: `${by}@test.invalid` };
     const commit = (await runOk('git', ['--git-dir', this.remote, 'commit-tree', tree, '-p', main, '-p', head, '-m', `${pr.title} (#${number})`], { env })).trim();
     await runOk('git', ['--git-dir', this.remote, 'update-ref', 'refs/heads/main', commit, main]);
     pr.mergeCommit = commit;

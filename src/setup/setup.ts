@@ -1,0 +1,394 @@
+import { basename, join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { computeLock, directoryReader } from '../ci/harness-ci.ts';
+import { ConfigSchema, requiredChecks, type Config } from '../design/schemas.ts';
+import { configDir, GitHubClient, loadAppCredentials } from '../github/app.ts';
+import { applyRepositoryRules, checkApp, createApp, installCi, type RulesetOptions } from '../github/setup.ts';
+import { BUNDLES } from '../sandbox/allowlist.ts';
+import type { Mode, State } from '../state/state.ts';
+import { run } from '../util.ts';
+import { doctor, type Check } from './doctor.ts';
+import { githubRepo, init } from './init.ts';
+
+/**
+ * `harness setup` (proposal v4 §4): the doctor with hands. It walks the setup in order,
+ * does every step the harness can, and stops only for what is the owner's: a login at
+ * the terminal, a token or a key at a hidden prompt, a click where GitHub has no API.
+ * It can run again at any time: what is done is skipped.
+ */
+export interface SetupOptions {
+  projectDir: string;
+  packageDir: string;
+  version: string;
+  /** The GitHub repository, like "acme/shop"; by default from the `origin` remote. */
+  repo?: string;
+  /** The owner's GitHub login, for CODEOWNERS; by default from `gh`. */
+  owner?: string;
+  say: (line: string) => void;
+  ask: (question: string) => Promise<string>;
+  /** Opens a page in the owner's browser. */
+  open: (url: string) => void;
+  /** Runs a program with the owner's terminal, like `gh auth login`, and returns its exit code. */
+  interactive: (file: string, args: string[]) => number;
+  /** Starts the daemon, at the end. */
+  up: () => Promise<void>;
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/** What `harness setup` does about a check the doctor reported; the pure part, for tests. */
+export type Fix =
+  | { kind: 'start-gateway' }
+  | { kind: 'build-image' }
+  | { kind: 'create-app' }
+  | { kind: 'install-app' }
+  | { kind: 'app-statuses' }
+  | { kind: 'apply-rules' }
+  | { kind: 'install-ci' };
+
+export function fixFor(check: Check): Fix | undefined {
+  if (check.status === 'ok' || check.status === 'skip') return undefined;
+  switch (check.name) {
+    case 'OpenShell gateway':
+      return { kind: 'start-gateway' };
+    case 'image':
+      return { kind: 'build-image' };
+    case 'GitHub App':
+      if (check.detail.startsWith('no GitHub App in')) return { kind: 'create-app' };
+      if (check.detail.includes("can't write commit statuses")) return { kind: 'app-statuses' };
+      return { kind: 'install-app' };
+    case 'ruleset':
+      return { kind: 'apply-rules' };
+    case '.github/workflows/harness.yml':
+    case '.github/harness/harness-ci.ts':
+      return { kind: 'install-ci' };
+    default:
+      return undefined;
+  }
+}
+
+/** The bundles the owner named, besides core, that exist; unknown ones are reported. */
+export function parseBundles(answer: string): { bundles: string[]; unknown: string[] } {
+  const named = answer.split(/[,\s]+/).map((b) => b.trim()).filter(Boolean);
+  const unknown = named.filter((b) => !(b in BUNDLES));
+  const bundles = ['core', ...named.filter((b) => b in BUNDLES && b !== 'core')];
+  return { bundles: [...new Set(bundles)], unknown };
+}
+
+const VIEW_ROLE = /^arn:aws:iam::\d{12}:role\/harness-[\w+=,.@-]+-view$/;
+const ROLE = /^arn:aws:iam::\d{12}:role\/[\w+=,.@/-]+$/;
+
+export async function setup(options: SetupOptions): Promise<void> {
+  const { projectDir, say } = options;
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+
+  await ghLogin(options);
+  const scaffolded = await scaffold(options);
+  const settings = await askSettings(options);
+  await commitAndPush(options, [...scaffolded, ...settings]);
+
+  const config = loadConfig(projectDir);
+  if (!config) throw new Error('harness/config.json is missing after init: run `harness setup` again');
+  let buildImages = false;
+  for (let round = 1; round <= 3; round++) {
+    say(round === 1 ? '\nChecking this machine and the project:' : '\nChecking again:');
+    const checks = await doctor({ projectDir, packageDir: options.packageDir, version: options.version, probe: false, buildImages, interactive: true, report: (c) => say(line(c)) });
+    buildImages = false;
+    let again = false;
+    for (const check of checks) {
+      const fix = fixFor(check);
+      if (!fix) continue;
+      if (fix.kind === 'build-image') {
+        buildImages = true;
+        again = true;
+        continue;
+      }
+      if (await applyFix(options, config, fix, sleep)) again = true;
+    }
+    if (!again) break;
+  }
+
+  say('\nThe probe: everything an agent must not do, tried.');
+  const probe = await doctor({ projectDir, packageDir: options.packageDir, version: options.version, probe: true, buildImages: false, interactive: false, report: (c) => { if (c.name.startsWith('probe')) say(line(c)); } });
+  const failed = probe.filter((c) => c.status === 'fail');
+  if (failed.length > 0) {
+    say(`\n${failed.length} problem${failed.length === 1 ? '' : 's'} left: ${failed.map((c) => c.name).join(', ')}. Fix them, then run \`harness setup\` again.`);
+    return;
+  }
+  say('\nAll good.');
+  if (!/^n/i.test(await options.ask('Start the daemon now? [Y/n] '))) await options.up();
+}
+
+/** gh must be logged in as an admin of the repository: it applies the rules and creates the repository. */
+async function ghLogin(options: SetupOptions): Promise<void> {
+  const status = await run('gh', ['auth', 'status']).catch(() => undefined);
+  if (status === undefined) throw new Error('gh is not installed: install the GitHub CLI, then run `harness setup` again');
+  if (status.code === 0) return;
+  options.say('GitHub: log in with gh, as an admin of the project\'s repository. It opens a browser, or asks for a token.');
+  options.interactive('gh', ['auth', 'login']);
+  const after = await run('gh', ['auth', 'status']);
+  if (after.code !== 0) throw new Error('gh is still not logged in: the setup needs it for the repository\'s rules');
+}
+
+/** The harness's files, when the project has none yet: a repository on GitHub first, if the owner wants one. */
+async function scaffold(options: SetupOptions): Promise<string[]> {
+  const { projectDir, say } = options;
+  if (existsSync(join(projectDir, 'harness', 'config.json'))) {
+    // The CI files follow the harness's version: written again when they differ, and committed with the rest.
+    const stale = ['.github/workflows/harness.yml', '.github/harness/harness-ci.ts'].filter((file) => {
+      const local = join(projectDir, file);
+      const packaged = join(options.packageDir, file.endsWith('.yml') ? 'templates/harness.yml' : 'src/ci/harness-ci.ts');
+      return !existsSync(local) || readFileSync(local, 'utf8') !== readFileSync(packaged, 'utf8');
+    });
+    if (stale.length === 0) return [];
+    const owner = options.owner ?? (await ownerLogin(options));
+    const written = installCi(projectDir, options.packageDir, owner);
+    for (const path of written) say(`wrote ${path}`);
+    return written;
+  }
+  const top = await run('git', ['-C', projectDir, 'rev-parse', '--show-toplevel']).catch(() => undefined);
+  if (top?.code !== 0) {
+    await run('git', ['init', '--quiet', '--initial-branch=main', projectDir]);
+    say('git: a new repository, on main.');
+  }
+  let repo = options.repo ?? githubRepo((await run('git', ['-C', projectDir, 'remote', 'get-url', 'origin'])).stdout.trim());
+  if (!repo) {
+    const name = basename(projectDir).toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '') || 'project';
+    const answer = (await options.ask(`No GitHub remote. Create a private repository on GitHub? Type org/name (like acme/${name}), or Enter to stay local: `)).trim();
+    if (answer) {
+      const created = await run('gh', ['repo', 'create', answer, '--private', `--source=${projectDir}`, '--remote=origin']);
+      if (created.code !== 0) throw new Error(`gh repo create: ${(created.stderr || created.stdout).trim()}`);
+      say(`created https://github.com/${answer}`);
+      repo = answer;
+    }
+  }
+  const result = await init({ projectDir, packageDir: options.packageDir, version: options.version, ...(repo ? { repo } : {}), ...(options.owner ? { owner: options.owner } : {}) });
+  for (const path of result.wrote) say(`wrote ${path}`);
+  for (const path of result.kept) say(`kept  ${path} (it exists)`);
+  for (const note of result.notes) say(note);
+  return result.wrote;
+}
+
+/** The owner's GitHub login from gh, for CODEOWNERS. */
+async function ownerLogin(options: SetupOptions): Promise<string | undefined> {
+  const login = await run('gh', ['api', 'user', '--jq', '.login']).catch(() => undefined);
+  if (login?.code !== 0 || !login.stdout.trim()) options.say('No owner login from gh: CODEOWNERS is not written. `harness install-ci --owner <you>` writes it.');
+  return login?.code === 0 ? login.stdout.trim() || undefined : undefined;
+}
+
+/**
+ * The three questions (v4 §4), asked once: the stack's network bundles, AWS, and the
+ * owner's hours. What they settle goes into harness/config.json, with the lock that
+ * hashes it, and into .harness/setup.json for the daemon.
+ */
+async function askSettings(options: SetupOptions): Promise<string[]> {
+  const { projectDir, say, ask } = options;
+  const configFile = join(projectDir, 'harness', 'config.json');
+  const config = JSON.parse(readFileSync(configFile, 'utf8')) as Record<string, any>;
+  const written: string[] = [];
+  let changed = false;
+
+  const bundles: string[] = config.network?.bundles ?? ['core'];
+  if (bundles.length === 1 && bundles[0] === 'core') {
+    const others = Object.keys(BUNDLES).filter((b) => b !== 'core').join(', ');
+    const answer = await ask(`Which network bundles do the sandboxes need besides core, for your stack? (${others}; Enter for none) `);
+    const parsed = parseBundles(answer);
+    if (parsed.unknown.length > 0) say(`unknown bundles, ignored: ${parsed.unknown.join(', ')}`);
+    if (parsed.bundles.length > 1) {
+      config.network = { ...(config.network ?? {}), bundles: parsed.bundles };
+      changed = true;
+    }
+  }
+
+  if (!config.aws && /^y/i.test(await ask('Does this project deploy to AWS with Terraform? [y/N] '))) {
+    say('The roles come from your bootstrap (see the README\'s AWS section); the key is asked for later, at a hidden prompt.');
+    const region = (await ask('AWS region (like eu-west-1): ')).trim();
+    const view = (await ask("The agents' view role ARN (arn:aws:iam::<account>:role/harness-<project>-view): ")).trim();
+    const plan = (await ask('The CI plan role ARN: ')).trim();
+    const apply = (await ask('The CI apply role ARN: ')).trim();
+    const services = (await ask('The AWS services the project uses, comma-separated (sts, s3, iam, ...): ')).split(/[,\s]+/).filter(Boolean);
+    if (!region || !VIEW_ROLE.test(view) || !ROLE.test(plan) || !ROLE.test(apply)) {
+      say('AWS skipped: a value is missing or malformed. Add `aws` and `terraform` to harness/config.json by hand, or run `harness setup` again.');
+    } else {
+      config.aws = { region, provider: `aws-view-${config.project?.name ?? 'project'}`, services: [...new Set(['sts', ...services])] };
+      config.terraform = { dir: 'iac', backendConfig: 'backend-configs/staging.hcl', varFile: 'env/staging.tfvars' };
+      changed = true;
+      const repo = config.project?.repo as string | undefined;
+      if (repo) await configureGitHubForAws(options, repo, { region, plan, apply });
+    }
+  }
+
+  if (changed) {
+    writeFileSync(configFile, `${JSON.stringify(config, null, 2)}\n`);
+    written.push('harness/config.json');
+    const lock = await computeLock(directoryReader(projectDir));
+    writeFileSync(join(projectDir, 'harness', 'lock.json'), `${JSON.stringify(lock, null, 2)}\n`);
+    written.push('harness/lock.json');
+  }
+
+  const pending = join(projectDir, '.harness', 'setup.json');
+  const stateFile = join(projectDir, '.harness', 'state.json');
+  const budgeted = existsSync(stateFile) && (JSON.parse(readFileSync(stateFile, 'utf8')) as State).budgets?.ownerHours !== undefined;
+  if (!existsSync(pending) && !budgeted) {
+    const answer = (await ask('How many hours of your time may this whole project take? The Architect designs your actions within it. (Enter to skip) ')).trim();
+    const hours = Number(answer);
+    if (answer && Number.isFinite(hours) && hours > 0) {
+      mkdirSync(join(projectDir, '.harness'), { recursive: true });
+      writeFileSync(pending, `${JSON.stringify({ ownerHours: hours }, null, 2)}\n`);
+      say(`${hours} hours: the daemon records it when it starts.`);
+    }
+  }
+  return written;
+}
+
+/** The staging environment, restricted to main, and the variables the workflow reads, with the owner's gh. */
+async function configureGitHubForAws(options: SetupOptions, repo: string, aws: { region: string; plan: string; apply: string }): Promise<void> {
+  const gh = async (args: string[], body?: object) => {
+    const result = await run('gh', ['api', ...args, ...(body ? ['--input', '-'] : [])], body ? { input: JSON.stringify(body) } : {});
+    if (result.code !== 0) throw new Error(`gh api ${args.join(' ')}: ${(result.stderr || result.stdout).trim()}`);
+  };
+  await gh(['--method', 'PUT', `/repos/${repo}/environments/staging`], { deployment_branch_policy: { protected_branches: false, custom_branch_policies: true } });
+  await gh(['--method', 'POST', `/repos/${repo}/environments/staging/deployment-branch-policies`], { name: 'main', type: 'branch' }).catch(() => {});
+  for (const [name, value] of [['AWS_REGION_STAGING', aws.region], ['AWS_ROLE_PLAN_ARN_STAGING', aws.plan], ['AWS_ROLE_APPLY_ARN_STAGING', aws.apply]] as const) {
+    const set = await run('gh', ['variable', 'set', name, '--repo', repo, '--body', value]);
+    if (set.code !== 0) throw new Error(`gh variable set ${name}: ${(set.stderr || set.stdout).trim()}`);
+  }
+  options.say(`GitHub: the staging environment, for main only, and the variables ${['AWS_REGION_STAGING', 'AWS_ROLE_PLAN_ARN_STAGING', 'AWS_ROLE_APPLY_ARN_STAGING'].join(', ')}.`);
+}
+
+/** The files the setup wrote, committed with the owner's git and pushed to main, once they agree: before the ruleset, which would refuse the push. */
+async function commitAndPush(options: SetupOptions, paths: string[]): Promise<void> {
+  const { projectDir, say } = options;
+  const tracked = paths.filter((p) => !p.startsWith('.harness/'));
+  if (tracked.length === 0) return;
+  const status = await run('git', ['-C', projectDir, 'status', '--porcelain', '--', ...tracked]);
+  const changed = status.stdout.split('\n').filter((l) => l.trim() !== '').map((l) => l.slice(3));
+  if (changed.length === 0) return;
+  say(`\nTo commit on main: ${changed.join(', ')}`);
+  if (/^n/i.test(await options.ask(`Commit and push ${changed.length} file${changed.length === 1 ? '' : 's'} to main, as you? [Y/n] `))) {
+    say('Commit and push them yourself before `harness up`.');
+    return;
+  }
+  const add = await run('git', ['-C', projectDir, 'add', '--', ...changed]);
+  if (add.code !== 0) throw new Error(`git add: ${add.stderr.trim()}`);
+  const commit = await run('git', ['-C', projectDir, 'commit', '--quiet', '-m', 'Set up razzou-harness']);
+  if (commit.code !== 0) throw new Error(`git commit: ${(commit.stderr || commit.stdout).trim()}`);
+  const origin = await run('git', ['-C', projectDir, 'remote', 'get-url', 'origin']);
+  if (origin.code !== 0) return say('committed; no origin to push to.');
+  const push = await run('git', ['-C', projectDir, 'push', '--quiet', '-u', 'origin', 'HEAD:main']);
+  if (push.code !== 0) say(`committed, but the push was refused: ${push.stderr.trim()}\nPush it yourself, through a pull request if main is protected already.`);
+  else say('committed and pushed to main.');
+}
+
+/** One fix, with the owner's part if any; true when something changed and the doctor should look again. */
+async function applyFix(options: SetupOptions, config: Config, fix: Fix, sleep: (ms: number) => Promise<void>): Promise<boolean> {
+  const { projectDir, say } = options;
+  const repo = config.project.repo;
+  switch (fix.kind) {
+    case 'start-gateway': {
+      const started = await run('openshell', ['gateway', 'start']).catch(() => undefined);
+      if (started?.code === 0) say('OpenShell: gateway started.');
+      else say(`OpenShell: the gateway did not start: ${(started?.stderr || started?.stdout || 'openshell is missing').trim()}`);
+      return started?.code === 0;
+    }
+    case 'create-app': {
+      if (!repo) return false;
+      const org = repo.split('/')[0]!;
+      const app = await createApp({
+        org,
+        name: `${org}-harness`,
+        onReady: (url) => {
+          say(`GitHub App: review it in the browser and click "Create GitHub App": ${url}`);
+          options.open(url);
+        },
+      });
+      say(`created ${app.name} (id ${app.appId}).`);
+      return waitForInstall(options, repo, app.slug, sleep);
+    }
+    case 'install-app': {
+      if (!repo) return false;
+      let slug: string | undefined;
+      try {
+        slug = loadAppCredentials().slug;
+      } catch {
+        return false;
+      }
+      return waitForInstall(options, repo, slug, sleep);
+    }
+    case 'app-statuses': {
+      if (!repo) return false;
+      const { slug } = loadAppCredentials();
+      const info = JSON.parse(readFileSync(join(configDir(), 'app.json'), 'utf8')) as { owner?: string };
+      const settings = info.owner ? `https://github.com/organizations/${info.owner}/settings/apps/${slug}/permissions` : `https://github.com/settings/apps/${slug}/permissions`;
+      say(`GitHub App: give it "Commit statuses: Read and write" and save: ${settings}`);
+      say(`Then accept the new permission on its installation: https://github.com/organizations/${repo.split('/')[0]}/settings/installations`);
+      options.open(settings);
+      return waitUntil(options, 'the App can write commit statuses', sleep, async () => {
+        const client = new GitHubClient(loadAppCredentials(), repo);
+        await client.token();
+        return client.canWriteStatuses;
+      });
+    }
+    case 'apply-rules': {
+      if (!repo) return false;
+      const stateFile = join(projectDir, '.harness', 'state.json');
+      const mode: Mode = existsSync(stateFile) ? ((JSON.parse(readFileSync(stateFile, 'utf8')) as State).mode ?? 'manual') : 'manual';
+      let ruleset: RulesetOptions = { mode };
+      if (mode === 'swarm') {
+        let appId: number | undefined;
+        try {
+          appId = loadAppCredentials().appId;
+        } catch {
+          appId = undefined;
+        }
+        ruleset = { mode, statuses: config.swarm.requiredStatuses, ...(appId !== undefined ? { appId } : {}) };
+      }
+      for (const done of await applyRepositoryRules(repo, requiredChecks(config), ruleset)) say(`set: ${done}`);
+      return true;
+    }
+    case 'install-ci': {
+      const owner = options.owner ?? (await ownerLogin(options));
+      for (const path of installCi(projectDir, options.packageDir, owner)) say(`wrote ${path}`);
+      say('Commit and push the CI files yourself: the App may not change workflows.');
+      return false;
+    }
+    default:
+      return false;
+  }
+}
+
+/** The App must be installed by the owner, in the browser: the page is opened, and the setup waits for the installation to show. */
+async function waitForInstall(options: SetupOptions, repo: string, slug: string, sleep: (ms: number) => Promise<void>): Promise<boolean> {
+  const url = `https://github.com/apps/${slug}/installations/new`;
+  options.say(`GitHub App: install it on ${repo}, and on that repository only: ${url}`);
+  options.open(url);
+  return waitUntil(options, `the App is installed on ${repo}`, sleep, async () => {
+    try {
+      await checkApp(repo);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+}
+
+/** Polls every five seconds, for up to fifteen minutes, saying what it waits for. */
+async function waitUntil(options: SetupOptions, what: string, sleep: (ms: number) => Promise<void>, done: () => Promise<boolean>): Promise<boolean> {
+  options.say(`Waiting until ${what}...`);
+  for (let i = 0; i < 180; i++) {
+    if (await done()) {
+      options.say(`${what}.`);
+      return true;
+    }
+    await sleep(5_000);
+  }
+  options.say(`Still waiting for ${what} after fifteen minutes: run \`harness setup\` again once it is done.`);
+  return false;
+}
+
+function loadConfig(projectDir: string): Config | undefined {
+  const file = join(projectDir, 'harness', 'config.json');
+  return existsSync(file) ? ConfigSchema.parse(JSON.parse(readFileSync(file, 'utf8'))) : undefined;
+}
+
+const MARKS = { ok: 'ok  ', warn: 'warn', fail: 'FAIL', skip: 'skip' };
+const line = (check: Check): string => `${MARKS[check.status]}  ${check.name}: ${check.detail}${check.fix ? `\n      → ${check.fix}` : ''}`;
