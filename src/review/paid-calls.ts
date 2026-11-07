@@ -12,20 +12,47 @@ export interface PaidCall {
   line: number;
 }
 
+/** An operation as the SDKs spell it: a JS v3 command, PascalCase, camelCase and snake_case. */
+function spellings(operation: string): string[] {
+  return [`${operation}Command`, operation, `${operation[0]!.toLowerCase()}${operation.slice(1)}`, operation.replace(/\B[A-Z]/g, (c) => `_${c}`).toLowerCase()];
+}
+
+/**
+ * A service's pattern: its operations in every spelling (`SendEmailCommand`, `SendEmail`,
+ * `sendEmail`, `send_email`), and its clients, by class (`SESv2Client`, `AWS.SES`) or by the
+ * id boto3 and the JS SDKs name them with (`client('ses')`, `@aws-sdk/client-ses`). `also`
+ * holds an operation named by a common word, which counts only where its context says so.
+ */
+function servicePattern(operations: string[], classes: string[], ids: string[], also?: RegExp): RegExp {
+  const names = [...operations.flatMap(spellings), ...classes.map((c) => c.replace('.', '\\.'))];
+  const sources = [`\\b(?:${names.join('|')})\\b`, `(?<=\\bclients?(?:\\(\\s*['"]|[-/]))(?:${ids.join('|')})\\b`, ...(also ? [also.source] : [])];
+  return new RegExp(sources.join('|'), 'g');
+}
+
 const TABLE: ReadonlyArray<{ service: string; pattern: RegExp }> = [
-  { service: 'Bedrock', pattern: /\b(InvokeModel(?:WithResponseStream)?(?:Command)?|Converse(?:Stream)?(?:Command)?|invoke_model(?:_with_response_stream)?|converse(?:_stream)?|RetrieveAndGenerate(?:Command)?|retrieve_and_generate|BedrockRuntime(?:Client)?|bedrock-runtime|BedrockAgentRuntime(?:Client)?)\b/g },
-  { service: 'Textract', pattern: /\b(AnalyzeDocument(?:Command)?|DetectDocumentText(?:Command)?|StartDocumentAnalysis(?:Command)?|AnalyzeExpense(?:Command)?|analyze_document|detect_document_text|start_document_analysis|Textract(?:Client)?)\b/g },
-  { service: 'Rekognition', pattern: /\b(DetectLabels(?:Command)?|DetectFaces(?:Command)?|DetectText(?:Command)?|DetectModerationLabels(?:Command)?|CompareFaces(?:Command)?|detect_labels|detect_faces|detect_text|Rekognition(?:Client)?)\b/g },
-  { service: 'Comprehend', pattern: /\b(DetectSentiment(?:Command)?|DetectEntities(?:Command)?|DetectKeyPhrases(?:Command)?|DetectPiiEntities(?:Command)?|detect_sentiment|detect_entities|detect_key_phrases|Comprehend(?:Client)?)\b/g },
-  { service: 'Transcribe', pattern: /\b(StartTranscriptionJob(?:Command)?|StartStreamTranscription(?:Command)?|start_transcription_job|Transcribe(?:Streaming)?(?:Client)?)\b/g },
-  { service: 'Polly', pattern: /\b(SynthesizeSpeech(?:Command)?|StartSpeechSynthesisTask(?:Command)?|synthesize_speech|Polly(?:Client)?)\b/g },
-  { service: 'Translate', pattern: /\b(TranslateText(?:Command)?|TranslateDocument(?:Command)?|translate_text|TranslateClient)\b/g },
-  { service: 'SES', pattern: /\b(SendEmail(?:Command)?|SendRawEmail(?:Command)?|SendBulkEmail(?:Command)?|SendTemplatedEmail(?:Command)?|send_email|send_raw_email|send_bulk_email|SES(?:v2)?(?:Client)?)\b/g },
-  { service: 'SNS to a phone', pattern: /\b(PhoneNumber)\b/g },
-  { service: 'Lambda invoke', pattern: /\b(InvokeCommand|InvokeAsyncCommand|InvokeWithResponseStream(?:Command)?|invoke_async|invoke_with_response_stream|LambdaClient)\b/g },
-  { service: 'Step Functions', pattern: /\b(StartExecution(?:Command)?|StartSyncExecution(?:Command)?|start_execution|start_sync_execution|SFNClient)\b/g },
-  { service: 'Location', pattern: /\b(SearchPlaceIndexFor(?:Text|Position)(?:Command)?|CalculateRoute(?:Matrix)?(?:Command)?|search_place_index_for_text|calculate_route|LocationClient)\b/g },
-  { service: 'Kendra', pattern: /\b(Query(?:Command)?|Retrieve(?:Command)?)\b(?=.*[Kk]endra)|\bKendraClient\b/g },
+  // Converse is also a word: only as a command, or called (`.converse(`).
+  {
+    service: 'Bedrock',
+    pattern: servicePattern(['InvokeModel', 'InvokeModelWithResponseStream', 'ConverseStream', 'RetrieveAndGenerate', 'RetrieveAndGenerateStream'], ['BedrockRuntimeClient', 'BedrockAgentRuntimeClient', 'AWS.BedrockRuntime', 'AWS.BedrockAgentRuntime'], ['bedrock-runtime', 'bedrock-agent-runtime'], /\bConverseCommand\b|(?<=\.)[Cc]onverse(?=\s*\()/),
+  },
+  { service: 'Textract', pattern: servicePattern(['AnalyzeDocument', 'DetectDocumentText', 'StartDocumentAnalysis', 'AnalyzeExpense'], ['TextractClient', 'AWS.Textract'], ['textract']) },
+  { service: 'Rekognition', pattern: servicePattern(['DetectLabels', 'DetectFaces', 'DetectText', 'DetectModerationLabels', 'CompareFaces'], ['RekognitionClient', 'AWS.Rekognition'], ['rekognition']) },
+  { service: 'Comprehend', pattern: servicePattern(['DetectSentiment', 'DetectEntities', 'DetectKeyPhrases', 'DetectPiiEntities'], ['ComprehendClient', 'AWS.Comprehend'], ['comprehend']) },
+  { service: 'Transcribe', pattern: servicePattern(['StartTranscriptionJob', 'StartStreamTranscription'], ['TranscribeClient', 'TranscribeStreamingClient', 'AWS.TranscribeService'], ['transcribe-streaming', 'transcribe']) },
+  { service: 'Polly', pattern: servicePattern(['SynthesizeSpeech', 'StartSpeechSynthesisTask'], ['PollyClient', 'AWS.Polly'], ['polly']) },
+  { service: 'Translate', pattern: servicePattern(['TranslateText', 'TranslateDocument'], ['TranslateClient', 'AWS.Translate'], ['translate']) },
+  { service: 'SES', pattern: servicePattern(['SendEmail', 'SendRawEmail', 'SendBulkEmail', 'SendTemplatedEmail'], ['SESClient', 'SESv2Client', 'AWS.SES', 'AWS.SESV2'], ['sesv2', 'ses']) },
+  // A phone number passed as SNS's Publish takes it, a key or a keyword argument; not a type of that name.
+  { service: 'SNS to a phone', pattern: /(?<!\btype\s+)\bPhoneNumber(?=['"]?\s*[:=])/g },
+  // Invoke is also a word: only as a command, or called on a client named after Lambda (`lambda_client.invoke(`).
+  {
+    service: 'Lambda invoke',
+    pattern: servicePattern(['InvokeWithResponseStream'], ['LambdaClient', 'AWS.Lambda'], ['lambda'], /\b(?:InvokeCommand|InvokeAsyncCommand)\b|(?<=[Ll]ambda\w*\.)(?:invoke|invoke_async|invokeAsync|Invoke)(?=\s*\()/),
+  },
+  { service: 'Step Functions', pattern: servicePattern(['StartExecution', 'StartSyncExecution'], ['SFNClient', 'AWS.StepFunctions'], ['sfn', 'stepfunctions']) },
+  { service: 'Location', pattern: servicePattern(['SearchPlaceIndexForText', 'SearchPlaceIndexForPosition', 'CalculateRoute', 'CalculateRouteMatrix'], ['LocationClient', 'AWS.Location'], ['location']) },
+  // Query and Retrieve are also words, and other services' commands: only with Kendra on the line, or called on its client.
+  { service: 'Kendra', pattern: servicePattern([], ['KendraClient', 'AWS.Kendra'], ['kendra'], /\b(?:QueryCommand|RetrieveCommand)\b(?=.*[Kk]endra)|(?<=[Kk]endra\w*\.)(?:query|retrieve|Query|Retrieve)(?=\s*\()/) },
 ];
 
 /** Files that aren't code the project runs, or are too long to be worth a scan. */
@@ -41,7 +68,7 @@ export function paidCalls(text: string, file: string): PaidCall[] {
     for (const { service, pattern } of TABLE) {
       pattern.lastIndex = 0;
       for (let match = pattern.exec(content); match; match = pattern.exec(content)) {
-        found.push({ service, call: match[1] ?? match[0], file, line: i + 1 });
+        found.push({ service, call: match[0], file, line: i + 1 });
         if (match[0].length === 0) pattern.lastIndex++;
       }
     }

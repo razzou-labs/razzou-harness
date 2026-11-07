@@ -234,6 +234,8 @@ export class Architects {
       o.record({ type: 'ARCH_PR_CLOSED', payload: { module: module.module } });
       return;
     }
+    // In Swarm, main's rules require the reviewers' statuses: an Arch PR, which the owner reviews, gets them as "not reviewed".
+    await o.markUnreviewed(pr.head, 'an Arch PR, which the owner reviews and merges');
     if (module.design!.ciNoted === pr.head) return;
     const required = requiredChecks(o.design.config);
     const latest = new Map<string, CheckRun>();

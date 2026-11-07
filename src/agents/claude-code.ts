@@ -265,6 +265,14 @@ export function reviewJsonSchema(): string {
   return JSON.stringify(schema);
 }
 
+/**
+ * How a session's error result says the subscription ran out. Claude Code 2.1.x writes
+ * "You've hit your 5-hour limit · resets 3pm", "You've reached your …", "You're out of
+ * usage credits", "You're out of extra usage" or "Your org is out of usage …"; older
+ * versions wrote "Claude AI usage limit reached|<epoch>".
+ */
+const USAGE_LIMIT = /usage limit|limit reached|rate.?limit|you['’]ve (?:hit|reached) your|you['’]re out of (?:usage credits|extra usage)|your org is out of usage/i;
+
 export interface ReviewResult {
   outcome: AttemptOutcome;
   report?: ReviewReport;
@@ -281,7 +289,7 @@ export function readReview(stream: string, exitCode: number, stderr = ''): Revie
   }
   const usage = toUsage(result.usage, result.total_cost_usd);
   const text = typeof result.result === 'string' ? result.result : '';
-  if (result.is_error === true && /usage limit|limit reached|rate.?limit/i.test(text)) return { outcome: 'usage_limit', detail: text.slice(0, 500), usage };
+  if (result.is_error === true && USAGE_LIMIT.test(text)) return { outcome: 'usage_limit', detail: text.slice(0, 500), usage };
   const report = ReviewReportSchema.safeParse(result.structured_output);
   if (!report.success) return { outcome: result.is_error === true ? 'error' : 'no_report', detail: text.slice(0, 500), usage };
   return { outcome: 'done', report: report.data, usage };
@@ -300,7 +308,7 @@ export function readResult(stream: string, exitCode: number, stderr = ''): Agent
 
   const usage = toUsage(result.usage, result.total_cost_usd);
   const text = typeof result.result === 'string' ? result.result : '';
-  if (result.is_error === true && /usage limit|limit reached|rate.?limit/i.test(text)) {
+  if (result.is_error === true && USAGE_LIMIT.test(text)) {
     return { outcome: 'usage_limit', detail: text.slice(0, 500), usage };
   }
   const report = ReportSchema.safeParse(result.structured_output);

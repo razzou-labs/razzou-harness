@@ -19,8 +19,17 @@ if (process.argv[2] === 'inbox') {
   const content = existsSync(file) ? readFileSync(file) : Buffer.alloc(0);
   const end = content.lastIndexOf(0x0a) + 1;
   if (end > offset) {
-    const notes = content.subarray(offset, end).toString('utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line).text);
-    process.stdout.write(`[harness] Messages for you since the last prompt:\n\n${notes.join('\n\n')}\n`);
+    // Only an unfinished last line waits. A torn or invalid one is skipped, or it would stop every prompt after it.
+    const notes = [];
+    for (const line of content.subarray(offset, end).toString('utf8').split('\n')) {
+      try {
+        const { text } = JSON.parse(line);
+        if (typeof text === 'string') notes.push(text);
+      } catch {
+        // skipped
+      }
+    }
+    if (notes.length > 0) process.stdout.write(`[harness] Messages for you since the last prompt:\n\n${notes.join('\n\n')}\n`);
     writeFileSync(offsetFile, String(end));
   }
   process.exit(0);

@@ -29,10 +29,10 @@ describe('the subscription\'s usage', () => {
     assert.throws(() => parseUsage({}), /without any limit/);
   });
 
-  it('calls the endpoint with the token and the beta header, and refuses any other answer', async () => {
-    const calls: Array<{ url: string; headers: Record<string, string> }> = [];
+  it('calls the endpoint with the token, the beta header and a timeout, and refuses any other answer', async () => {
+    const calls: Array<{ url: string; headers: Record<string, string>; signal?: AbortSignal | null }> = [];
     const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
-      calls.push({ url: String(url), headers: init?.headers as Record<string, string> });
+      calls.push({ url: String(url), headers: init?.headers as Record<string, string>, signal: init?.signal });
       return new Response(JSON.stringify(BODY), { status: 200, headers: { 'content-type': 'application/json' } });
     }) as typeof fetch;
     const usage = await readUsage('sk-ant-test', fetchImpl);
@@ -40,6 +40,7 @@ describe('the subscription\'s usage', () => {
     assert.equal(calls[0]!.url, USAGE_URL);
     assert.equal(calls[0]!.headers.authorization, 'Bearer sk-ant-test');
     assert.equal(calls[0]!.headers['anthropic-beta'], 'oauth-2025-04-20');
+    assert.ok(calls[0]!.signal instanceof AbortSignal, 'a hung endpoint times out');
     const refused = (async () => new Response('nope', { status: 401 })) as typeof fetch;
     await assert.rejects(readUsage('sk-ant-test', refused), /answered 401/);
   });

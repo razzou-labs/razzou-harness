@@ -27,7 +27,8 @@ export async function submitDesign(o: Orchestrator, module: ModuleState, summary
   const changed = await o.repo.changedFiles(base, head);
   const problems: string[] = [];
 
-  const rules = await protectionRules(tree);
+  // Judged by the rules it starts from, as CI judges it: a design can't widen the protected set to change application code with it.
+  const rules = await protectionRules(o.repo.treeReader(base));
   for (const path of changed) {
     if (!archMayChange(path, rules)) problems.push(`${path}: a design may change only harness/, shared knowledge, agents' instructions and tool configs`);
     else if (path.startsWith('harness/modules/') && !path.startsWith(`harness/modules/${module.module}/`)) {
@@ -41,6 +42,19 @@ export async function submitDesign(o: Orchestrator, module: ModuleState, summary
     problems.push((error as Error).message);
   }
   if (mine && mine.plans.length === 0) problems.push(`there is no plan: write harness/modules/${module.module}/plans/P1.json`);
+  // A feature is frozen with its plan once the plan is past its build: a change to it goes in a new plan.
+  const previous = await loadDesign(o.repo, base).catch(() => undefined);
+  for (const plan of previous?.modules.find((m) => m.id === module.module)?.plans ?? []) {
+    const status = o.state.plans[`${module.module}/${plan.id}`]?.status;
+    if (status === undefined || status === 'active' || !mine) continue;
+    const now = mine.plans.find((p) => p.id === plan.id);
+    for (const feature of plan.features) {
+      const after = now?.features.find((f) => f.id === feature.id);
+      if (!after || definitionHash(after) !== definitionHash(feature)) {
+        problems.push(`${plan.id}/${feature.id}: plan ${plan.id} is past its build (${status.replaceAll('_', ' ')}), so its features are frozen: put the change in a new plan`);
+      }
+    }
+  }
   if (!mine && problems.length === 0) problems.push(`there is no design for ${module.module}: write harness/modules/${module.module}/plans/P1.json`);
   for (const plan of mine?.plans ?? []) {
     for (const feature of plan.features) {
@@ -63,7 +77,6 @@ export async function submitDesign(o: Orchestrator, module: ModuleState, summary
   if (problems.length > 0 || !mine) return { ok: false, problems };
 
   // The new checks, run once on the repository as it is: nothing is built yet, so they should fail.
-  const previous = await loadDesign(o.repo, base).catch(() => undefined);
   const known = new Set(previous?.modules.flatMap((m) => m.plans.flatMap((p) => p.features.map((f) => `${m.id}/${p.id}/${f.id}:${definitionHash(f)}`))) ?? []);
   const fresh = mine.plans.flatMap((p) => p.features.filter((f) => !known.has(`${module.module}/${p.id}/${f.id}:${definitionHash(f)}`)).flatMap((f) => preMerge(f.checks)));
   const results = fresh.length === 0 ? [] : await o.runChecksIn(

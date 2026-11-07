@@ -1,4 +1,4 @@
-import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { computeLock, directoryReader } from '../ci/harness-ci.ts';
 import { configDir } from '../github/app.ts';
@@ -37,7 +37,8 @@ Then \`harness up\`.`;
 export async function init(options: InitOptions): Promise<{ wrote: string[]; kept: string[]; notes: string[] }> {
   const dir = options.projectDir;
   const top = await run('git', ['-C', dir, 'rev-parse', '--show-toplevel']).catch(() => undefined);
-  if (top?.code !== 0 || top.stdout.trim() !== dir) throw new Error(`${dir} isn't the top of a git repository: run \`harness init\` in the project's repository`);
+  // Real paths: a --dir through a symlink names the same folder.
+  if (top?.code !== 0 || realpathSync(top.stdout.trim()) !== realpathSync(dir)) throw new Error(`${dir} isn't the top of a git repository: run \`harness init\` in the project's repository`);
   const wrote: string[] = [];
   const kept: string[] = [];
   const notes: string[] = [];
@@ -55,7 +56,7 @@ export async function init(options: InitOptions): Promise<{ wrote: string[]; kep
   const name = basename(dir).toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '') || 'project';
   const project: Record<string, string> = { name };
   if (repo && bot) Object.assign(project, { repo, bot });
-  else notes.push(repo ? 'No GitHub App on this machine yet: create it, then set project.repo and project.bot in harness/config.json.' : 'No GitHub remote found: the project stays local until you set project.repo and project.bot.');
+  else notes.push(repo ? 'No GitHub App on this machine yet: `harness setup` creates it, and sets project.repo and project.bot in harness/config.json.' : 'No GitHub remote found: the project stays local until you set project.repo and project.bot.');
   write('harness/config.json', `${JSON.stringify({ harnessVersion: options.version, project, network: { bundles: ['core'] } }, null, 2)}\n`);
 
   const owner = options.owner ?? ((await run('gh', ['api', 'user', '--jq', '.login']).catch(() => undefined))?.stdout.trim() || undefined);
@@ -91,7 +92,7 @@ export function githubRepo(url: string): string | undefined {
 }
 
 /** The App's bot login, if this machine has the App. */
-function appBot(): string | undefined {
+export function appBot(): string | undefined {
   const file = join(configDir(), 'app.json');
   if (!existsSync(file)) return undefined;
   const { slug } = JSON.parse(readFileSync(file, 'utf8')) as { slug?: string };

@@ -1,6 +1,31 @@
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { run, runOk } from '../util.ts';
 import type { ExecResult, Follower, SandboxDriver, SandboxSpec, SandboxStatus } from './driver.ts';
+
+/** Longer lines from a sandbox are dropped: an agent could otherwise grow the daemon's memory without end. */
+export const MAX_FOLLOWED_LINE = 1024 * 1024;
+
+/** Splits a stream into lines for `onLine`. A line over the limit is dropped up to its newline, and `onDrop` called instead. */
+export function splitLines(onLine: (line: string) => void, onDrop: () => void = () => {}): (chunk: string) => void {
+  let buffer = '';
+  let dropping = false;
+  return (chunk) => {
+    let start = 0;
+    for (let i = chunk.indexOf('\n'); i >= 0; i = chunk.indexOf('\n', start)) {
+      const line = buffer + chunk.slice(start, i);
+      buffer = '';
+      start = i + 1;
+      if (dropping || line.length > MAX_FOLLOWED_LINE) onDrop();
+      else onLine(line);
+      dropping = false;
+    }
+    if (!dropping) buffer += chunk.slice(start);
+    if (buffer.length > MAX_FOLLOWED_LINE) {
+      buffer = '';
+      dropping = true;
+    }
+  };
+}
 
 /** The only code that calls the `openshell` CLI. OpenShell is young (0.1.x), so its surface stays in this file. */
 export class OpenShellDriver implements SandboxDriver {
@@ -27,30 +52,63 @@ export class OpenShellDriver implements SandboxDriver {
   exec(name: string, script: string, options: { input?: string; timeoutSec?: number } = {}): Promise<ExecResult> {
     const args = ['sandbox', 'exec', '-n', name, '--no-tty', '--no-login-shell'];
     if (options.timeoutSec) args.push('--timeout', String(options.timeoutSec));
-    return run(this.bin, [...args, '--', 'bash', '-c', script], { input: options.input });
+    // `--timeout` ends the command in the sandbox. A CLI stuck on a gateway that stopped
+    // answering gets as long again, 30 s more at most, and is then killed.
+    const limitSec = options.timeoutSec ? options.timeoutSec + Math.min(options.timeoutSec, 30) : 0;
+    return run(this.bin, [...args, '--', 'bash', '-c', script], { input: options.input, timeout: limitSec * 1000, killSignal: 'SIGKILL' }).catch(
+      (error: Error & { killed?: boolean }) => {
+        if (!error.killed) throw error;
+        return { code: 124, stdout: '', stderr: `openshell sandbox exec did not end within ${limitSec} s, and was killed` };
+      },
+    );
   }
 
   /**
    * A long-lived `exec` running `tail -F`. Piped input doesn't stream into an exec, but
    * output does, so every live stream from a sandbox is a file the daemon follows (spike 1).
+   * An exec that ends unasked, as when the gateway restarts, starts again after the last
+   * line it delivered: a second later, then twice as late each time it read nothing, a
+   * minute at most.
    */
   follow(name: string, file: string, from: number, onLine: (line: string) => void): Follower {
-    const child = spawn(
-      this.bin,
-      ['sandbox', 'exec', '-n', name, '--no-tty', '--no-login-shell', '--', 'tail', '-n', `+${from}`, '-s', '0.2', '-F', file],
-      { stdio: ['ignore', 'pipe', 'ignore'] },
-    );
-    let buffer = '';
-    child.stdout.setEncoding('utf8');
-    child.stdout.on('data', (chunk: string) => {
-      buffer += chunk;
-      for (let i = buffer.indexOf('\n'); i >= 0; i = buffer.indexOf('\n')) {
-        onLine(buffer.slice(0, i));
-        buffer = buffer.slice(i + 1);
-      }
-    });
-    const done = new Promise<void>((resolve) => child.on('close', () => resolve()));
-    return { stop: () => child.kill('SIGTERM'), done };
+    let next = from;
+    let stopped = false;
+    let backoff = 1000;
+    let child: ChildProcess | undefined;
+    let retry: NodeJS.Timeout | undefined;
+    const { promise: done, resolve: ended } = Promise.withResolvers<void>();
+    const start = () => {
+      const tail = spawn(
+        this.bin,
+        ['sandbox', 'exec', '-n', name, '--no-tty', '--no-login-shell', '--', 'tail', '-n', `+${next}`, '-s', '0.2', '-F', file],
+        { stdio: ['ignore', 'pipe', 'ignore'] },
+      );
+      child = tail;
+      // A spawn that fails closes too, and is retried like any other end.
+      tail.on('error', () => {});
+      tail.stdout.setEncoding('utf8');
+      tail.stdout.on('data', splitLines((line) => {
+        next++;
+        backoff = 1000;
+        onLine(line);
+      }, () => next++));
+      tail.on('close', () => {
+        child = undefined;
+        if (stopped) return ended();
+        retry = setTimeout(start, backoff);
+        backoff = Math.min(backoff * 2, 60_000);
+      });
+    };
+    start();
+    return {
+      stop: () => {
+        stopped = true;
+        clearTimeout(retry);
+        if (child) child.kill('SIGTERM');
+        else ended();
+      },
+      done,
+    };
   }
 
   async upload(name: string, localFile: string, remoteDir: string): Promise<void> {

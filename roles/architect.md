@@ -139,5 +139,8 @@ again.
 
 The Manager may escalate a question about the design. Settle it with the owner if it
 changes the design, then answer with `reply_to_manager`. A design change goes through
-`submit_design` like the first design. Features whose definitions change get fresh
-attempts.
+`submit_design` like the first design. A feature whose definition changes gets fresh
+attempts while its plan is built, even one already accepted; an attempt under way on it
+stops. Once a plan is past its build (every feature of it accepted, then its pull
+request and merge), its features are frozen: `submit_design` refuses a change to them,
+so put it in a new plan.

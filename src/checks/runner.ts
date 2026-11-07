@@ -75,7 +75,8 @@ async function makePlan(driver: SandboxDriver, sandbox: string, workDir: string,
     `cd ${sh(`${workDir}/${tf.dir}`)} || exit 1`,
     `terraform init -input=false -no-color -backend-config=${sh(tf.backendConfig)} > ${sh(`${out}/terraform-init.log`)} 2>&1 || { tail -c 3000 ${sh(`${out}/terraform-init.log`)}; exit 1; }`,
     `terraform plan -input=false -no-color -lock=false -var-file=${sh(tf.varFile)} -out=${sh(`${out}/plan.bin`)} > ${sh(`${out}/terraform-plan.log`)} 2>&1 || { tail -c 3000 ${sh(`${out}/terraform-plan.log`)}; exit 1; }`,
-    `terraform show -json ${sh(`${out}/plan.bin`)} > ${sh(`${out}/plan.json`)}`,
+    // Without the JSON, the checks would read an empty $HARNESS_PLAN_JSON: the plan fails instead, with terraform's error.
+    `terraform show -json ${sh(`${out}/plan.bin`)} > ${sh(`${out}/plan.json`)} || exit 1`,
     `grep -E '^(Plan:|No changes)' ${sh(`${out}/terraform-plan.log`)} || true`,
   ].join('\n');
   const result = await driver.exec(sandbox, script, { timeoutSec: 900 });

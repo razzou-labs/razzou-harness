@@ -44,9 +44,9 @@ export class Managers {
       this.errors += 1;
       const message = (error as Error).message;
       this.o.log(`manager: ${message} (${this.errors}/${ERROR_LIMIT})`);
-      if (this.errors >= ERROR_LIMIT && !this.o.state.pipeline.paused) {
+      if (this.errors >= ERROR_LIMIT) {
         this.errors = 0;
-        this.o.record({ type: 'PIPELINE_PAUSED', payload: { reason: `a Manager's sandbox keeps failing: ${clip(message, 300)}` } });
+        this.o.pausePipeline(`a Manager's sandbox keeps failing: ${clip(message, 300)}`);
       }
     }
   }
@@ -65,8 +65,12 @@ export class Managers {
 
   private async syncOnce(): Promise<void> {
     const o = this.o;
+    const current = o.currentModule();
     for (const manager of Object.values(o.state.managers)) {
-      if (manager.status !== 'stopped' && this.done(manager)) await this.stop(manager, manager.plan ? 'its plan is complete' : 'every plan of its module is complete');
+      if (manager.status === 'stopped') continue;
+      if (this.done(manager)) await this.stop(manager, manager.plan ? 'its plan is complete' : 'every plan of its module is complete');
+      // Only state left by 0.2.0 has one: Managers work on the module being built alone (v2 §12.8).
+      else if (manager.module !== current) await this.stop(manager, 'another module is being built');
     }
     for (const scope of this.wanted()) {
       const key = managerKey(scope);
@@ -87,27 +91,26 @@ export class Managers {
   }
 
   /**
-   * Who should be running: in Manual, one Manager for the module being built, as in v2;
-   * in Swarm, one per plan in flight (v3 §6.4). A Manager started under the other mode
-   * keeps its scope until it stops, so no item is ever delivered twice: a module's
-   * Manager serves every plan of its module, and a plan's Manager its plan.
+   * Who should be running, all in the module being built: in Manual, one Manager for the
+   * module, as in v2; in Swarm, one per plan in flight (v3 §6.4). A Manager started under
+   * the other mode keeps its scope until it stops, so no item is ever delivered twice: a
+   * module's Manager serves every plan of its module, and a plan's Manager its plan.
    */
   private wanted(): ManagerScope[] {
     const o = this.o;
+    const module = o.currentModule();
+    if (!module) return [];
     const alive = (key: string) => o.state.managers[key] !== undefined && o.state.managers[key]!.status !== 'stopped';
     const scopes = new Map<string, ManagerScope>();
-    const inFlight = Object.values(o.state.plans).filter((p) => p.status !== 'completed');
+    const inFlight = Object.values(o.state.plans).filter((p) => p.module === module && o.inFlight(p));
     if (o.state.mode === 'swarm') {
       for (const plan of inFlight) {
-        const scope: ManagerScope = alive(plan.module) ? { module: plan.module } : { module: plan.module, plan: plan.plan };
+        const scope: ManagerScope = alive(module) ? { module } : { module, plan: plan.plan };
         scopes.set(managerKey(scope), scope);
       }
     } else {
-      const module = o.currentModule();
-      if (module) {
-        const ofPlans = inFlight.filter((p) => p.module === module && alive(managerKey(p))).map((p): ManagerScope => ({ module, plan: p.plan }));
-        for (const scope of ofPlans.length > 0 ? ofPlans : [{ module }]) scopes.set(managerKey(scope), scope);
-      }
+      const ofPlans = inFlight.filter((p) => alive(managerKey(p))).map((p): ManagerScope => ({ module, plan: p.plan }));
+      for (const scope of ofPlans.length > 0 ? ofPlans : [{ module }]) scopes.set(managerKey(scope), scope);
     }
     return [...scopes.values()];
   }
@@ -190,7 +193,7 @@ export class Managers {
     if (manager.lastExit && (!manager.lastExit.started || recent >= 3)) {
       const why = manager.lastExit.started ? `stopped ${recent} times within an hour` : 'did not start';
       const detail = clip(manager.lastExit.stderr.replace(/\s+/g, ' ') || 'it wrote nothing', 400);
-      o.record({ type: 'PIPELINE_PAUSED', payload: { reason: `environment: the Manager of ${managerKey(manager)} ${why}: ${detail}` } });
+      o.pausePipeline(`environment: the Manager of ${managerKey(manager)} ${why}: ${detail}`);
       return;
     }
     await this.launch(manager, manager.launch + 1);
@@ -236,9 +239,9 @@ export class Managers {
       } else if (!sent.reminded && o.now() - Date.parse(sent.at) >= turnMs) {
         await this.send(manager, `[harness] REMINDER: ${item.title} is still waiting for you. ${item.ask}`);
         o.record({ type: 'MANAGER_ITEM_SENT', payload: { ...identity(manager), key: item.key, launch: manager.launch, reminder: true } });
-      } else if (sent.reminded && o.now() - Date.parse(sent.reminded) >= turnMs && !o.state.pipeline.paused) {
+      } else if (sent.reminded && o.now() - Date.parse(sent.reminded) >= turnMs) {
         const minutes = o.design.config.brakes.managerTurnMinutes * 2;
-        o.record({ type: 'PIPELINE_PAUSED', payload: { reason: `the Manager has not acted on ${item.title} for ${minutes} minutes` } });
+        o.pausePipeline(`the Manager has not acted on ${item.title} for ${minutes} minutes`);
       }
     }
   }
@@ -286,7 +289,7 @@ export class Managers {
   /** The branch the Manager's clone starts from: its plan's, or its module's plan under way, or main. */
   private branch(manager: ManagerState): string {
     if (manager.plan) return this.o.state.plans[managerKey(manager)]?.branch ?? 'main';
-    return Object.values(this.o.state.plans).find((p) => p.module === manager.module && p.status !== 'completed')?.branch ?? 'main';
+    return Object.values(this.o.state.plans).find((p) => p.module === manager.module && this.o.inFlight(p))?.branch ?? 'main';
   }
 
   /** The daemon's files for a Manager, where the dashboard also finds its transcripts after it stops. */

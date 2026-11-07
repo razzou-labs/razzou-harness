@@ -2,6 +2,10 @@
 # workflow through GitHub's OIDC (trusted publishing), so no npm token exists anywhere,
 # and each version carries a provenance attestation: built here, from this commit.
 #
+# Two jobs: `test` installs the dependencies, runs the checks and packs the tarball, with
+# no way to the OIDC token; `publish` holds the token and runs no dependency's code, only
+# npm itself on the tarball `test` packed.
+#
 # To release: set the version in package.json and CHANGELOG.md on main, then publish a
 # GitHub release tagged v<version>. A release marked as a pre-release goes to npm's
 # "next" tag instead of "latest".
@@ -18,15 +22,12 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  publish:
-    name: publish to npm
+  test:
+    name: test and pack
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    # npm's trusted publisher names this environment, so no other workflow can publish.
-    environment: npm
     permissions:
       contents: read
-      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -34,7 +35,6 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org
       - name: The release's tag is the package's version
         env:
           TAG: ${{ github.event.release.tag_name }}
@@ -47,6 +47,33 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+      - name: Pack
+        run: npm pack
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: package
+          path: razzou-harness-*.tgz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish to npm
+    needs: [test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # npm's trusted publisher names this environment, so no other workflow can publish.
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: package
       - name: npm 11.5.1 or later, which trusted publishing needs
         run: npm install -g npm@^11.5.1
       - name: Publish
@@ -54,4 +81,4 @@ jobs:
           PRERELEASE: ${{ github.event.release.prerelease }}
         run: |
           if [ "$PRERELEASE" = true ]; then tag=next; else tag=latest; fi
-          npm publish --tag "$tag"
+          npm publish ./razzou-harness-*.tgz --tag "$tag"

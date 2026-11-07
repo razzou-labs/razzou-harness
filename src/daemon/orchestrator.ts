@@ -8,7 +8,7 @@ import { allPassed, initEnvironment, runChecks, type CheckResult, type RunOption
 import { protectedChanges } from '../ci/harness-ci.ts';
 import { ownerTime, type OwnerTime } from '../design/owner-time.ts';
 import {
-  definitionHash, featureDependency, loadDesign, planDependencies, planKind, requiredChecks,
+  definitionHash, featureDependency, loadDesign, planDependencies, planKind, requiredChecks, REVIEWER_ROLES, statusContext,
   type Check, type Config, type Design, type Feature, type ModuleDesign, type Plan,
 } from '../design/schemas.ts';
 import { DEVELOPER, HARNESS, Repo } from '../git/repo.ts';
@@ -21,7 +21,7 @@ import { BUNDLES } from '../sandbox/allowlist.ts';
 import { buildPolicy } from '../sandbox/policy.ts';
 import { EventStore, type CiJob, type HarnessEvent, type NewEvent, type Ref } from '../state/events.ts';
 import {
-  activeAttempt, activeAttempts, apply, countedAttempts, featureKey, interruptions, isActive, managersOf, planKey, planMerged, project, writeSnapshot,
+  activeAttempts, apply, countedAttempts, featureKey, interruptions, isActive, managersOf, planKey, planMerged, project, writeSnapshot,
   type Attempt, type FeatureState, type InfraMerge, type ManagerState, type Mode, type PlanState, type ReviewState, type State,
 } from '../state/state.ts';
 import { clip, sh, sleep } from '../util.ts';
@@ -61,15 +61,9 @@ export interface OrchestratorOptions {
 /** One step either changed something, so the loop runs again at once, or has to wait for the world. */
 type Step = 'progress' | 'wait';
 
-/** After this many errors in a row on the same attempt (infrastructure, not the agent), the attempt is interrupted. */
+/** After this many errors in a row on the same attempt or plan (infrastructure, not the agent), the attempt is interrupted, or the pipeline pauses. */
 const STEP_ERROR_LIMIT = 5;
 
-/**
- * Runs the loop in code (proposal v2 §7). Each pass looks at the state and takes the
- * next step for the one active attempt, or starts the next piece of work, then brings
- * the Manager up to date. Every step records an event before it moves on, so after a
- * restart the same pass picks up where the previous process stopped.
- */
 /** Where the Swarm setup stands, for the dashboard's note (v4 §6): read through the App, at most every five minutes. */
 export interface SetupStatus {
   at: string;
@@ -81,6 +75,12 @@ export interface SetupStatus {
   tokenStored: boolean;
 }
 
+/**
+ * Runs the loop in code (proposal v2 §7). Each pass looks at the state and takes the
+ * next step for each attempt under way, or starts the next piece of work, then brings
+ * the Managers up to date. Every step records an event before it moves on, so after a
+ * restart the same pass picks up where the previous process stopped.
+ */
 export class Orchestrator {
   /**
    * For the dashboard: 'event' (a HarnessEvent), 'transcript' ({ agent, line }: a line of
@@ -112,9 +112,14 @@ export class Orchestrator {
   private again = false;
   private stopping = false;
   private stepErrors = { key: '', count: 0 };
+  /** Errors in a row of each plan's step, and when it is tried again: one plan that keeps failing never stops the others. */
+  private readonly planErrors = new Map<string, { count: number; retryAt: number }>();
+  /** The heads of Arch and Fix PRs already given the reviewers' statuses as "not reviewed". */
+  private readonly unreviewed = new Set<string>();
   /** The Developers under way, by sandbox: their transcripts for the dashboard, and their channels for the harness tools. */
   private readonly developers = new Map<string, { follower: Follower; channel: AgentChannel }>();
-  private reviewer?: { sandbox: string; follower: Follower; channel: AgentChannel };
+  /** The reviewers under way, by sandbox: plans in parallel can be reviewed at once. */
+  private readonly reviewers = new Map<string, { follower: Follower; channel: AgentChannel }>();
 
   constructor(options: OrchestratorOptions) {
     this.options = options;
@@ -148,13 +153,18 @@ export class Orchestrator {
     this.takePendingSetup();
   }
 
-  /** What `harness setup` or `harness budget` left for the daemon while it was down (v4 §5): the owner's hours, taken once. */
+  /**
+   * What `harness setup`, `harness budget` or `harness mode` left for the daemon while it
+   * was down (v4 §5), taken once: the owner's hours, which setup only offers, so they don't
+   * replace hours already set while budget's do, and the mode.
+   */
   private takePendingSetup(): void {
     const file = join(this.options.harnessDir, 'setup.json');
     if (!existsSync(file)) return;
     try {
-      const { ownerHours } = JSON.parse(readFileSync(file, 'utf8')) as { ownerHours?: unknown };
-      if (typeof ownerHours === 'number' && ownerHours > 0 && this.state.budgets.ownerHours === undefined) this.setBudgets({ ownerHours });
+      const { ownerHours, ownerHoursFrom, mode } = JSON.parse(readFileSync(file, 'utf8')) as { ownerHours?: unknown; ownerHoursFrom?: unknown; mode?: unknown };
+      if (typeof ownerHours === 'number' && ownerHours > 0 && (ownerHoursFrom === 'budget' || this.state.budgets.ownerHours === undefined)) this.setBudgets({ ownerHours });
+      if (mode === 'manual' || mode === 'swarm') this.setMode(mode);
     } catch (error) {
       this.log(`setup.json: ${(error as Error).message}`);
     }
@@ -224,6 +234,8 @@ export class Orchestrator {
   private async pass(): Promise<void> {
     do {
       this.again = false;
+      // The design on main, read once per pass: every step of it sees the same (§7.1).
+      await this.refreshDesign().catch((error: Error) => this.onStepError(error));
       try {
         for (let i = 0; i < 50 && !this.stopping && (await this.step()) === 'progress'; i++);
       } catch (error) {
@@ -239,8 +251,18 @@ export class Orchestrator {
 
   /** The owner pauses the pipeline: what runs goes on, and nothing new starts. */
   pause(): boolean {
-    if (this.state.pipeline.paused) return false;
-    this.record({ type: 'PIPELINE_PAUSED', payload: { reason: 'the owner paused the pipeline' } });
+    return this.pausePipeline('the owner paused the pipeline');
+  }
+
+  /**
+   * Pauses the pipeline, unless a pause that holds at least as long is there. A pause
+   * without `until` (the owner's, a brake's) holds until the owner lifts it, so a timed
+   * one never replaces it; a timed one gives way to an untimed one, or to a later `until`.
+   */
+  pausePipeline(reason: string, until?: string): boolean {
+    const current = this.state.pipeline.paused;
+    if (current && (current.until === undefined || (until !== undefined && Date.parse(until) <= Date.parse(current.until)))) return false;
+    this.record({ type: 'PIPELINE_PAUSED', payload: { reason, ...(until ? { until } : {}) } });
     return true;
   }
 
@@ -331,7 +353,7 @@ export class Orchestrator {
     const current = this.state.actions[`${module}/${actionId}`];
     if (!action || current?.status === 'done' || current?.status === 'verifying') return false;
     this.record({ type: 'OWNER_ACTION_CLAIMED', from: 'owner', payload: { module, action: actionId, ...(note ? { note } : {}) } });
-    if (!action.verify) this.record({ type: 'OWNER_ACTION_DONE', payload: { module, action: actionId, title: action.title, gate: action.kind === 'gate' } });
+    if (!action.verify) this.record({ type: 'OWNER_ACTION_DONE', payload: { module, action: actionId, title: action.title, gate: action.kind === 'gate', ...minutesOf(action) } });
     this.kick();
     return true;
   }
@@ -360,7 +382,7 @@ export class Orchestrator {
       if (failed) {
         this.record({ type: 'OWNER_ACTION_REFUSED', payload: { module, action: id, reason: `its check failed: ${clip(failed.output.trim(), 800)}` } });
       } else {
-        this.record({ type: 'OWNER_ACTION_DONE', payload: { module, action: id, title: definition.title, gate: definition.kind === 'gate' } });
+        this.record({ type: 'OWNER_ACTION_DONE', payload: { module, action: id, title: definition.title, gate: definition.kind === 'gate', ...minutesOf(definition) } });
       }
     }
   }
@@ -380,6 +402,9 @@ export class Orchestrator {
       this.record({ type: 'PIPELINE_RESUMED', payload: {} });
       return 'progress';
     }
+    // A design change merged meanwhile stops the attempts whose features it redefined, in both
+    // modes (v3 §6.6), and only the module being built has attempts.
+    if (await this.abortStale()) return 'progress';
     const active = activeAttempts(this.state);
     let progressed = false;
     for (const { feature, attempt } of active) {
@@ -419,65 +444,82 @@ export class Orchestrator {
   // ── Choosing work ────────────────────────────────────────────────────────────
 
   /**
-   * What to do besides the attempts under way (v3 §6.2). Every plan past its build gets
-   * its step: the full check run, the pull request, the deploy. Then, while fewer than
-   * `limit` attempts run, one starts in a plan being built, in plan order then file
-   * order. Then a plan whose dependencies are merged starts, while fewer than
-   * `swarm.maxPlans` are in flight. Manual keeps v2's order: it looks only at the first
-   * plan, in module order, that isn't complete.
+   * What to do besides the attempts under way (v3 §6.2), all of it in the module being
+   * built, since modules are built one after another (v2 §12.8). Every plan of it past
+   * its build gets its step: the full check run, the pull request, the deploy. Then,
+   * while fewer than `limit` attempts run, one starts in a plan of it being built, in plan
+   * order then file order; then a plan of it whose dependencies are merged starts, while
+   * fewer than `swarm.maxPlans` are in flight. Manual keeps v2's order: only the module's
+   * first plan that isn't complete, one feature at a time.
    */
   private async scheduleNext(running = 0, limit = 1): Promise<Step> {
-    await this.refreshDesign();
     const swarm = this.state.mode === 'swarm';
-    if (running > 0 && swarm && (await this.abortRedefined())) return 'progress';
-    const first = swarm ? undefined : this.firstUnfinished();
-    const considered = (ref: Ref) => first === undefined || (first.module === ref.module && first.plan === ref.plan);
-    const inFlight = Object.values(this.state.plans).filter((p) => p.status !== 'completed' && considered(p));
-
+    const current = this.currentModule();
+    const inFlight = Object.values(this.state.plans).filter((p) => p.module === current && this.inFlight(p));
     for (const planState of inFlight) {
-      if ((await this.planStep(planState)) === 'progress') return 'progress';
+      if ((await this.isolated(planState, () => this.planStep(planState))) === 'progress') return 'progress';
     }
     if (running >= limit) return 'wait';
-    for (const module of this.design.modules) {
-      for (const plan of module.plans) {
-        const planRef = { module: module.id, plan: plan.id };
-        const planState = this.state.plans[planKey(planRef)];
-        if (planState?.status !== 'active' || !considered(planRef)) continue;
-        // A design change merged meanwhile reaches the plan branch first; attempts under way land on the moved head (§6.3).
-        if (await this.mergeMain(planState)) return 'progress';
-        if (swarm) {
-          const own = activeAttempts(this.state).filter(({ feature }) => feature.module === module.id && feature.plan === plan.id).length;
-          if ((await this.scheduleParallel(planRef, plan, planState, own, running, limit)) === 'progress') return 'progress';
-          continue;
-        }
-        for (const feature of plan.features) {
-          const ref = { ...planRef, feature: feature.id };
-          const step = await this.scheduleWork(ref, feature, this.state.features[featureKey(ref)]);
-          if (step) return step;
-        }
-        this.record({ type: 'PLAN_VALIDATING', ref: planRef, payload: { head: planState.head } });
-        return 'progress';
-      }
+    const module = this.design.modules.find((m) => m.id === current);
+    if (!module) return 'wait';
+    const first = swarm ? undefined : module.plans.find((p) => this.state.plans[`${module.id}/${p.id}`]?.status !== 'completed');
+    const plans = first ? [first] : module.plans;
+    for (const plan of plans) {
+      const planState = this.state.plans[`${module.id}/${plan.id}`];
+      if (planState?.status !== 'active') continue;
+      if ((await this.isolated(planState, () => this.buildStep(module, plan, planState, running, limit))) === 'progress') return 'progress';
     }
     if (inFlight.length >= (swarm ? this.design.config.swarm.maxPlans : 1)) return 'wait';
-    for (const module of this.design.modules) {
-      for (const plan of module.plans) {
-        const planRef = { module: module.id, plan: plan.id };
-        if (this.state.plans[planKey(planRef)] || !considered(planRef) || !this.planCanStart(module, plan)) continue;
-        return this.startPlan(planRef);
-      }
+    for (const plan of plans) {
+      const planRef = { module: module.id, plan: plan.id };
+      if (this.state.plans[planKey(planRef)] || !this.planCanStart(module, plan)) continue;
+      return this.startPlan(planRef);
     }
     return 'wait';
   }
 
-  /** v2's order: the first plan, in module order, that isn't complete. */
-  private firstUnfinished(): Ref | undefined {
-    for (const module of this.design.modules) {
-      for (const plan of module.plans) {
-        if (this.state.plans[`${module.id}/${plan.id}`]?.status !== 'completed') return { module: module.id, plan: plan.id };
-      }
+  /** A plan being built: main's changes reach its branch first (§6.3), then an attempt starts, or the full check run once every feature is accepted. */
+  private async buildStep(module: ModuleDesign, plan: Plan, planState: PlanState, running: number, limit: number): Promise<Step> {
+    const planRef = { module: module.id, plan: plan.id };
+    if (await this.mergeMain(planState)) return 'progress';
+    if (this.state.mode === 'swarm') {
+      const own = activeAttempts(this.state).filter(({ feature }) => feature.module === module.id && feature.plan === plan.id).length;
+      return this.scheduleParallel(planRef, plan, planState, own, running, limit);
     }
-    return undefined;
+    for (const feature of plan.features) {
+      const ref = { ...planRef, feature: feature.id };
+      const step = await this.scheduleWork(ref, feature, this.state.features[featureKey(ref)]);
+      if (step) return step;
+    }
+    this.record({ type: 'PLAN_VALIDATING', ref: planRef, payload: { head: planState.head } });
+    return 'progress';
+  }
+
+  /**
+   * A plan's step, its errors counted for that plan alone: a plan that keeps failing is
+   * left alone for a while so the others go on, and past the limit the pipeline pauses
+   * with the error, where the owner sees it.
+   */
+  private async isolated(plan: PlanState, step: () => Promise<Step>): Promise<Step> {
+    const key = planKey(plan);
+    const errors = this.planErrors.get(key);
+    if (errors && this.now() < errors.retryAt) return 'wait';
+    try {
+      const result = await step();
+      this.planErrors.delete(key);
+      return result;
+    } catch (error) {
+      const count = (errors?.count ?? 0) + 1;
+      const message = (error as Error).message;
+      this.log(`step of ${key} failed (${count}/${STEP_ERROR_LIMIT}): ${message}`);
+      if (count < STEP_ERROR_LIMIT) {
+        this.planErrors.set(key, { count, retryAt: this.now() + 30_000 });
+      } else {
+        this.planErrors.delete(key);
+        this.pausePipeline(`${key} keeps failing: ${clip(message.replace(/\s+/g, ' '), 300)}`);
+      }
+      return 'wait';
+    }
   }
 
   /** A plan starts once every plan it depends on is merged, and no gate holds it (v3 §6.1). */
@@ -522,13 +564,13 @@ export class Orchestrator {
     for (const feature of plan.features) {
       const ref = { ...planRef, feature: feature.id };
       const state = this.state.features[featureKey(ref)];
-      if (state?.status === 'accepted' || (state && isActive(state))) continue;
-      if (!this.dependenciesMet(planRef, feature)) continue;
+      if (acceptedAsDefined(state, feature) || (state && isActive(state))) continue;
+      if (!this.dependenciesMet(planRef, plan, feature)) continue;
       if (running >= limit) break;
       const step = await this.scheduleWork(ref, feature, state);
       if (step === 'progress') return 'progress';
     }
-    const done = plan.features.every((f) => this.state.features[featureKey({ ...planRef, feature: f.id })]?.status === 'accepted');
+    const done = plan.features.every((f) => acceptedAsDefined(this.state.features[featureKey({ ...planRef, feature: f.id })], f));
     if (done && own === 0) {
       this.record({ type: 'PLAN_VALIDATING', ref: planRef, payload: { head: planState.head } });
       return 'progress';
@@ -536,46 +578,64 @@ export class Orchestrator {
     return 'wait';
   }
 
-  /**
-   * A design change merged while attempts run (v3 §6.6): an attempt whose feature it
-   * redefined is interrupted, without counting, and the next one builds the new
-   * definition. Fix rounds have no definition on main, so they go on.
-   */
-  private async abortRedefined(): Promise<boolean> {
+  /** Interrupts an attempt that mustn't go on (see `whyStop`). True when there was one. */
+  private async abortStale(): Promise<boolean> {
+    const current = this.currentModule();
     for (const { feature, attempt } of activeAttempts(this.state)) {
-      if (feature.fix) continue;
-      let hash: string | undefined;
-      try {
-        hash = definitionHash(this.lookup(feature).feature);
-      } catch {
-        hash = undefined;
-      }
-      if (hash === attempt.definitionHash) continue;
+      const reason = this.whyStop(feature, attempt, current);
+      if (!reason) continue;
       if (attempt.status === 'running') await this.killAgent(attempt.sandbox).catch(() => {});
       this.stopFollowing(attempt.sandbox);
-      await this.interrupt(feature, attempt, hash === undefined
-        ? 'the design no longer has this feature: the attempt stops'
-        : 'the design changed this feature while it was built: the next attempt builds the new definition');
+      await this.interrupt(feature, attempt, reason);
       return true;
     }
     return false;
   }
 
   /**
+   * Why an attempt under way must stop, if it must. A design change merged meanwhile
+   * (v3 §6.6) dropped or redefined its feature: the next attempt builds the new
+   * definition, since the old one's interruptions don't count against it. Fix rounds have
+   * no definition on main, so they go on. Or its module isn't the one being built, which
+   * only state left by 0.2.0 can show: it starts again in its module's turn.
+   */
+  private whyStop(feature: FeatureState, attempt: Attempt, current: string | undefined): string | undefined {
+    if (!feature.fix) {
+      let hash: string | undefined;
+      try {
+        hash = definitionHash(this.lookup(feature).feature);
+      } catch {
+        hash = undefined;
+      }
+      if (hash === undefined) return 'the design no longer has this feature: the attempt stops';
+      if (hash !== attempt.definitionHash) return 'the design changed this feature while it was built: the next attempt builds the new definition';
+    }
+    if (feature.module !== current) return 'another module is being built: this one goes on once that one is complete';
+    return undefined;
+  }
+
+  /**
    * Every feature this one depends on is accepted; one of an earlier plan counts once that
    * plan is merged, so that its code is on main and reaches this plan's branch (v3 §6.1).
    */
-  private dependenciesMet(planRef: Ref, feature: Feature): boolean {
+  private dependenciesMet(planRef: Ref, plan: Plan, feature: Feature): boolean {
     return feature.dependsOn.every((dep) => {
       const target = featureDependency(planRef.plan, dep);
-      if (target.plan === planRef.plan) return this.state.features[featureKey({ ...planRef, feature: target.feature })]?.status === 'accepted';
+      if (target.plan === planRef.plan) {
+        const definition = plan.features.find((f) => f.id === target.feature);
+        return definition !== undefined && acceptedAsDefined(this.state.features[featureKey({ ...planRef, feature: target.feature })], definition);
+      }
       return planMerged(this.state.plans[`${planRef.module}/${target.plan}`]);
     });
   }
 
-  /** The next attempt of a feature or a fix round, or why there can't be one yet. Undefined once it is accepted. */
+  /**
+   * The next attempt of a feature or a fix round, or why there can't be one yet. Undefined
+   * once it is accepted as the design defines it now: a design change that redefined an
+   * accepted feature while its plan is built gives it a fresh attempt.
+   */
   private async scheduleWork(ref: Ref, definition: Feature, state: FeatureState | undefined): Promise<Step | undefined> {
-    if (state?.status === 'accepted') return undefined;
+    if (acceptedAsDefined(state, definition)) return undefined;
     if (state && isActive(state)) return 'wait';
     const hash = definitionHash(definition);
     // The owner decides about an escalated feature, unless a design change redefined it since (§7.1).
@@ -607,10 +667,7 @@ export class Orchestrator {
     const binding = usage.limits.find((l) => l.percent === usage.percent);
     const reset = Date.parse(usage.resetsAt);
     const until = Number.isFinite(reset) && reset > this.now() ? usage.resetsAt : new Date(this.now() + 60 * 60_000).toISOString();
-    this.record({
-      type: 'PIPELINE_PAUSED',
-      payload: { reason: `the subscription's usage is at ${usage.percent}%${binding ? ` (${binding.kind})` : ''}, at or above the ${ceiling}% ceiling (swarm.usageCeilingPercent)`, until },
-    });
+    this.pausePipeline(`the subscription's usage is at ${usage.percent}%${binding ? ` (${binding.kind})` : ''}, at or above the ${ceiling}% ceiling (swarm.usageCeilingPercent)`, until);
     return true;
   }
 
@@ -628,20 +685,35 @@ export class Orchestrator {
   }
 
   /**
-   * A design change merged while a plan is built reaches the plan branch before the next
-   * attempt: the daemon merges main into it. The branch isn't pushed yet (§11.3).
+   * Main moved while a plan is built, as a design change or another plan's merge moves it:
+   * the daemon merges it into the plan branch before the next attempt, progress.txt taking
+   * both sides' lines (§11.3). When other files conflict, the plan goes on from its base and
+   * the conflict is resolved in its pull request, unless main changed this module's design
+   * or the config, which the next attempt must see: then the pipeline pauses.
    */
   private async mergeMain(plan: PlanState): Promise<boolean> {
     const main = (await this.repo.revParse('refs/heads/main'))!;
-    if (await this.repo.isAncestor(main, plan.head)) return false;
-    const merged = await this.repo.merge({ ours: plan.head, theirs: main, message: `Merge main into ${plan.branch}\n`, committer: HARNESS });
+    if (plan.mainConflict?.main === main || (await this.repo.isAncestor(main, plan.head))) return false;
+    const merged = await this.mergeMainInto(plan.head, plan.branch);
     if ('conflicts' in merged) {
-      this.record({ type: 'PIPELINE_PAUSED', payload: { reason: `main changed files that ${plan.branch} changed too, so the daemon can't merge it in: ${merged.conflicts.join(', ')}` } });
+      const changed = await this.repo.changedFiles(await this.repo.mergeBase(main, plan.head), main);
+      if (changed.some((file) => file === 'harness/config.json' || file.startsWith(`harness/modules/${plan.module}/`))) {
+        this.pausePipeline(`main changed the design of ${plan.module}, and files that ${plan.branch} changed too, so the daemon can't merge it in: ${merged.conflicts.join(', ')}`);
+        return true;
+      }
+      this.record({ type: 'PLAN_MAIN_CONFLICT', ref: { module: plan.module, plan: plan.plan }, payload: { main, files: merged.conflicts } });
       return true;
     }
-    await this.repo.setRef(`refs/heads/${plan.branch}`, merged.commit, plan.head);
     this.record({ type: 'PLAN_MAIN_MERGED', ref: { module: plan.module, plan: plan.plan }, payload: { main, head: merged.commit } });
     return true;
+  }
+
+  /** Main merged into a plan branch at `head`, the branch moved to the result; progress.txt takes main's lines, then the plan's. */
+  private async mergeMainInto(head: string, branch: string): Promise<{ commit: string } | { conflicts: string[] }> {
+    const main = (await this.repo.revParse('refs/heads/main'))!;
+    const merged = await this.repo.merge({ ours: head, theirs: main, message: `Merge main into ${branch}\n`, committer: HARNESS, union: ['progress.txt'] });
+    if (!('conflicts' in merged)) await this.repo.setRef(`refs/heads/${branch}`, merged.commit, head);
+    return merged;
   }
 
   private async startPlan(ref: Ref): Promise<Step> {
@@ -722,7 +794,9 @@ export class Orchestrator {
       return this.baselineFailed(state, attempt, 'checks of accepted work fail before the attempt starts', regression);
     }
     const own = preMerge(feature.checks);
-    if (own.length > 0 && allPassed(await runChecks(this.driver, sandbox, p.work, own, this.checkOptions(sandbox)))) {
+    // A feature built again after a design change redefined it has its earlier work in place: its checks may pass already.
+    const rebuilding = state.attempts.some((a) => a.status === 'accepted');
+    if (!rebuilding && own.length > 0 && allPassed(await runChecks(this.driver, sandbox, p.work, own, this.checkOptions(sandbox)))) {
       this.record({ type: 'ATTEMPT_INTERRUPTED', ref, payload: { reason: "the feature's checks already pass", counts: false } });
       this.record({ type: 'ESCALATED', ref, payload: { reason: 'its checks pass before anything is built: the feature is already done, or its checks are too weak' } });
       await this.driver.remove(sandbox);
@@ -783,8 +857,11 @@ export class Orchestrator {
     this.stopFollowing(attempt.sandbox);
     const ref = refOf(state, attempt);
     if (attempt.outcome === 'usage_limit') {
-      this.record({ type: 'ATTEMPT_INTERRUPTED', ref, payload: { reason: 'the subscription usage limit was reached', counts: false } });
-      this.record({ type: 'PIPELINE_PAUSED', payload: { reason: 'usage limit reached', until: new Date(this.now() + 3_600_000).toISOString() } });
+      // Not the Developer's doing, but the sandbox writes the stream it is read from: like any
+      // interruption, it counts from the third one of the same definition, so it can't buy attempts.
+      const counts = interruptions(state, attempt.definitionHash) >= 2;
+      this.record({ type: 'ATTEMPT_INTERRUPTED', ref, payload: { reason: 'the subscription usage limit was reached', counts } });
+      this.pausePipeline('usage limit reached', new Date(this.now() + 3_600_000).toISOString());
       await this.driver.remove(attempt.sandbox);
       return 'progress';
     }
@@ -901,7 +978,7 @@ export class Orchestrator {
     }
     if (validation.status === 'failed') {
       const failing = (validation.results ?? []).filter((r) => r.exit !== 0).map((r) => r.id).join(', ');
-      if (!this.state.pipeline.paused) this.record({ type: 'PIPELINE_PAUSED', payload: { reason: `the full check run of ${planKey(ref)} failed: ${failing}` } });
+      this.pausePipeline(`the full check run of ${planKey(ref)} failed: ${failing}`);
       return 'wait';
     }
     if (plan.summary === undefined) return 'wait';
@@ -930,12 +1007,12 @@ export class Orchestrator {
     return 'progress';
   }
 
-  /** Follows an open PR: pushes a landed fix, reads CI once it finished, and notices the owner's merge. */
+  /** Follows an open PR: pushes a landed fix, reads CI once it finished, takes the owner's pushes, and notices the owner's merge. */
   private async followPullRequest(plan: PlanState): Promise<Step> {
     const ref = { module: plan.module, plan: plan.plan };
     const key = planKey(plan);
     const pause = (reason: string): Step => {
-      if (!this.state.pipeline.paused) this.record({ type: 'PIPELINE_PAUSED', payload: { reason } });
+      this.pausePipeline(reason);
       return 'wait';
     };
     if (plan.pushed !== plan.head) {
@@ -960,12 +1037,26 @@ export class Orchestrator {
       if (!plan.pr!.closed) this.record({ type: 'PR_CLOSED', ref, payload: {} });
       return pause(`PR #${pr.number} of ${key} was closed without being merged. Reopen it to go on.`);
     }
-    if (pr.head !== plan.pushed) return pause(`the branch of PR #${pr.number} moved to ${pr.head.slice(0, 8)}, which the harness didn't push`);
-    if (plan.ci?.status === 'pending') {
+    if (pr.head !== plan.pushed) {
+      // The owner pushed to the branch, as GitHub's conflict editor does: the daemon builds on it, unless history was rewritten.
+      const head = await this.forge.fetchBranch(this.repo, plan.branch);
+      if (head !== pr.head || !(await this.repo.isAncestor(plan.pushed!, head))) {
+        // The fetch moved the daemon's branch: it stays where the harness had it.
+        await this.repo.setRef(`refs/heads/${plan.branch}`, plan.head);
+        return pause(`the branch of PR #${pr.number} moved to ${pr.head.slice(0, 8)}, which doesn't build on what the harness pushed`);
+      }
+      this.record({ type: 'PLAN_HEAD_ADOPTED', ref, payload: { head } });
+      this.nextPoll.delete(key);
+      return 'progress';
+    }
+    // CI is read until it passed: a run the owner starts again on GitHub counts too.
+    if (plan.ci?.status === 'pending' || plan.ci?.status === 'failed') {
       const step = await this.readCi(plan);
       if (step) return step;
     }
-    if (plan.ci?.status === 'passed' && !plan.branch.startsWith('fix/')) {
+    if (plan.ci?.status === 'passed' && plan.branch.startsWith('fix/')) {
+      await this.markUnreviewed(pr.head, 'a Fix PR, which the owner merges');
+    } else if (plan.ci?.status === 'passed') {
       // The cost job's estimate (v3 §5.3), then the reviewers (v3 §5), then the merge policy (v3 §3.2).
       if (await this.readCostEstimate(plan, pr)) {
         this.nextPoll.delete(key);
@@ -1006,7 +1097,8 @@ export class Orchestrator {
     if (kind === 'CODE' && policy.merge.code !== 'daemon') return leave('CODE plans are the owner\'s to merge (swarm.merge.code)');
     if (kind !== 'CODE') {
       const ceiling = policy.merge.infraMonthlyUsdCeiling;
-      const estimate = plan.costEstimate;
+      // Only an estimate of this very head counts: a fix round's head may add what the earlier one didn't.
+      const estimate = plan.costEstimate?.head === pr.head ? plan.costEstimate : undefined;
       if (ceiling !== null && estimate !== undefined && estimate.monthlyUsd > ceiling) {
         return leave(`the PR adds an estimated ${estimate.monthlyUsd} USD a month, over the ceiling of ${ceiling} (swarm.merge.infraMonthlyUsdCeiling)`);
       }
@@ -1018,6 +1110,15 @@ export class Orchestrator {
           return leave(`${kind === 'INFRA' ? 'an' : 'a'} ${kind} plan merges itself only with the cost job's estimate of the monthly cost it adds, and none was produced: the cost job needs iac/ and the INFRACOST_API_KEY secret; ${button}`);
         }
       }
+    }
+    // Main moved since CI ran: merge it in first, so CI and the reviewers judge what main gets.
+    // The new head is pushed, and everything runs again on it.
+    const main = (await this.repo.revParse('refs/heads/main'))!;
+    if (!(await this.repo.isAncestor(main, pr.head))) {
+      const merged = await this.mergeMainInto(pr.head, plan.branch);
+      if ('conflicts' in merged) return leave(`it conflicts with main in ${merged.conflicts.join(', ')}: resolve them on GitHub, and the daemon takes your push`);
+      this.record({ type: 'PLAN_MAIN_MERGED', ref, payload: { main, head: merged.commit } });
+      return true;
     }
     const statuses = await this.forge.commitStatuses(pr.head);
     const missing = policy.requiredStatuses.filter((context) => statuses.find((s) => s.context === context)?.state !== 'success');
@@ -1049,6 +1150,9 @@ export class Orchestrator {
     const definition = this.definitionOf(plan);
     if (!definition || planKind(definition) === 'CODE' || plan.costEstimate?.head === pr.head) return false;
     if (!plan.ci || this.now() - Date.parse(plan.ci.since) > 20 * 60_000) return false;
+    // The artifact counts only once the cost job itself succeeded: other jobs of the run execute the PR's code.
+    const job = (await this.forge.checkRuns(pr.head)).filter((r) => r.name === 'cost').sort((a, b) => b.id - a.id)[0];
+    if (job?.status !== 'completed' || job.conclusion !== 'success') return false;
     let text: string | undefined;
     try {
       text = await this.forge.artifactFile(pr.head, 'cost', 'cost.json');
@@ -1073,9 +1177,10 @@ export class Orchestrator {
   /** After a merge: CI applies the infrastructure it changed, then the plan's post-deploy checks run (§12.6). */
   private async afterMerge(plan: PlanState, commit: string | undefined): Promise<'deploying' | 'verifying' | 'completed'> {
     const terraform = this.design.config.terraform;
+    // Main as it is now, for the rest of the pass: the plans that wait for this merge start from it.
+    await this.forge.fetchMain(this.repo);
     let deploys = false;
     if (terraform && commit) {
-      await this.forge.fetchMain(this.repo);
       const parent = await this.repo.revParse(`${commit}^1`);
       deploys = parent !== undefined && (await this.repo.changedFiles(parent, commit)).some((file) => file.startsWith(`${terraform.dir}/`));
     }
@@ -1083,7 +1188,11 @@ export class Orchestrator {
     return this.postDeployChecks(plan).length > 0 ? 'verifying' : 'completed';
   }
 
-  /** Waits for the apply job on the merge commit. */
+  /**
+   * Waits for the apply job on the merge commit. A later apply on main covers it too:
+   * GitHub cancels a pending run when a newer one queues, and the owner may have fixed a
+   * failed deploy on main, then resumed.
+   */
   private async followDeploy(plan: PlanState): Promise<Step> {
     const ref = { module: plan.module, plan: plan.plan };
     const key = planKey(plan);
@@ -1091,21 +1200,25 @@ export class Orchestrator {
     this.nextPoll.set(key, this.now() + 30_000);
     const commit = plan.mergeCommit!;
     const name = this.design.config.github.applyJob;
-    const apply = (await this.forge.checkRuns(commit)).filter((r) => r.name === name).sort((a, b) => b.id - a.id)[0];
-    if (!apply) {
-      if (this.now() - Date.parse(plan.mergedAt!) > 15 * 60_000 && !this.state.pipeline.paused) {
-        this.record({ type: 'PIPELINE_PAUSED', payload: { reason: `no ${name} job ran on main for ${commit.slice(0, 8)} within 15 minutes: is the harness workflow up to date?` } });
-      }
-      return 'wait';
-    }
-    if (apply.status !== 'completed') return 'wait';
-    if (apply.conclusion === 'success') {
+    const latestApply = async (sha: string) => (await this.forge.checkRuns(sha)).filter((r) => r.name === name).sort((a, b) => b.id - a.id)[0];
+    const apply = await latestApply(commit);
+    const main = await this.repo.revParse('refs/heads/main');
+    const later = main && main !== commit && (await this.repo.isAncestor(commit, main)) ? await latestApply(main) : undefined;
+    if ([apply, later].some((r) => r?.status === 'completed' && r.conclusion === 'success')) {
       this.record({ type: 'DEPLOYED', ref, payload: { commit, verify: this.postDeployChecks(plan).length > 0 } });
       return 'progress';
     }
-    this.record({ type: 'DEPLOY_FAILED', ref, payload: { commit, jobs: [{ name, conclusion: apply.conclusion ?? 'unknown', ...(apply.url ? { url: apply.url } : {}), log: await this.forge.jobLog(apply) }] } });
-    this.pauseIfOutOfDeployRounds(plan);
-    return 'progress';
+    if (apply?.status === 'completed' && apply.conclusion !== 'cancelled') {
+      const log = await this.forge.jobLog(apply).catch(() => '');
+      this.record({ type: 'DEPLOY_FAILED', ref, payload: { commit, jobs: [{ name, conclusion: apply.conclusion ?? 'unknown', ...(apply.url ? { url: apply.url } : {}), log }] } });
+      this.pauseIfOutOfDeployRounds(plan);
+      return 'progress';
+    }
+    const running = [apply, later].some((r) => r !== undefined && r.status !== 'completed');
+    if (!running && this.now() - Date.parse(plan.mergedAt!) > 15 * 60_000) {
+      this.pausePipeline(`no ${name} job ran on main for ${commit.slice(0, 8)} within 15 minutes: is the harness workflow up to date?`);
+    }
+    return 'wait';
   }
 
   /** The plan's post-deploy checks, on main, with the view-only role (§12.6). */
@@ -1128,8 +1241,8 @@ export class Orchestrator {
 
   private pauseIfOutOfDeployRounds(plan: PlanState): void {
     const limit = this.design.config.brakes.deployFixRounds;
-    if ((plan.deployFixRounds ?? 0) >= limit && !this.state.pipeline.paused) {
-      this.record({ type: 'PIPELINE_PAUSED', payload: { reason: `the deploy of ${planKey(plan)} still fails after ${limit} Fix PR(s): the owner decides` } });
+    if ((plan.deployFixRounds ?? 0) >= limit) {
+      this.pausePipeline(`the deploy of ${planKey(plan)} still fails after ${limit} Fix PR(s): fix it on main, or re-run the apply, then resume, and the daemon looks again`);
     }
   }
 
@@ -1138,7 +1251,11 @@ export class Orchestrator {
     return (definition?.features ?? []).flatMap((f) => f.checks.filter((c) => c.phase === 'post-deploy'));
   }
 
-  /** CI on the pushed head, recorded once every required job has finished. Undefined while it runs. */
+  /**
+   * CI on the pushed head, recorded once every required job has finished; undefined while
+   * it runs. After a failure it is still read: a re-run that passes, which the owner starts
+   * on GitHub once they fixed the cause, is CI passing.
+   */
   private async readCi(plan: PlanState): Promise<Step | undefined> {
     const ref = { module: plan.module, plan: plan.plan };
     const ci = plan.ci!;
@@ -1147,27 +1264,29 @@ export class Orchestrator {
     for (const run of await this.forge.checkRuns(ci.sha)) {
       if (required.includes(run.name) && run.id >= (latest.get(run.name)?.id ?? 0)) latest.set(run.name, run);
     }
-    if (latest.size === 0 && this.now() - Date.parse(ci.since) > 10 * 60_000) {
-      if (!this.state.pipeline.paused) {
-        this.record({ type: 'PIPELINE_PAUSED', payload: { reason: `no CI ran on PR #${plan.pr!.number} within 10 minutes: is the harness workflow on main?` } });
-      }
+    if (ci.status === 'pending' && latest.size === 0 && this.now() - Date.parse(ci.since) > 10 * 60_000) {
+      this.pausePipeline(`no CI ran on PR #${plan.pr!.number} within 10 minutes: is the harness workflow on main?`);
       return 'wait';
     }
     if (latest.size < required.length || [...latest.values()].some((r) => r.status !== 'completed')) return undefined;
+    const passed = required.every((name) => latest.get(name)!.conclusion === 'success');
+    // A re-run that fails again changes nothing.
+    if (!passed && ci.status === 'failed') return undefined;
     const jobs: CiJob[] = [];
     for (const name of required) {
       const run = latest.get(name)!;
       const conclusion = run.conclusion ?? 'unknown';
-      jobs.push({ name, conclusion, ...(run.url ? { url: run.url } : {}), ...(conclusion === 'success' ? {} : { log: await this.forge.jobLog(run) }) });
+      const log = conclusion === 'success' ? undefined : await this.forge.jobLog(run).catch(() => '(the log could not be read)');
+      jobs.push({ name, conclusion, ...(run.url ? { url: run.url } : {}), ...(log === undefined ? {} : { log }) });
     }
-    if (jobs.every((j) => j.conclusion === 'success')) {
+    if (passed) {
       this.record({ type: 'CI_PASSED', ref, payload: { sha: ci.sha, jobs } });
       return 'progress';
     }
     this.record({ type: 'CI_FAILED', ref, payload: { sha: ci.sha, jobs } });
     const limit = this.design.config.brakes.ciFixRounds;
-    if ((plan.fixRounds ?? 0) >= limit && !this.state.pipeline.paused) {
-      this.record({ type: 'PIPELINE_PAUSED', payload: { reason: `CI failed on PR #${plan.pr!.number} of ${planKey(plan)} after ${limit} fix round(s): the owner decides` } });
+    if ((plan.fixRounds ?? 0) >= limit) {
+      this.pausePipeline(`CI failed on PR #${plan.pr!.number} of ${planKey(plan)} after ${limit} fix round(s): fix it on the PR's branch, or fix the cause and re-run CI, then resume`);
     }
     return 'progress';
   }
@@ -1178,9 +1297,7 @@ export class Orchestrator {
     const changed = await this.repo.changedFiles(base, plan.head);
     const problems = await protectedChanges(this.repo.treeReader(base), this.repo.treeReader(plan.head), changed, { progress: 'append' });
     if (problems.length === 0) return undefined;
-    if (!this.state.pipeline.paused) {
-      this.record({ type: 'PIPELINE_PAUSED', payload: { reason: `refusing to push ${plan.branch}: it changes protected files: ${problems.join(', ')}` } });
-    }
+    this.pausePipeline(`refusing to push ${plan.branch}: it changes protected files: ${problems.join(', ')}`);
     return 'wait';
   }
 
@@ -1264,11 +1381,10 @@ export class Orchestrator {
   /** The attempt counts. Unless it was a rejection, which carries guidance, the next one waits for the Manager's. */
   private async fail(state: FeatureState, attempt: Attempt, reason: string): Promise<Step> {
     this.record({ type: 'ATTEMPT_FAILED', ref: refOf(state, attempt), payload: { reason } });
+    this.stopFollowing(attempt.sandbox);
     await this.driver.remove(attempt.sandbox);
     const limit = this.design.config.brakes.consecutiveFailures;
-    if (this.state.pipeline.consecutiveFailures >= limit && !this.state.pipeline.paused) {
-      this.record({ type: 'PIPELINE_PAUSED', payload: { reason: `${limit} attempts failed in a row` } });
-    }
+    if (this.state.pipeline.consecutiveFailures >= limit) this.pausePipeline(`${limit} attempts failed in a row`);
     return 'progress';
   }
 
@@ -1276,6 +1392,8 @@ export class Orchestrator {
   private async interrupt(state: FeatureState, attempt: Attempt, reason: string): Promise<Step> {
     const counts = interruptions(state, attempt.definitionHash) >= 2;
     this.record({ type: 'ATTEMPT_INTERRUPTED', ref: refOf(state, attempt), payload: { reason, counts } });
+    // Followers start again when their stream ends: one left on a removed sandbox would go on trying.
+    this.stopFollowing(attempt.sandbox);
     await this.driver.remove(attempt.sandbox);
     return 'progress';
   }
@@ -1284,7 +1402,8 @@ export class Orchestrator {
   private async agentDidNotStart(state: FeatureState, attempt: Attempt, stderr: string): Promise<Step> {
     const reason = `Claude Code did not start: ${clip(stderr.trim().replace(/\s+/g, ' ') || 'it wrote nothing', 400)}`;
     this.record({ type: 'ATTEMPT_INTERRUPTED', ref: refOf(state, attempt), payload: { reason, counts: false } });
-    this.record({ type: 'PIPELINE_PAUSED', payload: { reason: `environment: ${reason}` } });
+    this.pausePipeline(`environment: ${reason}`);
+    this.stopFollowing(attempt.sandbox);
     await this.driver.remove(attempt.sandbox);
     return 'progress';
   }
@@ -1293,7 +1412,8 @@ export class Orchestrator {
     const ref = refOf(state, attempt);
     this.record({ type: 'BASELINE_FAILED', ref, payload: { reason, results } });
     this.record({ type: 'ATTEMPT_INTERRUPTED', ref, payload: { reason, counts: false } });
-    this.record({ type: 'PIPELINE_PAUSED', payload: { reason: `environment: ${reason}` } });
+    this.pausePipeline(`environment: ${reason}`);
+    this.stopFollowing(attempt.sandbox);
     await this.driver.remove(attempt.sandbox);
     return 'progress';
   }
@@ -1363,9 +1483,28 @@ export class Orchestrator {
     return stamped;
   }
 
-  /** The module being built: the first, in design order, with a plan that isn't complete. */
+  /**
+   * The module being built, the only one with Developers, Managers and reviewers: modules
+   * are built one after another (v2 §12.8), and only Architects work on the others
+   * meanwhile. It is the module of the oldest plan in flight; with none in flight, the
+   * module of the plan started last while it has a plan to build, such as one a gate
+   * holds; then the first, in design order, with a plan to build. Only state left by
+   * 0.2.0 has plans of two modules in flight: the older module is finished first.
+   */
   currentModule(): string | undefined {
-    return this.design.modules.find((m) => m.plans.some((p) => this.state.plans[`${m.id}/${p.id}`]?.status !== 'completed'))?.id;
+    const plans = Object.values(this.state.plans);
+    const inFlight = plans.find((p) => this.inFlight(p));
+    if (inFlight) return inFlight.module;
+    const toBuild = (id: string) => this.design.modules.find((m) => m.id === id)?.plans.some((p) => this.state.plans[`${id}/${p.id}`]?.status !== 'completed') ?? false;
+    const last = plans.at(-1)?.module;
+    if (last !== undefined && toBuild(last)) return last;
+    return this.design.modules.find((m) => toBuild(m.id))?.id;
+  }
+
+  /** A plan under way: not complete, and still in the design while it is built, since a design change may drop a plan before its build ends. */
+  inFlight(plan: PlanState): boolean {
+    if (plan.status === 'completed') return false;
+    return plan.status !== 'active' || this.design.modules.some((m) => m.id === plan.module && m.plans.some((p) => p.id === plan.plan));
   }
 
   /** A blocking question to the owner holds back new attempts in its module. */
@@ -1377,6 +1516,15 @@ export class Orchestrator {
   designChanging(module: string): boolean {
     const state = this.state.modules[module];
     return state !== undefined && (state.status === 'in_review' || state.submission !== undefined);
+  }
+
+  /** The feature's definition in the design now, or undefined once a design change dropped it. */
+  featureDefinition(state: { module: string; plan: string; feature: string }): Feature | undefined {
+    try {
+      return this.lookup(state).feature;
+    } catch {
+      return undefined;
+    }
   }
 
   lookup(state: { module: string; plan: string; feature: string }): { plan: Plan; feature: Feature } {
@@ -1392,13 +1540,16 @@ export class Orchestrator {
    * The project's own pre-merge checks, then those of every accepted feature whose
    * commit `commit` contains: they must keep passing. Work landed on another plan's
    * branch, or merged on main after this branch last took it, isn't in `commit`, so its
-   * checks aren't asked of it (v3 §6.2).
+   * checks aren't asked of it (v3 §6.2). Nor are those of a feature the design dropped,
+   * or redefined since: it is built again, and its new checks are its attempt's.
    */
   async regressionChecks(commit: string): Promise<Check[]> {
     const accepted: Check[] = [];
     for (const feature of Object.values(this.state.features)) {
-      if (feature.status !== 'accepted' || !feature.commit || !(await this.repo.isAncestor(feature.commit, commit))) continue;
-      accepted.push(...preMerge(this.lookup(feature).feature.checks));
+      if (feature.status !== 'accepted' || !feature.commit) continue;
+      const definition = this.featureDefinition(feature);
+      if (!definition || !acceptedAsDefined(feature, definition) || !(await this.repo.isAncestor(feature.commit, commit))) continue;
+      accepted.push(...preMerge(definition.checks));
     }
     return [...preMerge(this.design.config.checks), ...accepted];
   }
@@ -1520,7 +1671,13 @@ export class Orchestrator {
 
   private async refreshDesign(): Promise<void> {
     await this.forge.fetchMain(this.repo);
-    this.design = await loadDesign(this.repo, 'refs/heads/main');
+    try {
+      this.design = await loadDesign(this.repo, 'refs/heads/main');
+    } catch (error) {
+      // What runs goes on under the last valid design, and nothing new starts until main is fixed.
+      this.pausePipeline(`the design on main is invalid: ${clip((error as Error).message.replace(/\s+/g, ' '), 400)}`);
+      throw error;
+    }
   }
 
   /** Bundles the attempt's commits into `refs/attempts/...`. Undefined when it committed nothing. */
@@ -1568,20 +1725,41 @@ export class Orchestrator {
     this.developers.delete(sandbox);
   }
 
-  /** A reviewer's transcript for the dashboard, and its channel for `web_read` (v3 §5.1). */
+  /** A reviewer's transcript for the dashboard, and its channel for `web_read` (v3 §5.1), once per sandbox: plans in parallel may be reviewed at once. */
   followReview(review: ReviewState): void {
-    if (this.reviewer?.sandbox === review.sandbox) return;
-    this.stopFollowingReview();
+    if (this.reviewers.has(review.sandbox)) return;
     const agent = `${review.role}:${review.head.slice(0, 8)}`;
     const follower = this.driver.follow(review.sandbox, this.paths(review.sandbox).stream, 1, (line) => this.events.emit('transcript', { agent, line }));
     const channel = this.channel({ role: 'reviewer', sandbox: review.sandbox }, join(this.options.harnessDir, 'reviews', `${review.sandbox}.replied.txt`));
-    this.reviewer = { sandbox: review.sandbox, follower, channel };
+    this.reviewers.set(review.sandbox, { follower, channel });
   }
 
-  stopFollowingReview(): void {
-    this.reviewer?.follower.stop();
-    this.reviewer?.channel.stop();
-    this.reviewer = undefined;
+  /** Stops following one reviewer's sandbox, or every one. */
+  stopFollowingReview(sandbox?: string): void {
+    for (const [name, reviewer] of [...this.reviewers]) {
+      if (sandbox !== undefined && name !== sandbox) continue;
+      reviewer.follower.stop();
+      reviewer.channel.stop();
+      this.reviewers.delete(name);
+    }
+  }
+
+  /**
+   * In Swarm, main's rules require the reviewers' statuses on every PR (v3 §3.3), but only
+   * plan PRs are reviewed: an Arch or Fix PR, which the owner merges, gets them as "not
+   * reviewed", once per head, so the owner merges it without bypassing the rules, and CI
+   * still gates it.
+   */
+  async markUnreviewed(head: string, what: string): Promise<void> {
+    if (this.state.mode !== 'swarm' || this.unreviewed.has(head)) return;
+    const contexts = this.design.config.swarm.requiredStatuses.filter((context) => REVIEWER_ROLES.some((role) => statusContext(role) === context));
+    try {
+      for (const context of contexts) await this.forge.setCommitStatus(head, { context, state: 'success', description: `not reviewed: ${what}` });
+      this.unreviewed.add(head);
+    } catch (error) {
+      // Without "Commit statuses: write" the owner merges it with the bypass, as before.
+      this.log(`the reviewers' statuses on ${head.slice(0, 8)} could not be set: ${(error as Error).message}`);
+    }
   }
 
   private agentRun(sandbox: string, attempt: Attempt): AgentRun {
@@ -1643,6 +1821,21 @@ function fixDefinition(id: string, plan: string, fix: NonNullable<FeatureState['
     resources: [],
     checks: [],
   };
+}
+
+/**
+ * Accepted, as the design defines the feature now: one redefined since is built again
+ * while its plan is. A feature recovered from git has no attempts to compare with.
+ */
+function acceptedAsDefined(state: FeatureState | undefined, definition: Feature): boolean {
+  if (state?.status !== 'accepted') return false;
+  const accepted = state.attempts.findLast((a) => a.status === 'accepted');
+  return accepted === undefined || accepted.definitionHash === definitionHash(definition);
+}
+
+/** An owner action's estimate, carried by its OWNER_ACTION_DONE so the time used survives a redesign. */
+function minutesOf(action: { estimatedMinutes?: number | undefined }): { minutes?: number } {
+  return action.estimatedMinutes === undefined ? {} : { minutes: action.estimatedMinutes };
 }
 
 function ensureDir(dir: string): string {

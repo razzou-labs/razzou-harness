@@ -1,6 +1,6 @@
 import { existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
-import { isAlive, readDaemonInfo } from '../daemon/main.ts';
+import { runningDaemon } from '../daemon/main.ts';
 import { makeForge } from '../daemon/orchestrator.ts';
 import { loadDesign } from '../design/schemas.ts';
 import { Repo } from '../git/repo.ts';
@@ -20,20 +20,24 @@ export interface RecoverOptions {
  * Rebuilds `.harness/` after it was lost (§15.2), from what outlives it: the designs and
  * `progress.txt` on main, and the plans' pull requests and branches on GitHub. The result
  * is one RECOVERED event, the first of a new log. Whatever lived only in `.harness/` is
- * gone: attempts under way, sessions, unanswered questions, unpushed plan branches.
+ * gone: attempts under way, sessions, unanswered questions, unpushed plan branches, and
+ * what the owner set, which the notes list.
  */
 export async function recover(options: RecoverOptions): Promise<string[]> {
-  const daemon = readDaemonInfo(options.harnessDir);
-  if (daemon && isAlive(daemon.pid)) throw new Error(`a daemon runs for this project (pid ${daemon.pid}): stop it with \`harness down\` first`);
+  const daemon = runningDaemon(options.harnessDir);
+  if (daemon) throw new Error(`a daemon runs for this project (pid ${daemon.pid}): stop it with \`harness down\` first`);
   const log = join(options.harnessDir, 'events.jsonl');
   if (existsSync(log) && statSync(log).size > 0) {
     throw new Error(`${log} exists, so there is nothing to recover. If it is damaged, move .harness away first.`);
   }
   const at = new Date((options.now ?? Date.now)()).toISOString();
   const repo = await Repo.open(join(options.harnessDir, 'git', 'repo.git'));
-  const main = await repo.fetchMain(options.projectDir);
+  // As in the daemon: the owner's checkout gives the config, and the config the forge. Main comes from the forge:
+  // the owner's checkout may be behind the merges on GitHub.
+  await repo.fetchMain(options.projectDir);
+  const forge = options.forge ?? makeForge((await loadDesign(repo, 'refs/heads/main')).config, options.projectDir);
+  const main = await forge.fetchMain(repo);
   const design = await loadDesign(repo, 'refs/heads/main');
-  const forge = options.forge ?? makeForge(design.config, options.projectDir);
   const onMain = progress(await repo.show('refs/heads/main', 'progress.txt'));
   const plans: Record<string, PlanState> = {};
   const features: Record<string, FeatureState> = {};
@@ -78,6 +82,7 @@ export async function recover(options: RecoverOptions): Promise<string[]> {
   for (const gate of onMain.gates) actions[gate] = { status: 'done', at, note: 'recovered from progress.txt' };
   if (onMain.gates.size > 0) notes.push(`gates satisfied: ${[...onMain.gates].join(', ')}`);
   notes.push('Not recovered: attempts under way, the Architects\' and Managers\' sessions, unanswered questions, plan branches that were never pushed, and deploys a merge started.');
+  notes.push('Nor what you set: the mode is Manual again (`harness mode swarm` switches back), the hours of your time and the agent-hours threshold are unset (`harness budget`), the INFRA merge button is off, and the owner tasks you marked done are pending again (gates come back from progress.txt; `harness done <module>/<task>` once the daemon runs).');
   new EventStore(log).append({ type: 'RECOVERED', payload: { plans, features, actions, notes } });
   return notes;
 }

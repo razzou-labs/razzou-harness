@@ -104,11 +104,17 @@ export function createApp(options: CreateAppOptions): Promise<CreatedApp> {
   });
 }
 
-/** Whether the App works on a repository: who it is, whether it's installed there, and whether a token can be minted. */
+/**
+ * Whether the App works on a repository: who it is, whether it's installed there, and whether
+ * a token can be minted. `Permissions:` are the ones the installation accepted, which tokens
+ * get; the App may ask for more, which the owner still has to accept.
+ */
 export async function checkApp(repo: string, dir = configDir()): Promise<string[]> {
   const client = new GitHubClient(loadAppCredentials(dir), repo);
   const app = await client.appRequest<{ name: string; owner: { login: string }; permissions: Record<string, string> }>('GET', '/app');
-  const lines = [`App: ${app.name} (owner ${app.owner.login})`, `Permissions: ${Object.entries(app.permissions).map(([k, v]) => `${k}=${v}`).join(', ')}`];
+  const installation = await client.appRequest<{ permissions: Record<string, string> }>('GET', '/repos/{repo}/installation');
+  const list = (permissions: Record<string, string>) => Object.entries(permissions).map(([k, v]) => `${k}=${v}`).join(', ');
+  const lines = [`App: ${app.name} (owner ${app.owner.login})`, `Permissions: ${list(installation.permissions)}`, `App permissions: ${list(app.permissions)}`];
   const installations = await client.appRequest<Array<{ account: { login: string }; repository_selection: string }>>('GET', '/app/installations');
   lines.push(`Installations: ${installations.map((i) => `${i.account.login} (${i.repository_selection} repositories)`).join(', ') || 'none'}`);
   const repos = await client.request<{ repositories: Array<{ full_name: string }> }>('GET', '/installation/repositories');
@@ -128,7 +134,8 @@ export function ciFiles(packageDir: string, owner?: string): Array<[string, stri
     ['.github/harness/harness-ci.ts', readFileSync(join(packageDir, 'src', 'ci', 'harness-ci.ts'), 'utf8')],
   ];
   if (owner) {
-    const paths = ['/harness/', '/.github/', '/.claude/', '/CLAUDE.md', '/AGENTS.md', '/ARCHITECTURE.md', '/init.sh', '/.npmrc', '/package.json'];
+    // Without a leading slash, a pattern matches in any folder: Claude Code reads these in every one.
+    const paths = ['/harness/', '/.github/', '.claude/', 'CLAUDE.md', 'CLAUDE.local.md', 'AGENTS.md', '/ARCHITECTURE.md', '/init.sh', '/.npmrc', '/package.json'];
     files.push(['.github/CODEOWNERS', `# The owner reviews every protected path (razzou-harness).\n${paths.map((p) => `${p} @${owner}`).join('\n')}\n`]);
   }
   return files;

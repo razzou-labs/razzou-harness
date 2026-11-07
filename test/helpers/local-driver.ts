@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import type { ExecResult, Follower, SandboxDriver, SandboxSpec, SandboxStatus } from '../../src/sandbox/driver.ts';
+import { splitLines } from '../../src/sandbox/openshell.ts';
 import { run } from '../../src/util.ts';
 
 /** Runs each "sandbox" as a plain directory on this machine, so the orchestrator can be tested without OpenShell. */
@@ -52,15 +53,9 @@ export class LocalDriver implements SandboxDriver {
 
   follow(name: string, file: string, from: number, onLine: (line: string) => void): Follower {
     const child = spawn('tail', ['-n', `+${from}`, '-s', '0.2', '-F', file], { stdio: ['ignore', 'pipe', 'ignore'] });
-    let buffer = '';
     child.stdout.setEncoding('utf8');
-    child.stdout.on('data', (chunk: string) => {
-      buffer += chunk;
-      for (let i = buffer.indexOf('\n'); i >= 0; i = buffer.indexOf('\n')) {
-        onLine(buffer.slice(0, i));
-        buffer = buffer.slice(i + 1);
-      }
-    });
+    // The same bound on a line as OpenShell's driver.
+    child.stdout.on('data', splitLines(onLine));
     return { stop: () => child.kill(), done: new Promise((resolve) => child.on('close', () => resolve())) };
   }
 

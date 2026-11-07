@@ -10,11 +10,11 @@ export function sha256(text: string): string {
   return createHash('sha256').update(text).digest('hex');
 }
 
-/** JSON with object keys sorted at every level, so equal values hash the same. */
+/** JSON with object keys sorted at every level, so equal values hash the same. The order is English's, whatever the machine's locale. */
 export function canonicalJson(value: unknown): string {
   return JSON.stringify(value, (_key, v: unknown) =>
     v && typeof v === 'object' && !Array.isArray(v)
-      ? Object.fromEntries(Object.entries(v as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)))
+      ? Object.fromEntries(Object.entries(v as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b, 'en')))
       : v,
   );
 }

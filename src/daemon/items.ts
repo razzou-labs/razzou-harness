@@ -28,7 +28,8 @@ export function pendingItems(o: Orchestrator, scope: { module: string; plan?: st
   const others: Item[] = [];
   for (const feature of Object.values(o.state.features).filter((f) => f.module === module && (only === undefined || f.plan === only))) {
     const last = feature.attempts.at(-1);
-    if (!last) continue;
+    // A feature a design change dropped waits for nobody: an attempt under way stops (v3 §6.6).
+    if (!last || !o.featureDefinition(feature)) continue;
     if (last.status === 'running') {
       for (const question of (last.questions ?? []).filter((q) => q.answer === undefined)) {
         questions.push(questionItem(feature, last, question.requestId, question.text));
@@ -254,8 +255,9 @@ export function mailText(o: Orchestrator, manager: ManagerState, mail: ManagerSt
 }
 
 export function attemptsLeft(o: Orchestrator, feature: FeatureState): number {
-  const hash = definitionHash(o.lookup(feature).feature);
-  return o.design.config.roles.developer.maxAttempts + feature.extraAttempts - countedAttempts(feature, hash);
+  const definition = o.featureDefinition(feature);
+  if (!definition) return 0;
+  return o.design.config.roles.developer.maxAttempts + feature.extraAttempts - countedAttempts(feature, definitionHash(definition));
 }
 
 function questionsAsked(attempt: Attempt): string[] {

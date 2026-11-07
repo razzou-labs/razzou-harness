@@ -19,6 +19,39 @@ describe('the paid-call inventory', () => {
     assert.deepEqual(paidCalls(code, 'package-lock.json'), []);
   });
 
+  it('finds the camelCase and snake_case calls, and the clients, of the SDKs a project is likely to use', () => {
+    const code = [
+      'const out = await bedrock.invokeModel(params).promise();',
+      'await ses.sendEmail({ Source: from }).promise();',
+      "lambda_client.invoke(FunctionName='resize', Payload=body)",
+      'await lambda.invoke({ FunctionName: name }).promise();',
+      'await sfn.startExecution({ stateMachineArn }).promise();',
+      'rekognition.detectLabels({ Image: image });',
+      'const hits = await kendra.query({ IndexId, QueryText }).promise();',
+      'response = client.converse(modelId=MODEL, messages=messages)',
+      "sns.publish(PhoneNumber='+15550100', Message=text)",
+      "mail = boto3.client('sesv2')",
+      "import { KendraClient, QueryCommand } from '@aws-sdk/client-kendra';",
+    ].join('\n');
+    assert.deepEqual(paidCalls(code, 'src/a.ts').map((c) => `${c.line} ${c.service}: ${c.call}`), [
+      '1 Bedrock: invokeModel', '2 SES: sendEmail', '3 Lambda invoke: invoke', '4 Lambda invoke: invoke', '5 Step Functions: startExecution',
+      '6 Rekognition: detectLabels', '7 Kendra: query', '8 Bedrock: converse', '9 SNS to a phone: PhoneNumber', '10 SES: sesv2',
+      '11 Kendra: KendraClient', '11 Kendra: QueryCommand', '11 Kendra: kendra',
+    ]);
+  });
+
+  it('skips words that only look like calls', () => {
+    const code = [
+      'type PhoneNumber = string;',
+      '// We converse with the model, then send the receipt through SES.',
+      'Converse with the team before you change the queue.',
+      'const rows = await users.query(sql);',
+      'chain.invoke(input);',
+      "import { QueryCommand } from '@aws-sdk/client-dynamodb';",
+    ].join('\n');
+    assert.deepEqual(paidCalls(code, 'src/a.ts'), []);
+  });
+
   it('diffs the inventory between the base and the head, per file', async () => {
     const base: Record<string, string> = { 'src/a.ts': 'client.send(new InvokeModelCommand(a));\n', 'src/b.py': 'polly.synthesize_speech(Text=t)\n' };
     const head: Record<string, string> = { 'src/a.ts': 'client.send(new InvokeModelCommand(a));\nclient.send(new InvokeModelCommand(b));\n', 'src/b.py': 'print(1)\n', 'src/c.ts': 'await ses.send(new SendEmailCommand(m));\n' };

@@ -77,7 +77,14 @@ export class AgentChannel {
 
   private receive(line: string): void {
     if (line.trim() === '') return;
-    if (line.length > MAX_LINE) return this.options.onInvalid(`a request of ${line.length} characters (the limit is ${MAX_LINE})`);
+    if (line.length > MAX_LINE) {
+      // Not parsed, but its id is near the start: the agent hears why, instead of waiting out its call.
+      const id = /"id"\s*:\s*"([A-Za-z0-9-]{1,64})"/.exec(line.slice(0, 300))?.[1];
+      if (id && !this.replied.has(id)) {
+        void this.reply(id, false, `the request is too large: ${line.length} characters, where the limit is ${MAX_LINE}`).catch(() => {});
+      }
+      return this.options.onInvalid(`a request of ${line.length} characters (the limit is ${MAX_LINE})`);
+    }
     let json: unknown;
     try {
       json = JSON.parse(line);

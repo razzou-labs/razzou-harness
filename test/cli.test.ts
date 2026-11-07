@@ -1,0 +1,126 @@
+import { strict as assert } from 'node:assert';
+import { spawn } from 'node:child_process';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { join } from 'node:path';
+import { describe, it } from 'node:test';
+import { fileURLToPath } from 'node:url';
+import { processStart, runningDaemon, takeDaemonLock } from '../src/daemon/main.ts';
+import { run } from '../src/util.ts';
+import { tempDir } from './helpers/toy-repo.ts';
+
+const CLI = fileURLToPath(new URL('../src/cli.ts', import.meta.url));
+// The CLI runs as the owner would, with a configuration folder of its own.
+const env = { ...process.env, XDG_CONFIG_HOME: tempDir('xdg') };
+const harness = (dir: string, ...args: string[]) => run(process.execPath, [CLI, ...args, '--dir', dir], { env });
+
+/** A project folder whose daemon.json names `pid`, started at `start`, listening on `port`. */
+function daemonJson(info: { pid: number; processStart?: number; port?: number }): string {
+  const dir = tempDir('project');
+  mkdirSync(join(dir, '.harness'));
+  writeFileSync(join(dir, '.harness', 'daemon.json'), JSON.stringify({ port: 1, token: 'cafe', startedAt: '2026-11-07T00:00:00.000Z', ...info }));
+  return dir;
+}
+
+describe('a daemon counts as running only while its own process does', () => {
+  const start = processStart(process.pid)!;
+
+  it('reads a process\'s start time, and none once the process is gone', async () => {
+    assert.ok(Number.isInteger(start) && start > 0);
+    const child = spawn('true');
+    await new Promise((resolve) => child.once('exit', resolve));
+    assert.equal(processStart(child.pid!), undefined);
+  });
+
+  it('tells the daemon of daemon.json from a process that took its pid since', () => {
+    const harnessDir = (info: { pid: number; processStart?: number }) => join(daemonJson(info), '.harness');
+    assert.equal(runningDaemon(harnessDir({ pid: process.pid, processStart: start }))?.pid, process.pid);
+    assert.equal(runningDaemon(harnessDir({ pid: process.pid, processStart: start - 1 })), undefined, 'the pid is alive, but not the daemon');
+    assert.equal(runningDaemon(harnessDir({ pid: process.pid }))?.pid, process.pid, 'a daemon.json from before start times: the pid alone');
+  });
+
+  it('lets one daemon start at a time, and takes over the lock of one that is gone', () => {
+    const dir = tempDir('harness');
+    const unlock = takeDaemonLock(dir);
+    assert.throws(() => takeDaemonLock(dir), /a daemon is starting or running for this project \(pid \d+\)/);
+    unlock();
+    assert.equal(existsSync(join(dir, 'daemon.lock')), false);
+    writeFileSync(join(dir, 'daemon.lock'), JSON.stringify({ pid: process.pid, processStart: start - 1 }));
+    const again = takeDaemonLock(dir);
+    assert.deepEqual(JSON.parse(readFileSync(join(dir, 'daemon.lock'), 'utf8')), { pid: process.pid, processStart: start });
+    again();
+  });
+
+  it('`harness down` leaves alone a process that took a dead daemon\'s pid', async () => {
+    const other = spawn('sleep', ['30'], { stdio: 'ignore' });
+    await new Promise((resolve) => other.once('spawn', resolve));
+    try {
+      const dir = daemonJson({ pid: other.pid!, processStart: processStart(other.pid!)! + 1 });
+      const down = await harness(dir, 'down');
+      assert.equal(down.stdout.trim(), 'no daemon is running');
+      assert.equal(other.exitCode, null);
+      assert.notEqual(processStart(other.pid!), undefined, 'still running');
+    } finally {
+      other.kill();
+    }
+  });
+});
+
+describe('the CLI', () => {
+  it('fails on an unknown command, with the help on stderr', async () => {
+    const dir = tempDir('project');
+    const unknown = await harness(dir, 'frobnicate');
+    assert.equal(unknown.code, 1);
+    assert.equal(unknown.stdout, '');
+    assert.match(unknown.stderr, /^unknown command: frobnicate\n\nharness \d+\.\d+\.\d+\n\nUsage: harness <command>/);
+    const help = await harness(dir, '--help');
+    assert.equal(help.code, 0);
+    assert.match(help.stdout, /Usage: harness <command>/);
+  });
+
+  it('fails when the daemon refuses an owner action, and not when the mode was already so', async () => {
+    const answers: Record<string, { status?: number; body: string }> = {
+      '/api/resume': { body: JSON.stringify({ done: false, error: 'the pipeline is not paused' }) },
+      '/api/actions/done': { body: JSON.stringify({ done: true }) },
+      '/api/accept': { body: JSON.stringify({ done: false }) },
+      '/api/mode': { body: JSON.stringify({ done: false }) },
+      '/api/answer': { status: 500, body: 'boom' },
+    };
+    const server = createServer((req, res) => {
+      req.resume().on('end', () => {
+        const answer = answers[req.url ?? ''] ?? { status: 404, body: 'not found' };
+        res.writeHead(answer.status ?? 200, { 'content-type': answer.status ? 'text/plain' : 'application/json' }).end(answer.body);
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+      // The daemon is this process, as far as the CLI can tell.
+      const dir = daemonJson({ pid: process.pid, processStart: processStart(process.pid)!, port: (server.address() as AddressInfo).port });
+      const refused = await harness(dir, 'resume');
+      assert.deepEqual([refused.code, refused.stderr.trim()], [1, 'the pipeline is not paused']);
+      const done = await harness(dir, 'done', 'shop/T1');
+      assert.deepEqual([done.code, done.stdout.trim()], [0, 'done']);
+      const nothing = await harness(dir, 'accept', 'shop', 'v2');
+      assert.deepEqual([nothing.code, nothing.stderr.trim()], [1, 'nothing to do']);
+      const already = await harness(dir, 'mode', 'swarm');
+      assert.deepEqual([already.code, already.stdout.trim()], [0, 'already swarm']);
+      assert.equal(existsSync(join(dir, '.harness', 'setup.json')), false, 'the running daemon took the switch');
+      const failed = await harness(dir, 'answer', 'r1', 'yes');
+      assert.deepEqual([failed.code, failed.stderr.trim()], [1, 'the daemon answered 500: boom']);
+    } finally {
+      server.close();
+    }
+  });
+
+  it('records the hours and the mode for the daemon while it is down (v4 §5)', async () => {
+    const dir = tempDir('project');
+    const budget = await harness(dir, 'budget', '--owner-hours', '12');
+    assert.equal(budget.code, 0, budget.stderr);
+    const mode = await harness(dir, 'mode', 'swarm');
+    assert.equal(mode.code, 0, mode.stderr);
+    assert.match(mode.stdout, /swarm: the daemon switches when it starts/);
+    // `harness budget` replaces hours the daemon has; the setup's hours only fill in.
+    assert.deepEqual(JSON.parse(readFileSync(join(dir, '.harness', 'setup.json'), 'utf8')), { ownerHours: 12, ownerHoursFrom: 'budget', mode: 'swarm' });
+  });
+});
