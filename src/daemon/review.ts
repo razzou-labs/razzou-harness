@@ -46,7 +46,9 @@ export async function reviewStep(o: Orchestrator, plan: PlanState, pr: PullReque
   for (const role of reviewRoles(o)) {
     const reviews = (plan.reviews ?? []).filter((r) => r.role === role && r.head === pr.head);
     const review = reviews.at(-1);
-    if (!review || (review.status === 'failed' && reviews.length < 2)) {
+    // A usage limit isn't the reviewer's failure: the session runs again once the pause lifts.
+    const failures = reviews.filter((r) => r.status === 'failed' && r.outcome !== 'usage_limit').length;
+    if (!review || (review.status === 'failed' && failures < 2)) {
       const minutes = o.design.config.swarm.reviewTimeoutMinutes;
       o.record({
         type: 'REVIEW_STARTING',
@@ -167,7 +169,7 @@ async function poll(o: Orchestrator, plan: PlanState, review: ReviewState): Prom
   const p = o.paths(review.sandbox);
   const end = async (outcome: 'error' | 'timed_out', reason: string) => {
     o.record({ type: 'REVIEW_ENDED', ref, payload: { role: review.role, head: review.head, outcome, reason } });
-    o.stopFollowingReview();
+    o.stopFollowingReview(review.sandbox);
     await o.driver.remove(review.sandbox);
     return 'progress' as const;
   };
@@ -186,23 +188,25 @@ async function poll(o: Orchestrator, plan: PlanState, review: ReviewState): Prom
   const stream = await fetch(p.stream, 'stream.jsonl');
   const stderr = await fetch(p.stderr, 'stderr.log');
   const result = readReview(stream, Number(status), stderr);
-  o.stopFollowingReview();
+  o.stopFollowingReview(review.sandbox);
   await o.driver.remove(review.sandbox);
   if (result.outcome === 'usage_limit') {
     o.record({ type: 'REVIEW_ENDED', ref, payload: { role: review.role, head: review.head, outcome: 'usage_limit', reason: result.detail ?? 'usage limit', ...(result.usage ? { usage: result.usage } : {}) } });
-    o.record({ type: 'PIPELINE_PAUSED', payload: { reason: 'usage limit reached', until: new Date(o.now() + 3_600_000).toISOString() } });
+    o.pausePipeline('usage limit reached', new Date(o.now() + 3_600_000).toISOString());
     return 'progress';
   }
   if (result.outcome !== 'done' || !result.report) {
     o.record({ type: 'REVIEW_ENDED', ref, payload: { role: review.role, head: review.head, outcome: result.outcome, reason: result.detail ?? result.outcome, ...(result.usage ? { usage: result.usage } : {}) } });
     return 'progress';
   }
+  // A blocking finding blocks, whatever the verdict says: the status follows the findings.
+  const verdict = result.report.findings.some((f) => f.severity === 'blocking') ? 'block' : result.report.verdict;
   o.record({
     type: 'REVIEW_ENDED',
     ref,
     payload: {
       role: review.role, head: review.head, outcome: 'done',
-      verdict: result.report.verdict, summary: result.report.summary, findings: result.report.findings,
+      verdict, summary: result.report.summary, findings: result.report.findings,
       ...(result.usage ? { usage: result.usage } : {}),
     },
   });
@@ -253,11 +257,14 @@ function requestFix(o: Orchestrator, plan: PlanState, pr: PullRequest, review: R
   if (rounds >= limit) {
     const reason = `the ${review.role} reviewer still blocks PR #${pr.number} after ${limit} fix round(s): the owner decides`;
     leaveToOwner(o, plan, pr, reason);
-    if (!o.state.pipeline.paused) o.record({ type: 'PIPELINE_PAUSED', payload: { reason: `${reason} (${planKey(plan)})` } });
+    o.pausePipeline(`${reason} (${planKey(plan)})`);
     return 'owner';
   }
   const blocking = (review.findings ?? []).filter((f) => f.severity === 'blocking');
-  const guidance = blocking.map((f) => `- ${f.title}${f.file ? ` (${f.file}${f.line ? `:${f.line}` : ''})` : ''}: ${f.detail}`).join('\n');
+  // A block without a blocking finding still gives the Developer the reviewer's reason.
+  const guidance = blocking.length > 0
+    ? blocking.map((f) => `- ${f.title}${f.file ? ` (${f.file}${f.line ? `:${f.line}` : ''})` : ''}: ${f.detail}`).join('\n')
+    : `- ${review.summary ?? 'the reviewer blocked the change without a finding'}`;
   o.record({
     type: 'REQUEST_FIX',
     ref,

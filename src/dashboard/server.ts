@@ -17,6 +17,11 @@ export interface DashboardOptions {
   /** 0 picks a free port; the server's address tells which. */
   port: number;
   token: string;
+  /**
+   * For the link the daemon opens in a browser, whose command line other users can read:
+   * `/?code=` logs in once, in the first two minutes. `/?token=` always does.
+   */
+  loginCode?: string;
   /** The built front end: `index.html` and its assets. */
   webRoot: string;
   terminals: Terminals;
@@ -54,8 +59,12 @@ const TYPES: Record<string, string> = {
  * content security policy. Server-sent events carry the live updates, WebSockets the
  * terminals, and POST requests the owner's actions.
  */
-export function startDashboard({ orchestrator, port, token, webRoot, terminals }: DashboardOptions): Promise<Server> {
+export function startDashboard({ orchestrator, port, token, loginCode, webRoot, terminals }: DashboardOptions): Promise<Server> {
   let allowedHosts = new Set<string>();
+  // Named for the port: cookies don't tell ports apart, and every project's dashboard has its own token.
+  let cookie = 'harness_token';
+  let code = loginCode;
+  const started = Date.now();
   const clients = new Set<ServerResponse>();
   const transcripts = new Transcripts(orchestrator);
 
@@ -75,11 +84,16 @@ export function startDashboard({ orchestrator, port, token, webRoot, terminals }
   });
   setInterval(() => clients.forEach((client) => client.write(': keepalive\n\n')), 20_000).unref();
 
-  const authorized = (req: IncomingMessage, url: URL) => {
-    const given = url.searchParams.get('token')
-      ?? /(?:^|;\s*)harness_token=([0-9a-f]+)/.exec(req.headers.cookie ?? '')?.[1]
-      ?? /^Bearer ([0-9a-f]+)$/.exec(req.headers.authorization ?? '')?.[1];
-    return given !== undefined && given.length === token.length && timingSafeEqual(Buffer.from(given), Buffer.from(token));
+  const authorized = (req: IncomingMessage, url: URL) =>
+    matches(
+      url.searchParams.get('token')
+        ?? new RegExp(`(?:^|;\\s*)${cookie}=([0-9a-f]+)`).exec(req.headers.cookie ?? '')?.[1]
+        ?? /^Bearer ([0-9a-f]+)$/.exec(req.headers.authorization ?? '')?.[1],
+      token,
+    );
+  const login = (res: ServerResponse) => {
+    res.writeHead(303, { 'set-cookie': `${cookie}=${token}; HttpOnly; SameSite=Strict; Path=/`, location: '/' });
+    res.end();
   };
   const sameOrigin = (origin: string | undefined) => origin !== undefined && allowedHosts.has(origin.replace(/^http:\/\//, ''));
 
@@ -89,12 +103,13 @@ export function startDashboard({ orchestrator, port, token, webRoot, terminals }
       if (!allowedHosts.has(req.headers.host ?? '')) return send(res, 421, 'wrong host');
       if (req.method === 'POST' && req.headers.origin && !sameOrigin(req.headers.origin)) return send(res, 403, 'wrong origin');
       const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+      if (req.method === 'GET' && url.pathname === '/' && code !== undefined && Date.now() - started < 120_000 && matches(url.searchParams.get('code'), code)) {
+        code = undefined;
+        return login(res);
+      }
       if (!authorized(req, url)) return send(res, 401, 'open the URL the daemon printed, with its token');
 
-      if (req.method === 'GET' && url.pathname === '/' && url.searchParams.has('token')) {
-        res.writeHead(303, { 'set-cookie': `harness_token=${token}; HttpOnly; SameSite=Strict; Path=/`, location: '/' });
-        return res.end();
-      }
+      if (req.method === 'GET' && url.pathname === '/' && url.searchParams.has('token')) return login(res);
       if (req.method === 'GET' && !url.pathname.startsWith('/api/')) return serveFile(res, webRoot, url.pathname, [...allowedHosts]);
 
       const body = req.method === 'POST' ? (JSON.parse(await readBody(req)) as Record<string, unknown>) : {};
@@ -202,6 +217,7 @@ export function startDashboard({ orchestrator, port, token, webRoot, terminals }
         server.off('error', onError);
         const actual = (server.address() as AddressInfo).port;
         allowedHosts = new Set([`127.0.0.1:${actual}`, `localhost:${actual}`]);
+        cookie = `harness_token_${actual}`;
         resolve(server);
       });
     });
@@ -254,7 +270,16 @@ export function runningSandboxes(state: State): string[] {
     ...Object.values(state.modules).map((m) => m.architect.sandbox),
     ...Object.values(state.managers).filter((m) => m.status !== 'stopped').map((m) => m.sandbox),
     ...Object.values(state.features).flatMap((f) => f.attempts.filter((a) => live.includes(a.status)).map((a) => a.sandbox)),
+    ...Object.values(state.plans).flatMap((p) => (p.reviews ?? []).filter((r) => r.status === 'starting' || r.status === 'running').map((r) => r.sandbox)),
   ];
+}
+
+/** A secret given in a request, compared in constant time. Bytes, not characters: timingSafeEqual throws on lengths that differ. */
+function matches(given: string | null | undefined, secret: string): boolean {
+  if (!given) return false;
+  const a = Buffer.from(given);
+  const b = Buffer.from(secret);
+  return a.length === b.length && timingSafeEqual(a, b);
 }
 
 /**

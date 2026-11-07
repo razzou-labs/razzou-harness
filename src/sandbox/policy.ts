@@ -61,7 +61,8 @@ export function buildPolicy(options: PolicyOptions): object {
   }
   rules.push(...options.extraHosts.map((host): HostRule => ({ host, access: 'read' })));
 
-  const unique = [...new Map(rules.map((rule) => [rule.host, rule])).values()];
+  // A host's first rule wins: a bundle's, like github.com's with git, over an extra host's read-only one.
+  const unique = rules.filter((rule, i) => rules.findIndex((r) => r.host === rule.host) === i);
   unique.forEach((rule) => checkHost(rule.host));
   const binaries = BINARIES.map((path) => ({ path }));
 

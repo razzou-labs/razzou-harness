@@ -1,6 +1,11 @@
 import { strict as assert } from 'node:assert';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, it } from 'node:test';
-import { featureDependency, planDependencies, PlanSchema } from '../src/design/schemas.ts';
+import { featureDependency, loadDesign, planDependencies, PlanSchema } from '../src/design/schemas.ts';
+import { Repo } from '../src/git/repo.ts';
+import { runOk } from '../src/util.ts';
+import { createToyRepo, tempDir } from './helpers/toy-repo.ts';
 
 const feature = (id: string, dependsOn: string[] = []) => ({
   id, title: id, description: 'd', expected: 'e', dependsOn, checks: [{ id: `${id}-c`, run: 'true', phase: 'pre-merge' }],
@@ -24,5 +29,17 @@ describe('plan dependencies (v3 §6.1)', () => {
     assert.deepEqual(featureDependency('P2', 'P1/F03'), { plan: 'P1', feature: 'F03' });
     assert.equal(PlanSchema.safeParse(plan('P2', { features: [feature('F01', ['P1/F03'])] })).success, true);
     assert.equal(PlanSchema.safeParse(plan('P2', { features: [feature('F01', ['P1/F03/x'])] })).success, false);
+  });
+
+  it('refuse P1/F02 inside P1 unless F02 is an earlier feature of P1, as without the prefix', async () => {
+    const dir = tempDir('design');
+    await createToyRepo(dir, {}, { design: false });
+    mkdirSync(join(dir, 'harness/modules/m/plans'), { recursive: true });
+    writeFileSync(join(dir, 'harness/modules/m/plans/P1.json'), JSON.stringify(plan('P1', { features: [feature('F01', ['P1/F02']), feature('F02')] })));
+    await runOk('git', ['-C', dir, 'add', '-A']);
+    await runOk('git', ['-C', dir, '-c', 'user.name=o', '-c', 'user.email=o@test.invalid', 'commit', '--quiet', '-m', 'a plan']);
+    const repo = await Repo.open(join(tempDir('git'), 'repo.git'));
+    await repo.fetchMain(dir);
+    await assert.rejects(loadDesign(repo, 'refs/heads/main'), /F01 depends on P1\/F02, which is not an earlier feature of P1/);
   });
 });

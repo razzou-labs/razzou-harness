@@ -50,6 +50,10 @@ interface Payloads {
   PLAN_STARTED: { branch: string; base: string };
   /** Main moved while the plan was built, as a design change makes it: merged into the plan branch. */
   PLAN_MAIN_MERGED: { main: string; head: string };
+  /** Main moved, but its changes conflict with the plan branch's in `files`: the plan goes on from its base, and the conflict is resolved in its pull request. */
+  PLAN_MAIN_CONFLICT: { main: string; files: string[] };
+  /** The owner pushed to the plan's PR branch on GitHub, on top of what the harness pushed: the daemon builds on the new head. */
+  PLAN_HEAD_ADOPTED: { head: string };
   PLAN_COMPLETED: { head: string };
   ATTEMPT_STARTING: { sandbox: string; base: string; sessionId: string; deadline: string; definitionHash: string };
   ATTEMPT_STARTED: Record<string, never>;
@@ -99,7 +103,8 @@ interface Payloads {
   DESIGN_FROZEN: { module: string; commit: string };
   ARCHITECT_NOTE_SENT: { module: string; key: string };
   OWNER_ACTION_CLAIMED: { module: string; action: string; note?: string };
-  OWNER_ACTION_DONE: { module: string; action: string; title: string; gate: boolean };
+  /** `minutes`: the action's estimate when it was done, so the owner's time used survives a redesign that drops it. */
+  OWNER_ACTION_DONE: { module: string; action: string; title: string; gate: boolean; minutes?: number };
   OWNER_ACTION_REFUSED: { module: string; action: string; reason: string };
   /** The owner switched the mode (v3 §2.1); it takes effect at item boundaries. */
   MODE_CHANGED: { mode: Mode };

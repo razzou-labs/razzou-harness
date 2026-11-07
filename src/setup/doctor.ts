@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { webRead } from '../daemon/web-read.ts';
 import { loadPty } from '../dashboard/terminals.ts';
 import { ConfigSchema, requiredChecks, type Config } from '../design/schemas.ts';
-import { claudeTokenFile, loadClaudeToken, saveClaudeToken } from '../anthropic/usage.ts';
+import { claudeTokenFile, loadClaudeToken, readUsage, saveClaudeToken } from '../anthropic/usage.ts';
 import { GitHubClient, loadAppCredentials } from '../github/app.ts';
 import { checkApp } from '../github/setup.ts';
 import { BUNDLES } from '../sandbox/allowlist.ts';
@@ -36,6 +36,8 @@ export interface DoctorOptions {
   buildImages: boolean;
   /** Whether the owner is at a terminal: then missing providers are set up, with hidden prompts for secrets. */
   interactive: boolean;
+  /** The AWS view role's ARN, when `harness setup` asked for it already: the AWS provider takes it without asking again. */
+  awsViewRole?: string;
   report: (check: Check) => void;
 }
 
@@ -139,7 +141,7 @@ async function claude(options: DoctorOptions, provider: string, report: (c: Chec
   });
   report(created.code === 0 ? ok('Claude provider', `${provider} created`) : fail('Claude provider', firstLine(created.stderr), 'see `openshell provider create --help`'));
   // The same token lets the daemon read the subscription's usage before a launch in Swarm (v3 §4.3).
-  if (created.code === 0) report(ok('Claude token', `stored in ${saveClaudeToken(token)}: the daemon reads the subscription's usage with it`));
+  if (created.code === 0) await storeClaudeToken(token, report);
 }
 
 /** The stored token (v3 §4.3), asked for when Swarm needs it and the provider was created before the harness stored tokens. */
@@ -153,7 +155,24 @@ async function claudeToken(options: DoctorOptions, report: (c: Check) => void): 
   }
   const token = await askSecret("Swarm reads the subscription's usage before a launch. Paste the token from `claude setup-token` (hidden), or press Enter to skip: ");
   if (!token) return report(warn('Claude token', 'not stored: the daemon learns of a limit only when an attempt hits it', 'run `harness doctor` again to store it'));
-  report(ok('Claude token', `stored in ${saveClaudeToken(token)}`));
+  await storeClaudeToken(token, report);
+}
+
+/**
+ * Stores the token for the daemon, after one reading of the usage with it. A token the
+ * endpoint refuses is stored all the same: only Swarm's usage ceiling needs the reading.
+ */
+async function storeClaudeToken(token: string, report: (c: Check) => void): Promise<void> {
+  const file = saveClaudeToken(token);
+  const refused = await readUsage(token).then(() => undefined, (error: Error) => (/answered 40[13]$/.test(error.message) ? error.message : undefined));
+  report(refused
+    ? warn('Claude token', `stored in ${file}, but ${refused}: Swarm's usage ceiling can't read the subscription's usage with this token`, `Swarm then learns of a limit only when an attempt hits it. For another token, delete ${file} and run \`harness doctor\` again`)
+    : ok('Claude token', `stored in ${file}: the daemon reads the subscription's usage with it`));
+}
+
+/** What the App's installation grants of a permission, from checkApp's `Permissions:` line: only what the owner accepted on it. */
+export function granted(appCheck: string[], permission: string): string | undefined {
+  return new RegExp(`\\b${permission}=(\\w+)`).exec(appCheck.find((l) => l.startsWith('Permissions:')) ?? '')?.[1];
 }
 
 async function project(options: DoctorOptions, config: Config, report: (c: Check) => void): Promise<void> {
@@ -166,8 +185,8 @@ async function project(options: DoctorOptions, config: Config, report: (c: Check
     try {
       const lines = await checkApp(repo);
       report(ok('GitHub App', lines.find((l) => l.startsWith('App:'))?.slice(5) ?? 'installed'));
-      // In Swarm the reviewers' verdicts are commit statuses the App posts (v3 §3.4).
-      if (mode === 'swarm' && !/\bstatuses=write\b/.test(lines.find((l) => l.startsWith('Permissions:')) ?? '')) {
+      // In Swarm the reviewers' verdicts are commit statuses the App posts (v3 §3.4), once the installation accepted the permission.
+      if (mode === 'swarm' && granted(lines, 'statuses') !== 'write') {
         report(warn('GitHub App', "can't write commit statuses, which the reviewers' verdicts need in Swarm", 'give the App "Commit statuses: write" on GitHub, and accept the new permission on its installation'));
       }
     } catch (error) {
@@ -180,7 +199,11 @@ async function project(options: DoctorOptions, config: Config, report: (c: Check
       // In Swarm the reviewers' statuses are required too (v3 §3.3); the probe checks the rest.
       const wanted = [...requiredChecks(config), ...(mode === 'swarm' ? config.swarm.requiredStatuses : [])];
       const missing = wanted.filter((c) => !ruleset.checks.includes(c));
-      report(missing.length === 0 && ruleset.active ? ok('ruleset', `requires ${ruleset.checks.join(', ')}`) : fail('ruleset', missing.length ? `doesn't require ${missing.join(', ')}` : 'not active', `run \`harness github-setup --repo ${repo}\``));
+      const fix = `run \`harness github-setup --repo ${repo}\``;
+      if (missing.length > 0) report(fail('ruleset', `doesn't require ${missing.join(', ')}`, fix));
+      else if (!ruleset.active) report(fail('ruleset', 'not active', fix));
+      else if (ruleset.offMain) report(fail('ruleset', ruleset.offMain, offMainFix(repo)));
+      else report(ok('ruleset', `requires ${ruleset.checks.join(', ')}`));
     }
     for (const file of ['.github/workflows/harness.yml', '.github/harness/harness-ci.ts']) {
       const local = join(options.projectDir, file);
@@ -213,7 +236,7 @@ async function aws(options: DoctorOptions, config: Config, report: (c: Check) =>
     if (imported.code !== 0) return report(fail('AWS profile', firstLine(imported.stderr), `import ${AWS_PROFILE_URL}`));
   }
   console.log(`AWS provider ${provider} is missing. It needs the project's read-only role, and the gateway user's key (see the README's AWS section).`);
-  const role = await ask('The project\'s view role ARN: ');
+  const role = options.awsViewRole ?? (await ask('The project\'s view role ARN: '));
   const keyId = await ask('The harness-gateway user\'s AccessKeyId: ');
   const secret = await askSecret('Its SecretAccessKey (hidden): ');
   if (!/^arn:aws:iam::\d{12}:role\/harness-[\w+=,.@-]+-view$/.test(role) || !keyId || !secret) {
@@ -229,7 +252,14 @@ async function aws(options: DoctorOptions, config: Config, report: (c: Check) =>
   for (const args of steps) {
     // The secret goes through the environment of these commands only.
     const result = await run('openshell', args, { env: { ...process.env, HARNESS_AWS_SECRET: secret } });
-    if (result.code !== 0) return report(fail('AWS provider', `openshell ${args.slice(0, 3).join(' ')}: ${firstLine(result.stderr)}`, 'fix it, then run `harness doctor` again'));
+    if (result.code === 0) continue;
+    const failed = `openshell ${args.slice(0, 3).join(' ')}: ${firstLine(result.stderr)}`;
+    if (args[1] === 'create') return report(fail('AWS provider', failed, 'fix it, then run `harness doctor` again'));
+    // A provider without its key would pass for done on every later run, and the key would never be asked for again.
+    const deleted = await run('openshell', ['provider', 'delete', provider]);
+    return report(deleted.code === 0
+      ? fail('AWS provider', `${failed}; ${provider} was deleted again`, 'fix it, then run `harness doctor` again: it asks for the key again')
+      : fail('AWS provider', `${failed}; deleting ${provider} failed too: ${firstLine(deleted.stderr)}`, `run \`openshell provider delete ${provider}\`, then \`harness doctor\` again`));
   }
   report(ok('AWS provider', `${provider} created`));
 }
@@ -253,13 +283,17 @@ async function probes(options: DoctorOptions, config: Config, report: (c: Check)
     }
   }
   const refused = await webRead('http://192.168.1.1/');
-  report(!refused.ok ? ok('probe (outside)', `web_read refuses a private address: ${refused.text}`) : fail('probe (outside)', 'web_read read a private address'));
+  // Only the harness's own refusal counts: a network error, or an answer from the address, means it tried.
+  report(refused.text.startsWith('refused:')
+    ? ok('probe (outside)', `web_read refuses a private address: ${refused.text}`)
+    : fail('probe (outside)', `web_read didn't refuse a private address: ${refused.status === undefined ? firstLine(refused.text) : `it answered ${refused.status}`}`));
   if (config.project.repo) {
     const repo = config.project.repo;
     report(await workflowPushRefused(repo));
     const ruleset = await mainRuleset(repo);
     if (!ruleset) report(warn('probe (outside)', 'the ruleset is not readable with your gh login', 'install and log in to gh'));
     else if (projectMode(options.projectDir) === 'swarm') report(swarmRuleset(ruleset, config, repo));
+    else if (ruleset.active && ruleset.offMain) report(fail('probe (outside)', `main can be merged without the owner's approval: the ruleset ${ruleset.offMain}`, offMainFix(repo)));
     else {
       report(ruleset.approvals >= 1 && ruleset.codeOwners && ruleset.active
         ? ok('probe (outside)', `main needs ${ruleset.approvals} code owner approval to merge`)
@@ -273,6 +307,7 @@ function swarmRuleset(ruleset: Ruleset, config: Config, repo: string): Check {
   const statuses = config.swarm.requiredStatuses;
   const fix = `run \`harness github-setup --repo ${repo}\``;
   if (!ruleset.active) return fail('probe (outside)', 'the ruleset on main is not active', fix);
+  if (ruleset.offMain) return fail('probe (outside)', `the ruleset ${ruleset.offMain}`, offMainFix(repo));
   if (ruleset.approvals > 0) return fail('probe (outside)', "main's rules are the Manual ones: they need an approval the daemon can't give", fix);
   const missing = statuses.filter((s) => !ruleset.checks.includes(s));
   if (missing.length > 0) return fail('probe (outside)', `main's rules miss the statuses ${missing.join(', ')}`, fix);
@@ -298,10 +333,16 @@ function projectMode(projectDir: string): Mode {
   }
 }
 
-/** The App tries to push a workflow to a new branch. GitHub must refuse it: the App has no workflow permission. */
+/**
+ * The App tries to push a workflow to a new branch, and GitHub must refuse it. Its tokens
+ * are minted without workflows, so GitHub refuses whatever the App holds: its
+ * installation must not grant workflows either.
+ */
 async function workflowPushRefused(repo: string): Promise<Check> {
   const dir = mkdtempSync(join(tmpdir(), 'harness-probe-git-'));
   try {
+    const workflows = granted(await checkApp(repo), 'workflows');
+    if (workflows) return fail('probe (outside)', `the App's installation grants workflows=${workflows}: it must not have the workflows permission`, "remove the permission from the App's settings on GitHub");
     const client = new GitHubClient(loadAppCredentials(), repo);
     const env = { ...process.env, ...(await client.gitEnv()), GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
     const git = (args: string[]) => run('git', ['-C', dir, ...args], { env });
@@ -335,17 +376,33 @@ interface Ruleset {
   approvals: number;
   codeOwners: boolean;
   active: boolean;
+  /** Why it doesn't apply to main, when it doesn't: it names neither main nor the default branch, or the default branch isn't main. */
+  offMain?: string;
 }
 
+/** A default branch other than main is the owner's to change: the ruleset applies to the default branch. */
+const offMainFix = (repo: string) => `make main the repository's default branch on GitHub, then run \`harness github-setup --repo ${repo}\``;
+
 /** The ruleset on main, read with the owner's own `gh` login: the App may not read administration settings. */
-async function mainRuleset(repo: string): Promise<Ruleset | undefined> {
+export async function mainRuleset(repo: string): Promise<Ruleset | undefined> {
   const list = await run('gh', ['api', `repos/${repo}/rulesets`]).catch(() => undefined);
   if (list?.code !== 0) return undefined;
   const id = (JSON.parse(list.stdout) as Array<{ id: number; name: string }>).find((r) => r.name === 'harness: main')?.id;
   if (id === undefined) return { checks: [], integrations: {}, approvals: 0, codeOwners: false, active: false };
   const detail = await run('gh', ['api', `repos/${repo}/rulesets/${id}`]);
   if (detail.code !== 0) return undefined;
-  const ruleset = JSON.parse(detail.stdout) as { enforcement: string; rules: Array<{ type: string; parameters?: Record<string, any> }> };
+  const ruleset = JSON.parse(detail.stdout) as { enforcement: string; conditions?: { ref_name?: { include?: string[] } }; rules: Array<{ type: string; parameters?: Record<string, any> }> };
+  // The harness's ruleset names the default branch, which must then be main.
+  const include = ruleset.conditions?.ref_name?.include ?? [];
+  let offMain: string | undefined;
+  if (!include.includes('refs/heads/main')) {
+    if (!include.includes('~DEFAULT_BRANCH')) offMain = "doesn't apply to main";
+    else {
+      const info = await run('gh', ['api', `repos/${repo}`, '--jq', '.default_branch']);
+      if (info.code !== 0) return undefined;
+      if (info.stdout.trim() !== 'main') offMain = `applies to the default branch, ${info.stdout.trim()}, not to main`;
+    }
+  }
   const pr = ruleset.rules.find((r) => r.type === 'pull_request')?.parameters ?? {};
   const checks = (ruleset.rules.find((r) => r.type === 'required_status_checks')?.parameters?.required_status_checks ?? []) as Array<{ context: string; integration_id?: number }>;
   return {
@@ -354,6 +411,7 @@ async function mainRuleset(repo: string): Promise<Ruleset | undefined> {
     approvals: Number(pr.required_approving_review_count ?? 0),
     codeOwners: pr.require_code_owner_review === true,
     active: ruleset.enforcement === 'active',
+    ...(offMain ? { offMain } : {}),
   };
 }
 

@@ -47,7 +47,7 @@ export class GitHubClient {
   private readonly credentials: AppCredentials;
   private readonly fetch: typeof fetch;
   private cached?: { token: string; expires: number };
-  /** False once a token had to be minted without the statuses permission: the App predates it. */
+  /** False while the latest token had to be minted without the statuses permission: the App, or its installation, doesn't have it yet. */
   canWriteStatuses = true;
 
   constructor(credentials: AppCredentials, repo: string, fetchImpl: typeof fetch = fetch) {
@@ -120,13 +120,15 @@ export class GitHubClient {
       permissions,
     });
     let minted: { token: string; expires_at: string };
+    // Every new token asks for writing statuses first, so a permission granted since counts without a restart.
     try {
-      minted = await mint(this.canWriteStatuses ? APP_PERMISSIONS : { ...APP_PERMISSIONS, statuses: 'read' });
+      minted = await mint(APP_PERMISSIONS);
+      this.canWriteStatuses = true;
     } catch (error) {
-      // GitHub refuses a token with more than the App has: an App from before the reviewers can only read statuses.
-      if (!this.canWriteStatuses || !(error instanceof GitHubError) || error.status !== 422) throw error;
-      this.canWriteStatuses = false;
+      // GitHub refuses a token with more than the installation has: an App from before the reviewers can only read statuses.
+      if (!(error instanceof GitHubError) || error.status !== 422) throw error;
       minted = await mint({ ...APP_PERMISSIONS, statuses: 'read' });
+      this.canWriteStatuses = false;
     }
     this.cached = { token: minted.token, expires: Date.parse(minted.expires_at) };
     return minted.token;

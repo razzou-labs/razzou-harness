@@ -137,7 +137,7 @@ export const TOOLS: Record<Role, ToolSpec[]> = {
     { name: 'get_inbox', description: 'Your messages: questions from the Manager and notes from the harness, newest last.', waitSec: 60 },
     {
       name: 'get_owner_time',
-      description: "The owner's time budget, if they set one: the hours available to this module for its owner actions and the reading of its proposal. A design over it is refused.",
+      description: "The owner's time budget, if they set one: the hours available to this module for its owner actions. Only owner actions count, not what the owner reads. A design over it is refused.",
       waitSec: 60,
     },
     { name: 'reply_to_manager', description: "Answers one of the Manager's escalations. Your decision reaches it at once.", waitSec: 120 },

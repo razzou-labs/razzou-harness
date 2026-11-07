@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { z } from 'zod';
 import { describeOwnerTime } from '../design/owner-time.ts';
 import { INPUTS, TOOLS, type Role, type ToolInput, type ToolName } from '../roles.ts';
-import { activeAttempt, attemptInSandbox, featureKey, managerKey, planKey, type Attempt, type FeatureState } from '../state/state.ts';
+import { activeAttempts, attemptInSandbox, featureKey, managerKey, planKey, type Attempt, type FeatureState } from '../state/state.ts';
 import { clip, sh, sha256, tail } from '../util.ts';
 import type { AgentRequest } from './channel.ts';
 import { attemptsLeft, ciReport, deployReport } from './items.ts';
@@ -73,9 +73,10 @@ const HANDLERS: Handlers = {
   },
 
   async answer_developer({ o, agent }, { question_id, answer }) {
-    const active = activeAttempt(o.state);
+    // Several attempts may run at once in Swarm (v3 §6.2): the question names its own.
+    const active = activeAttempts(o.state).find((a) => inScope(agent, a.feature) && a.attempt.questions?.some((q) => q.requestId === question_id));
     const question = active?.attempt.questions?.find((q) => q.requestId === question_id);
-    if (!active || !question || !inModule(agent, active.feature.module)) {
+    if (!active || !question) {
       return refuse(`No open question has the id ${question_id}. get_state lists the open questions.`);
     }
     if (question.answer !== undefined) return ok('That question is already answered.');
@@ -108,7 +109,7 @@ const HANDLERS: Handlers = {
 
   retry_feature({ o, agent, requestId }, { feature, guidance }) {
     const state = o.state.features[feature];
-    if (!state || !inModule(agent, state.module)) return refuse(`${feature} has no attempt in your module.`);
+    if (!state || !inScope(agent, state)) return refuse(`${feature} has no attempt in your ${scopeName(agent)}.`);
     const last = state.attempts.at(-1)!;
     if (state.status === 'escalated') return refuse(`${feature} is escalated: the owner decides now.`);
     if (!state.awaitingGuidanceSince) {
@@ -120,10 +121,8 @@ const HANDLERS: Handlers = {
   },
 
   abort_attempt({ o, agent, requestId }, { feature, attempt, reason }) {
-    const active = activeAttempt(o.state);
-    if (!active || featureKey(active.feature) !== feature || active.attempt.n !== attempt || !inModule(agent, active.feature.module)) {
-      return refuse(`Attempt ${attempt} of ${feature} is not running.`);
-    }
+    const active = activeAttempts(o.state).find((a) => featureKey(a.feature) === feature && a.attempt.n === attempt && inScope(agent, a.feature));
+    if (!active) return refuse(`Attempt ${attempt} of ${feature} is not running.`);
     if (active.attempt.abort) return ok('It is already being stopped.');
     if (active.attempt.status !== 'running') return refuse(`Attempt ${attempt} of ${feature} is ${active.attempt.status}; only a running attempt can be stopped.`);
     o.record({ type: 'ABORT', ref: refOf(active.feature, active.attempt), from: 'manager', to: 'daemon', payload: { requestId, reason } });
@@ -141,7 +140,7 @@ const HANDLERS: Handlers = {
 
   submit_plan({ o, agent, requestId }, { plan, summary }) {
     const state = o.state.plans[plan];
-    if (!state || !inModule(agent, state.module)) return refuse(`${plan} is not a plan of your module.`);
+    if (!state || !inScope(agent, state)) return refuse(`${plan} is not ${agent.plan ? 'your plan' : 'a plan of your module'}.`);
     if (state.summary !== undefined) return ok(`${plan} is already submitted.`);
     if (state.status !== 'validating' || state.validation?.status !== 'passed') {
       return refuse(`${plan} is ${state.status}. Submit it once every feature is accepted and its full check run passed.`);
@@ -167,13 +166,13 @@ const HANDLERS: Handlers = {
 
   get_ci_results({ o, agent }, { plan }) {
     const state = o.state.plans[plan];
-    if (!state || !inModule(agent, state.module)) return refuse(`${plan} is not a plan of your module.`);
+    if (!state || !inScope(agent, state)) return refuse(`${plan} is not ${agent.plan ? 'your plan' : 'a plan of your module'}.`);
     return ok(ciReport(state));
   },
 
   request_fix({ o, agent, requestId }, { plan, guidance }) {
     const state = o.state.plans[plan];
-    if (!state || !inModule(agent, state.module)) return refuse(`${plan} is not a plan of your module.`);
+    if (!state || !inScope(agent, state)) return refuse(`${plan} is not ${agent.plan ? 'your plan' : 'a plan of your module'}.`);
     if (state.status === 'fixing') return ok(`A fix of ${plan} is already under way.`);
     if (state.status === 'deploy_failed' || state.status === 'verify_failed') {
       const limit = o.design.config.brakes.deployFixRounds;
@@ -260,7 +259,7 @@ const HANDLERS: Handlers = {
   get_attempt({ o, agent }, { feature, attempt: n }) {
     const state = o.state.features[feature];
     const attempt = state?.attempts.find((a) => a.n === n);
-    if (!state || !attempt || !inModule(agent, state.module)) return refuse(`${feature} has no attempt ${n} in your module.`);
+    if (!state || !attempt || !inScope(agent, state)) return refuse(`${feature} has no attempt ${n} in your ${scopeName(agent)}.`);
     const taskFile = join(o.attemptDir(refOf(state, attempt)), 'task.md');
     const task = existsSync(taskFile) ? readFileSync(taskFile, 'utf8') : '(no task was written)';
     return ok([
@@ -286,7 +285,7 @@ const HANDLERS: Handlers = {
 function underReview(o: Orchestrator, agent: AgentIdentity, requestId: string, feature: string, n: number): { state: FeatureState; attempt: Attempt } | Reply {
   const state = o.state.features[feature];
   const attempt = state?.attempts.find((a) => a.n === n);
-  if (!state || !attempt || !inModule(agent, state.module)) return refuse(`${feature} has no attempt ${n} in your module.`);
+  if (!state || !attempt || !inScope(agent, state)) return refuse(`${feature} has no attempt ${n} in your ${scopeName(agent)}.`);
   if (attempt.decision?.requestId === requestId) return ok('Recorded.');
   if (attempt.decision) return refuse(`Attempt ${n} of ${feature} was already ${attempt.decision.kind === 'accept' ? 'accepted' : 'rejected'}.`);
   if (attempt.status !== 'reviewing') {
@@ -312,7 +311,10 @@ function featureSummary(feature: FeatureState) {
   };
 }
 
-const inModule = (agent: AgentIdentity, module: string) => agent.role === 'developer' || agent.module === module;
+/** A Manager acts within its scope: its module, or in Swarm its one plan of it (v3 §6.4). */
+const inScope = (agent: AgentIdentity, of: { module: string; plan: string }) =>
+  agent.role === 'developer' || (agent.module === of.module && (agent.plan === undefined || agent.plan === of.plan));
+const scopeName = (agent: AgentIdentity) => (agent.plan ? 'plan' : 'module');
 
 /** The Architect's view: its module's design and how the build of it goes. */
 function architectState(o: Orchestrator, id: string): string {

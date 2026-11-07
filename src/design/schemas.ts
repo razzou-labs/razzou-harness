@@ -1,6 +1,10 @@
+import { readFileSync } from 'node:fs';
 import { z } from 'zod';
 import type { Repo } from '../git/repo.ts';
 import { canonicalJson, sha256 } from '../util.ts';
+
+/** The agents' image is tagged with the harness's version, which may change what goes into it: `harness doctor --build-images` builds it. */
+const AGENT_IMAGE = `razzou-harness/agent:${(JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')) as { version: string }).version}`;
 
 /** Ids end up in branch names, refs and sandbox names, so they stay short and plain. */
 const Id = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9-]{0,39}$/, 'use letters, digits and dashes (at most 40)');
@@ -120,7 +124,7 @@ export const ConfigSchema = z.object({
     .prefault({}),
   sandbox: z
     .object({
-      image: z.string().default('razzou-harness/agent:0.1.0'),
+      image: z.string().default(AGENT_IMAGE),
       claudeProvider: z.string().default('claude-sub'),
       env: z.record(z.string(), z.string()).default({}),
     })
@@ -163,7 +167,9 @@ export const ConfigSchema = z.object({
   /** Where the project's Terraform lives, and how a plan is made against the real state (§12.4). */
   terraform: z
     .object({
-      dir: z.string().default('iac'),
+      /** A folder from the repository root, written `iac`, `./iac` or `iac/` alike, as CI's path rules read it. */
+      dir: z.string().transform((dir) => dir.replace(/^(?:\.?\/)+/, '').replace(/\/+$/, ''))
+        .refine((dir) => dir !== '' && dir !== '.' && !dir.split('/').includes('..'), 'a folder inside the repository, like iac: the CI workflow plans and applies iac/').default('iac'),
       backendConfig: z.string().default('backend-configs/staging.hcl'),
       varFile: z.string().default('env/staging.tfvars'),
     })
@@ -365,10 +371,16 @@ function checkReferences(module: ModuleDesign): void {
     for (const dep of plan.dependsOn ?? []) {
       if (!earlier.includes(dep)) throw new Error(`${where}/plans/${plan.id}.json: it depends on ${dep}, which is not an earlier plan of ${module.id}`);
     }
-    for (const feature of plan.features) {
+    for (const [index, feature] of plan.features.entries()) {
       for (const dep of feature.dependsOn) {
         const target = featureDependency(plan.id, dep);
-        if (target.plan === plan.id) continue;
+        if (target.plan === plan.id) {
+          // `P2/F01` inside P2 names a feature of the same plan: an earlier one, as without the prefix.
+          if (!plan.features.slice(0, index).some((f) => f.id === target.feature)) {
+            throw new Error(`${where}/plans/${plan.id}.json: ${feature.id} depends on ${dep}, which is not an earlier feature of ${plan.id}`);
+          }
+          continue;
+        }
         const other = module.plans.find((p) => p.id === target.plan);
         if (!earlier.includes(target.plan) || !other?.features.some((f) => f.id === target.feature)) {
           throw new Error(`${where}/plans/${plan.id}.json: ${feature.id} depends on ${dep}, which is not a feature of an earlier plan of ${module.id}`);

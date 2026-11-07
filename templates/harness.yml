@@ -10,8 +10,11 @@ on:
 
 permissions: {}
 
-# A newer push to a PR replaces its run. On main, nothing is cancelled: an apply cut short
-# leaves the state locked.
+# A newer push to a PR replaces its run. On main, the run under way is never cancelled: an
+# apply cut short leaves the state locked. A waiting one is, whatever cancel-in-progress
+# says: GitHub keeps one pending run per group, and a newer one replaces it. The newer run
+# applies main with the earlier merge in it, so the daemon takes a later successful
+# tf-apply on main as covering the earlier merge.
 concurrency:
   group: harness-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}

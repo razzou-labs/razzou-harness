@@ -77,8 +77,10 @@ export class Repo {
     return result.code === 0 ? result.stdout : undefined;
   }
 
+  /** Every file under a folder, or in the whole tree for ''. NUL-separated: git quotes unusual paths otherwise. */
   async listFiles(ref: string, prefix: string): Promise<string[]> {
-    return lines(await this.git(['ls-tree', '-r', '--name-only', ref, '--', prefix]));
+    const scope = prefix === '' || prefix === '.' ? [] : ['--', prefix];
+    return nulSeparated(await this.git(['ls-tree', '-r', '-z', '--name-only', ref, ...scope]));
   }
 
   /** The blob id of each file under a folder, by path. */
@@ -96,21 +98,44 @@ export class Repo {
 
   /**
    * Merges `theirs` into `ours`, with nothing checked out: `theirs` itself when `ours` has
-   * nothing of its own, else one merge commit; or names the files that conflict.
+   * nothing of its own, else one merge commit; or names the files that conflict. A file in
+   * `union` that both sides only appended to, like progress.txt, takes theirs' lines and
+   * then ours', so the result still starts with theirs: it conflicts only when a side
+   * rewrote it.
    */
-  async merge(options: { ours: string; theirs: string; message: string; committer: Identity }): Promise<{ commit: string } | { conflicts: string[] }> {
+  async merge(options: { ours: string; theirs: string; message: string; committer: Identity; union?: string[] }): Promise<{ commit: string } | { conflicts: string[] }> {
     if (await this.isAncestor(options.ours, options.theirs)) return { commit: options.theirs };
-    const result = await run('git', ['--git-dir', this.dir, 'merge-tree', '--write-tree', '--name-only', '--no-messages', options.ours, options.theirs], { env: ISOLATED });
-    const [tree, ...conflicts] = lines(result.stdout);
-    if (result.code === 1) return { conflicts: [...new Set(conflicts)] };
-    if (result.code !== 0 || !tree) throw new Error(`git merge-tree failed: ${result.stderr.trim()}`);
+    const result = await run('git', ['--git-dir', this.dir, 'merge-tree', '--write-tree', '-z', '--name-only', '--no-messages', options.ours, options.theirs], { env: ISOLATED });
+    const [tree, ...names] = nulSeparated(result.stdout);
+    if ((result.code !== 0 && result.code !== 1) || !tree) throw new Error(`git merge-tree failed: ${result.stderr.trim()}`);
+    let merged = tree;
+    if (result.code === 1) {
+      const conflicts = [...new Set(names)];
+      const appended = conflicts.every((file) => options.union?.includes(file)) ? await this.appendedOnBothSides(options.ours, options.theirs, conflicts) : undefined;
+      if (!appended) return { conflicts };
+      merged = await this.treeWith(tree, appended);
+    }
     const identity = {
       GIT_AUTHOR_NAME: options.committer.name,
       GIT_AUTHOR_EMAIL: options.committer.email,
       GIT_COMMITTER_NAME: options.committer.name,
       GIT_COMMITTER_EMAIL: options.committer.email,
     };
-    return { commit: (await this.git(['commit-tree', tree, '-p', options.ours, '-p', options.theirs, '-F', '-'], identity, options.message)).trim() };
+    return { commit: (await this.git(['commit-tree', merged, '-p', options.ours, '-p', options.theirs, '-F', '-'], identity, options.message)).trim() };
+  }
+
+  /** Each file's lines added by theirs, then by ours, on top of the merge base; undefined when a side did more than append. */
+  private async appendedOnBothSides(ours: string, theirs: string, files: string[]): Promise<Record<string, string> | undefined> {
+    const base = lines(await this.git(['merge-base', ours, theirs]))[0]!;
+    const merged: Record<string, string> = {};
+    for (const file of files) {
+      const [before, mine, other] = await Promise.all([this.show(base, file), this.show(ours, file), this.show(theirs, file)]);
+      const start = before ?? '';
+      if (mine === undefined || other === undefined || !mine.startsWith(start) || !other.startsWith(start)) return undefined;
+      const added = mine.slice(start.length);
+      merged[file] = added === '' ? other : `${other}${other === '' || other.endsWith('\n') ? '' : '\n'}${added}`;
+    }
+    return merged;
   }
 
   /** Moves a ref, refusing if it no longer points at `expected` (use '' for "must not exist yet"). */
@@ -137,8 +162,9 @@ export class Repo {
     return (await this.git(['merge-base', a, b])).trim();
   }
 
+  /** The paths that differ, NUL-separated: git quotes unusual ones otherwise, and a quoted path matches no protection rule (§8.7). */
   async changedFiles(base: string, head: string): Promise<string[]> {
-    return lines(await this.git(['diff', '--name-only', '--no-renames', base, head]));
+    return nulSeparated(await this.git(['diff', '-z', '--name-only', '--no-renames', base, head]));
   }
 
   async log(ref: string, count: number): Promise<string> {
@@ -185,22 +211,27 @@ export class Repo {
     author: Identity;
     committer: Identity;
   }): Promise<string> {
+    const tree = await this.treeWith(options.tree, options.files);
+    const identity = {
+      GIT_AUTHOR_NAME: options.author.name,
+      GIT_AUTHOR_EMAIL: options.author.email,
+      GIT_COMMITTER_NAME: options.committer.name,
+      GIT_COMMITTER_EMAIL: options.committer.email,
+    };
+    return (await this.git(['commit-tree', tree, '-p', options.parent, '-F', '-'], identity, options.message)).trim();
+  }
+
+  /** The tree of `treeish` with some files replaced, written with a scratch index. */
+  private async treeWith(treeish: string, files: Record<string, string>): Promise<string> {
     const scratch = mkdtempSync(join(tmpdir(), 'harness-index-'));
     const index = { GIT_INDEX_FILE: join(scratch, 'index') };
     try {
-      await this.git(['read-tree', options.tree], index);
-      for (const [path, content] of Object.entries(options.files)) {
+      await this.git(['read-tree', treeish], index);
+      for (const [path, content] of Object.entries(files)) {
         const blob = (await this.git(['hash-object', '-w', '--stdin'], {}, content)).trim();
         await this.git(['update-index', '--add', '--cacheinfo', `100644,${blob},${path}`], index);
       }
-      const tree = (await this.git(['write-tree'], index)).trim();
-      const identity = {
-        GIT_AUTHOR_NAME: options.author.name,
-        GIT_AUTHOR_EMAIL: options.author.email,
-        GIT_COMMITTER_NAME: options.committer.name,
-        GIT_COMMITTER_EMAIL: options.committer.email,
-      };
-      return (await this.git(['commit-tree', tree, '-p', options.parent, '-F', '-'], identity, options.message)).trim();
+      return (await this.git(['write-tree'], index)).trim();
     } finally {
       rmSync(scratch, { recursive: true, force: true });
     }
@@ -219,4 +250,8 @@ const ISOLATED: NodeJS.ProcessEnv = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/n
 
 function lines(text: string): string[] {
   return text.split('\n').filter((line) => line !== '');
+}
+
+function nulSeparated(text: string): string[] {
+  return text.split('\0').filter((part) => part !== '');
 }

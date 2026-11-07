@@ -16,41 +16,56 @@ import { parseArgs } from 'node:util';
 /** A tree to read: a checkout in CI, a commit in the daemon. */
 export interface TreeReader {
   read(path: string): Promise<string | undefined>;
-  /** Every file under a folder, as paths from the root. */
+  /** Every file under a folder, as paths from the root; '' is the whole tree. */
   list(folder: string): Promise<string[]>;
 }
 
 export function directoryReader(root: string): TreeReader {
+  const isFile = (file: string) => existsSync(file) && statSync(file).isFile();
+  const git = (args: string[]) => spawnSync('git', ['-C', root, ...args], { encoding: 'utf8', maxBuffer: 1 << 30 });
   return {
     async read(path) {
       const file = join(root, path);
-      return existsSync(file) && statSync(file).isFile() ? readFileSync(file, 'utf8') : undefined;
+      return isFile(file) ? readFileSync(file, 'utf8') : undefined;
     },
     async list(folder) {
+      // In a work tree, git's view: what it ignores, such as node_modules, isn't in a checkout either.
+      if (git(['rev-parse', '--is-inside-work-tree']).stdout?.trim() === 'true') {
+        const listed = git(['ls-files', '-z', '--cached', '--others', '--exclude-standard', '--', folder || '.']);
+        if (listed.status !== 0) throw new Error(`git ls-files failed in ${root}: ${listed.stderr}`);
+        return listed.stdout.split('\0').filter((path) => path !== '' && isFile(join(root, path)));
+      }
       const start = join(root, folder);
       if (!existsSync(start)) return [];
       return (readdirSync(start, { recursive: true, encoding: 'utf8' }) as string[])
         .map((entry) => join(start, entry))
-        .filter((file) => statSync(file).isFile() && !relative(root, file).startsWith('.git/'))
+        .filter((file) => isFile(file) && !relative(root, file).startsWith('.git/'))
         .map((file) => relative(root, file));
     },
   };
 }
 
-/** Paths no Plan or Fix PR may change, in every project. */
-export const ALWAYS_PROTECTED = ['harness/**', '.github/**', '.claude/**', 'CLAUDE.md', 'AGENTS.md', 'ARCHITECTURE.md', 'init.sh', '.npmrc'];
+/**
+ * Paths no Plan or Fix PR may change, in every project. Claude Code reads CLAUDE.md,
+ * CLAUDE.local.md, AGENTS.md and `.claude/` in every folder, not only the root's; the
+ * root's CLAUDE.md and AGENTS.md are also named, so the lock lists them even when absent.
+ */
+export const ALWAYS_PROTECTED = [
+  'harness/**', '.github/**', 'CLAUDE.md', 'AGENTS.md', '**/.claude/**', '**/CLAUDE.md', '**/CLAUDE.local.md', '**/AGENTS.md',
+  'ARCHITECTURE.md', 'init.sh', '.npmrc',
+];
 
-/** Tool configs written as code: protected whole when they exist. */
+/** Configs that decide what a tool or a test runner runs, written as code: protected whole when they exist. */
 const TOOL_FILES = [
-  'eslint.config.js', 'eslint.config.mjs', 'eslint.config.cjs', 'eslint.config.ts', '.eslintrc', '.eslintrc.js', '.eslintrc.cjs',
-  '.eslintrc.json', '.eslintrc.yml', '.eslintrc.yaml', 'vitest.config.ts', 'vitest.config.js', 'vitest.config.mjs', 'vitest.workspace.ts',
-  'jest.config.js', 'jest.config.ts', 'jest.config.mjs', 'playwright.config.ts', 'playwright.config.js', 'biome.json', 'biome.jsonc',
-  '.prettierrc', '.prettierrc.json', '.prettierrc.js', 'prettier.config.js', 'prettier.config.mjs',
+  'eslint.config.*', '.eslintrc', '.eslintrc.*', 'biome.json', 'biome.jsonc', '.prettierrc', '.prettierrc.*', 'prettier.config.*',
+  'vitest.config.*', 'vitest.workspace.*', 'vite.config.*', 'jest.config.*', 'babel.config.*', '**/.babelrc', '**/.babelrc.*',
+  'playwright.config.*', '.mocharc.*', '**/pytest.ini', '**/.pytest.ini', '**/tox.ini', '**/conftest.py',
 ];
 
 /** JSON configs: protected by field, so ordinary changes stay possible. */
 const JSON_FIELDS: Record<string, string[]> = {
   'tsconfig.json': ['/compilerOptions/strict', '/compilerOptions/noImplicitAny', '/compilerOptions/skipLibCheck', '/exclude'],
+  'package.json': ['/jest', '/babel', '/mocha'],
 };
 
 export interface ProtectionRules {
@@ -82,20 +97,59 @@ export async function protectionRules(tree: TreeReader): Promise<ProtectionRules
   for (const script of new Set(checks.flatMap((c) => npmScripts(c.run)))) {
     add('package.json', [`/scripts/${script}`, `/scripts/pre${script}`, `/scripts/post${script}`]);
   }
-  return { paths: [...ALWAYS_PROTECTED, ...TOOL_FILES, ...(config?.protect?.files ?? [])], fields };
+  return { paths: [...ALWAYS_PROTECTED, ...TOOL_FILES, ...(config?.protect?.files ?? [])].map(normalisePattern), fields };
 }
 
-/** npm scripts a command line runs: `npm run lint`, `npm test`, `npm start`. */
+/** npm's options that take the next word as their value. */
+const NPM_VALUE_OPTIONS = ['--prefix', '-C', '--workspace', '-w', '--userconfig', '--globalconfig', '--loglevel'];
+
+/** npm scripts a command line runs: `npm run lint`, `npm -s test`, `npm --prefix . start`, `node --run lint`. */
 export function npmScripts(command: string): string[] {
   const scripts: string[] = [];
-  for (const match of command.matchAll(/\bnpm\s+(?:run(?:-script)?\s+([\w:.-]+)|(test|t|start|stop|restart)\b)/g)) {
-    scripts.push(match[1] ?? (match[2] === 't' ? 'test' : match[2]!));
+  const words = command.split(/[\s;&|()<>'"`]+/);
+  // The next word that isn't one of npm's options, or an option's value.
+  const next = (i: number) => {
+    while (words[++i]?.startsWith('-')) if (NPM_VALUE_OPTIONS.includes(words[i]!)) i++;
+    return i;
+  };
+  for (let i = 0; i < words.length; i++) {
+    if (words[i] === 'node' && words[i + 1] === '--run' && words[i + 2]) scripts.push(words[i + 2]!);
+    if (words[i] === 'node' && words[i + 1]?.startsWith('--run=')) scripts.push(words[i + 1]!.slice('--run='.length));
+    if (words[i] !== 'npm') continue;
+    const at = next(i);
+    if (words[at] === 'run' || words[at] === 'run-script') {
+      const script = words[next(at)];
+      if (script) scripts.push(script);
+    } else if (words[at] === 'test' || words[at] === 't') scripts.push('test');
+    else if (words[at] === 'start' || words[at] === 'stop' || words[at] === 'restart') scripts.push(words[at]!);
   }
   return scripts;
 }
 
+/** A pattern as written in a config: `./x` is `x`, and `dir/` is `dir/**`. */
+function normalisePattern(pattern: string): string {
+  const path = pattern.replace(/^(?:\.?\/)+/, '');
+  // Trailing slashes are counted by hand: /\/+$/ takes quadratic time on a run of slashes before the end.
+  let end = path.length;
+  while (end > 0 && path[end - 1] === '/') end--;
+  return end === path.length ? path : `${path.slice(0, end)}/**`;
+}
+
+/** Each pattern's regular expression, made once. */
+const compiled = new Map<string, RegExp>();
+
+// Whether a path matches a protected pattern: `*` and `?` within a segment, `**` across
+// segments. `**/x` is x in any folder, the root included; `dir/**` is dir and all it holds.
 export function matches(path: string, pattern: string): boolean {
-  return pattern.endsWith('/**') ? path.startsWith(pattern.slice(0, -2)) : path === pattern;
+  let regexp = compiled.get(pattern);
+  if (!regexp) {
+    const source = normalisePattern(pattern).replace(/(^|\/)\*\*(\/|$)|\*|\?|[.+^${}()|[\]\\]/g, (token, before?: string, after?: string) => {
+      if (before === undefined) return token === '*' ? '[^/]*' : token === '?' ? '[^/]' : `\\${token}`;
+      return before && after ? '/(?:.*/)?' : before ? '(?:/.*)?' : after ? '(?:.*/)?' : '.*';
+    });
+    compiled.set(pattern, (regexp = new RegExp(`^${source}$`, 's')));
+  }
+  return regexp.test(path);
 }
 
 /**
@@ -133,13 +187,23 @@ export async function protectedChanges(
   return problems;
 }
 
-/** Packages in package-lock.json that don't come from the public npm registry. */
-export async function lockfileProblems(tree: TreeReader): Promise<string[]> {
-  const lock = parseJson(await tree.read('package-lock.json')) as { packages?: Record<string, { resolved?: string; link?: boolean }> } | undefined;
+/**
+ * Packages in the head's package-lock.json that don't come from the public npm registry, and
+ * links to a local folder that the base's doesn't have as they are: workspaces already on
+ * the base keep working, and a new link comes through an Arch PR.
+ */
+export async function lockfileProblems(base: TreeReader, head: TreeReader): Promise<string[]> {
+  const packages = async (tree: TreeReader) =>
+    (parseJson(await tree.read('package-lock.json')) as { packages?: Record<string, { resolved?: string; link?: boolean }> } | undefined)?.packages ?? {};
+  const [before, after] = [await packages(base), await packages(head)];
   const problems: string[] = [];
-  for (const [name, entry] of Object.entries(lock?.packages ?? {})) {
-    if (name === '' || entry.link || entry.resolved === undefined) continue;
-    if (!entry.resolved.startsWith('https://registry.npmjs.org/')) problems.push(`${name} resolves from ${entry.resolved}`);
+  for (const [name, entry] of Object.entries(after)) {
+    if (name === '') continue;
+    if (entry.link) {
+      if (before[name]?.link !== true || before[name].resolved !== entry.resolved) problems.push(`${name} links to ${entry.resolved}, which the base branch doesn't`);
+    } else if (entry.resolved !== undefined && !entry.resolved.startsWith('https://registry.npmjs.org/')) {
+      problems.push(`${name} resolves from ${entry.resolved}`);
+    }
   }
   return problems;
 }
@@ -153,9 +217,13 @@ export interface Lock {
 export async function computeLock(tree: TreeReader): Promise<Lock> {
   const rules = await protectionRules(tree);
   const files = new Set<string>();
+  let all: string[] | undefined;
   for (const pattern of rules.paths) {
-    if (pattern.endsWith('/**')) for (const file of await tree.list(pattern.slice(0, -3))) files.add(file);
-    else if ((await tree.read(pattern)) !== undefined || ALWAYS_PROTECTED.includes(pattern)) files.add(pattern);
+    if (/[*?]/.test(pattern)) {
+      // A glob is matched against every file of the tree, listed once.
+      all ??= await tree.list('');
+      for (const file of all) if (matches(file, pattern)) files.add(file);
+    } else if ((await tree.read(pattern)) !== undefined || ALWAYS_PROTECTED.includes(pattern)) files.add(pattern);
   }
   files.delete('harness/lock.json');
   const entries: Lock['entries'] = [];
@@ -163,7 +231,7 @@ export async function computeLock(tree: TreeReader): Promise<Lock> {
     const text = await tree.read(path);
     entries.push({ path, sha256: text === undefined ? 'absent' : sha256(text) });
   }
-  for (const [file, pointers] of Object.entries(rules.fields).sort(([a], [b]) => a.localeCompare(b))) {
+  for (const [file, pointers] of Object.entries(rules.fields).sort(([a], [b]) => a.localeCompare(b, 'en'))) {
     const text = await tree.read(file);
     entries.push({ path: file, fields: Object.fromEntries(pointers.map((pointer) => [pointer, fieldHash(text, pointer)])) });
   }
@@ -250,9 +318,11 @@ async function planKindProblems(input: VerifyInput, config: BaseConfig | undefin
   const tag = /(?:^|\s)-(CODE|INFRA|MIXED)-(?:\s|$)/.exec(input.title)?.[1];
   if (tag && tag !== kind) problems.push(`the title says -${tag}-, but ${module}/${plan} is a ${kind} plan on the base branch: its features' kinds decide`);
   if (kind === 'CODE' && config?.terraform && typeof config.terraform === 'object') {
-    const dir = (config.terraform.dir || 'iac').replace(/\/+$/, '');
-    const touched = input.changedPaths.filter((p) => p === dir || p.startsWith(`${dir}/`));
-    if (touched.length > 0) problems.push(`a CODE plan may not change ${dir}/: infrastructure gets plans of its own (v3 §3.1); changed: ${touched.join(', ')}`);
+    // Terraform at the root, `.` or empty, is every .tf or .tf.json file.
+    const dir = (config.terraform.dir ?? 'iac').replace(/^(?:\.?\/)+/, '').replace(/\/+$/, '');
+    const root = dir === '' || dir === '.';
+    const touched = input.changedPaths.filter((p) => (root ? /\.tf(?:\.json)?$/.test(p) : p === dir || p.startsWith(`${dir}/`)));
+    if (touched.length > 0) problems.push(`a CODE plan may not change ${root ? 'Terraform files' : `${dir}/`}: infrastructure gets plans of its own (v3 §3.1); changed: ${touched.join(', ')}`);
   }
   return problems;
 }
@@ -267,11 +337,12 @@ export async function verify(input: VerifyInput): Promise<string[]> {
     for (const change of await protectedChanges(input.base, input.head, input.changedPaths, { progress: 'append' })) {
       problems.push(`changes a protected file: ${change}`);
     }
-    for (const problem of await lockfileProblems(input.head)) problems.push(`package-lock.json: ${problem}`);
+    for (const problem of await lockfileProblems(input.base, input.head)) problems.push(`package-lock.json: ${problem}`);
   }
   if (kind === 'Plan') problems.push(...(await planKindProblems(input, config)));
   if (kind === 'Arch') {
-    const rules = await protectionRules(input.head);
+    // The base's rules, as for every PR: what its head protects opens nothing to the PR itself.
+    const rules = await protectionRules(input.base);
     for (const path of input.changedPaths.filter((p) => !archMayChange(p, rules))) {
       problems.push(`an Arch PR may not change ${path}: only the design, shared knowledge and tool configs`);
     }
@@ -343,10 +414,11 @@ export function resolvePointer(value: unknown, pointer: string): unknown {
   return current;
 }
 
+/** JSON with object keys sorted at every level. The order is English's, whatever the machine's locale, so CI and the owner's machine agree. */
 function canonicalJson(value: unknown): string {
   return JSON.stringify(value, (_key, v: unknown) =>
     v && typeof v === 'object' && !Array.isArray(v)
-      ? Object.fromEntries(Object.entries(v as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)))
+      ? Object.fromEntries(Object.entries(v as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b, 'en')))
       : v);
 }
 
@@ -401,12 +473,13 @@ async function main(): Promise<number> {
   };
   switch (positionals[0]) {
     case 'verify': {
-      const diff = spawnSync('git', ['-C', values.head!, 'diff', '--name-only', '--no-renames', `${values['base-sha']}...${values['head-sha']}`], { encoding: 'utf8' });
+      // NUL-separated: otherwise git quotes a path with unusual bytes, and no pattern matches the quoted form.
+      const diff = spawnSync('git', ['-C', values.head!, 'diff', '-z', '--name-only', '--no-renames', `${values['base-sha']}...${values['head-sha']}`], { encoding: 'utf8', maxBuffer: 1 << 30 });
       if (diff.status !== 0) throw new Error(`git diff failed: ${diff.stderr}`);
       const problems = await verify({
         base: directoryReader(values.base!),
         head: directoryReader(values.head!),
-        changedPaths: diff.stdout.split('\n').filter(Boolean),
+        changedPaths: diff.stdout.split('\0').filter(Boolean),
         author: values.author!,
         branch: values.branch!,
         title: values.title ?? '',

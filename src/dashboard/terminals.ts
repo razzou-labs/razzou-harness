@@ -69,11 +69,11 @@ export class Terminals {
     session.viewers.add(viewer);
     if (session.output) viewer.send(session.output);
     // A full-screen program redraws on a size change: nudge it, so the newcomer sees a whole screen.
-    session.pty.resize(size.cols, Math.max(2, size.rows - 1));
-    setTimeout(() => session.pty.resize(size.cols, size.rows), 100);
+    resize(session.pty, size.cols, Math.max(2, size.rows - 1));
+    setTimeout(() => resize(session.pty, size.cols, size.rows), 100);
     return {
       input: (data) => session.pty.write(data),
-      resize: ({ cols, rows }) => session.pty.resize(cols, rows),
+      resize: ({ cols, rows }) => resize(session.pty, cols, rows),
       detach: () => {
         session.viewers.delete(viewer);
         if (session.viewers.size === 0) this.disconnect(sandbox);
@@ -112,7 +112,7 @@ export class Terminals {
     });
     return {
       input: (data) => pty.write(data),
-      resize: ({ cols, rows }) => pty.resize(cols, rows),
+      resize: ({ cols, rows }) => resize(pty, cols, rows),
       detach: () => {
         this.shells.delete(pty);
         kill(pty);
@@ -156,7 +156,11 @@ export class Terminals {
     const session = this.shared.get(sandbox);
     if (!session) return;
     this.shared.delete(sandbox);
-    session.pty.write(DETACH);
+    try {
+      session.pty.write(DETACH);
+    } catch {
+      // gone already
+    }
     // `connect` exits by itself once detached; this is in case it doesn't.
     setTimeout(() => kill(session.pty), 2000).unref?.();
   }
@@ -168,6 +172,18 @@ const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 function kill(pty: Pty): void {
   try {
     pty.kill();
+  } catch {
+    // gone already
+  }
+}
+
+/**
+ * node-pty throws EBADF on a resize once the process exited, as when `openshell sandbox
+ * connect` fails at once. From a timer or a socket's callback, that would stop the daemon.
+ */
+function resize(pty: Pty, cols: number, rows: number): void {
+  try {
+    pty.resize(cols, rows);
   } catch {
     // gone already
   }

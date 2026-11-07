@@ -16,7 +16,7 @@ export interface ModuleOwnerTime {
   missing: string[];
   /** The module's design is on main, submitted or frozen: its time is committed. */
   committed: boolean;
-  /** The estimates of the actions marked done. */
+  /** The estimates of the actions marked done, with those a redesign dropped since. */
   usedMinutes: number;
 }
 
@@ -47,6 +47,11 @@ export function moduleOwnerTime(module: ModuleDesign, state: State): ModuleOwner
     }
     plannedMinutes += action.estimatedMinutes;
     if (state.actions[`${module.id}/${action.id}`]?.status === 'done') usedMinutes += action.estimatedMinutes;
+  }
+  // An action done, then dropped by a redesign, still took the owner's time: its estimate when it was done.
+  const designed = new Set(module.actions.map((a) => `${module.id}/${a.id}`));
+  for (const [key, action] of Object.entries(state.actions)) {
+    if (key.startsWith(`${module.id}/`) && !designed.has(key) && action.status === 'done') usedMinutes += action.minutes ?? 0;
   }
   return { module: module.id, plannedMinutes, missing, committed, usedMinutes };
 }
@@ -83,7 +88,8 @@ export function ownerTimeProblems(time: OwnerTime | undefined, candidate: Module
   if (problems.length > 0) return problems;
   const available = availableHours(time, candidate.module);
   const planned = round(candidate.plannedMinutes / 60);
-  if (planned > available) {
+  // A design that asks nothing of the owner always fits, even once others took more than what is plannable.
+  if (planned > 0 && planned > available) {
     problems.push(
       `the design takes ${planned} h of the owner's time in owner actions, but ${available} h are available: ` +
       `${time.hours} h for the project, minus the ${time.reservePercent}% reserve and what other modules committed. ` +

@@ -24,10 +24,11 @@ export interface SubscriptionUsage {
 
 export const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 
-/** Reads the usage with the token the provider was created with. Throws when the endpoint refuses or answers something else. */
+/** Reads the usage with the token the provider was created with. Throws when the endpoint refuses, answers something else, or not within 15 seconds. */
 export async function readUsage(token: string, fetchImpl: typeof fetch = fetch): Promise<SubscriptionUsage> {
   const response = await fetchImpl(USAGE_URL, {
     headers: { authorization: `Bearer ${token}`, accept: 'application/json', 'anthropic-beta': 'oauth-2025-04-20', 'user-agent': 'razzou-harness' },
+    signal: AbortSignal.timeout(15_000),
   });
   if (!response.ok) throw new Error(`the usage endpoint answered ${response.status}`);
   return parseUsage(await response.json());

@@ -5,6 +5,7 @@ import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
 import { after, describe, it } from 'node:test';
 import { WebSocket } from 'ws';
+import { detach, type AgentAdapter, type AgentRun } from '../src/agents/claude-code.ts';
 import type { SubscriptionUsage } from '../src/anthropic/usage.ts';
 import { Orchestrator } from '../src/daemon/orchestrator.ts';
 import { handleRequest } from '../src/daemon/requests.ts';
@@ -12,7 +13,7 @@ import { startDashboard, type DashboardState } from '../src/dashboard/server.ts'
 import { Terminals, type Pty } from '../src/dashboard/terminals.ts';
 import { recover } from '../src/setup/recover.ts';
 import { activeAttempts } from '../src/state/state.ts';
-import { runOk, sleep } from '../src/util.ts';
+import { runOk, sh, sleep } from '../src/util.ts';
 import { FAKE_BOT, FakeForge } from './helpers/fake-forge.ts';
 import { LocalDriver } from './helpers/local-driver.ts';
 import { stubAgent, type ReviewBehavior, type StubBehavior } from './helpers/stub-agent.ts';
@@ -48,6 +49,8 @@ interface SetupOptions {
   architect?: ArchitectBehavior;
   /** Whether the usage probe's token is stored (v4 §6); never the machine's real file. */
   tokenStored?: () => boolean;
+  /** Wraps the stub agent, to make some of its sessions end otherwise. */
+  agent?: (stub: AgentAdapter) => AgentAdapter;
 }
 
 async function setup(decide: Decide, options: SetupOptions = {}) {
@@ -66,7 +69,7 @@ async function setup(decide: Decide, options: SetupOptions = {}) {
       driver,
       packageDir,
       version: 'test',
-      agent: stubAgent(decide, options.manager, options.architect, options.review),
+      agent: (options.agent ?? ((stub) => stub))(stubAgent(decide, options.manager, options.architect, options.review)),
       webRead: async (url) => ({ ok: true, text: `the page at ${url}`, bytes: 20 }),
       // The log is kept for the timeout message; HARNESS_TEST_LOG=1 prints it as it comes.
       log: (message: string) => {
@@ -106,6 +109,50 @@ async function until(o: Orchestrator, done: () => boolean, timeoutMs = 30_000): 
 }
 
 const solved = (feature: string): StubBehavior => ({ files: SOLUTIONS[feature as keyof typeof SOLUTIONS] });
+
+/** The owner commits a file on a branch of the fake GitHub, as with GitHub's editor, and gets the new head. */
+async function ownerCommit(remote: string, branch: string, path: string, content: string): Promise<string> {
+  const dir = tempDir('owner');
+  await runOk('git', ['clone', '--quiet', '--branch', branch, remote, dir]);
+  mkdirSync(join(dir, path, '..'), { recursive: true });
+  writeFileSync(join(dir, path), content);
+  await runOk('git', ['-C', dir, 'add', '-A']);
+  await runOk('git', ['-C', dir, '-c', 'user.name=o', '-c', 'user.email=o@test.invalid', 'commit', '--quiet', '-m', "the owner's change"]);
+  await runOk('git', ['-C', dir, 'push', '--quiet', 'origin', branch]);
+  return (await runOk('git', ['-C', dir, 'rev-parse', 'HEAD'])).trim();
+}
+
+/** The owner commits on the project's main, which the daemon reads without GitHub. */
+async function commitOnMain(projectDir: string, files: Record<string, string>, message: string): Promise<void> {
+  for (const [path, content] of Object.entries(files)) {
+    mkdirSync(join(projectDir, path, '..'), { recursive: true });
+    writeFileSync(join(projectDir, path), content);
+  }
+  await runOk('git', ['-C', projectDir, 'add', '-A']);
+  await runOk('git', ['-C', projectDir, '-c', 'user.name=o', '-c', 'user.email=o@test.invalid', 'commit', '--quiet', '-m', message]);
+}
+
+/** A second module, "alpha", which sorts before "demo": one feature, A01. */
+const alphaDesign: Record<string, string> = {
+  'harness/modules/alpha/plans/P1.json': JSON.stringify({
+    id: 'P1', module: 'alpha', title: 'Alpha', goal: 'A file.',
+    features: [{ id: 'A01', title: 'File', description: 'src/alpha.txt exists.', expected: 'It exists.', checks: [{ id: 'A01-file', run: 'test -f src/alpha.txt', phase: 'pre-merge', timeoutSec: 30 }] }],
+  }, null, 2),
+};
+const alphaOrSolved = (f: string): StubBehavior => (f === 'A01' ? { files: { 'src/alpha.txt': '1\n' } } : solved(f));
+
+/** The stub, except that the listed attempts of a feature end on a usage limit, as Claude Code reports one. */
+const usageLimitOn = (feature: string, attempts: number[]) => (stub: AgentAdapter): AgentAdapter => ({
+  ...stub,
+  launch(run: AgentRun) {
+    const task = readFileSync(run.taskFile, 'utf8');
+    const which = /^# Feature [^/]+\/[^/]+\/([^:]+):/m.exec(task)?.[1];
+    const attempt = Number(/This is attempt (\d+)\./.exec(task)?.[1] ?? 0);
+    if (which !== feature || !attempts.includes(attempt)) return stub.launch(run);
+    const result = { type: 'result', subtype: 'error_during_execution', is_error: true, result: 'Claude AI usage limit reached|1900000000' };
+    return detach(run.workDir, [`echo $$ > ${sh(run.pidFile)}`, 'sleep 1', `printf '%s\\n' ${sh(JSON.stringify(result))} > ${sh(run.streamFile)}`, `echo 1 > ${sh(run.exitFile)}`].join('\n'));
+  },
+});
 const feature = (o: Orchestrator, id: string) => o.state.features[`demo/P1/${id}`];
 const completed = (o: Orchestrator) => () => o.state.plans['demo/P1']?.status === 'completed';
 
@@ -842,7 +889,7 @@ describe('pull requests', () => {
     });
     fake.ci = () => ({ verify: 'success', checks: 'failure' });
     await until(o, () => o.state.pipeline.paused !== undefined);
-    assert.equal(o.state.pipeline.paused!.reason, 'CI failed on PR #1 of demo/P1 after 1 fix round(s): the owner decides');
+    assert.equal(o.state.pipeline.paused!.reason, "CI failed on PR #1 of demo/P1 after 1 fix round(s): fix it on the PR's branch, or fix the cause and re-run CI, then resume");
     assert.equal(plan(o)!.fixRounds, 1);
   });
 
@@ -1186,7 +1233,7 @@ describe('dashboard', () => {
     assert.equal(JSON.parse(state.body).design.project, 'toy');
     const login = await call(port, `/?token=${token}`, { host });
     assert.equal(login.status, 303);
-    assert.match(String(login.headers['set-cookie']), /^harness_token=[0-9a-f]+; HttpOnly; SameSite=Strict/);
+    assert.match(String(login.headers['set-cookie']), new RegExp(`^harness_token_${port}=[0-9a-f]+; HttpOnly; SameSite=Strict`));
   });
 
   it('serves the built front end under a content security policy, and nothing outside it', async () => {
@@ -1228,7 +1275,7 @@ describe('dashboard', () => {
         socket.on('close', (code, reason) => resolve(`closed ${code} ${String(reason)}`));
         socket.on('error', () => {});
       });
-    const cookie = `harness_token=${token}`;
+    const cookie = `harness_token_${port}=${token}`;
     assert.equal(await open({ cookie }, 'module=demo'), 'refused 403');
     assert.equal(await open({ cookie, origin: 'http://attacker.example' }, 'module=demo'), 'refused 403');
     assert.equal(await open({ origin: `http://${host}` }, 'module=demo'), 'refused 403');
@@ -1294,3 +1341,382 @@ function fakePty(command: string[] = []) {
   };
   return { pty, command, writes, emit: (data: string) => listeners.forEach((listener) => listener(data)) };
 }
+
+describe('pauses', () => {
+  it("keeps the owner's pause when an attempt then hits a usage limit, past the limit's hour", async () => {
+    let skew = 0;
+    const { orchestrator: o } = await setup((f) => solved(f), { agent: usageLimitOn('F01', [1]), now: () => Date.now() + skew });
+    await until(o, () => feature(o, 'F01')?.attempts[0]?.status === 'running');
+    assert.equal(o.pause(), true);
+    await until(o, () => feature(o, 'F01')?.attempts[0]?.status === 'interrupted');
+    assert.deepEqual(o.state.pipeline.paused, { reason: 'the owner paused the pipeline', since: o.state.pipeline.paused!.since, until: undefined });
+    skew += 61 * 60_000;
+    for (let i = 0; i < 3; i++) await o.tick();
+    assert.equal(o.state.pipeline.paused?.reason, 'the owner paused the pipeline');
+    assert.equal(feature(o, 'F01')!.attempts.length, 1);
+  });
+
+  it('counts a usage limit from the third one of the same feature, since an attempt writes its own stream', async () => {
+    let skew = 0;
+    const { orchestrator: o } = await setup((f) => solved(f), { agent: usageLimitOn('F01', [1, 2, 3]), now: () => Date.now() + skew });
+    for (let n = 1; n <= 3; n++) {
+      await until(o, () => feature(o, 'F01')?.attempts[n - 1]?.status === 'interrupted');
+      assert.equal(o.state.pipeline.paused?.reason, 'usage limit reached');
+      skew += 61 * 60_000;
+    }
+    assert.deepEqual(feature(o, 'F01')!.attempts.map((a) => a.counts), [false, false, true]);
+  });
+
+  it('takes the hours harness budget left while it was down over earlier ones, and the mode harness mode left', async () => {
+    const { orchestrator: o, harnessDir, make } = await setup((f) => solved(f));
+    o.setBudgets({ ownerHours: 20 });
+    await o.stop(0);
+    writeFileSync(join(harnessDir, 'setup.json'), JSON.stringify({ ownerHours: 40, ownerHoursFrom: 'budget', mode: 'swarm' }));
+    const again = make();
+    await again.start();
+    assert.equal(again.state.budgets.ownerHours, 40);
+    assert.equal(again.state.mode, 'swarm');
+    assert.equal(existsSync(join(harnessDir, 'setup.json')), false);
+  });
+});
+
+describe('modules in order', () => {
+  it('in Manual, builds a module whose design lands later only once the one under way is complete, and follows its PR meanwhile', async () => {
+    let skew = 0;
+    const { orchestrator: o, fake, harnessDir } = await setup(alphaOrSolved, { github: true, now: () => Date.now() + skew });
+    await until(o, () => o.state.plans['demo/P1']?.status === 'ready_to_merge');
+    const projectDir = join(harnessDir, '..');
+    await commitOnMain(projectDir, alphaDesign, 'the alpha design');
+    await runOk('git', ['-C', projectDir, 'push', '--quiet', fake.remote, 'main:main']);
+    for (let i = 0; i < 5; i++) await o.tick();
+    assert.equal(o.state.plans['alpha/P1'], undefined, 'alpha waits for demo');
+    await fake.merge(1);
+    skew += 120_000;
+    await until(o, () => o.state.plans['demo/P1']?.status === 'completed' && o.state.plans['alpha/P1'] !== undefined);
+  });
+
+  it('in Swarm, builds the modules one after another', async () => {
+    const { orchestrator: o } = await setup(alphaOrSolved, { prepare: (dir) => commitOnMain(dir, alphaDesign, 'the alpha design') });
+    o.setMode('swarm');
+    let together = false;
+    await until(o, () => {
+      together ||= new Set(Object.values(o.state.plans).filter((p) => p.status !== 'completed').map((p) => p.module)).size > 1;
+      return ['alpha/P1', 'demo/P1'].every((key) => o.state.plans[key]?.status === 'completed');
+    }, 60_000);
+    assert.equal(together, false);
+    assert.ok(o.store.readAll().findIndex((e) => e.type === 'PLAN_STARTED' && e.ref?.module === 'demo') > o.store.readAll().findIndex((e) => e.type === 'PLAN_COMPLETED' && e.ref?.module === 'alpha'));
+  });
+});
+
+describe('parallel work, continued', () => {
+  /** The toy plan with F02 independent of F01. */
+  const independent = async (dir: string) => {
+    const file = join(dir, 'harness/modules/demo/plans/P1.json');
+    const design = JSON.parse(readFileSync(file, 'utf8')) as { features: Array<Record<string, unknown>> };
+    for (const f of design.features) delete f.dependsOn;
+    await commitOnMain(dir, { 'harness/modules/demo/plans/P1.json': JSON.stringify(design, null, 2) }, 'independent features');
+  };
+  /** The toy design split in two independent plans: P1 greets; P2 adds, then writes a third file (F03, after F02). */
+  const twoPlans = async (dir: string) => {
+    const file = join(dir, 'harness/modules/demo/plans/P1.json');
+    const design = JSON.parse(readFileSync(file, 'utf8')) as { features: Array<Record<string, unknown>> };
+    const [f01, f02] = design.features as [Record<string, unknown>, Record<string, unknown>];
+    delete f02.dependsOn;
+    const f03 = { id: 'F03', title: 'Three', description: 'src/three.txt exists.', expected: 'It exists.', dependsOn: ['F02'], checks: [{ id: 'F03-file', run: 'test -f src/three.txt', phase: 'pre-merge', timeoutSec: 30 }] };
+    await commitOnMain(dir, {
+      'harness/modules/demo/plans/P1.json': JSON.stringify({ ...design, features: [f01] }, null, 2),
+      'harness/modules/demo/plans/P2.json': JSON.stringify({ ...design, id: 'P2', title: 'Adding', dependsOn: [], features: [f02, f03] }, null, 2),
+    }, 'two plans');
+  };
+  const files = (f: string): Record<string, string> => (f === 'F03' ? { 'src/three.txt': '3\n' } : SOLUTIONS[f as keyof typeof SOLUTIONS]);
+
+  it('in Swarm, every Developer under way reaches the Manager', async () => {
+    const decide = (f: string): StubBehavior => (f === 'F01' ? { files: files('F01'), sleepSec: 5 } : { files: files('F02'), ask: 'Which shell should add.sh use?' });
+    const { orchestrator: o } = await setup(decide, { prepare: independent });
+    o.setMode('swarm');
+    await until(o, completed(o), 60_000);
+    assert.equal(await o.repo.show(o.state.plans['demo/P1']!.head, 'answer.txt'), 'Use the simplest option.');
+    assert.equal(o.store.readAll().filter((e) => e.type === 'QUESTION').length, 1);
+  });
+
+  it("in Swarm, parallel plans take each other's progress lines, and both merge", async () => {
+    const { orchestrator: o, fake } = await setup((f) => ({ files: files(f), sleepSec: f === 'F03' ? 4 : 0 }), {
+      github: true, prepare: twoPlans, config: { swarm: { requiredStatuses: [] } },
+    });
+    o.setMode('swarm');
+    await until(o, () => ['demo/P1', 'demo/P2'].every((key) => o.state.plans[key]?.status === 'completed'), 60_000);
+    assert.equal(o.state.pipeline.paused, undefined);
+    const progress = await runOk('git', ['--git-dir', fake.remote, 'show', 'refs/heads/main:progress.txt']);
+    for (const key of ['demo/P1/F01', 'demo/P2/F02', 'demo/P2/F03']) assert.match(progress, new RegExp(`feature\\.accepted ${key} `));
+  });
+
+  it('in Swarm, a plan whose step keeps failing leaves the other going, then pauses with its error', async () => {
+    let skew = 0;
+    const { orchestrator: o, fake } = await setup((f) => ({ files: files(f) }), {
+      github: true, prepare: twoPlans, config: { swarm: { requiredStatuses: [] } }, now: () => Date.now() + skew,
+    });
+    const push = fake.push.bind(fake);
+    fake.push = async (repo, branch) => {
+      if (branch === 'plan/demo/P1') throw new Error('remote rejected: refusing to update plan/demo/P1');
+      return push(repo, branch);
+    };
+    o.setMode('swarm');
+    await until(o, () => o.state.plans['demo/P2']?.status === 'completed', 60_000);
+    for (let i = 0; i < 8 && !o.state.pipeline.paused; i++) {
+      skew += 31_000;
+      await o.tick();
+    }
+    assert.match(o.state.pipeline.paused?.reason ?? '', /^demo\/P1 keeps failing: remote rejected/);
+  });
+});
+
+describe('pull requests, continued', () => {
+  const plan = (o: Orchestrator) => o.state.plans['demo/P1'];
+  const infraPlan = async (dir: string) => {
+    const file = join(dir, 'harness/modules/demo/plans/P1.json');
+    const design = JSON.parse(readFileSync(file, 'utf8')) as { features: Array<Record<string, unknown>> };
+    for (const f of design.features) f.kind = 'infra';
+    await commitOnMain(dir, { 'harness/modules/demo/plans/P1.json': JSON.stringify(design, null, 2) }, 'infra plan');
+  };
+  const fixGreet = (f: string): StubBehavior => (f.startsWith('fix') ? { files: { 'src/greet.sh': 'echo "hello"\n' } } : solved(f));
+
+  it("in Swarm, an earlier head's cost estimate doesn't let a later head merge itself", async () => {
+    let first: string | undefined;
+    const review: ReviewBehavior = (role, rounds) => (role === 'security' && rounds === 0
+      ? { verdict: 'block', summary: 'One problem.', findings: [{ severity: 'blocking', title: 'Fix me', detail: 'Do it.' }] }
+      : { verdict: 'pass', summary: 'Fine.', findings: [] });
+    const { orchestrator: o, fake } = await setup(fixGreet, { github: true, prepare: infraPlan, review });
+    o.setMode('swarm');
+    // The cost job uploads an estimate for the first head only, as when it fails on the next one.
+    fake.artifacts = (sha): Record<string, Record<string, string>> => {
+      first ??= sha;
+      return sha === first ? { cost: { 'cost.json': JSON.stringify({ diffTotalMonthlyCost: '12.5' }) } } : {};
+    };
+    await until(o, () => plan(o)?.leftToOwner !== undefined && plan(o)?.leftToOwner?.head !== first, 60_000);
+    assert.match(plan(o)!.leftToOwner!.reason, /none was produced/);
+    assert.equal(plan(o)!.costEstimate!.head, first);
+    assert.equal(fake.prs[0]!.state, 'open');
+  });
+
+  it('in Swarm, reads no cost artifact unless the cost job itself succeeded', async () => {
+    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true, prepare: infraPlan });
+    o.setMode('swarm');
+    fake.ci = () => ({ verify: 'success', checks: 'success', cost: 'failure' });
+    fake.artifacts = () => ({ cost: { 'cost.json': JSON.stringify({ diffTotalMonthlyCost: '1' }) } });
+    await until(o, () => plan(o)?.leftToOwner !== undefined);
+    assert.equal(plan(o)!.costEstimate, undefined);
+    assert.match(plan(o)!.leftToOwner!.reason, /none was produced/);
+  });
+
+  it("takes the owner's push to a plan's branch, and runs CI on it", async () => {
+    let skew = 0;
+    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true, now: () => Date.now() + skew });
+    await until(o, () => plan(o)?.status === 'ready_to_merge');
+    const pushed = plan(o)!.pushed!;
+    const head = await ownerCommit(fake.remote, 'plan/demo/P1', 'NOTES.md', 'by the owner\n');
+    skew += 120_000;
+    await until(o, () => plan(o)?.pushed === head && plan(o)?.status === 'ready_to_merge');
+    assert.equal(o.state.pipeline.paused, undefined);
+    assert.ok(await o.repo.isAncestor(pushed, plan(o)!.head));
+    assert.ok(o.store.readAll().some((e) => e.type === 'PLAN_HEAD_ADOPTED'));
+  });
+
+  it('counts a CI run the owner starts again on GitHub, once it passes', async () => {
+    let skew = 0;
+    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true, config: { brakes: { ciFixRounds: 0 } }, now: () => Date.now() + skew });
+    fake.ci = () => ({ verify: 'success', checks: 'failure' });
+    await until(o, () => o.state.pipeline.paused !== undefined);
+    assert.match(o.state.pipeline.paused!.reason, /^CI failed on PR #1 of demo\/P1 after 0 fix round\(s\)/);
+    await fake.rerun(plan(o)!.pushed!, { checks: 'success' });
+    assert.equal(o.resume(), true);
+    skew += 120_000;
+    await until(o, () => plan(o)?.status === 'ready_to_merge');
+  });
+
+  it('in Swarm, a review that passes with a blocking finding blocks', async () => {
+    const review: ReviewBehavior = (role, rounds) => (role === 'security' && rounds === 0
+      ? { verdict: 'pass', summary: 'Looks fine.', findings: [{ severity: 'blocking', title: 'Injection', detail: 'Quote it.' }] }
+      : { verdict: 'pass', summary: 'Fine.', findings: [] });
+    const { orchestrator: o, fake } = await setup(fixGreet, { github: true, review });
+    o.setMode('swarm');
+    await until(o, completed(o), 60_000);
+    assert.deepEqual(fake.statusesSet[0] && [fake.statusesSet[0].context, fake.statusesSet[0].state], ['harness/security', 'failure']);
+    assert.equal(o.state.features['demo/P1/fix1']!.fix!.kind, 'review');
+  });
+});
+
+describe('deploys, continued', () => {
+  const infra = (f: string): StubBehavior => (f === 'F02' ? { files: { ...SOLUTIONS.F02, 'iac/main.tf': '# a bucket\n' } } : solved(f));
+
+  it('after a failed apply with no Fix PR left, looks again on resume, and a later apply on main counts', async () => {
+    let skew = 0;
+    let merge: string | undefined;
+    const { orchestrator: o, fake } = await setup(infra, { github: true, config: { terraform: {}, brakes: { deployFixRounds: 0 } }, now: () => Date.now() + skew });
+    fake.ci = (sha) => ({ verify: 'success', 'tf-plan': 'success', checks: 'success', 'tf-apply': sha === merge ? 'failure' : 'success' });
+    await until(o, () => o.state.plans['demo/P1']?.status === 'ready_to_merge');
+    merge = await fake.merge(1);
+    skew += 120_000;
+    await until(o, () => o.state.plans['demo/P1']?.status === 'deploy_failed' && o.state.pipeline.paused !== undefined);
+    assert.match(o.state.pipeline.paused!.reason, /still fails after 0 Fix PR\(s\)/);
+    // The owner fixes it on main; its apply succeeds.
+    await ownerCommit(fake.remote, 'main', 'iac/fixed.tf', '# fixed\n');
+    assert.equal(o.resume(), true);
+    skew += 120_000;
+    await until(o, completed(o));
+    assert.equal(o.state.plans['demo/P1']!.deploy!.status, 'passed');
+  });
+});
+
+describe('design changes', () => {
+  const redefine = async (projectDir: string, id: string, description: string) => {
+    const file = join(projectDir, 'harness/modules/demo/plans/P1.json');
+    const design = JSON.parse(readFileSync(file, 'utf8')) as { features: Array<Record<string, unknown>> };
+    design.features.find((f) => f.id === id)!.description = description;
+    await commitOnMain(projectDir, { 'harness/modules/demo/plans/P1.json': JSON.stringify(design, null, 2) }, `redefine ${id}`);
+  };
+
+  it('in Manual, a design change that redefines the feature under way interrupts its attempt, and the next builds the new definition', async () => {
+    const { orchestrator: o, harnessDir } = await setup((f) => ({ ...solved(f), sleepSec: f === 'F01' ? 6 : 0 }));
+    await until(o, () => feature(o, 'F01')?.attempts[0]?.status === 'running');
+    await redefine(join(harnessDir, '..'), 'F01', 'src/greet.sh prints hello, politely.');
+    await until(o, completed(o), 60_000);
+    const f01 = feature(o, 'F01')!;
+    assert.equal(f01.attempts[0]!.status, 'interrupted');
+    assert.equal(f01.attempts[0]!.reason, 'the design changed this feature while it was built: the next attempt builds the new definition');
+    assert.equal(f01.attempts.at(-1)!.status, 'accepted');
+  });
+
+  it('builds again an accepted feature that a design change redefined while its plan is built', async () => {
+    const { orchestrator: o, harnessDir } = await setup((f) => ({ ...solved(f), sleepSec: f === 'F02' ? 6 : 0 }));
+    await until(o, () => feature(o, 'F01')?.status === 'accepted' && feature(o, 'F02')?.attempts[0]?.status === 'running');
+    await redefine(join(harnessDir, '..'), 'F01', 'src/greet.sh prints hello, politely.');
+    await until(o, completed(o), 60_000);
+    const f01 = feature(o, 'F01')!;
+    assert.equal(f01.attempts.length, 2);
+    assert.notEqual(f01.attempts[1]!.definitionHash, f01.attempts[0]!.definitionHash);
+    assert.equal(f01.attempts[1]!.status, 'accepted');
+  });
+
+  it('drops a feature waiting for guidance that a design change removed, and the Manager carries on', async () => {
+    const { orchestrator: o, harnessDir } = await setup((f) => (f === 'F02' ? { outcome: 'blocked' } : solved(f)), { manager: { ignore: ['ATTEMPT'] } });
+    await until(o, () => feature(o, 'F02')?.awaitingGuidanceSince !== undefined);
+    const projectDir = join(harnessDir, '..');
+    const file = join(projectDir, 'harness/modules/demo/plans/P1.json');
+    const design = JSON.parse(readFileSync(file, 'utf8')) as { features: Array<{ id: string }> };
+    design.features = design.features.filter((f) => f.id !== 'F02');
+    await commitOnMain(projectDir, { 'harness/modules/demo/plans/P1.json': JSON.stringify(design, null, 2) }, 'drop F02');
+    await until(o, completed(o));
+    assert.equal(o.state.pipeline.paused, undefined);
+  });
+});
+
+describe('architect, continued', () => {
+  const shop = (behavior: Partial<ArchitectBehavior> = {}): ArchitectBehavior => ({ module: 'shop', design: toyDesign('shop'), summary: 'Greeting and adding', ...behavior });
+  const module = (o: Orchestrator) => o.state.modules.shop;
+
+  it("in Swarm, gives an Arch PR the reviewers' statuses as not reviewed, so the owner merges it without a bypass", async () => {
+    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true, design: false, architect: shop() });
+    o.setMode('swarm');
+    o.createModule('shop', 'A tiny shop');
+    await until(o, () => module(o)?.status === 'proposed');
+    o.acceptProposal('shop', 1);
+    await until(o, () => module(o)?.status === 'in_review' && fake.statusesSet.length >= 2);
+    const head = (await runOk('git', ['--git-dir', fake.remote, 'rev-parse', 'refs/heads/arch/shop'])).trim();
+    assert.deepEqual(fake.statusesSet.map((s) => [s.sha === head, s.context, s.state, s.description]), [
+      [true, 'harness/security', 'success', 'not reviewed: an Arch PR, which the owner reviews and merges'],
+      [true, 'harness/cost', 'success', 'not reviewed: an Arch PR, which the owner reviews and merges'],
+    ]);
+  });
+
+  it('refuses a design change to a feature of a plan past its build', async () => {
+    let skew = 0;
+    const plan = JSON.parse(toyDesign('shop')['harness/modules/shop/plans/P1.json']!) as { features: Array<{ description: string }> };
+    plan.features[0]!.description = 'src/greet.sh prints hello, politely.';
+    const { orchestrator: o, fake } = await setup((f) => solved(f), {
+      github: true, design: false, now: () => Date.now() + skew,
+      architect: shop({ change: { 'harness/modules/shop/plans/P1.json': JSON.stringify(plan, null, 2) }, decision: 'Changed F01.' }),
+    });
+    o.createModule('shop', 'A tiny shop');
+    await until(o, () => module(o)?.status === 'proposed');
+    o.acceptProposal('shop', 1);
+    await until(o, () => module(o)?.status === 'in_review');
+    await fake.merge(1);
+    skew += 120_000;
+    await until(o, () => o.state.plans['shop/P1']?.status === 'ready_to_merge', 60_000);
+    await fake.merge(2);
+    skew += 120_000;
+    await until(o, () => o.state.plans['shop/P1']?.status === 'completed');
+    await handleRequest(o, { role: 'manager', sandbox: 'mgr-x', module: 'shop' }, { v: 1, id: 'esc-1', tool: 'escalate_to_architect', args: { question: 'Should F01 be polite?' } });
+    await until(o, () => o.store.readAll().some((e) => e.type === 'DESIGN_REFUSED'));
+    const refused = o.store.readAll().find((e) => e.type === 'DESIGN_REFUSED');
+    assert.ok(refused && refused.type === 'DESIGN_REFUSED');
+    assert.ok(refused.payload.problems.some((p) => /^P1\/F01: plan P1 is past its build \(completed\), so its features are frozen: put the change in a new plan$/.test(p)), refused.payload.problems.join('\n'));
+  });
+});
+
+describe('one module at a time', () => {
+  /** The toy design in two plans, P1 greets and P2 adds; P2 waits for P1 unless `independent`. */
+  const twoPlans = (independent: boolean) => async (dir: string) => {
+    const file = join(dir, 'harness/modules/demo/plans/P1.json');
+    const design = JSON.parse(readFileSync(file, 'utf8')) as { features: Array<Record<string, unknown>> };
+    const [f01, f02] = design.features as [Record<string, unknown>, Record<string, unknown>];
+    delete f02.dependsOn;
+    await commitOnMain(dir, {
+      'harness/modules/demo/plans/P1.json': JSON.stringify({ ...design, features: [f01] }, null, 2),
+      'harness/modules/demo/plans/P2.json': JSON.stringify({ ...design, id: 'P2', title: 'Adding', ...(independent ? { dependsOn: [] } : {}), features: [f02] }, null, 2),
+    }, 'two plans');
+  };
+  const dropP1 = async (projectDir: string) => {
+    rmSync(join(projectDir, 'harness/modules/demo/plans/P1.json'));
+    await commitOnMain(projectDir, {}, 'drop P1');
+  };
+  const slowF01 = (f: string): StubBehavior => ({ ...solved(f), sleepSec: f === 'F01' ? 6 : 0 });
+  const dropped = 'the design no longer has this feature: the attempt stops';
+
+  it('in Manual, a design change that drops the plan under way stops its attempt, and the next plan builds', async () => {
+    const { orchestrator: o, harnessDir } = await setup(slowF01, { prepare: twoPlans(false) });
+    await until(o, () => o.state.features['demo/P1/F01']?.attempts[0]?.status === 'running');
+    await dropP1(join(harnessDir, '..'));
+    await until(o, () => o.state.plans['demo/P2']?.status === 'completed', 60_000);
+    assert.equal(o.state.features['demo/P1/F01']!.attempts[0]!.reason, dropped);
+  });
+
+  it('in Swarm, a plan dropped while it is built leaves its place under swarm.maxPlans, and its Manager stays stopped', async () => {
+    const { orchestrator: o, harnessDir } = await setup(slowF01, { prepare: twoPlans(true), config: { swarm: { maxPlans: 1 } } });
+    o.setMode('swarm');
+    await until(o, () => o.state.features['demo/P1/F01']?.attempts[0]?.status === 'running' && o.state.managers['demo/P1']?.status === 'running');
+    await dropP1(join(harnessDir, '..'));
+    await until(o, () => o.state.plans['demo/P2']?.status === 'completed', 60_000);
+    assert.equal(o.state.features['demo/P1/F01']!.attempts[0]!.reason, dropped);
+    const starts = o.store.readAll().filter((e) => e.type === 'MANAGER_STARTING' && e.payload.plan === 'P1');
+    assert.equal(starts.length, 1);
+    assert.equal(o.state.managers['demo/P1']!.status, 'stopped');
+  });
+
+  it('in Swarm, with two modules under way, as 0.2.0 could leave them, only the older one has Developers and Managers until it is complete', async () => {
+    const decide = (f: string): StubBehavior => (f === 'A01' ? { files: { 'src/alpha.txt': '1\n' }, sleepSec: 6 } : solved(f));
+    const { orchestrator: o } = await setup(decide, { prepare: (dir) => commitOnMain(dir, alphaDesign, 'the alpha design') });
+    o.setMode('swarm');
+    await until(o, () => o.state.features['alpha/P1/A01']?.attempts[0]?.status === 'running');
+    // What 0.2.0 did: demo's first plan started alongside alpha's, with an attempt and a Manager.
+    const internals = o as unknown as { startPlan(ref: object): Promise<unknown>; scheduleWork(ref: object, definition: object, state: undefined): Promise<unknown> };
+    await internals.startPlan({ module: 'demo', plan: 'P1' });
+    await internals.scheduleWork({ module: 'demo', plan: 'P1', feature: 'F01' }, o.design.modules.find((m) => m.id === 'demo')!.plans[0]!.features[0]!, undefined);
+    o.record({ type: 'MANAGER_STARTING', payload: { module: 'demo', plan: 'P1', sandbox: 'mgr-toy-demo-p1', sessionId: 'session' } });
+    const forced = o.store.readAll().length;
+    await until(o, () => o.state.plans['demo/P1']?.status === 'completed', 90_000);
+
+    const events = o.store.readAll();
+    const alphaDone = events.findIndex((e) => e.type === 'PLAN_COMPLETED' && e.ref?.module === 'alpha');
+    assert.ok(alphaDone > forced, 'alpha completed after the forced start');
+    const meanwhile = events.slice(forced, alphaDone);
+    assert.ok(!meanwhile.some((e) => (e.type === 'ATTEMPT_STARTING' || e.type === 'MANAGER_STARTING') && (e.ref?.module ?? (e.payload as { module?: string }).module) === 'demo'), 'nothing of demo started before alpha was complete');
+    const stopped = meanwhile.find((e) => e.type === 'MANAGER_STOPPED' && e.payload.module === 'demo');
+    assert.ok(stopped && stopped.type === 'MANAGER_STOPPED');
+    assert.equal(stopped.payload.reason, 'another module is being built');
+    const f01 = o.state.features['demo/P1/F01']!;
+    assert.equal(f01.attempts[0]!.status, 'interrupted');
+    assert.equal(f01.attempts[0]!.reason, 'another module is being built: this one goes on once that one is complete');
+    assert.equal(f01.attempts.at(-1)!.status, 'accepted');
+  });
+});

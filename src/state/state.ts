@@ -111,6 +111,8 @@ export interface PlanState {
   mergedBy?: 'owner' | 'daemon';
   /** In Swarm, the policy left this head's PR to the owner: the reason shows under Needs you. */
   leftToOwner?: { head: string; reason: string; at: string };
+  /** Main at `main` conflicts with the plan branch in `files`: tried once per main, and resolved in the PR. */
+  mainConflict?: { main: string; files: string[] };
   /** The cost job's estimate of the monthly cost the PR adds, for the head it was computed on (v3 §5.3). */
   costEstimate?: { head: string; monthlyUsd: number };
   /** The reviewers' sessions on the PR's heads (v3 §5), oldest first. */
@@ -131,6 +133,8 @@ export interface ReviewState {
   startedAt: string;
   deadline: string;
   endedAt?: string;
+  /** How the session ended: a usage limit isn't one of the reviewer's failures. */
+  outcome?: AttemptOutcome;
   verdict?: 'pass' | 'block';
   summary?: string;
   findings?: ReviewFinding[];
@@ -186,6 +190,8 @@ export interface ActionState {
   at: string;
   note?: string;
   reason?: string;
+  /** The action's estimate when it was done: it still counts once a redesign drops the action. */
+  minutes?: number;
 }
 
 export interface OwnerRequest {
@@ -269,8 +275,21 @@ export function apply(state: State, event: HarnessEvent): State {
         head: event.payload.base,
       };
       break;
-    case 'PLAN_MAIN_MERGED':
-      Object.assign(state.plans[planKey(ref!)]!, { base: event.payload.main, head: event.payload.head });
+    case 'PLAN_MAIN_MERGED': {
+      const plan = state.plans[planKey(ref!)]!;
+      Object.assign(plan, { base: event.payload.main, head: event.payload.head });
+      delete plan.mainConflict;
+      // A PR takes main before the daemon merges it (v3 §3.2): its new head is pushed, and CI runs again.
+      if (plan.pr && plan.status === 'ready_to_merge') plan.status = 'pr_open';
+      break;
+    }
+    case 'PLAN_MAIN_CONFLICT':
+      state.plans[planKey(ref!)]!.mainConflict = { main: event.payload.main, files: event.payload.files };
+      break;
+    case 'PLAN_HEAD_ADOPTED':
+      Object.assign(state.plans[planKey(ref!)]!, {
+        status: 'pr_open', head: event.payload.head, pushed: event.payload.head, ci: { sha: event.payload.head, status: 'pending', since: event.ts },
+      });
       break;
     case 'PLAN_VALIDATING':
       Object.assign(state.plans[planKey(ref!)]!, { status: 'validating', head: event.payload.head, validation: { status: 'running', since: event.ts } });
@@ -413,6 +432,7 @@ export function apply(state: State, event: HarnessEvent): State {
       const review = reviewOf(state, ref!, event.payload);
       const { outcome, verdict, summary, findings, usage, reason } = event.payload;
       review.endedAt = event.ts;
+      review.outcome = outcome;
       if (usage) review.usage = usage;
       if (outcome === 'done' && verdict) Object.assign(review, { status: 'reported', verdict, summary, findings: findings ?? [] });
       else Object.assign(review, { status: 'failed', reason: reason ?? outcome });
@@ -622,9 +642,19 @@ export function apply(state: State, event: HarnessEvent): State {
       delete state.pipeline.paused;
       state.pipeline.consecutiveFailures = 0;
       // The owner looked: waiting items start a fresh turn, a failed full check run runs again,
+      // a failed deploy is looked at again (the owner may have fixed it, or re-run the apply),
       // and a Manager that kept stopping gets another chance.
       for (const manager of Object.values(state.managers)) Object.assign(manager, { sent: {}, exits: [] });
-      for (const plan of Object.values(state.plans)) if (plan.validation?.status === 'failed') delete plan.validation;
+      for (const plan of Object.values(state.plans)) {
+        if (plan.validation?.status === 'failed') delete plan.validation;
+        if (plan.status === 'deploy_failed') {
+          plan.status = 'deploying';
+          delete plan.deploy;
+        } else if (plan.status === 'verify_failed') {
+          plan.status = 'verifying';
+          delete plan.postDeploy;
+        }
+      }
       break;
     case 'MODULE_CREATED': {
       const { module, title, sandbox, sessionId } = event.payload;
@@ -738,7 +768,7 @@ export function apply(state: State, event: HarnessEvent): State {
       break;
     case 'OWNER_ACTION_DONE': {
       const key = `${event.payload.module}/${event.payload.action}`;
-      state.actions[key] = { ...state.actions[key], status: 'done', at: event.ts };
+      state.actions[key] = { ...state.actions[key], status: 'done', at: event.ts, ...(event.payload.minutes === undefined ? {} : { minutes: event.payload.minutes }) };
       if (event.payload.gate) state.pendingProgress.push(`${event.ts} gate.satisfied ${key} by=owner "${event.payload.title.replaceAll('"', "'")}"`);
       break;
     }
@@ -754,11 +784,6 @@ export function apply(state: State, event: HarnessEvent): State {
 }
 
 const ACTIVE: AttemptStatus[] = ['starting', 'running', 'collecting', 'checking', 'reviewing'];
-
-/** The one attempt that hasn't reached a terminal status, if any. There is at most one. */
-export function activeAttempt(state: State): { feature: FeatureState; attempt: Attempt } | undefined {
-  return activeAttempts(state)[0];
-}
 
 /** Every attempt under way, in the features' order: one in Manual, up to `swarm.maxDevelopers` in Swarm (v3 §6.2). */
 export function activeAttempts(state: State): Array<{ feature: FeatureState; attempt: Attempt }> {
@@ -785,10 +810,9 @@ export function interruptions(feature: FeatureState, definitionHash: string): nu
   return feature.attempts.filter((a) => a.definitionHash === definitionHash && a.status === 'interrupted').length;
 }
 
-/** The attempt a Developer sandbox runs, if it is still going. */
+/** The attempt a Developer sandbox runs, if it is still going: each attempt has its own sandbox. */
 export function attemptInSandbox(state: State, sandbox: string): { feature: FeatureState; attempt: Attempt } | undefined {
-  const active = activeAttempt(state);
-  return active?.attempt.sandbox === sandbox ? active : undefined;
+  return activeAttempts(state).find((a) => a.attempt.sandbox === sandbox);
 }
 
 export function writeSnapshot(file: string, state: State): void {

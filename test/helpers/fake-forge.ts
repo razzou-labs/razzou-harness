@@ -2,7 +2,7 @@ import { join } from 'node:path';
 import type { Repo } from '../../src/git/repo.ts';
 import { GitHubError } from '../../src/github/app.ts';
 import type { BranchRules, CheckRun, CommitStatus, Forge, PullRequest, ReviewPost } from '../../src/github/forge.ts';
-import { runOk } from '../../src/util.ts';
+import { run, runOk } from '../../src/util.ts';
 import { tempDir } from './toy-repo.ts';
 
 export const FAKE_BOT = 'toy-harness[bot]';
@@ -32,7 +32,8 @@ export class FakeForge implements Forge {
   /** False once the App is known not to write statuses. */
   writable: boolean | undefined = undefined;
   readonly prs: FakePullRequest[] = [];
-  ci: (sha: string) => Record<string, string> | undefined = () => ({ verify: 'success', checks: 'success' });
+  /** How CI ends on each pushed commit, by job; the cost job runs on every PR, as the workflow's does, and is no required check. */
+  ci: (sha: string) => Record<string, string> | undefined = () => ({ verify: 'success', checks: 'success', cost: 'success' });
   /** The commit statuses on each commit, by context: what the reviewers would post as the App (v3 §5.4). */
   statuses: (sha: string) => Record<string, string> = () => ({});
   /** When set, the daemon's merge is refused with this message, as GitHub does under rules the merge doesn't meet. */
@@ -103,6 +104,14 @@ export class FakeForge implements Forge {
     return this.runs.get(sha)!;
   }
 
+  /** The owner runs CI again on GitHub: newer runs of the same jobs, which end as `conclusions` say. */
+  async rerun(sha: string, conclusions: Record<string, string>): Promise<void> {
+    await this.checkRuns(sha);
+    const runs = this.runs.get(sha) ?? [];
+    runs.push(...Object.entries(conclusions).map(([name, conclusion]) => ({ id: this.nextRun++, name, status: 'completed', conclusion })));
+    this.runs.set(sha, runs);
+  }
+
   async jobLog(run: CheckRun): Promise<string> {
     return `the ${run.name} job failed: expected 5, got 4`;
   }
@@ -145,12 +154,18 @@ export class FakeForge implements Forge {
     return { commit: await this.merge(number, FAKE_BOT) };
   }
 
-  /** The owner merges, or the daemon as the App: a merge commit on main with the branch as second parent. */
+  /**
+   * The owner merges, or the daemon as the App: a merge commit on main with the branch as
+   * second parent, from a real three-way merge, refused like GitHub's when they conflict.
+   */
   async merge(number: number, by = 'owner'): Promise<string> {
     const pr = this.prs[number - 1]!;
     const head = await this.head(pr.branch);
     const main = await this.head('main');
-    const tree = (await runOk('git', ['--git-dir', this.remote, 'rev-parse', `${head}^{tree}`])).trim();
+    const merged = await run('git', ['--git-dir', this.remote, 'merge-tree', '--write-tree', '-z', '--name-only', '--no-messages', main, head]);
+    if (merged.code === 1) throw new GitHubError(`Merge conflict in ${merged.stdout.split('\0').slice(1).filter(Boolean).join(', ')}: the pull request is not mergeable`, 405);
+    if (merged.code !== 0) throw new Error(`git merge-tree failed: ${merged.stderr.trim()}`);
+    const tree = merged.stdout.split('\0')[0]!;
     const env = { ...process.env, GIT_AUTHOR_NAME: by, GIT_AUTHOR_EMAIL: `${by}@test.invalid`, GIT_COMMITTER_NAME: by, GIT_COMMITTER_EMAIL: `${by}@test.invalid` };
     const commit = (await runOk('git', ['--git-dir', this.remote, 'commit-tree', tree, '-p', main, '-p', head, '-m', `${pr.title} (#${number})`], { env })).trim();
     await runOk('git', ['--git-dir', this.remote, 'update-ref', 'refs/heads/main', commit, main]);

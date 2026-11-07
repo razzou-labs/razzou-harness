@@ -59,4 +59,24 @@ describe('the owner\'s time', () => {
     assert.match(over[0]!, /^the design takes 6\.67 h of the owner's time in owner actions, but 6\.5 h are available: 10 h for the project, minus the 20% reserve/);
     assert.deepEqual(ownerTimeProblems(time, moduleOwnerTime(module('billing', [action('G1', 390)]), s)), []);
   });
+
+  it('lets a design without owner actions through, even once others committed more than is plannable', () => {
+    const s = state(1);
+    const time = ownerTime(config, design, s)!;
+    // shop committed 1.5 h of the 0.8 h plannable: billing has -0.7 h.
+    assert.equal(availableHours(time, 'billing'), -0.7);
+    assert.deepEqual(ownerTimeProblems(time, moduleOwnerTime(module('billing', []), s)), []);
+    assert.equal(ownerTimeProblems(time, moduleOwnerTime(module('billing', [action('G1', 5)]), s)).length, 1);
+  });
+
+  it('keeps the time of an action done, after a redesign dropped it', () => {
+    const s = state(10);
+    s.actions['shop/T1'] = { status: 'done', at: 't', minutes: 60 };
+    s.actions['shop/T9'] = { status: 'done', at: 't', minutes: 45 };
+    s.actions['shop/T8'] = { status: 'verifying', at: 't', minutes: 20 };
+    // T9 left the design of shop, and T8 was never done: T1 counts its current estimate, T9 the one it had.
+    assert.equal(moduleOwnerTime(design.modules[0]!, s).usedMinutes, 105);
+    assert.equal(moduleOwnerTime(design.modules[1]!, s).usedMinutes, 0, "billing doesn't take shop's actions");
+    assert.equal(ownerTime(config, design, s)!.usedHours, 1.75);
+  });
 });

@@ -5,7 +5,7 @@ import { join, resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { parseArgs } from 'node:util';
 import { computeLock, directoryReader } from './ci/harness-ci.ts';
-import { isAlive, packageRoot, readDaemonInfo, runDaemon, version } from './daemon/main.ts';
+import { isRunning, packageRoot, runDaemon, runningDaemon, version } from './daemon/main.ts';
 import { ConfigSchema, requiredChecks } from './design/schemas.ts';
 import { loadAppCredentials } from './github/app.ts';
 import { applyRepositoryRules, checkApp, createApp, installCi, type RulesetOptions } from './github/setup.ts';
@@ -98,18 +98,27 @@ async function main(): Promise<void> {
       if (!argument) {
         const file = join(harnessDir, 'state.json');
         const state = existsSync(file) ? (JSON.parse(readFileSync(file, 'utf8')) as State) : undefined;
-        console.log(state?.mode ?? 'manual');
+        const pendingFile = join(harnessDir, 'setup.json');
+        const pending = existsSync(pendingFile) ? (JSON.parse(readFileSync(pendingFile, 'utf8')) as { mode?: string }).mode : undefined;
+        console.log(`${state?.mode ?? 'manual'}${pending && pending !== (state?.mode ?? 'manual') ? `, and ${pending} once the daemon starts` : ''}`);
         return;
       }
       if (argument !== 'manual' && argument !== 'swarm') throw new Error('usage: harness mode [manual|swarm]');
-      const result = await ownerAction(harnessDir, '/api/mode', { mode: argument });
+      const running = runningDaemon(harnessDir) !== undefined;
+      if (running && (await ownerAction(harnessDir, '/api/mode', { mode: argument }, `already ${argument}`)).error) return;
       // GitHub's rules on main differ per mode, and only the owner's gh may change them (v3 §2.1): done here, in the same command.
       const repo = projectConfig(projectDir)?.project.repo;
-      if (result.error || !repo) return;
-      try {
-        await applyRules(projectDir, harnessDir, repo, argument);
-      } catch (error) {
-        console.log(`GitHub's rules on main were not changed: ${(error as Error).message}\nRun \`harness github-setup --repo ${repo}\` with gh logged in as an admin of the repository.`);
+      if (repo) {
+        try {
+          await applyRules(projectDir, harnessDir, repo, argument);
+        } catch (error) {
+          console.log(`GitHub's rules on main were not changed: ${(error as Error).message}\nRun \`harness github-setup --repo ${repo}\` with gh logged in as an admin of the repository.`);
+        }
+      }
+      if (!running) {
+        // The daemon is down: the switch waits for it in .harness/setup.json (v4 §5).
+        recordForDaemon(harnessDir, { mode: argument });
+        console.log(`${argument}: the daemon switches when it starts (harness up).`);
       }
       return;
     }
@@ -119,14 +128,10 @@ async function main(): Promise<void> {
       if ((budgets.ownerHours === undefined && budgets.agentHours === undefined) || [budgets.ownerHours, budgets.agentHours].some((h) => h !== undefined && (!Number.isFinite(h) || h <= 0))) {
         throw new Error('usage: harness budget --owner-hours <n> | --agent-hours <n>, with positive numbers');
       }
-      const info = readDaemonInfo(harnessDir);
-      if (info && isAlive(info.pid)) return void (await ownerAction(harnessDir, '/api/budgets', budgets));
-      // The daemon is down: the hours wait for it in .harness/setup.json (v4 §5).
+      if (runningDaemon(harnessDir)) return void (await ownerAction(harnessDir, '/api/budgets', budgets, 'already set'));
+      // The daemon is down: the hours wait for it in .harness/setup.json (v4 §5), and replace any it has, as they would if it ran.
       if (budgets.agentHours !== undefined) throw new Error('the agent-hours threshold needs the daemon running: `harness up`');
-      const file = join(harnessDir, 'setup.json');
-      const pending = existsSync(file) ? (JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>) : {};
-      mkdirSync(harnessDir, { recursive: true });
-      writeFileSync(file, `${JSON.stringify({ ...pending, ownerHours: budgets.ownerHours }, null, 2)}\n`);
+      recordForDaemon(harnessDir, { ownerHours: budgets.ownerHours, ownerHoursFrom: 'budget' });
       console.log(`${budgets.ownerHours} hours of your time: the daemon records it when it starts (harness up).`);
       return;
     }
@@ -211,8 +216,13 @@ async function main(): Promise<void> {
     case 'version':
       console.log(version);
       return;
-    default:
+    case 'help':
+    case undefined:
       console.log(HELP);
+      return;
+    default:
+      console.error(`unknown command: ${command}\n\n${HELP}`);
+      process.exitCode = 1;
   }
 }
 
@@ -223,6 +233,14 @@ async function ask(question: string): Promise<string> {
   } finally {
     rl.close();
   }
+}
+
+/** Records what the daemon takes from .harness/setup.json when it starts, while it is down (v4 §5). */
+function recordForDaemon(harnessDir: string, values: Record<string, unknown>): void {
+  const file = join(harnessDir, 'setup.json');
+  const pending = existsSync(file) ? (JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>) : {};
+  mkdirSync(harnessDir, { recursive: true });
+  writeFileSync(file, `${JSON.stringify({ ...pending, ...values }, null, 2)}\n`);
 }
 
 /** The project's configuration, when the directory has one. */
@@ -293,19 +311,19 @@ async function runDoctor(projectDir: string, values: { probe?: boolean; 'build-i
 }
 
 async function down(harnessDir: string): Promise<void> {
-  const info = readDaemonInfo(harnessDir);
-  if (!info || !isAlive(info.pid)) return console.log('no daemon is running');
+  const info = runningDaemon(harnessDir);
+  if (!info) return console.log('no daemon is running');
   process.kill(info.pid, 'SIGTERM');
-  for (let i = 0; i < 50 && isAlive(info.pid); i++) await sleep(200);
-  console.log(isAlive(info.pid) ? `pid ${info.pid} is still stopping` : 'stopped');
+  for (let i = 0; i < 50 && isRunning(info); i++) await sleep(200);
+  console.log(isRunning(info) ? `pid ${info.pid} is still stopping` : 'stopped');
 }
 
 function status(harnessDir: string): void {
   const file = join(harnessDir, 'state.json');
   if (!existsSync(file)) return console.log('no state yet: run `harness up` first');
   const state = JSON.parse(readFileSync(file, 'utf8')) as State;
-  const info = readDaemonInfo(harnessDir);
-  console.log(info && isAlive(info.pid) ? `daemon: running, http://127.0.0.1:${info.port}` : 'daemon: stopped');
+  const info = runningDaemon(harnessDir);
+  console.log(info ? `daemon: running, http://127.0.0.1:${info.port}` : 'daemon: stopped');
   console.log(`pipeline: ${state.pipeline.paused ? `paused (${state.pipeline.paused.reason})` : 'running'}`);
   for (const [key, plan] of Object.entries(state.plans)) {
     console.log(`\n${key}  ${plan.status}  ${plan.branch} @ ${plan.head.slice(0, 8)}`);
@@ -327,16 +345,26 @@ function status(harnessDir: string): void {
   if (open.length > 0) console.log('\nAnswer with: harness answer <request-id> <text>');
 }
 
-async function ownerAction(harnessDir: string, path: string, body: unknown): Promise<{ done: boolean; error?: string }> {
-  const info = readDaemonInfo(harnessDir);
-  if (!info || !isAlive(info.pid)) throw new Error('no daemon is running');
+/**
+ * An owner action, through the running daemon. When the daemon refuses it, the command
+ * fails; `unchanged` is what to say instead when it was already so, such as a mode.
+ */
+async function ownerAction(harnessDir: string, path: string, body: unknown, unchanged?: string): Promise<{ done: boolean; error?: string }> {
+  const info = runningDaemon(harnessDir);
+  if (!info) throw new Error('no daemon is running');
   const response = await fetch(`http://127.0.0.1:${info.port}${path}`, {
     method: 'POST',
     headers: { authorization: `Bearer ${info.token}`, 'content-type': 'application/json' },
     body: JSON.stringify(body),
   });
+  if (!response.ok) throw new Error(`the daemon answered ${response.status}: ${(await response.text()).trim()}`);
   const result = (await response.json()) as { done: boolean; error?: string };
-  console.log(result.done ? 'done' : result.error ?? 'nothing to do');
+  if (result.done) console.log('done');
+  else if (unchanged !== undefined && result.error === undefined) console.log(unchanged);
+  else {
+    console.error(result.error ?? 'nothing to do');
+    process.exitCode = 1;
+  }
   return result;
 }
 
@@ -352,8 +380,8 @@ function attach(harnessDir: string, module: string | undefined): void {
 }
 
 async function listActions(harnessDir: string): Promise<void> {
-  const info = readDaemonInfo(harnessDir);
-  if (!info || !isAlive(info.pid)) throw new Error('no daemon is running');
+  const info = runningDaemon(harnessDir);
+  if (!info) throw new Error('no daemon is running');
   const response = await fetch(`http://127.0.0.1:${info.port}/api/state`, { headers: { authorization: `Bearer ${info.token}` } });
   const { state, design } = (await response.json()) as {
     state: State;

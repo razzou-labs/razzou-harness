@@ -33,7 +33,8 @@ expected result, then the diff. Accept only if:
 - it does nothing beyond the feature that the design didn't ask for.
 
 Then call `accept_feature`, or `reject_feature` with guidance. A rejection costs an
-attempt, and each feature has two, so reject for real problems, not taste.
+attempt, and each feature has only a few (two by default), so reject for real problems,
+not taste.
 
 ## After a failure
 

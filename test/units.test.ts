@@ -11,7 +11,7 @@ import { checkHost } from '../src/sandbox/allowlist.ts';
 import { githubRepo, init } from '../src/setup/init.ts';
 import { buildPolicy } from '../src/sandbox/policy.ts';
 import { EventStore } from '../src/state/events.ts';
-import { activeAttempt, countedAttempts, project } from '../src/state/state.ts';
+import { activeAttempts, attemptInSandbox, countedAttempts, project } from '../src/state/state.ts';
 import { clip, runOk } from '../src/util.ts';
 import { createToyRepo, tempDir } from './helpers/toy-repo.ts';
 
@@ -37,13 +37,14 @@ describe('state projection', () => {
     store.append({ type: 'ATTEMPT_STARTING', ref, payload: { sandbox: 's', base: 'b0', sessionId: 'x', deadline: '2030-01-01T00:00:00Z', definitionHash: 'h' } });
     store.append({ type: 'ATTEMPT_STARTED', ref, payload: {} });
     let state = project(store.readAll());
-    assert.equal(activeAttempt(state)?.attempt.status, 'running');
+    assert.equal(activeAttempts(state)[0]?.attempt.status, 'running');
+    assert.equal(attemptInSandbox(state, 's')?.attempt.n, 1);
 
     store.append({ type: 'ATTEMPT_ENDED', ref, payload: { outcome: 'done', summary: 'ok' } });
     store.append({ type: 'CHECKS_STARTED', ref, payload: { head: 'h1', files: ['a'] } });
     store.append({ type: 'FEATURE_ACCEPTED', ref, payload: { commit: 'c1' } });
     state = project(store.readAll());
-    assert.equal(activeAttempt(state), undefined);
+    assert.deepEqual(activeAttempts(state), []);
     assert.equal(state.features['demo/P1/F01']!.status, 'accepted');
     assert.equal(state.plans['demo/P1']!.head, 'c1');
   });

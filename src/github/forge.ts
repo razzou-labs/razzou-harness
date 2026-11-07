@@ -257,6 +257,8 @@ export class GitHubForge implements Forge {
   }
 
   async setCommitStatus(sha: string, status: { context: string; state: 'success' | 'failure' | 'pending'; description: string }): Promise<void> {
+    // The current token decides, and a new one asks for the permission again.
+    await this.client.token();
     if (!this.client.canWriteStatuses) throw new GitHubError('the App has no "Commit statuses: write" permission: add it on GitHub and accept it on the installation', 403);
     await this.client.request('POST', `/repos/{repo}/statuses/${sha}`, { context: status.context, state: status.state, description: status.description.slice(0, 140) });
   }
@@ -282,20 +284,28 @@ export class GitHubForge implements Forge {
     return undefined;
   }
 
-  /** The rules GitHub applies to the branch, from every active ruleset; an empty list when none applies. Unreadable rules are undefined. */
+  /**
+   * The rules GitHub applies to the branch, from every active ruleset, every page of them;
+   * an empty list when none applies. Unreadable rules are undefined. GitHub enforces each
+   * rule: the approvals are the most any asks for, and code owners count if one says so.
+   */
   async branchRules(branch: string): Promise<BranchRules | undefined> {
-    let rules: Array<{ type: string; parameters?: Record<string, any> }>;
+    const rules: Array<{ type: string; parameters?: Record<string, any> }> = [];
     try {
-      rules = await this.client.request('GET', `/repos/{repo}/rules/branches/${encodeURIComponent(branch)}`);
+      for (let page = 1; ; page++) {
+        const batch = await this.client.request<typeof rules>('GET', `/repos/{repo}/rules/branches/${encodeURIComponent(branch)}?per_page=100&page=${page}`);
+        rules.push(...batch);
+        if (batch.length < 100) break;
+      }
     } catch (error) {
       if (error instanceof GitHubError && (error.status === 403 || error.status === 404)) return undefined;
       throw error;
     }
-    const pr = rules.find((r) => r.type === 'pull_request')?.parameters ?? {};
+    const prs = rules.filter((r) => r.type === 'pull_request').map((r) => r.parameters ?? {});
     const checks = rules.filter((r) => r.type === 'required_status_checks').flatMap((r) => (r.parameters?.required_status_checks ?? []) as Array<{ context: string; integration_id?: number | null }>);
     return {
-      approvals: Number(pr.required_approving_review_count ?? 0),
-      codeOwners: pr.require_code_owner_review === true,
+      approvals: Math.max(0, ...prs.map((pr) => Number(pr.required_approving_review_count ?? 0))),
+      codeOwners: prs.some((pr) => pr.require_code_owner_review === true),
       checks: checks.map((c) => ({ context: c.context, ...(typeof c.integration_id === 'number' ? { integrationId: c.integration_id } : {}) })),
     };
   }
