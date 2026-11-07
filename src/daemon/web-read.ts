@@ -309,7 +309,8 @@ function readable(html: string, base: URL | undefined, plain: boolean): string {
   let out = '';
   let at = 0;
   for (let lt = html.indexOf('<'); lt >= 0; lt = html.indexOf('<', at)) {
-    const comment = html.startsWith('<!--', lt) ? find(/-->/g, lt + 4) : undefined;
+    // A comment ends at `-->`, or at `--!>` as browsers also read it.
+    const comment = html.startsWith('<!--', lt) ? find(/--!?>/g, lt + 4) : undefined;
     const gt = comment ? comment.end - 1 : html.indexOf('>', lt + 1);
     // No tag ends after this point: the rest is text.
     if (gt < 0) break;

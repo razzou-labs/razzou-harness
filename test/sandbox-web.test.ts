@@ -113,6 +113,10 @@ describe('web_read', () => {
       '# A & B\n\nHome (https://example.com/) | Top\n\n## Install v2\n\nRun\nnpm i, then see the next page (https://example.com/guide/docs/next.html) or mail.\nDone.\n\nName | Value |\na | 1 |\n\n- one\n- two <3',
     );
   });
+
+  it('ends a comment at --!> too, as browsers do', () => {
+    assert.equal(htmlToText('<p>one <!-- a --!>two</p><p>three</p><!-- b -->'), 'one two\nthree');
+  });
 });
 
 describe('the sandbox policy', () => {
@@ -121,8 +125,8 @@ describe('the sandbox policy', () => {
       network_policies: Record<string, { endpoints: Array<{ host: string }> }>;
     };
     const hosts = (name: string) => policy.network_policies[name]!.endpoints.map((e) => e.host);
-    assert.ok(hosts('git_fetch').includes('github.com'));
-    assert.ok(!hosts('read_only_web').includes('github.com'));
+    assert.equal(hosts('git_fetch').filter((host) => host === 'github.com').length, 1);
+    assert.equal(hosts('read_only_web').filter((host) => host === 'github.com').length, 0);
     assert.equal(hosts('read_only_web').filter((host) => host === 'docs.example.com').length, 1);
   });
 });

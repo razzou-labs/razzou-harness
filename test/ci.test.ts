@@ -88,7 +88,7 @@ describe('protection rules', () => {
     const yes: Array<[string, string]> = [
       ['CLAUDE.md', '**/CLAUDE.md'], ['a/b/CLAUDE.md', '**/CLAUDE.md'], ['src/.claude/rules/x.md', '**/.claude/**'], ['src/.claude', '**/.claude/**'],
       ['harness/a\nb', 'harness/**'], ['a/b', 'a/**/b'], ['a/x/y/b', 'a/**/b'], ['src/a.ts', 'src/*.ts'], ['docs/a.md', 'docs/?.md'],
-      ['x.ts', './x.ts'], ['config/a/b.yml', 'config/'], ['a+b (1).txt', 'a+b (1).txt'],
+      ['x.ts', './x.ts'], ['config/a/b.yml', 'config/'], ['config/a/b.yml', 'config///'], ['a+b (1).txt', 'a+b (1).txt'],
     ];
     const no: Array<[string, string]> = [
       ['a/xCLAUDE.md', '**/CLAUDE.md'], ['CLAUDE.md.bak', '**/CLAUDE.md'], ['harnessx/a', 'harness/**'], ['src/a/b.ts', 'src/*.ts'],
@@ -96,6 +96,15 @@ describe('protection rules', () => {
     ];
     for (const [path, pattern] of yes) assert.ok(matches(path, pattern), `${path} matches ${pattern}`);
     for (const [path, pattern] of no) assert.ok(!matches(path, pattern), `${path} doesn't match ${pattern}`);
+  });
+
+  it('read protect.files in linear time, even a pattern with a long run of slashes before its end', async () => {
+    const files: Record<string, string> = { 'harness/config.json': JSON.stringify({ protect: { files: [`a${'/'.repeat(100_000)}b`, 'config///'] } }) };
+    const tree = { read: async (path: string) => files[path], list: async () => Object.keys(files) };
+    const started = performance.now();
+    const rules = await protectionRules(tree);
+    assert.ok(performance.now() - started < 1000);
+    assert.ok(rules.paths.includes('config/**'));
   });
 
   it('protect the instructions Claude Code reads in any folder, and the configs that decide what a check runs', async () => {

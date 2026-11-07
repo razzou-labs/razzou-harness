@@ -117,7 +117,8 @@ The sandboxes and the dashboard:
   router. A compressed page past the size limit stops decompressing, instead of growing
   the daemon's memory, and a page full of unclosed comments or tags no longer freezes
   the daemon for minutes. One deadline of 75 seconds covers a read and its redirects,
-  within the 90 seconds an agent waits. claude.ai and chatgpt.com are never read.
+  within the 90 seconds an agent waits. claude.ai and chatgpt.com are never read. An
+  HTML comment ends at `--!>` too, as browsers read it: the text after one was lost.
 - Usage limits are recognised in Claude Code 2.1's words ("You've hit your 5-hour
   limit"): an attempt that hit one counted as failed.
 - An agent can no longer crash the daemon with a line too long for its follower, and a

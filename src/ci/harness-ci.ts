@@ -128,7 +128,11 @@ export function npmScripts(command: string): string[] {
 
 /** A pattern as written in a config: `./x` is `x`, and `dir/` is `dir/**`. */
 function normalisePattern(pattern: string): string {
-  return pattern.replace(/^(?:\.?\/)+/, '').replace(/\/+$/, '/**');
+  const path = pattern.replace(/^(?:\.?\/)+/, '');
+  // Trailing slashes are counted by hand: /\/+$/ takes quadratic time on a run of slashes before the end.
+  let end = path.length;
+  while (end > 0 && path[end - 1] === '/') end--;
+  return end === path.length ? path : `${path.slice(0, end)}/**`;
 }
 
 /** Each pattern's regular expression, made once. */
