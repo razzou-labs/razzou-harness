@@ -3,13 +3,17 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
-## Unreleased
+## 0.3.0 (2026-11-07)
 
-Fixes from a review of 0.2.0. **Upgrading:** run `harness install-ci` and commit the CI
-files it writes before the next `Arch:` pull request: the protected paths changed, and
-the lock the daemon writes lists more, which the old CI script on `main` would refuse.
-Rebuild the agents' image with `harness doctor --build-images`: its tag now follows the
-harness's version. `harness setup` does both.
+**Upgrading a project from 0.2.x:** install the new version, then run `harness setup`
+in the project, which does both steps, or do them by hand. Run `harness install-ci` and
+commit the CI files it writes before the next `Arch:` pull request: the protected paths
+changed, and the lock the daemon writes lists more, which the old CI script on `main`
+would refuse. Rebuild the agents' image with `harness doctor --build-images`: its tag
+now follows the harness's version. Then open the dashboard from the link the daemon
+prints, once.
+
+Fixes from a review of 0.2.0.
 
 Protected files:
 - Paths with a non-ASCII character, a quote or a backslash passed every protection rule,
