@@ -3,6 +3,21 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## 0.4.6 (2026-11-08)
+
+**Upgrading from 0.4.5:** install the new version, rebuild the agents' image with
+`harness doctor --build-images` (its tag follows the harness's version), then restart the
+daemon with `harness down` and `harness up`. A repository that already has the
+`INFRACOST_API_KEY` secret needs nothing else.
+
+- **`harness setup` asks for the cost job's Infracost token** at a hidden prompt, once the
+  project has Terraform and while its repository has no `INFRACOST_API_KEY` secret, and
+  sets the secret with `gh`. The token is free, from your Infracost organization's
+  Settings, CLI tokens; Enter skips it. `harness doctor` says whether the secret is set.
+  Infracost's current CLI, 2.x, stores no key, so the README no longer points at
+  `infracost auth login`. The cost job was checked on a real repository with such a token:
+  its pinned Infracost 0.10.47 priced a KMS key at 1 USD a month, and the daemon read it.
+
 ## 0.4.5 (2026-11-08)
 
 **Upgrading from 0.4.4:** install the new version, rebuild the agents' image with

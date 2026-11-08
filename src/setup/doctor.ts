@@ -215,6 +215,15 @@ async function project(options: DoctorOptions, config: Config, report: (c: Check
       else if (ruleset.offMain) report(fail('ruleset', ruleset.offMain, offMainFix(repo)));
       else report(ok('ruleset', `requires ${ruleset.checks.join(', ')}`));
     }
+    // The cost job's key: optional, so it is reported, never asked for here. `harness setup` asks once.
+    if (config.terraform) {
+      const set = await repositorySecret(repo, 'INFRACOST_API_KEY');
+      report(set
+        ? ok('Infracost key', 'INFRACOST_API_KEY is set: the cost job estimates each pull request')
+        : { status: 'skip', name: 'Infracost key', detail: set === false
+          ? "INFRACOST_API_KEY isn't set: the cost job estimates nothing, and Swarm leaves INFRA and MIXED plans to you. `harness setup` asks for it"
+          : "your gh login can't tell whether INFRACOST_API_KEY is set" });
+    }
     for (const file of ['.github/workflows/harness.yml', '.github/harness/harness-ci.ts']) {
       const local = join(options.projectDir, file);
       const packaged = join(options.packageDir, file.endsWith('.yml') ? 'templates/harness.yml' : 'src/ci/harness-ci.ts');
@@ -457,6 +466,13 @@ interface Ruleset {
 /** A default branch other than main is the owner's to change: the ruleset applies to the default branch. */
 const offMainFix = (repo: string) => `make main the repository's default branch on GitHub, then run \`harness github-setup --repo ${repo}\``;
 
+/** Whether the repository has the Actions secret, read with the owner's own `gh` login: undefined when it can't tell. */
+export async function repositorySecret(repo: string, name: string): Promise<boolean | undefined> {
+  const result = await run('gh', ['api', `repos/${repo}/actions/secrets/${name}`]).catch(() => undefined);
+  if (result?.code === 0) return true;
+  return /\(HTTP 404\)/.test(result?.stderr ?? '') ? false : undefined;
+}
+
 /** The ruleset on main, read with the owner's own `gh` login: the App may not read administration settings. */
 export async function mainRuleset(repo: string): Promise<Ruleset | undefined> {
   const list = await run('gh', ['api', `repos/${repo}/rulesets`]).catch(() => undefined);
@@ -504,7 +520,7 @@ async function ask(question: string): Promise<string> {
 }
 
 /** Reads a secret without echoing it. */
-function askSecret(question: string): Promise<string> {
+export function askSecret(question: string): Promise<string> {
   process.stdout.write(question);
   const stdin = process.stdin;
   stdin.setRawMode(true);

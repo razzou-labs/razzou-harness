@@ -6,7 +6,7 @@ import { configDir, loadAppCredentials } from '../github/app.ts';
 import { applyRepositoryRules, checkApp, createApp, installCi, type RulesetOptions } from '../github/setup.ts';
 import type { Mode, State } from '../state/state.ts';
 import { run, sha256 } from '../util.ts';
-import { doctor, granted, type Check } from './doctor.ts';
+import { doctor, granted, repositorySecret, type Check } from './doctor.ts';
 import { appBot, githubRepo, init } from './init.ts';
 import { writeTerraformScaffold, type TerraformLayout, type TerraformScaffold } from './terraform.ts';
 
@@ -26,6 +26,8 @@ export interface SetupOptions {
   owner?: string;
   say: (line: string) => void;
   ask: (question: string) => Promise<string>;
+  /** Asks for a secret without echoing it. */
+  askSecret: (question: string) => Promise<string>;
   /** Opens a page in the owner's browser. */
   open: (url: string) => void;
   /** Runs a program with the owner's terminal, like `gh auth login`, and returns its exit code. */
@@ -229,11 +231,11 @@ async function ownerLogin(options: SetupOptions): Promise<string | undefined> {
 }
 
 /**
- * The questions (v4 §4), asked once: AWS, and the owner's hours. The network needs none:
- * a project gets every bundle unless its config lists fewer. What they settle goes into
- * harness/config.json, with the lock that hashes it, and into .harness/setup.json for
- * the daemon. The view role's ARN goes to the doctor, which creates the AWS provider
- * with it.
+ * The questions (v4 §4), asked once: AWS, Infracost's token once there is Terraform, and
+ * the owner's hours. The network needs none: a project gets every bundle unless its config
+ * lists fewer. What they settle goes into harness/config.json, with the lock that hashes
+ * it, into .harness/setup.json for the daemon, and the token into a repository secret.
+ * The view role's ARN goes to the doctor, which creates the AWS provider with it.
  */
 async function askSettings(options: SetupOptions): Promise<{ written: string[]; viewRole?: string }> {
   const { projectDir, say, ask } = options;
@@ -281,6 +283,7 @@ async function askSettings(options: SetupOptions): Promise<{ written: string[]; 
       written.push(...scaffold);
     }
   }
+  if (config.terraform && config.project?.repo) await infracostKey(options, config.project.repo);
 
   if (changed) {
     writeFileSync(configFile, `${JSON.stringify(config, null, 2)}\n`);
@@ -303,6 +306,26 @@ async function askSettings(options: SetupOptions): Promise<{ written: string[]; 
     }
   }
   return { written, ...(viewRole ? { viewRole } : {}) };
+}
+
+/** Where an Infracost organization's CLI tokens are: its Settings, on this site. */
+export const INFRACOST_DASHBOARD = 'https://dashboard.infracost.io';
+
+/**
+ * The cost job's key (v3 §5.3): Infracost's token as the repository secret
+ * INFRACOST_API_KEY, asked for while it is missing. It is optional: without it the cost job
+ * estimates nothing, and Swarm leaves INFRA and MIXED plans to the owner. The token goes
+ * from the hidden prompt to gh's input, and nowhere else.
+ */
+export async function infracostKey(options: Pick<SetupOptions, 'say' | 'askSecret'>, repo: string): Promise<void> {
+  const { say } = options;
+  if ((await repositorySecret(repo, 'INFRACOST_API_KEY')) !== false) return;
+  say(`\nThe cost job estimates, with Infracost, what each pull request adds to the AWS bill a month. It needs a free token: on ${INFRACOST_DASHBOARD}, your organization's Settings, CLI tokens.`);
+  const token = (await options.askSecret('Infracost token (hidden, or Enter to skip): ')).trim();
+  if (!token) return say('Skipped: the cost job estimates nothing, and Swarm leaves INFRA and MIXED plans to you. `harness setup` asks again.');
+  const set = await run('gh', ['secret', 'set', 'INFRACOST_API_KEY', '--repo', repo], { input: token });
+  if (set.code !== 0) return say(`GitHub: INFRACOST_API_KEY was not set: ${(set.stderr || set.stdout).trim().split('\n')[0]}`);
+  say('GitHub: the secret INFRACOST_API_KEY is set: the cost job estimates each pull request.');
 }
 
 /**
