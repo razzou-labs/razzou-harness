@@ -3,7 +3,10 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
-## Unreleased
+## 0.4.4 (2026-11-08)
+
+**Upgrading from 0.4.3:** install the new version, then rebuild the agents' image with
+`harness doctor --build-images`: its tag follows the harness's version.
 
 - **Claude's tokens, in the dashboard.** A meter beside the agents' hours counts every
   token Claude used for the project, written and read (the prompt cache included), and
