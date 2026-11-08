@@ -3,7 +3,10 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
-## Unreleased
+## 0.4.3 (2026-11-08)
+
+**Upgrading from 0.4.2:** install the new version, then rebuild the agents' image with
+`harness doctor --build-images`: its tag follows the harness's version.
 
 - **`harness setup` writes the Terraform scaffold** your bootstrap expects, when you
   answer its AWS questions, and on any later run: a partial `backend "s3" {}` block in
