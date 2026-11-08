@@ -8,6 +8,7 @@ import type { Mode, State } from '../state/state.ts';
 import { run, sha256 } from '../util.ts';
 import { doctor, granted, type Check } from './doctor.ts';
 import { appBot, githubRepo, init } from './init.ts';
+import { writeTerraformScaffold, type TerraformLayout, type TerraformScaffold } from './terraform.ts';
 
 /**
  * `harness setup` (proposal v4 §4): the doctor with hands. It walks the setup in order,
@@ -241,6 +242,7 @@ async function askSettings(options: SetupOptions): Promise<{ written: string[]; 
   const written: string[] = [];
   let changed = false;
   let viewRole: string | undefined;
+  let account: string | undefined;
 
   if (!config.aws && /^y/i.test(await ask('Does this project deploy to AWS with Terraform? [y/N] '))) {
     say('The roles come from your bootstrap (see the README\'s AWS section); the key is asked for later, at a hidden prompt.');
@@ -257,6 +259,26 @@ async function askSettings(options: SetupOptions): Promise<{ written: string[]; 
       viewRole = view;
       const repo = config.project?.repo as string | undefined;
       if (repo) await configureGitHubForAws(options, repo, { region, plan, apply });
+      account = /^arn:aws:iam::(\d{12}):/.exec(view)![1]!;
+    }
+  }
+
+  // The Terraform scaffold the bootstrap expects, which the doctor checks: whatever of it is
+  // missing, on this run or a later one. A later run reads the account from the plan role
+  // this one stored on GitHub.
+  if (config.aws?.region && config.terraform) {
+    const repo = config.project?.repo as string | undefined;
+    account ??= /^arn:aws:iam::(\d{12}):/.exec((await githubVariable(repo, 'AWS_ROLE_PLAN_ARN_STAGING')) ?? '')?.[1];
+    if (account) {
+      const layout = { dir: 'iac', backendConfig: 'backend-configs/staging.hcl', varFile: 'env/staging.tfvars', ...(config.terraform as object) } as TerraformLayout;
+      // As the schema reads it: `iac`, `./iac` and `iac/` are one folder. Slashes are trimmed by hand: a regex would take quadratic time on a long run of them.
+      let dir = layout.dir;
+      while (dir.startsWith('./') || dir.startsWith('/')) dir = dir.slice(dir.startsWith('./') ? 2 : 1);
+      while (dir.endsWith('/')) dir = dir.slice(0, -1);
+      layout.dir = dir || 'iac';
+      const scaffold = writeTerraformScaffold(projectDir, layout, await terraformFacts(repo, String(config.project?.name ?? 'project'), String(config.aws.region), account));
+      if (scaffold.length > 0) say(`Terraform: wrote ${scaffold.join(', ')}.`);
+      written.push(...scaffold);
     }
   }
 
@@ -282,6 +304,33 @@ async function askSettings(options: SetupOptions): Promise<{ written: string[]; 
   }
   return { written, ...(viewRole ? { viewRole } : {}) };
 }
+
+/**
+ * Where the project's state lives, and its repository's numeric ids: read from GitHub, where
+ * the bootstrap's configure-github.sh set TF_STATE_BUCKET_STAGING and TF_STATE_KEY_STAGING,
+ * or else by the bootstrap's naming, `tf-state-staging-<account>` and
+ * `staging/<repository>/terraform.tfstate`.
+ */
+async function terraformFacts(repo: string | undefined, name: string, region: string, account: string): Promise<TerraformScaffold> {
+  const bucket = await githubVariable(repo, 'TF_STATE_BUCKET_STAGING');
+  const key = await githubVariable(repo, 'TF_STATE_KEY_STAGING');
+  const ids = (await ghApi(repo, `repos/${repo}`, '"\\(.owner.id) \\(.id)"'))?.split(' ');
+  return {
+    region,
+    account,
+    bucket: bucket ?? `tf-state-staging-${account}`,
+    key: key ?? `staging/${repo ? repo.split('/')[1] : name}/terraform.tfstate`,
+    ...(repo && ids?.length === 2 ? { github: { repo, ownerId: ids[0]!, repoId: ids[1]! } } : {}),
+  };
+}
+
+/** What the owner's gh reads at `path`, through `jq`; undefined without a repository, or on any failure. */
+async function ghApi(repo: string | undefined, path: string, jq: string): Promise<string | undefined> {
+  const result = repo ? await run('gh', ['api', path, '--jq', jq]).catch(() => undefined) : undefined;
+  return result?.code === 0 && result.stdout.trim() ? result.stdout.trim() : undefined;
+}
+
+const githubVariable = (repo: string | undefined, name: string) => ghApi(repo, `repos/${repo}/actions/variables/${name}`, '.value');
 
 /** The staging environment, restricted to main, and the variables the workflow reads, with the owner's gh. */
 async function configureGitHubForAws(options: SetupOptions, repo: string, aws: { region: string; plan: string; apply: string }): Promise<void> {

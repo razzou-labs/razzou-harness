@@ -1,0 +1,105 @@
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+
+/** Where the project's Terraform is, as `harness/config.json` says under `terraform`. */
+export interface TerraformLayout {
+  dir: string;
+  backendConfig: string;
+  varFile: string;
+}
+
+/** What a project's Terraform scaffold says: where its state lives, and the facts its Terraform reads. */
+export interface TerraformScaffold {
+  region: string;
+  account: string;
+  /** The bootstrap's state bucket, and the project's key in it. */
+  bucket: string;
+  key: string;
+  /** The repository and its numeric ids, which OIDC trust policies pin; none for a local project. */
+  github?: { repo: string; ownerId: string; repoId: string } | undefined;
+}
+
+/**
+ * Writes the Terraform scaffold the bootstrap expects in the layout's folder: a partial
+ * `backend "s3"` block in `versions.tf`, the backend config and the variables file, and the
+ * variables and provider those values feed. Only what is missing is written: an existing
+ * file, or a backend block in any of the folder's `.tf` files, is the project's own. The
+ * backend config sets no encryption, so the bucket's default, the bootstrap's KMS key,
+ * applies: `encrypt = true` without `kms_key_id` would replace it with SSE-S3. Every file
+ * is as `terraform fmt` writes it, which CI checks. Returns the paths written, from the
+ * project's root.
+ */
+export function writeTerraformScaffold(projectDir: string, layout: TerraformLayout, values: TerraformScaffold): string[] {
+  const { dir } = layout;
+  const written: string[] = [];
+  const write = (path: string, content: string) => {
+    const file = join(projectDir, dir, path);
+    if (existsSync(file)) return false;
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, content);
+    written.push(`${dir}/${path}`);
+    return true;
+  };
+  const folder = join(projectDir, dir);
+  const hasBackend = existsSync(folder)
+    && readdirSync(folder).filter((f) => f.endsWith('.tf')).some((f) => /^\s*backend\s+"/m.test(readFileSync(join(folder, f), 'utf8')));
+  if (!hasBackend) {
+    write('versions.tf', [
+      'terraform {',
+      '  required_version = ">= 1.10"',
+      '',
+      '  required_providers {',
+      '    aws = {',
+      '      source  = "hashicorp/aws"',
+      '      version = "~> 6.65"',
+      '    }',
+      '  }',
+      '',
+      `  # Partial configuration: the values are in ${layout.backendConfig}, for`,
+      `  #   terraform init -backend-config=${layout.backendConfig}`,
+      '  backend "s3" {}',
+      '}',
+      '',
+    ].join('\n'));
+  }
+  write(layout.backendConfig, [
+    ...assignments([['bucket', values.bucket], ['key', values.key], ['region', values.region]]),
+    '',
+    "# No encrypt or kms_key_id: the bucket's default encryption, its KMS key, applies.",
+    '# encrypt = true without kms_key_id would replace it with SSE-S3.',
+    'use_lockfile = true',
+    '',
+  ].join('\n'));
+  const github = values.github;
+  const variables: Array<[string, string, string]> = [
+    ['env', 'staging', 'The environment.'],
+    ['aws_account_id', values.account, 'The AWS account the environment is in.'],
+    ['aws_region', values.region, 'The AWS region the environment is in.'],
+    ...(github ? [
+      ['github_repo', github.repo, 'The GitHub repository, as owner/name.'],
+      ['github_owner_id', github.ownerId, "The repository owner's numeric id, which OIDC trust policies pin."],
+      ['github_repo_id', github.repoId, "The repository's numeric id, which OIDC trust policies pin."],
+    ] as Array<[string, string, string]> : []),
+  ];
+  const tfvars = [
+    ...assignments(variables.slice(0, 3).map(([name, value]) => [name, value])),
+    ...(github ? ['', ...assignments(variables.slice(3).map(([name, value]) => [name, value]))] : []),
+    '',
+  ].join('\n');
+  // The variables follow the values: a tfvars file of the project's own sets its own.
+  if (write(layout.varFile, tfvars)) {
+    write('variables.tf', variables.map(([name, , description]) => [
+      `variable "${name}" {`,
+      ...assignments([['description', description], ['type', 'string']], ['type']).map((line) => `  ${line}`),
+      '}',
+    ].join('\n')).join('\n\n') + '\n');
+    write('providers.tf', ['provider "aws" {', '  region = var.aws_region', '}', ''].join('\n'));
+  }
+  return written;
+}
+
+/** `name = "value"` lines with their equals signs aligned, as `terraform fmt` aligns them; `bare` names take an expression, unquoted. */
+function assignments(pairs: Array<[string, string]>, bare: string[] = []): string[] {
+  const width = Math.max(...pairs.map(([name]) => name.length));
+  return pairs.map(([name, value]) => `${name.padEnd(width)} = ${bare.includes(name) ? value : JSON.stringify(value)}`);
+}

@@ -8,6 +8,7 @@ import { granted, mainRuleset } from '../src/setup/doctor.ts';
 import { init } from '../src/setup/init.ts';
 import { recover } from '../src/setup/recover.ts';
 import { awsProviderName, commitAndPush, fixFor, linkRepo, type SetupOptions } from '../src/setup/setup.ts';
+import { writeTerraformScaffold } from '../src/setup/terraform.ts';
 import { run, runOk } from '../src/util.ts';
 import { FakeForge } from './helpers/fake-forge.ts';
 import { createToyRepo, tempDir } from './helpers/toy-repo.ts';
@@ -242,5 +243,58 @@ describe('harness recover', () => {
     const notes = await recover({ projectDir, harnessDir: join(projectDir, '.harness'), forge: fake });
     assert.equal(notes[0], 'demo/P1: completed');
     assert.match(notes.at(-1)!, /^Nor what you set: the mode is Manual again .*the hours of your time .*the owner tasks you marked done are pending again/);
+  });
+});
+
+describe('the Terraform scaffold', () => {
+  const values = { region: 'eu-west-1', account: '123456789012', bucket: 'tf-state-staging-123456789012', key: 'staging/shop/terraform.tfstate' };
+  const LAYOUT = { dir: 'iac', backendConfig: 'backend-configs/staging.hcl', varFile: 'env/staging.tfvars' };
+
+  it("writes what the bootstrap expects, as terraform fmt writes it, with the bucket's own encryption", () => {
+    const dir = tempDir('scaffold');
+    const written = writeTerraformScaffold(dir, LAYOUT, { ...values, github: { repo: 'acme/shop', ownerId: '42', repoId: '4242' } });
+    assert.deepEqual(written, ['iac/versions.tf', 'iac/backend-configs/staging.hcl', 'iac/env/staging.tfvars', 'iac/variables.tf', 'iac/providers.tf']);
+    const read = (path: string) => readFileSync(join(dir, 'iac', path), 'utf8');
+    assert.match(read('versions.tf'), /required_version = ">= 1\.10"[\s\S]*source  = "hashicorp\/aws"\n      version = "~> 6\.65"[\s\S]*\n  backend "s3" \{\}\n\}\n$/);
+    assert.equal(read('backend-configs/staging.hcl'), [
+      'bucket = "tf-state-staging-123456789012"',
+      'key    = "staging/shop/terraform.tfstate"',
+      'region = "eu-west-1"',
+      '',
+      "# No encrypt or kms_key_id: the bucket's default encryption, its KMS key, applies.",
+      '# encrypt = true without kms_key_id would replace it with SSE-S3.',
+      'use_lockfile = true',
+      '',
+    ].join('\n'));
+    assert.equal(read('env/staging.tfvars'), [
+      'env            = "staging"',
+      'aws_account_id = "123456789012"',
+      'aws_region     = "eu-west-1"',
+      '',
+      'github_repo     = "acme/shop"',
+      'github_owner_id = "42"',
+      'github_repo_id  = "4242"',
+      '',
+    ].join('\n'));
+    assert.match(read('variables.tf'), /^variable "env" \{\n  description = "The environment\."\n  type        = string\n\}\n\nvariable "aws_account_id" \{/);
+    assert.equal((read('variables.tf').match(/^variable "/gm) ?? []).length, 6);
+    assert.equal(read('providers.tf'), 'provider "aws" {\n  region = var.aws_region\n}\n');
+  });
+
+  it("keeps the project's own files, and its backend block wherever it is", () => {
+    const dir = tempDir('scaffold-own');
+    mkdirSync(join(dir, 'iac', 'env'), { recursive: true });
+    writeFileSync(join(dir, 'iac', 'main.tf'), 'terraform {\n  backend "s3" {}\n}\n');
+    writeFileSync(join(dir, 'iac', 'env', 'staging.tfvars'), 'mine = true\n');
+    assert.deepEqual(writeTerraformScaffold(dir, LAYOUT, values), ['iac/backend-configs/staging.hcl']);
+    assert.equal(readFileSync(join(dir, 'iac', 'env', 'staging.tfvars'), 'utf8'), 'mine = true\n');
+    assert.deepEqual(writeTerraformScaffold(dir, LAYOUT, values), [], 'a second run writes nothing');
+  });
+
+  it('leaves the repository variables out for a local project', () => {
+    const dir = tempDir('scaffold-local');
+    writeTerraformScaffold(dir, { ...LAYOUT, dir: 'infra' }, values);
+    assert.doesNotMatch(readFileSync(join(dir, 'infra', 'env', 'staging.tfvars'), 'utf8'), /github/);
+    assert.equal((readFileSync(join(dir, 'infra', 'variables.tf'), 'utf8').match(/^variable "/gm) ?? []).length, 3);
   });
 });

@@ -3,6 +3,18 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## Unreleased
+
+- **`harness setup` writes the Terraform scaffold** your bootstrap expects, when you
+  answer its AWS questions, and on any later run: a partial `backend "s3" {}` block in
+  `iac/versions.tf`, `iac/backend-configs/staging.hcl` with the state bucket and the
+  project's key, read from the GitHub variables the bootstrap set, `iac/env/staging.tfvars`
+  with the account, the region and the repository's ids, and the variables and provider
+  they feed. Only missing files are written, a backend block of the project's own is
+  kept, and the files are committed with setup's others. The backend config sets no
+  encryption, so the bucket's default, its KMS key, applies. Until now the doctor
+  required these files and nothing wrote them.
+
 ## 0.4.2 (2026-11-08)
 
 **Upgrading from 0.4.1:** upgrade OpenShell to 0.1.7 first, from its Debian package
