@@ -181,8 +181,8 @@ export const ConfigSchema = z.object({
       region: z.string().regex(/^[a-z]{2}(-[a-z]+)+-\d$/, 'an AWS region, like us-east-1'),
       /** The OpenShell provider holding the view role, like "aws-view-shop". */
       provider: z.string().min(1),
-      /** The services the project uses: their endpoints are reachable, and signed. */
-      services: z.array(z.string().regex(/^[a-z0-9-]+$/)).default(['sts', 's3', 'iam']),
+      /** The services whose endpoints are reachable, and signed; `all`, the default, is every one, so the view role alone decides. */
+      services: z.array(z.string().regex(/^[a-z0-9-]+$/)).default(['all']),
     })
     .optional(),
   /** Where the project's Terraform lives, and how a plan is made against the real state (§12.4). */

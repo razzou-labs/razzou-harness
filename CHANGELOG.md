@@ -3,6 +3,34 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## 0.4.2 (2026-11-08)
+
+**Upgrading from 0.4.1:** upgrade OpenShell to 0.1.7 first, from its Debian package
+(`sudo dpkg -i openshell_0.1.7-1_amd64.deb`); the gateway keeps its providers and
+profiles. Then install the new version, and rebuild the agents' image with `harness
+doctor --build-images`: its tag follows the harness's version. A project's AWS services
+stay as its `harness/config.json` lists them; for every one, set `"services": ["all"]`
+under `aws`.
+
+- **OpenShell 0.1.7.** The harness is pinned to it, and tested with it: the probe passes
+  with every bundle and every AWS service, and the Architect's terminal and the shell
+  in a sandbox work. The doctor's and setup's fix for a stopped gateway now starts its
+  systemd user service: OpenShell's CLI has no command for it.
+- **Every AWS service by default.** `"all"` in `aws.services` is every service the AWS
+  SDK knows, about 420 endpoints in a region with the global ones, each signed with the
+  view role under its own signing name, as OpenShell requires. It is the default, and
+  `harness setup` no longer asks which services the project uses: the view role alone
+  decides what agents read. The table comes from the AWS SDK's own data
+  (`scripts/aws-services.ts` writes it).
+- **AWS reads with `GET` work.** OpenShell's automatic `sigv4` mode signs a request
+  with neither a body nor `x-amz-content-sha256` as `UNSIGNED-PAYLOAD`, which only S3
+  accepts ([NVIDIA/OpenShell#5375](https://github.com/NVIDIA/OpenShell/issues/5375)):
+  every service that reads with `GET`, such as Lambda, API Gateway, EKS, Route 53,
+  CloudFront and Bedrock, answered `SignatureDoesNotMatch` in the sandboxes, and a
+  `terraform plan` there failed on their resources. Every AWS endpoint but S3's is now
+  signed with `sigv4:body`, the hash of the request's body, empty for a `GET`: the AWS
+  CLI's calls to those services and a `terraform plan` reading them work.
+
 ## 0.4.1 (2026-11-08)
 
 **Upgrading a project from 0.4.0:** install the new version, then rebuild the agents'

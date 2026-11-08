@@ -248,11 +248,10 @@ async function askSettings(options: SetupOptions): Promise<{ written: string[]; 
     const view = (await ask("The agents' view role ARN (arn:aws:iam::<account>:role/harness-<project>-view): ")).trim();
     const plan = (await ask('The CI plan role ARN: ')).trim();
     const apply = (await ask('The CI apply role ARN: ')).trim();
-    const services = (await ask('The AWS services the project uses, comma-separated (sts, s3, iam, ...): ')).split(/[,\s]+/).filter(Boolean);
     if (!region || !VIEW_ROLE.test(view) || !ROLE.test(plan) || !ROLE.test(apply)) {
       say('AWS skipped: a value is missing or malformed. Add `aws` and `terraform` to harness/config.json by hand, or run `harness setup` again.');
     } else {
-      config.aws = { region, provider: awsProviderName(projectDir, config.project?.repo), services: [...new Set(['sts', ...services])] };
+      config.aws = { region, provider: awsProviderName(projectDir, config.project?.repo), services: ['all'] };
       config.terraform = { dir: 'iac', backendConfig: 'backend-configs/staging.hcl', varFile: 'env/staging.tfvars' };
       changed = true;
       viewRole = view;
@@ -356,9 +355,10 @@ async function applyFix(options: SetupOptions, config: Config, fix: Fix, sleep: 
   const repo = config.project.repo;
   switch (fix.kind) {
     case 'start-gateway': {
-      const started = await run('openshell', ['gateway', 'start']).catch(() => undefined);
+      // OpenShell's Debian package runs the gateway as a systemd user service; its CLI has no command to start it.
+      const started = await run('systemctl', ['--user', 'start', 'openshell-gateway']).catch(() => undefined);
       if (started?.code === 0) say('OpenShell: gateway started.');
-      else say(`OpenShell: the gateway did not start: ${(started?.stderr || started?.stdout || 'openshell is missing').trim()}`);
+      else say(`OpenShell: the gateway did not start: ${(started?.stderr || started?.stdout || 'systemctl is missing').trim()}`);
       return started?.code === 0;
     }
     case 'create-app':

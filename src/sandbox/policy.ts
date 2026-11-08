@@ -1,4 +1,5 @@
 import { BUNDLES, bundleNames, checkHost, type HostRule } from './allowlist.ts';
+import { GLOBAL_SERVICES, REGIONAL_SERVICES } from './aws-services.ts';
 
 /** A third-party API the sandboxes may call with any method; with `key`, the variable its key is read from. */
 export interface Api {
@@ -25,26 +26,49 @@ const AWS_SERVICES: Record<string, { hosts: (region: string) => string[]; signin
   route53: { hosts: () => ['route53.amazonaws.com'], signing: 'route53', global: true },
 };
 
+/** In `aws.services`, every AWS service: the view role alone then decides what agents read. */
+export const ALL_SERVICES = 'all';
+
 /**
  * One signed endpoint per host. `access: full`, because most AWS APIs are POSTs: the
- * role itself is what allows only reads (spike 2).
+ * role itself is what allows only reads (spike 2). OpenShell signs only for endpoints
+ * named with their service, with no rule for every AWS host, so `all` names every one
+ * the AWS SDK knows (aws-services.ts), with the hosts that carry a bucket's or an
+ * account's name in front.
+ *
+ * Every service but S3 is signed with `sigv4:body`: the hash of the request's body, an
+ * empty one for a GET. OpenShell's automatic `sigv4` signs a request with neither a body
+ * nor `x-amz-content-sha256` as UNSIGNED-PAYLOAD, which only S3 accepts, so every other
+ * service's GET failed (NVIDIA/OpenShell#5375). S3 keeps it: its SDKs say how to sign.
  */
 function awsEndpoints(aws: NonNullable<PolicyOptions['aws']>): object[] {
-  return aws.services.flatMap((service) => {
+  const signed = (host: string, service: string, region?: string): { host: string } => ({
+    host,
+    port: 443,
+    protocol: 'rest',
+    enforcement: 'enforce',
+    access: 'full',
+    credential_binding: { provider: aws.provider },
+    credential_signing: service === 's3' ? 'sigv4' : 'sigv4:body',
+    signing_service: service,
+    ...(region ? { signing_region: region } : {}),
+  } as { host: string });
+  const named = aws.services.filter((service) => service !== ALL_SERVICES).flatMap((service) => {
     const known = AWS_SERVICES[service];
     const hosts = known ? known.hosts(aws.region) : [`${service}.${aws.region}.amazonaws.com`];
-    return hosts.map((host) => ({
-      host,
-      port: 443,
-      protocol: 'rest',
-      enforcement: 'enforce',
-      access: 'full',
-      credential_binding: { provider: aws.provider },
-      credential_signing: 'sigv4',
-      signing_service: known?.signing ?? service,
-      ...(known?.global ? { signing_region: 'us-east-1' } : {}),
-    }));
+    return hosts.map((host) => signed(host, known?.signing ?? service, known?.global ? 'us-east-1' : undefined));
   });
+  const all = aws.services.includes(ALL_SERVICES)
+    ? [
+        ...REGIONAL_SERVICES.map(([prefix, service, template]) => signed((template ?? '{service}.{region}.{dnsSuffix}').replace('{service}', prefix).replace('{region}', aws.region).replace('{dnsSuffix}', 'amazonaws.com'), service)),
+        signed(`*.s3.${aws.region}.amazonaws.com`, 's3'),
+        signed(`*.s3-control.${aws.region}.amazonaws.com`, 's3'),
+        ...GLOBAL_SERVICES.map(([, host, service, region]) => signed(host, service, region)),
+      ]
+    : [];
+  // One rule per host, a named service's first.
+  const endpoints = [...named, ...all];
+  return endpoints.filter((endpoint, i) => endpoints.findIndex((other) => other.host === endpoint.host) === i);
 }
 
 /**
