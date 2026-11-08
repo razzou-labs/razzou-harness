@@ -104,6 +104,12 @@ application code, and never `.github/`: CI refuses both.
     resources. CI doesn't run checks that need `aws`.
 - Project-wide checks, such as `npm run lint`, go in `harness/config.json` under
   `checks`. The npm scripts they run become protected.
+- Third-party APIs the code calls, such as a payment provider's test API, go in
+  `harness/config.json` under `network.apis`: `{ "host": "api.stripe.com", "key":
+  "STRIPE_API_KEY" }`, with `key` only for an API that needs one. The code reads the key
+  from that variable; never write a key in the repository. The owner stores it, and no
+  new attempt starts until they do. CI has no key, so no pre-merge check may depend on
+  calling the API.
 
 **Owner actions**: `harness/modules/<module>/owner-actions.json`, if the owner has
 anything to do.

@@ -7,7 +7,7 @@ import { computeLock, directoryReader } from '../src/ci/harness-ci.ts';
 import { granted, mainRuleset } from '../src/setup/doctor.ts';
 import { init } from '../src/setup/init.ts';
 import { recover } from '../src/setup/recover.ts';
-import { awsProviderName, commitAndPush, fixFor, linkRepo, parseBundles, type SetupOptions } from '../src/setup/setup.ts';
+import { awsProviderName, commitAndPush, fixFor, linkRepo, type SetupOptions } from '../src/setup/setup.ts';
 import { run, runOk } from '../src/util.ts';
 import { FakeForge } from './helpers/fake-forge.ts';
 import { createToyRepo, tempDir } from './helpers/toy-repo.ts';
@@ -72,12 +72,6 @@ describe('harness setup (v4 §4)', () => {
     assert.equal(fixFor(check('ruleset', 'fail', 'applies to the default branch, master, not to main')), undefined, 'the default branch is the owner\'s to change');
     assert.deepEqual(fixFor(check('.github/workflows/harness.yml', 'warn', 'differs from this version of the harness')), { kind: 'install-ci' });
     assert.equal(fixFor(check('Claude provider', 'fail', 'claude-sub is missing')), undefined, 'the doctor asks for the token itself');
-  });
-
-  it('reads the bundles the owner names, keeps core, and reports the unknown ones', () => {
-    assert.deepEqual(parseBundles(''), { bundles: ['core'], unknown: [] });
-    assert.deepEqual(parseBundles('node, python core'), { bundles: ['core', 'node', 'python'], unknown: [] });
-    assert.deepEqual(parseBundles('node,ruby'), { bundles: ['core', 'node'], unknown: ['ruby'] });
   });
 
   it('names the AWS provider after the repository, or else the folder and its path, so projects never share one', () => {

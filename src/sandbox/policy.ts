@@ -1,8 +1,16 @@
-import { BUNDLES, checkHost, type HostRule } from './allowlist.ts';
+import { BUNDLES, bundleNames, checkHost, type HostRule } from './allowlist.ts';
+
+/** A third-party API the sandboxes may call with any method; with `key`, the variable its key is read from. */
+export interface Api {
+  host: string;
+  key?: string | undefined;
+}
 
 export interface PolicyOptions {
   bundles: string[];
   extraHosts: string[];
+  /** Third-party APIs: one without a key is opened here; one with a key comes with its provider, whose profile opens it (apiProfile). */
+  apis?: Api[] | undefined;
   /** The project's AWS endpoints, signed in the proxy with the view-only role (§12.3). */
   aws?: { region: string; provider: string; services: string[] };
 }
@@ -54,16 +62,21 @@ const BINARIES = ['/usr/local/bin/claude', '/usr/bin/bash', '/usr/bin/dash'];
  */
 export function buildPolicy(options: PolicyOptions): object {
   const rules: HostRule[] = [];
-  for (const name of options.bundles) {
+  for (const name of bundleNames(options.bundles)) {
     const bundle = BUNDLES[name];
-    if (!bundle) throw new Error(`unknown network bundle "${name}" (known: ${Object.keys(BUNDLES).join(', ')})`);
+    if (!bundle) throw new Error(`unknown network bundle "${name}" (known: all, ${Object.keys(BUNDLES).join(', ')})`);
     rules.push(...bundle);
   }
   rules.push(...options.extraHosts.map((host): HostRule => ({ host, access: 'read' })));
 
   // A host's first rule wins: a bundle's, like github.com's with git, over an extra host's read-only one.
-  const unique = rules.filter((rule, i) => rules.findIndex((r) => r.host === rule.host) === i);
+  // An API's own rule wins over both, so a host listed as an API takes every method.
+  const apis = options.apis ?? [];
+  const apiHosts = new Set(apis.map((api) => api.host));
+  const unique = rules.filter((rule, i) => rules.findIndex((r) => r.host === rule.host) === i && !apiHosts.has(rule.host));
   unique.forEach((rule) => checkHost(rule.host));
+  apis.forEach((api) => checkHost(api.host));
+  const keyless = apis.filter((api) => !api.key);
   const binaries = BINARIES.map((path) => ({ path }));
 
   return {
@@ -77,7 +90,40 @@ export function buildPolicy(options: PolicyOptions): object {
       read_only_web: { endpoints: unique.filter((r) => r.access === 'read').map(readEndpoint), binaries },
       git_fetch: { endpoints: unique.filter((r) => r.access === 'git').map(gitEndpoint), binaries },
       ...(options.aws ? { aws_view: { endpoints: awsEndpoints(options.aws), binaries } } : {}),
+      ...(keyless.length > 0 ? { third_party_apis: { endpoints: keyless.map((api) => apiEndpoint(api.host)), binaries } } : {}),
     },
+  };
+}
+
+/** A third-party API's host, open to every method: the project's code calls it as it would in production. */
+function apiEndpoint(host: string): object {
+  return { host, port: 443, protocol: 'rest', enforcement: 'enforce', access: 'full' };
+}
+
+/**
+ * The OpenShell provider, and its profile, that hold a third-party API's key for a
+ * project. Providers are per machine, so the name says whose and which.
+ */
+export function apiProviderName(project: string, host: string): string {
+  const safe = (text: string) => text.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '');
+  return `api-${safe(project)}-${safe(host)}`;
+}
+
+/**
+ * The provider profile of a third-party API's key. A sandbox with the provider sees a
+ * placeholder in the variable, and OpenShell's proxy puts the key in its place on
+ * requests to the host alone: in any header, Basic auth included, and in the URL, but
+ * not in a request's body. The profile also opens the host to every method.
+ */
+export function apiProfile(project: string, api: Required<Api>): object {
+  return {
+    id: apiProviderName(project, api.host),
+    display_name: `${api.host} for ${project}`,
+    description: `The key of ${api.host} that the harness's sandboxes of ${project} use, as ${api.key}`,
+    category: 'other',
+    credentials: [{ name: 'key', description: `The key of ${api.host}`, env_vars: [api.key], required: true, auth_style: 'bearer', header_name: 'authorization' }],
+    endpoints: [{ host: api.host, port: 443, protocol: 'rest', access: 'full', enforcement: 'enforce' }],
+    binaries: BINARIES,
   };
 }
 

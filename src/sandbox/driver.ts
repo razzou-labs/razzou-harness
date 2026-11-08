@@ -69,4 +69,6 @@ export interface SandboxDriver {
   /** The sandbox's last `lines` log lines, among them the network requests its policy refused. */
   logs(name: string, lines: number): Promise<string>;
   gateway(): Promise<GatewayStatus>;
+  /** The names of the providers on the gateway: those holding credentials sandboxes may use. */
+  providers(): Promise<string[]>;
 }

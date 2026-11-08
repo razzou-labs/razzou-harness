@@ -18,7 +18,7 @@ import { rulesProblems } from '../github/setup.ts';
 import { toolsManifest, type Role } from '../roles.ts';
 import { PROJECT_LABEL, type ExecResult, type Follower, type SandboxDriver, type SandboxSpec } from '../sandbox/driver.ts';
 import { BUNDLES } from '../sandbox/allowlist.ts';
-import { buildPolicy } from '../sandbox/policy.ts';
+import { apiProviderName, buildPolicy } from '../sandbox/policy.ts';
 import { Denials, LOG_LINES } from '../sandbox/refusals.ts';
 import { EventStore, type CiJob, type HarnessEvent, type NewEvent, type Ref } from '../state/events.ts';
 import {
@@ -121,6 +121,8 @@ export class Orchestrator {
   private stepErrors = { key: '', count: 0 };
   /** When the left-over sandboxes are next deleted: at the first pass, then every hour. */
   private nextSweep = 0;
+  /** The gateway's providers, read at most once a minute, for the keys of the project's APIs. */
+  private providerNames?: { at: number; names: string[] };
   /** Errors in a row of each plan's step, and when it is tried again: one plan that keeps failing never stops the others. */
   private readonly planErrors = new Map<string, { count: number; retryAt: number }>();
   /** The heads of Arch and Fix PRs already given the reviewers' statuses as "not reviewed". */
@@ -303,9 +305,10 @@ export class Orchestrator {
     return true;
   }
 
-  /** The owner lifts a pause. */
+  /** The owner lifts a pause. An API key stored meanwhile counts at once. */
   resume(): boolean {
     if (!this.state.pipeline.paused) return false;
+    this.providerNames = undefined;
     this.record({ type: 'PIPELINE_RESUMED', payload: {} });
     this.kick();
     return true;
@@ -463,12 +466,37 @@ export class Orchestrator {
     }
     if (progressed) return 'progress';
     if (paused) return 'wait';
+    if (await this.apiKeysMissing()) return 'wait';
     // Manual builds one feature at a time, and looks at nothing else while it runs. Swarm starts
     // more while others run, up to its limit, and follows its other plans meanwhile (v3 §6.2).
     const swarm = this.state.mode === 'swarm';
     const limit = swarm ? this.design.config.swarm.maxDevelopers : 1;
     if (active.length >= limit && !swarm) return 'wait';
     return this.scheduleNext(active.length, limit);
+  }
+
+  /**
+   * An API of the design whose key isn't stored on this machine pauses the pipeline, with
+   * what to do: every new sandbox carries the API's provider, and OpenShell refuses one
+   * that doesn't exist. A design change that adds an API leads here.
+   */
+  private async apiKeysMissing(): Promise<boolean> {
+    const keyed = this.design.config.network.apis.filter((api) => api.key);
+    if (keyed.length === 0) return false;
+    if (!this.providerNames || this.now() - this.providerNames.at >= 60_000) {
+      try {
+        this.providerNames = { at: this.now(), names: await this.driver.providers() };
+      } catch (error) {
+        // The gateway's trouble shows elsewhere; this check doesn't hold the pipeline for it.
+        this.log(`the providers could not be listed: ${(error as Error).message}`);
+        return false;
+      }
+    }
+    const project = this.design.config.project.name;
+    const missing = keyed.filter((api) => !this.providerNames!.names.includes(apiProviderName(project, api.host)));
+    if (missing.length === 0) return false;
+    this.pausePipeline(`no key stored on this machine for ${missing.map((api) => api.host).join(', ')}: run \`harness doctor\` in a terminal, which asks for it, then resume`);
+    return true;
   }
 
   /** One attempt's next step. An error counts against this attempt alone, and interrupts it past the limit. */
@@ -1749,12 +1777,16 @@ export class Orchestrator {
    * A sandbox's providers, policy and settings. Agents get Claude; with AWS in the
    * project, they and the checks that need it also get the view role, which OpenShell
    * holds and signs with (§12.1). A provider is only attached where its endpoints are.
+   * Every sandbox gets the keys of the project's APIs, for the code it runs.
    */
   access(options: { claude: boolean; aws: boolean; allBundles?: boolean }): Pick<SandboxSpec, 'providers' | 'env' | 'labels' | 'cpu' | 'memory'> & { policyFile: string } {
     const aws = options.aws ? this.design.config.aws : undefined;
     const limits = this.state.sandboxLimits;
+    const project = this.design.config.project.name;
+    // The keys of the project's APIs, which OpenShell adds on requests to their hosts alone.
+    const apiKeys = this.design.config.network.apis.flatMap((api) => (api.key ? [apiProviderName(project, api.host)] : []));
     return {
-      providers: [...(options.claude ? [this.design.config.sandbox.claudeProvider] : []), ...(aws ? [aws.provider] : [])],
+      providers: [...(options.claude ? [this.design.config.sandbox.claudeProvider] : []), ...(aws ? [aws.provider] : []), ...apiKeys],
       policyFile: this.policyFile({ allBundles: options.allBundles ?? false, aws: aws !== undefined }),
       env: this.sandboxEnv(),
       // Every sandbox the daemon makes says whose it is: the dashboard tells them from other projects'.

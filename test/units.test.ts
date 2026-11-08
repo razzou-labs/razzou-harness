@@ -9,7 +9,7 @@ import { ConfigSchema, definitionHash, loadDesign, PlanSchema, requiredChecks } 
 import { DEVELOPER, HARNESS, Repo } from '../src/git/repo.ts';
 import { checkHost } from '../src/sandbox/allowlist.ts';
 import { githubRepo, init } from '../src/setup/init.ts';
-import { buildPolicy } from '../src/sandbox/policy.ts';
+import { apiProfile, apiProviderName, buildPolicy } from '../src/sandbox/policy.ts';
 import { EventStore } from '../src/state/events.ts';
 import { activeAttempts, attemptInSandbox, countedAttempts, project } from '../src/state/state.ts';
 import { clip, runOk } from '../src/util.ts';
@@ -139,6 +139,7 @@ describe('init', () => {
     assert.deepEqual(first.kept, ['README.md']);
     assert.ok(['harness/config.json', '.github/workflows/harness.yml', '.github/CODEOWNERS', 'init.sh', '.gitignore', 'harness/lock.json'].every((p) => first.wrote.includes(p)));
     assert.match(first.notes[0]!, /No GitHub App on this machine yet/);
+    assert.deepEqual(JSON.parse(readFileSync(join(dir, 'harness/config.json'), 'utf8')).network, { bundles: ['all'] }, 'every bundle, with no question');
     assert.deepEqual(JSON.parse(readFileSync(join(dir, 'harness/config.json'), 'utf8')).project, { name: dir.split('/').at(-1)!.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '') });
     assert.match(readFileSync(join(dir, '.github/CODEOWNERS'), 'utf8'), /^\/harness\/ @boss$/m);
     const second = await init({ projectDir: dir, packageDir: join(import.meta.dirname, '..'), version: '9.9.9', owner: 'boss' });
@@ -282,6 +283,56 @@ describe('sandbox policy', () => {
     assert.throws(() => checkHost('docs.**.example.com'));
     assert.doesNotThrow(() => checkHost('**.github.io'));
     assert.throws(() => buildPolicy({ bundles: ['nope'], extraHosts: [] }));
+  });
+
+  it('reads all as every bundle, and opens an API to every method, over a bundle\'s read-only rule', () => {
+    type Policy = { network_policies: Record<string, { endpoints: Array<Record<string, unknown>> }> };
+    const hosts = (policy: Policy) => Object.values(policy.network_policies).flatMap((p) => p.endpoints.map((e) => e.host));
+    const all = buildPolicy({ bundles: ['all'], extraHosts: [] }) as Policy;
+    for (const host of ['registry.npmjs.org', 'pypi.org', 'registry.terraform.io', 'proxy.golang.org', 'index.crates.io', 'repo1.maven.org', 'registry.opentofu.org', 'cdn.playwright.dev']) {
+      assert.ok(hosts(all).includes(host), `${host} is in every bundle's list`);
+    }
+    const policy = buildPolicy({ bundles: ['core'], extraHosts: [], apis: [{ host: 'api.github.com' }, { host: 'api.example.com' }, { host: 'api.stripe.com', key: 'STRIPE_API_KEY' }] }) as Policy;
+    assert.deepEqual(policy.network_policies.third_party_apis!.endpoints, [
+      { host: 'api.github.com', port: 443, protocol: 'rest', enforcement: 'enforce', access: 'full' },
+      { host: 'api.example.com', port: 443, protocol: 'rest', enforcement: 'enforce', access: 'full' },
+    ]);
+    assert.equal(hosts(policy).filter((host) => host === 'api.github.com').length, 1, "the API's rule replaces core's read-only one");
+    assert.ok(!hosts(policy).includes('api.stripe.com'), 'an API with a key is opened by its provider\'s profile');
+    assert.equal((buildPolicy({ bundles: ['core'], extraHosts: [] }) as Policy).network_policies.third_party_apis, undefined);
+  });
+
+  it("writes an API key's provider profile: the variable, the host alone, every method", () => {
+    assert.equal(apiProviderName('People Infra', 'api.stripe.com'), 'api-people-infra-api-stripe-com');
+    assert.deepEqual(apiProfile('shop', { host: 'api.stripe.com', key: 'STRIPE_API_KEY' }), {
+      id: 'api-shop-api-stripe-com',
+      display_name: 'api.stripe.com for shop',
+      description: "The key of api.stripe.com that the harness's sandboxes of shop use, as STRIPE_API_KEY",
+      category: 'other',
+      credentials: [{ name: 'key', description: 'The key of api.stripe.com', env_vars: ['STRIPE_API_KEY'], required: true, auth_style: 'bearer', header_name: 'authorization' }],
+      endpoints: [{ host: 'api.stripe.com', port: 443, protocol: 'rest', access: 'full', enforcement: 'enforce' }],
+      binaries: ['/usr/local/bin/claude', '/usr/bin/bash', '/usr/bin/dash'],
+    });
+  });
+
+  it('takes every bundle by default, and checks bundles and APIs when the config is read', () => {
+    const parse = (network: object) => ConfigSchema.safeParse({ harnessVersion: '0.4.1', project: { name: 'p' }, network });
+    assert.deepEqual(ConfigSchema.parse({ harnessVersion: '0.4.1', project: { name: 'p' } }).network, { bundles: ['all'], extraHosts: [], apis: [] });
+    assert.equal(parse({ bundles: ['core', 'node'] }).success, true);
+    assert.equal(parse({ bundles: ['All'] }).success, false, 'an unknown bundle fails when the config is read, not when a sandbox is made');
+    assert.equal(parse({ apis: [{ host: 'api.stripe.com', key: 'STRIPE_API_KEY' }, { host: 'httpbin.org' }] }).success, true);
+    for (const apis of [
+      [{ host: '*.stripe.com' }],
+      [{ host: 'https://api.stripe.com' }],
+      [{ host: 'api.stripe.com', key: 'stripe_key' }],
+      [{ host: 'api.stripe.com', key: 'AWS_SECRET_ACCESS_KEY' }],
+      [{ host: 'api.stripe.com', key: 'PATH' }],
+      [{ host: 'api.stripe.com', secret: 'sk_test_123' }],
+      [{ host: 'api.stripe.com' }, { host: 'api.stripe.com' }],
+      [{ host: 'a.example.com', key: 'K' }, { host: 'b.example.com', key: 'K' }],
+    ]) {
+      assert.equal(parse({ apis }).success, false, JSON.stringify(apis));
+    }
   });
 });
 

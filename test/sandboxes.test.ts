@@ -1,10 +1,11 @@
 import { strict as assert } from 'node:assert';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 import { bytes, readDockerUsage } from '../src/sandbox/docker.ts';
 import { OpenShellDriver } from '../src/sandbox/openshell.ts';
 import { Denials, parseDenials } from '../src/sandbox/refusals.ts';
+import { storeApiKey } from '../src/setup/doctor.ts';
 import { buildCache, removeOldAgentImages } from '../src/setup/images.ts';
 import { tempDir } from './helpers/toy-repo.ts';
 
@@ -89,6 +90,8 @@ describe('the sandboxes view', () => {
       '  "sandbox list --output json --page-token p2") cat "$dir/page2.json" ;;',
       '  "sandbox list --output json") cat "$dir/page1.json" ;;',
       '  "status --output json") cat "$dir/status.json" ;;',
+      `  "provider list --output json") echo '{"providers":[{"name":"claude-sub","credential_keys":["CLAUDE_CODE_OAUTH_TOKEN"]}],"next_page_token":"q2"}' ;;`,
+      `  "provider list --output json --page-token q2") echo '{"providers":[{"name":"api-shop-api-stripe-com"}],"next_page_token":""}' ;;`,
       '  logs*) echo "the log" ;;',
       '  "sandbox create"*) ;;',
       '  *) echo "unexpected: $*" >&2; exit 2 ;;',
@@ -100,6 +103,7 @@ describe('the sandboxes view', () => {
       { name: 'prb-9f8e7d6c', phase: 'Provisioning', labels: {} },
     ]);
     assert.deepEqual(await driver.gateway(), { status: 'connected', version: '0.1.2' });
+    assert.deepEqual(await driver.providers(), ['claude-sub', 'api-shop-api-stripe-com']);
     assert.equal(await driver.logs('arc-1a2b3c4d', 50), 'the log\n');
     assert.deepEqual(await new OpenShellDriver(join(dir, 'missing')).gateway().then((g) => g.status), 'unreachable');
     await driver.create({ name: 'dev-1a2b3c4d-a1', image: 'img', providers: [], env: {}, labels: { 'harness.project': 'shop' }, cpu: '1500m', memory: '2048Mi', command: ['sleep', 'infinity'] });
@@ -132,5 +136,33 @@ describe("the doctor's cleanup of the agents' images", () => {
     assert.deepEqual(await removeOldAgentImages('acme/agent:2', bin), { removed: [], kept: [] }, 'a project with its own image keeps every other');
     assert.deepEqual(await buildCache(bin), { size: '8.028GB', reclaimable: '4.102GB' });
     assert.equal(await buildCache(join(dir, 'missing')), undefined);
+  });
+});
+
+describe("the doctor's API keys", () => {
+  it('stores a key in its own provider, after its profile, through the environment alone', async () => {
+    const dir = tempDir('openshell-api');
+    const bin = join(dir, 'openshell');
+    writeFileSync(bin, [
+      '#!/bin/bash',
+      `echo "$*" >> '${dir}/calls'`,
+      'case "$1 $2" in',
+      `  'profile import') cp "$4" '${dir}/profile.json' ;;`,
+      `  'provider create') [ "$STRIPE_API_KEY" = 'sk_test_123' ] && echo 'key in the environment' > '${dir}/env' ;;`,
+      '  *) ;;',
+      'esac',
+    ].join('\n'), { mode: 0o755 });
+    assert.equal(await storeApiKey('shop', { host: 'api.stripe.com', key: 'STRIPE_API_KEY' }, 'sk_test_123', bin), undefined);
+    const calls = readFileSync(join(dir, 'calls'), 'utf8').trim().split('\n');
+    assert.deepEqual(calls.map((call) => call.replace(/-f \S+/, '-f <file>')), [
+      'profile delete api-shop-api-stripe-com --global',
+      'profile import -f <file> --global',
+      'provider create --name api-shop-api-stripe-com --type api-shop-api-stripe-com --credential STRIPE_API_KEY --global-profile',
+    ]);
+    assert.ok(!calls.join(' ').includes('sk_test_123'), 'never in the arguments');
+    assert.equal(readFileSync(join(dir, 'env'), 'utf8'), 'key in the environment\n');
+    const profile = JSON.parse(readFileSync(join(dir, 'profile.json'), 'utf8')) as { id: string; endpoints: Array<{ host: string }> };
+    assert.deepEqual([profile.id, profile.endpoints.map((e) => e.host)], ['api-shop-api-stripe-com', ['api.stripe.com']]);
+    assert.ok(!existsSync(calls[1]!.split(' ')[3]!), 'the profile file is gone');
   });
 });

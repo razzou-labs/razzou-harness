@@ -3,6 +3,22 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## Unreleased
+
+- **Every network bundle by default.** `"all"` in `network.bundles` stands for every
+  bundle, those later versions add included, and it is the default: `harness init`
+  writes it, and `harness setup` no longer asks which bundles the stack needs. The
+  sandboxes of every role reach every bundle's package registries and documentation,
+  read-only. A project narrows it by listing bundles. An unknown bundle now fails when
+  the config is read, not when a sandbox is made.
+- **Third-party APIs**, in `network.apis`: the hosts the code may call with any method,
+  like a payment provider's test API. With `"key": "STRIPE_API_KEY"`, `harness doctor`
+  asks for the API's key at a hidden prompt and stores it in an OpenShell provider of
+  its own; every sandbox gets it, and holds a placeholder in that variable, which
+  OpenShell replaces with the key on requests to that host alone, in headers and URLs,
+  not in request bodies. While a key isn't stored on the machine, no new attempt
+  starts: the pipeline pauses and says so.
+
 ## 0.4.0 (2026-11-08)
 
 **Upgrading a project from 0.3.x:** install the new version, then rebuild the agents'

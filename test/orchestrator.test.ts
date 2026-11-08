@@ -360,6 +360,23 @@ describe('orchestrator', () => {
     await until(o, completed(o));
   });
 
+  it("opens the project's APIs, carries their keys to every sandbox, and pauses while a key isn't stored", async () => {
+    const apis = [{ host: 'api.stripe.com', key: 'STRIPE_API_KEY' }, { host: 'postman-echo.com' }];
+    const { orchestrator: o, driver, harnessDir } = await setup((f) => solved(f), { config: { network: { bundles: ['all'], apis } } });
+    await o.tick();
+    assert.match(o.state.pipeline.paused?.reason ?? '', /^no key stored on this machine for api\.stripe\.com: run `harness doctor` in a terminal, which asks for it, then resume$/);
+    assert.equal(driver.created.filter((spec) => spec.name.startsWith('dev-')).length, 0, 'no attempt starts without the key');
+
+    driver.providerNames.push('api-toy-api-stripe-com');
+    assert.equal(o.resume(), true);
+    await until(o, completed(o));
+    const made = driver.created.filter((spec) => !spec.name.startsWith('arc-'));
+    assert.ok(made.length > 0 && made.every((spec) => spec.providers.includes('api-toy-api-stripe-com')), 'every sandbox carries the key');
+    const policy = JSON.parse(readFileSync(join(harnessDir, 'tmp', 'sandbox-policy.yaml'), 'utf8')) as { network_policies: Record<string, { endpoints: Array<{ host: string; access?: string }> }> };
+    assert.deepEqual(policy.network_policies.third_party_apis!.endpoints.map((e) => [e.host, e.access]), [['postman-echo.com', 'full']]);
+    assert.ok(policy.network_policies.read_only_web!.endpoints.some((e) => e.host === 'pypi.org'), 'every bundle');
+  });
+
   it('escalates a feature whose checks pass before anything is built', async () => {
     const { orchestrator: o } = await setup((f) => solved(f), {
       prepare: async (dir) => {

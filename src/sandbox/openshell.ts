@@ -157,6 +157,20 @@ export class OpenShellDriver implements SandboxDriver {
     return result.stdout;
   }
 
+  async providers(): Promise<string[]> {
+    const names: string[] = [];
+    let token = '';
+    for (let page = 0; page < 20; page++) {
+      const result = await run(this.bin, ['provider', 'list', '--output', 'json', ...(token ? ['--page-token', token] : [])], { timeout: 30_000, killSignal: 'SIGKILL' });
+      if (result.code !== 0) throw new Error(`openshell provider list failed: ${(result.stderr || result.stdout).trim().slice(0, 300)}`);
+      const listed = JSON.parse(result.stdout) as { providers?: Array<{ name?: unknown }>; next_page_token?: string };
+      names.push(...(listed.providers ?? []).flatMap((p) => (typeof p.name === 'string' ? [p.name] : [])));
+      token = listed.next_page_token ?? '';
+      if (!token) break;
+    }
+    return names;
+  }
+
   async gateway(): Promise<GatewayStatus> {
     const result = await run(this.bin, ['status', '--output', 'json'], { timeout: 15_000, killSignal: 'SIGKILL' }).catch((error: Error) => ({ code: 1, stdout: '', stderr: error.message }));
     if (result.code !== 0) return { status: 'unreachable', problem: (result.stderr || result.stdout).trim().slice(0, 300) || `openshell status exited with ${result.code}` };
