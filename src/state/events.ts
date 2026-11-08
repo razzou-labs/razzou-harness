@@ -117,6 +117,11 @@ interface Payloads {
   OWNER_HOURS_SET: { hours: number | null };
   /** The owner set, or cleared, the threshold the agent-hours meter turns red at (v3 §4.2). */
   AGENT_HOURS_SET: { hours: number | null };
+  /**
+   * What a long-lived agent, a Manager or an Architect, has used of Claude, read from the
+   * conversations saved in its sandbox: a running count, which a new sandbox starts again.
+   */
+  AGENT_TOKENS: { agent: string; reading: Usage };
   /** The owner capped what each new sandbox may use of the machine, CPUs and memory; null lifts a cap. */
   SANDBOX_LIMITS_SET: { cpu: number | null; memoryGiB: number | null };
   /** In Swarm, the merge policy left a plan's PR to the owner, and why (v3 §3.2). */

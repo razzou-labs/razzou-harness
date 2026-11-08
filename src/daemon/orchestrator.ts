@@ -33,6 +33,7 @@ import { parseCostEstimate } from '../review/cost-estimate.ts';
 import { activeReview, reviewStep, stepReview } from './review.ts';
 import { Managers } from './manager.ts';
 import { sweepLeftOvers } from './sandboxes.ts';
+import { readTokens } from './tokens.ts';
 import { attemptRefName, preMerge, probeScript, refOf, sandboxName, waitForFile } from './refs.ts';
 import { handleRequest, type AgentIdentity, type Reply } from './requests.ts';
 import { buildTask } from './task.ts';
@@ -121,6 +122,8 @@ export class Orchestrator {
   private stepErrors = { key: '', count: 0 };
   /** When the left-over sandboxes are next deleted: at the first pass, then every hour. */
   private nextSweep = 0;
+  /** When each long-lived agent's tokens were last read, by agent. */
+  private readonly tokensReadAt = new Map<string, number>();
   /** The gateway's providers, read at most once a minute, for the keys of the project's APIs. */
   private providerNames?: { at: number; names: string[] };
   /** Errors in a row of each plan's step, and when it is tried again: one plan that keeps failing never stops the others. */
@@ -1540,6 +1543,21 @@ export class Orchestrator {
     const requests = (await this.readRefusals(attempt.sandbox, true)).list();
     this.refusals.delete(attempt.sandbox);
     if (requests.length > 0) this.record({ type: 'NETWORK_REFUSED', ref: refOf(state, attempt), payload: { requests } });
+  }
+
+  /**
+   * Records what a long-lived agent, a Manager (`manager:<key>`) or an Architect
+   * (`architect:<module>`), has used of Claude, read from its sandbox at most every five
+   * minutes unless `now`: before a sandbox goes. Only a reading that changed is recorded.
+   */
+  async noteTokens(agent: string, sandbox: string, now = false): Promise<void> {
+    if (!now && this.now() - (this.tokensReadAt.get(agent) ?? -Infinity) < 5 * 60_000) return;
+    this.tokensReadAt.set(agent, this.now());
+    const reading = await readTokens(this, sandbox);
+    if (!reading) return;
+    const last = this.state.agentTokens?.[agent]?.reading ?? { inputTokens: 0, outputTokens: 0 };
+    if (last.inputTokens === reading.inputTokens && last.outputTokens === reading.outputTokens) return;
+    this.record({ type: 'AGENT_TOKENS', payload: { agent, reading } });
   }
 
   /** An error outside any attempt: logged, and the loop goes on. */

@@ -84,6 +84,7 @@ export class Managers {
       } else if (manager.status === 'running' && (await this.alive(manager))) {
         this.attach(manager);
         await this.deliver(manager);
+        await o.noteTokens(`manager:${key}`, manager.sandbox);
       } else {
         await this.relaunch(o.state.managers[key]!);
       }
@@ -276,6 +277,7 @@ export class Managers {
     this.detachOne(managerKey(manager));
     const backup = join(this.localDir(manager), `transcript-${manager.sessionId}.jsonl`);
     await o.driver.download(manager.sandbox, this.paths(manager).output, backup).catch(() => {});
+    await o.noteTokens(`manager:${managerKey(manager)}`, manager.sandbox, true);
     await o.driver.remove(manager.sandbox);
     o.record({ type: 'MANAGER_STOPPED', payload: { ...identity(manager), reason } });
   }
