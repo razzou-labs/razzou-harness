@@ -283,7 +283,7 @@ function refusedLines(attempt: Attempt, failed: boolean): string[] {
     ...shown.map((d) => `- ${d.target} ${d.program ? `from ${d.program}` : '(a DNS query)'}, ${d.count} time${d.count === 1 ? '' : 's'}: ${d.reason.replace(/_/g, ' ')}`),
     ...(refused.length > shown.length ? [`- and ${refused.length - shown.length} more`] : []),
     ...(failed
-      ? ["A sandbox reaches only the hosts of network.bundles and network.extraHosts in harness/config.json, and the next attempt meets the same policy. If the feature can do without a host, give the way around it in your guidance. If it can't, ask_owner to allow the host, with blocking: true when no attempt can succeed without it: only the owner widens the policy."]
+      ? ["A sandbox reaches only the hosts of network.bundles, network.extraHosts and network.apis in harness/config.json, and the next attempt meets the same policy. If the feature can do without a host, give the way around it in your guidance. If it can't, ask_owner to allow the host, with blocking: true when no attempt can succeed without it: only the owner widens the policy."]
       : []),
   ];
 }

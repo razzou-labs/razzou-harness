@@ -134,9 +134,9 @@ such as the Harness.io CLI, comes first on the PATH.
 
 `harness setup` does every step it can and asks only for what is yours: a `gh` login,
 the token from `claude setup-token` at a hidden prompt, two clicks on GitHub for the
-App, since GitHub creates and installs Apps only in the browser, three questions (your
-stack's network bundles, AWS or not, the hours of your time), and, with AWS, the role
-ARNs from your bootstrap and the gateway key. In order, it logs you in to `gh`; creates
+App, since GitHub creates and installs Apps only in the browser, two questions (AWS or
+not, the hours of your time), and, with AWS, the role ARNs from your bootstrap and the
+gateway key. In order, it logs you in to `gh`; creates
 the repository on GitHub if the project has no remote; creates the App from its
 manifest when this machine has none, and waits for you to install it; writes the
 harness's files; asks the questions and writes `harness/config.json`, with the
@@ -169,9 +169,10 @@ from a sandbox like an agent's and from outside, everything that must be refused
 writes and secret reads, other projects' state, `git push`, unlisted hosts and the
 metadata address, a workflow pushed by the App, a merge without your approval.
 
-`harness init` lets the sandboxes reach only the `core` network bundle. Add your
-stack's bundles, such as `node` for npm, in `harness/config.json` (see
-[Configuration](#configuration)).
+`harness init` lets the sandboxes reach every network bundle: the package registries
+and documentation of each stack, read-only. To narrow it, list fewer bundles in
+`harness/config.json`; to let the code call a third-party API, add it under
+`network.apis` (see [Configuration](#configuration)).
 
 ## Your first module
 
@@ -432,14 +433,14 @@ through an `Arch:` pull request, or a commit of your own on `main`.
 
 ```json
 {
-  "harnessVersion": "0.4.0",
+  "harnessVersion": "0.4.1",
   "project": { "name": "shop", "repo": "<org>/shop", "bot": "<org>-harness[bot]" },
   "roles": {
     "architect": { "model": "claude-opus-5-5", "effort": "max" },
     "manager": { "model": "claude-opus-5-5", "effort": "high" },
     "developer": { "model": "claude-opus-5-5", "effort": "xhigh", "attemptTimeoutMinutes": 90, "maxAttempts": 2 }
   },
-  "network": { "bundles": ["core", "node"], "extraHosts": [] },
+  "network": { "bundles": ["all"], "apis": [{ "host": "api.stripe.com", "key": "STRIPE_API_KEY" }] },
   "checks": [{ "id": "unit", "run": "npm test", "phase": "pre-merge" }]
 }
 ```
@@ -452,8 +453,9 @@ through an `Arch:` pull request, or a commit of your own on `main`.
 | `roles.<role>.effort` | `max`, `high`, `xhigh` | Claude Code's `--effort`; `null` for a model without effort levels, such as Haiku |
 | `roles.developer.attemptTimeoutMinutes` | 120 | An attempt's deadline |
 | `roles.developer.maxAttempts` | 2 | Attempts per feature before it is escalated to you |
-| `network.bundles` | `["core"]` | The hosts sandboxes reach, by bundle: `core`, `node`, `python`, `aws`, `terraform`, `go`, `rust`, `jvm`, `opentofu`, `browsers`. The Architect gets them all. |
+| `network.bundles` | `["all"]` | The hosts sandboxes reach directly, read-only, by bundle: `core`, `node`, `python`, `aws`, `terraform`, `go`, `rust`, `jvm`, `opentofu`, `browsers`, or `all` for every one, those later versions add included. The Architect gets them all. |
 | `network.extraHosts` | `[]` | More hosts, read-only |
+| `network.apis` | `[]` | Third-party APIs the code may call with any method, like a payment provider's test API: `{ "host": "api.stripe.com" }`, with `"key": "STRIPE_API_KEY"` for one that needs a key. `harness doctor` asks for the key at a hidden prompt and stores it in OpenShell; in a sandbox the variable holds a placeholder, which OpenShell replaces with the key on requests to that host alone, in headers and URLs, not in request bodies. CI gets no key. |
 | `checks` | `[]` | Checks that every feature must keep passing, such as `npm run lint` |
 | `protect.files`, `protect.jsonFields` | none | More protected files, as paths or globs (`scripts/*.sh`, `docs/`, `**/Makefile`), and protected JSON fields by file, like `{"tsconfig.json": ["/compilerOptions/strict"]}` |
 | `sandbox.image` | `razzou-harness/agent:<version>` | The agents' image, tagged with the harness's version, which `harness doctor --build-images` builds |
@@ -581,7 +583,8 @@ RDS, `manage_master_user_password`); anything else uses write-only arguments.
 
 What agents can't do, and what stops them:
 - **Hold credentials.** Sandboxes hold placeholders. The OpenShell proxy adds the Claude
-  token on `api.anthropic.com` only, and signs AWS requests with the read-only role.
+  token on `api.anthropic.com` only, each key of `network.apis` on its API's host only,
+  and signs AWS requests with the read-only role.
 - **Reach the host.** Each agent runs in its own container, with no host folder mounted;
   code moves in and out as git bundles. The host never runs code or git hooks that an
   agent wrote.
@@ -594,7 +597,8 @@ What agents can't do, and what stops them:
   They change only through an Arch PR you merge, or your own commits.
 - **Change AWS.** A read-only role with explicit denies, and applies only in CI after
   your merge.
-- **Go anywhere online.** Sandboxes reach listed hosts, read-only. Other pages go
+- **Go anywhere online.** Sandboxes reach listed hosts, read-only, and the APIs in
+  `network.apis` with any method; OpenShell has no rule for every host. Other pages go
   through `web_read`: GET only, public addresses only, never this machine's own
   addresses or the networks it is on (IPv6 included), checked again after every
   redirect, within 75 seconds and 2 MB, decompressed.

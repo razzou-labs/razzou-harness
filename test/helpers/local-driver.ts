@@ -9,6 +9,8 @@ import { run } from '../../src/util.ts';
 export class LocalDriver implements SandboxDriver {
   readonly base: string;
   readonly created: SandboxSpec[] = [];
+  /** The providers on this pretend gateway: a test adds an API's to store its key. */
+  readonly providerNames: string[] = ['claude-sub'];
   private readonly env = new Map<string, Record<string, string>>();
   private readonly labels = new Map<string, Record<string, string>>();
 
@@ -107,5 +109,9 @@ export class LocalDriver implements SandboxDriver {
 
   async gateway(): Promise<GatewayStatus> {
     return { status: 'connected', version: 'local' };
+  }
+
+  async providers(): Promise<string[]> {
+    return [...this.providerNames];
   }
 }

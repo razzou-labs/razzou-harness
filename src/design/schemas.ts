@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { z } from 'zod';
 import type { Repo } from '../git/repo.ts';
+import { ALL_BUNDLES, BUNDLES } from '../sandbox/allowlist.ts';
 import { canonicalJson, sha256 } from '../util.ts';
 
 /** The agents' image is tagged with the harness's version, which may change what goes into it: `harness doctor --build-images` builds it. */
@@ -85,6 +86,16 @@ export function featureDependency(planId: string, dep: string): { plan: string; 
   return b === undefined ? { plan: planId, feature: a } : { plan: a, feature: b };
 }
 
+/** Variables the harness, OpenShell or the system set in a sandbox: an API's key can't take one of their names. */
+const RESERVED_VARIABLES = /^(AWS_|CLAUDE_|OPENSHELL_|HARNESS_|SSL_|NODE_|NPM_)|^(PATH|HOME|USER|SHELL|LANG|TERM|PWD|TMPDIR|REQUESTS_CA_BUNDLE|CURL_CA_BUNDLE|DISABLE_AUTOUPDATER|CHECKPOINT_DISABLE|MCP_TOOL_TIMEOUT)$/;
+
+/** A third-party API of `network.apis`: an exact host, and the variable its key is read from, if it has one. */
+const ApiSchema = z.object({
+  host: z.string().regex(/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/, 'a host name, like api.stripe.com'),
+  key: z.string().regex(/^[A-Z][A-Z0-9_]*$/, 'a variable name in capitals, like STRIPE_API_KEY')
+    .refine((name) => !RESERVED_VARIABLES.test(name), 'a variable the harness, OpenShell or the system sets; pick another name, like STRIPE_API_KEY').optional(),
+}).strict();
+
 export const ConfigSchema = z.object({
   harnessVersion: z.string(),
   project: z.object({
@@ -131,8 +142,18 @@ export const ConfigSchema = z.object({
     .prefault({}),
   network: z
     .object({
-      bundles: z.array(z.string()).default(['core']),
+      /** The hosts sandboxes reach directly, read-only, by bundle; `all`, the default, is every bundle. */
+      bundles: z.array(z.string().refine((name) => name === ALL_BUNDLES || name in BUNDLES, `a bundle: ${ALL_BUNDLES}, ${Object.keys(BUNDLES).join(', ')}`)).default([ALL_BUNDLES]),
       extraHosts: z.array(z.string()).default([]),
+      /**
+       * Third-party APIs sandboxes may call with any method, like a payment provider's test
+       * API. `key` names the variable the project's code reads the API's key from: in a
+       * sandbox it holds a placeholder, which OpenShell replaces with the key on requests to
+       * the host alone. `harness doctor` stores the key, at a hidden prompt.
+       */
+      apis: z.array(ApiSchema).default([])
+        .refine((apis) => new Set(apis.map((a) => a.host)).size === apis.length, 'each host once')
+        .refine((apis) => { const keys = apis.flatMap((a) => (a.key ? [a.key] : [])); return new Set(keys).size === keys.length; }, 'each key once'),
     })
     .prefault({}),
   checks: z.array(CheckSchema).default([]),

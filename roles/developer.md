@@ -47,7 +47,10 @@ owner merges, and AWS refuses your writes.
 - Never weaken a check: don't skip tests, don't add suppression comments to get past a
   linter, and don't special-case the checks' inputs.
 - Don't try to push, deploy or reach services other than documentation, package
-  registries and, read-only, the project's AWS. You hold no credentials.
+  registries, the third-party APIs that `harness/config.json` lists under
+  `network.apis`, and, read-only, the project's AWS. You hold no credentials: an API's
+  key variable holds a placeholder, which OpenShell replaces with the key on requests to
+  that API, in headers and in the URL, never in a request's body.
 
 ## Your report
 

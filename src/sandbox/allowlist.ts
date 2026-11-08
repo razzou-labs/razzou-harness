@@ -56,6 +56,14 @@ export const BUNDLES: Record<string, HostRule[]> = {
   browsers: read('cdn.playwright.dev', 'playwright.download.prss.microsoft.com'),
 };
 
+/** Every bundle, those later versions add included: what a project gets unless it lists fewer. */
+export const ALL_BUNDLES = 'all';
+
+/** The bundles a project's list names, `all` standing for every one. */
+export function bundleNames(names: readonly string[]): string[] {
+  return names.includes(ALL_BUNDLES) ? Object.keys(BUNDLES) : [...names];
+}
+
 /** Throws on a host OpenShell would reject, so a bad entry fails at load time rather than at sandbox creation. */
 export function checkHost(host: string): void {
   const labels = host.split('.');

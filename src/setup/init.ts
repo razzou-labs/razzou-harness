@@ -57,7 +57,7 @@ export async function init(options: InitOptions): Promise<{ wrote: string[]; kep
   const project: Record<string, string> = { name };
   if (repo && bot) Object.assign(project, { repo, bot });
   else notes.push(repo ? 'No GitHub App on this machine yet: `harness setup` creates it, and sets project.repo and project.bot in harness/config.json.' : 'No GitHub remote found: the project stays local until you set project.repo and project.bot.');
-  write('harness/config.json', `${JSON.stringify({ harnessVersion: options.version, project, network: { bundles: ['core'] } }, null, 2)}\n`);
+  write('harness/config.json', `${JSON.stringify({ harnessVersion: options.version, project, network: { bundles: ['all'] } }, null, 2)}\n`);
 
   const owner = options.owner ?? ((await run('gh', ['api', 'user', '--jq', '.login']).catch(() => undefined))?.stdout.trim() || undefined);
   for (const [path, content] of ciFiles(options.packageDir, owner)) write(path, content);

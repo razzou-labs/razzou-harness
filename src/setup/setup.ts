@@ -4,7 +4,6 @@ import { computeLock, directoryReader } from '../ci/harness-ci.ts';
 import { ConfigSchema, requiredChecks, type Config } from '../design/schemas.ts';
 import { configDir, loadAppCredentials } from '../github/app.ts';
 import { applyRepositoryRules, checkApp, createApp, installCi, type RulesetOptions } from '../github/setup.ts';
-import { BUNDLES } from '../sandbox/allowlist.ts';
 import type { Mode, State } from '../state/state.ts';
 import { run, sha256 } from '../util.ts';
 import { doctor, granted, type Check } from './doctor.ts';
@@ -65,14 +64,6 @@ export function fixFor(check: Check): Fix | undefined {
     default:
       return undefined;
   }
-}
-
-/** The bundles the owner named, besides core, that exist; unknown ones are reported. */
-export function parseBundles(answer: string): { bundles: string[]; unknown: string[] } {
-  const named = answer.split(/[,\s]+/).map((b) => b.trim()).filter(Boolean);
-  const unknown = named.filter((b) => !(b in BUNDLES));
-  const bundles = ['core', ...named.filter((b) => b in BUNDLES && b !== 'core')];
-  return { bundles: [...new Set(bundles)], unknown };
 }
 
 /**
@@ -237,10 +228,11 @@ async function ownerLogin(options: SetupOptions): Promise<string | undefined> {
 }
 
 /**
- * The three questions (v4 §4), asked once: the stack's network bundles, AWS, and the
- * owner's hours. What they settle goes into harness/config.json, with the lock that
- * hashes it, and into .harness/setup.json for the daemon. The view role's ARN goes to
- * the doctor, which creates the AWS provider with it.
+ * The questions (v4 §4), asked once: AWS, and the owner's hours. The network needs none:
+ * a project gets every bundle unless its config lists fewer. What they settle goes into
+ * harness/config.json, with the lock that hashes it, and into .harness/setup.json for
+ * the daemon. The view role's ARN goes to the doctor, which creates the AWS provider
+ * with it.
  */
 async function askSettings(options: SetupOptions): Promise<{ written: string[]; viewRole?: string }> {
   const { projectDir, say, ask } = options;
@@ -249,18 +241,6 @@ async function askSettings(options: SetupOptions): Promise<{ written: string[]; 
   const written: string[] = [];
   let changed = false;
   let viewRole: string | undefined;
-
-  const bundles: string[] = config.network?.bundles ?? ['core'];
-  if (bundles.length === 1 && bundles[0] === 'core') {
-    const others = Object.keys(BUNDLES).filter((b) => b !== 'core').join(', ');
-    const answer = await ask(`Which network bundles do the sandboxes need besides core, for your stack? (${others}; Enter for none) `);
-    const parsed = parseBundles(answer);
-    if (parsed.unknown.length > 0) say(`unknown bundles, ignored: ${parsed.unknown.join(', ')}`);
-    if (parsed.bundles.length > 1) {
-      config.network = { ...(config.network ?? {}), bundles: parsed.bundles };
-      changed = true;
-    }
-  }
 
   if (!config.aws && /^y/i.test(await ask('Does this project deploy to AWS with Terraform? [y/N] '))) {
     say('The roles come from your bootstrap (see the README\'s AWS section); the key is asked for later, at a hidden prompt.');

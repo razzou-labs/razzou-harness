@@ -11,6 +11,7 @@ import { GitHubClient, loadAppCredentials } from '../github/app.ts';
 import { checkApp } from '../github/setup.ts';
 import { BUNDLES } from '../sandbox/allowlist.ts';
 import { OpenShellDriver } from '../sandbox/openshell.ts';
+import { apiProfile, apiProviderName } from '../sandbox/policy.ts';
 import type { Mode } from '../state/state.ts';
 import { run } from '../util.ts';
 import { buildCache, removeOldAgentImages } from './images.ts';
@@ -223,11 +224,75 @@ async function project(options: DoctorOptions, config: Config, report: (c: Check
     }
   }
   if (config.aws) await aws(options, config, report);
+  await apis(options, config, report);
   if (config.terraform) {
     const tf = config.terraform;
     for (const file of [tf.backendConfig, tf.varFile]) {
       report(existsSync(join(options.projectDir, tf.dir, file)) ? ok('Terraform', `${tf.dir}/${file}`) : fail('Terraform', `${tf.dir}/${file} is missing`, 'see harness/config.json under terraform'));
     }
+  }
+}
+
+/** The project's third-party APIs: each key in an OpenShell provider, under the variable the config names. */
+async function apis(options: DoctorOptions, config: Config, report: (c: Check) => void): Promise<void> {
+  for (const api of config.network.apis) {
+    if (!api.key) {
+      report(ok('API', `${api.host}: every method, no key`));
+      continue;
+    }
+    const name = apiProviderName(config.project.name, api.host);
+    const keys = await providerKeys(name);
+    if (keys && keys.includes(api.key)) {
+      report(ok('API', `${api.host}: its key in ${name}, as ${api.key}`));
+      continue;
+    }
+    if (keys) {
+      report(fail('API', `${name} holds the key of ${api.host} as ${keys.join(', ') || 'nothing'}, but the config says ${api.key}`, `delete it with \`openshell provider delete ${name}\`, then run \`harness doctor\` in a terminal`));
+      continue;
+    }
+    if (!options.interactive) {
+      report(fail('API', `no key stored for ${api.host}`, 'run `harness doctor` in a terminal: it asks for the key'));
+      continue;
+    }
+    const secret = await askSecret(`The key of ${api.host}, which the project's code reads as ${api.key} (hidden, or Enter to skip): `);
+    if (!secret) {
+      report(fail('API', `no key stored for ${api.host}`, 'run `harness doctor` again with the key at hand'));
+      continue;
+    }
+    const problem = await storeApiKey(config.project.name, { host: api.host, key: api.key }, secret);
+    report(problem ? fail('API', `${api.host}: ${problem}`, 'fix it, then run `harness doctor` again') : ok('API', `${api.host}: key stored in ${name}`));
+  }
+}
+
+/** The variables a provider holds credentials under, or undefined when there is no such provider. */
+async function providerKeys(name: string, bin = 'openshell'): Promise<string[] | undefined> {
+  const listed = await run(bin, ['provider', 'list', '--output', 'json']).catch(() => undefined);
+  if (listed?.code !== 0) return undefined;
+  const provider = (JSON.parse(listed.stdout) as { providers?: Array<{ name?: string; credential_keys?: string[] }> }).providers?.find((p) => p.name === name);
+  return provider ? provider.credential_keys ?? [] : undefined;
+}
+
+/**
+ * Stores an API's key in a new OpenShell provider, after importing the profile the
+ * harness writes for it (apiProfile). The key reaches `openshell` through its
+ * environment, never its arguments, which other users of the machine can read. Returns
+ * what went wrong, if anything.
+ */
+export async function storeApiKey(project: string, api: { host: string; key: string }, secret: string, bin = 'openshell'): Promise<string | undefined> {
+  const name = apiProviderName(project, api.host);
+  const dir = mkdtempSync(join(tmpdir(), 'harness-api-'));
+  try {
+    const file = join(dir, `${name}.yaml`);
+    writeFileSync(file, `${JSON.stringify(apiProfile(project, api), null, 2)}\n`);
+    // A profile left by an earlier try, or written for another variable, gives way to this one.
+    await run(bin, ['profile', 'delete', name, '--global']).catch(() => undefined);
+    const imported = await run(bin, ['profile', 'import', '-f', file, '--global']);
+    if (imported.code !== 0) return `openshell profile import: ${firstLine(imported.stderr || imported.stdout)}`;
+    const created = await run(bin, ['provider', 'create', '--name', name, '--type', name, '--credential', api.key, '--global-profile'], { env: { ...process.env, [api.key]: secret } });
+    if (created.code !== 0) return `openshell provider create: ${firstLine(created.stderr || created.stdout)}`;
+    return undefined;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 }
 

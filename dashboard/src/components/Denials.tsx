@@ -20,7 +20,7 @@ export function DenialTable({ denials }: { denials: Denial[] }) {
         </tbody>
       </table>
       <p className="muted small">
-        An agent's sandbox reaches only the hosts of its bundles and <code>network.extraHosts</code> in <code>harness/config.json</code>. To allow one, add it there, in an <code>Arch:</code> pull request or a commit of your own on <code>main</code>.
+        An agent's sandbox reaches only the hosts of its bundles, <code>network.extraHosts</code> and <code>network.apis</code> in <code>harness/config.json</code>. To allow one, add it there, in an <code>Arch:</code> pull request or a commit of your own on <code>main</code>.
       </p>
     </>
   );
