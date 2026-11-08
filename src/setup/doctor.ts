@@ -18,7 +18,7 @@ import { buildCache, removeOldAgentImages } from './images.ts';
 import { probe, stateLocation } from './probe.ts';
 
 /** The OpenShell release the harness is built and probed against (§17.4). */
-export const OPENSHELL_VERSION = '0.1.2';
+export const OPENSHELL_VERSION = '0.1.7';
 /** OpenShell's AWS provider profile, at that release. */
 const AWS_PROFILE_URL = `https://raw.githubusercontent.com/NVIDIA/OpenShell/v${OPENSHELL_VERSION}/providers/aws.yaml`;
 
@@ -96,7 +96,7 @@ async function machine(options: DoctorOptions, image: string, report: (c: Check)
   if (!found) report(fail('OpenShell', 'not found', `install OpenShell ${OPENSHELL_VERSION}`));
   else report(found === OPENSHELL_VERSION ? ok('OpenShell', found) : fail('OpenShell', `${found}, but the harness is pinned to ${OPENSHELL_VERSION}`, `install OpenShell ${OPENSHELL_VERSION}`));
   const status = await run('openshell', ['status']).catch(() => undefined);
-  report(/Status:\s*Connected/.test(status?.stdout ?? '') ? ok('OpenShell gateway', 'connected') : fail('OpenShell gateway', firstLine(status?.stdout || status?.stderr) || 'not running', 'start the gateway: `openshell gateway start`'));
+  report(/Status:\s*Connected/.test(status?.stdout ?? '') ? ok('OpenShell gateway', 'connected') : fail('OpenShell gateway', firstLine(status?.stdout || status?.stderr) || 'not running', 'start the gateway, a systemd user service: `systemctl --user start openshell-gateway`'));
 
   const host = await run('claude', ['--version']).catch(() => undefined);
   const hostClaude = /^(\S+)/.exec(host?.stdout ?? '')?.[1];

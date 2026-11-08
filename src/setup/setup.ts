@@ -355,9 +355,10 @@ async function applyFix(options: SetupOptions, config: Config, fix: Fix, sleep: 
   const repo = config.project.repo;
   switch (fix.kind) {
     case 'start-gateway': {
-      const started = await run('openshell', ['gateway', 'start']).catch(() => undefined);
+      // OpenShell's Debian package runs the gateway as a systemd user service; its CLI has no command to start it.
+      const started = await run('systemctl', ['--user', 'start', 'openshell-gateway']).catch(() => undefined);
       if (started?.code === 0) say('OpenShell: gateway started.');
-      else say(`OpenShell: the gateway did not start: ${(started?.stderr || started?.stdout || 'openshell is missing').trim()}`);
+      else say(`OpenShell: the gateway did not start: ${(started?.stderr || started?.stdout || 'systemctl is missing').trim()}`);
       return started?.code === 0;
     }
     case 'create-app':

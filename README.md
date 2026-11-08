@@ -106,7 +106,7 @@ without pull requests.
 
 - Linux, Node 24 or later, git, Docker, and `gh` logged in as an admin of your
   project's repository.
-- OpenShell 0.1.2 with a running gateway. The harness is tested with this version only,
+- OpenShell 0.1.7 with a running gateway. The harness is tested with this version only,
   and `harness doctor` refuses others.
 - Claude Code on this machine, with a Claude subscription: its binary goes into the
   sandbox image, and `claude setup-token` gives the agents' token. Access with an API
@@ -564,11 +564,12 @@ and Terraform applies only in CI, after you merge.
 
    `services` lists the AWS services whose endpoints the sandboxes reach, signed with
    the view role. `all`, the default, is every service the AWS SDK knows, so the view
-   role alone decides what agents read; a list of names narrows it. OpenShell 0.1.2
-   signs `GET` requests to AWS wrongly, except S3's: services that read with `GET`, such
-   as Lambda, API Gateway, EKS, Route 53, CloudFront and Bedrock, answer
-   `SignatureDoesNotMatch` in the sandboxes, and a `terraform plan` there fails on their
-   resources. CI's plan, outside OpenShell, isn't affected. Keep the `terraform` paths
+   role alone decides what agents read; a list of names narrows it. OpenShell, up to
+   0.1.7 at least, signs `GET` requests to AWS wrongly, except S3's
+   ([NVIDIA/OpenShell#5375](https://github.com/NVIDIA/OpenShell/issues/5375)): services
+   that read with `GET`, such as Lambda, API Gateway, EKS, Route 53, CloudFront and
+   Bedrock, answer `SignatureDoesNotMatch` in the sandboxes, and a `terraform plan`
+   there fails on their resources. CI's plan, outside OpenShell, isn't affected. Keep the `terraform` paths
    as they are: the CI workflow uses the same ones. `harness github-setup` then requires
    `tf-plan` as well.
 2. Set the repository variables the workflow reads: `AWS_REGION_STAGING`,
@@ -649,8 +650,8 @@ To report a vulnerability, see `SECURITY.md` in the source repository.
 |---|---|
 | `Docker: … permission denied` | Add yourself to the `docker` group, then log in again |
 | `Tailscale: an exit node is active`, or `container network` fails | An exit node can cut the containers' network: turn it off |
-| `OpenShell: … pinned to 0.1.2` | Install OpenShell 0.1.2 |
-| `OpenShell gateway` fails | `openshell gateway start` |
+| `OpenShell: … pinned to 0.1.7` | Install OpenShell 0.1.7, from its Debian package |
+| `OpenShell gateway` fails | `systemctl --user start openshell-gateway`: the gateway is a systemd user service |
 | `image: … has Claude Code X, this machine Y` | `harness doctor --build-images`, after each Claude Code update |
 | `terminals: node-pty is missing` | Install `python3`, `make` and `g++`, then reinstall with `--allow-scripts=node-pty`. `harness attach` works meanwhile. |
 | `Claude provider: … is missing` | `claude setup-token`, then `harness doctor` in a terminal: it asks for the token |
