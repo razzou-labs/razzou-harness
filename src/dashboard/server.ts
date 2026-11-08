@@ -11,7 +11,7 @@ import type { OwnerTime } from '../design/owner-time.ts';
 import { planDependencies } from '../design/schemas.ts';
 import type { State } from '../state/state.ts';
 import { readDockerUsage, type UsageReading } from '../sandbox/docker.ts';
-import { removeLeftOver, sandboxDenials, sandboxOverview, sharedReading } from './sandboxes.ts';
+import { removeLeftOver, sandboxDenials, sandboxOverview, sharedReading } from '../daemon/sandboxes.ts';
 import { Terminals, type Size } from './terminals.ts';
 
 export interface DashboardOptions {

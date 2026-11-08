@@ -265,8 +265,9 @@ behind a token. Its views:
   attempt's card keeps the network requests its sandbox's policy refused.
 - **Sandboxes:** what runs on the OpenShell gateway. This project's sandboxes, with what
   each is for, whether anything still uses it, and the CPUs and memory it uses now,
-  read from `docker stats` every five seconds; a left-over one, which a crash or a
-  failed delete left, has a button to delete it. Select one to see the network requests
+  read from `docker stats` every five seconds. A left-over one, which a crash or a
+  failed delete left, has a button to delete it; the daemon deletes them itself when it
+  starts and every hour, except an Architect's. Select one to see the network requests
   its policy refused, from its log: the program, the host, why, and how often. Then the
   other projects' sandboxes, which the dashboard only lists, and the gateway's status.
   Above them, the caps on each new sandbox: how many CPUs and how much memory it may

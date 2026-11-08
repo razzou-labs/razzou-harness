@@ -101,7 +101,7 @@ async function prepare(o: Orchestrator, plan: PlanState, review: ReviewState): P
     command: ['sleep', 'infinity'],
   });
   await o.repo.bundle(`refs/heads/${plan.branch}`, join(dir, 'plan.bundle'));
-  await o.driver.upload(sandbox, join(dir, 'plan.bundle'), p.harness);
+  await o.uploadBundle(sandbox, join(dir, 'plan.bundle'), p.harness);
   const clone = await o.exec(sandbox, [
     `git clone --quiet --branch ${sh(plan.branch)} ${sh(`${p.harness}/plan.bundle`)} ${sh(p.work)}`,
     `cd ${sh(p.work)}`,

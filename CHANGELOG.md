@@ -27,6 +27,21 @@ may change how a project is set up, and its notes say how.
   Manager's to resolve: it guides the next Developer around the host, or asks the owner
   to allow it, since only the owner widens the network policy.
 
+Disk space:
+- The git bundles the daemon hands to sandboxes, each a copy of the plan branch's whole
+  history, are deleted once uploaded, and the ones it takes back once fetched. One was
+  kept for every attempt and every review, and never deleted, so `.harness/` grew with
+  each. The daemon deletes the ones earlier versions left in `.harness/modules/` when it
+  starts.
+- The daemon deletes this project's left-over sandboxes when it starts and every hour:
+  those the Sandboxes view offers to delete, so a delete that failed is tried again. It
+  spares an Architect's, which holds the owner's conversation with it.
+- `harness doctor --build-images` removes the agents' images the new one replaces, about
+  2 GB each, once no container uses them: the other versions' tags, and the untagged
+  images that building a tag again leaves. It also shows the size of Docker's build
+  cache, with `docker builder prune` to free it; that cache is shared with every other
+  build on the machine, so the doctor leaves it alone.
+
 ## 0.3.0 (2026-11-07)
 
 **Upgrading a project from 0.2.x:** install the new version, then run `harness setup`
