@@ -5,6 +5,7 @@ import { describe, it } from 'node:test';
 import { bytes, readDockerUsage } from '../src/sandbox/docker.ts';
 import { OpenShellDriver } from '../src/sandbox/openshell.ts';
 import { Denials, parseDenials } from '../src/sandbox/refusals.ts';
+import { buildCache, removeOldAgentImages } from '../src/setup/images.ts';
 import { tempDir } from './helpers/toy-repo.ts';
 
 /** Lines of `openshell logs`, as OpenShell 0.1.2 wrote them for a sandbox whose policy refused two hosts. */
@@ -104,5 +105,32 @@ describe('the sandboxes view', () => {
     await driver.create({ name: 'dev-1a2b3c4d-a1', image: 'img', providers: [], env: {}, labels: { 'harness.project': 'shop' }, cpu: '1500m', memory: '2048Mi', command: ['sleep', 'infinity'] });
     const created = readFileSync(join(dir, 'calls'), 'utf8').split('\n').find((line) => line.startsWith('sandbox create'));
     assert.equal(created, 'sandbox create --name dev-1a2b3c4d-a1 --from img --detach --label harness.project=shop --cpu 1500m --memory 2048Mi -- sleep infinity');
+  });
+});
+
+describe("the doctor's cleanup of the agents' images", () => {
+  it('removes the images a build replaces that no container uses, leaves any other, and reads the build cache', async () => {
+    const dir = tempDir('docker');
+    const bin = join(dir, 'docker');
+    writeFileSync(bin, [
+      '#!/bin/bash',
+      `echo "$*" >> '${dir}/calls'`,
+      'case "$*" in',
+      "  'image ls'*) printf 'razzou-harness/agent:0.4.0\\tid4\\nrazzou-harness/agent:0.3.0\\tid3\\nrazzou-harness/agent:0.2.0\\tid2\\n<none>:<none>\\tid1\\nacme/agent:1\\tida\\n' ;;",
+      "  'image rm razzou-harness/agent:0.2.0') echo 'Error response from daemon: conflict: unable to remove repository reference' >&2; exit 1 ;;",
+      "  'image rm '*) echo \"Untagged: $3\" ;;",
+      `  'system df'*) echo '{"Active":"1","Reclaimable":"1.821GB (93%)","Size":"1.938GB","TotalCount":"6","Type":"Images"}'; echo '{"Active":"0","Reclaimable":"4.102GB","Size":"8.028GB","TotalCount":"50","Type":"Build Cache"}' ;;`,
+      '  *) exit 2 ;;',
+      'esac',
+    ].join('\n'), { mode: 0o755 });
+    assert.deepEqual(await removeOldAgentImages('razzou-harness/agent:0.4.0', bin), {
+      removed: ['razzou-harness/agent:0.3.0', 'an untagged image (id1)'],
+      kept: ['razzou-harness/agent:0.2.0'],
+    });
+    const removals = readFileSync(join(dir, 'calls'), 'utf8').split('\n').filter((line) => line.startsWith('image rm'));
+    assert.deepEqual(removals, ['image rm razzou-harness/agent:0.3.0', 'image rm razzou-harness/agent:0.2.0', 'image rm id1'], 'never the new image, nor another repository\'s');
+    assert.deepEqual(await removeOldAgentImages('acme/agent:2', bin), { removed: [], kept: [] }, 'a project with its own image keeps every other');
+    assert.deepEqual(await buildCache(bin), { size: '8.028GB', reclaimable: '4.102GB' });
+    assert.equal(await buildCache(join(dir, 'missing')), undefined);
   });
 });

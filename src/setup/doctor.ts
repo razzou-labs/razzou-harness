@@ -13,6 +13,7 @@ import { BUNDLES } from '../sandbox/allowlist.ts';
 import { OpenShellDriver } from '../sandbox/openshell.ts';
 import type { Mode } from '../state/state.ts';
 import { run } from '../util.ts';
+import { buildCache, removeOldAgentImages } from './images.ts';
 import { probe, stateLocation } from './probe.ts';
 
 /** The OpenShell release the harness is built and probed against (§17.4). */
@@ -103,6 +104,14 @@ async function machine(options: DoctorOptions, image: string, report: (c: Check)
   if (options.buildImages) {
     const built = await run('bash', [join(options.packageDir, 'images', 'agent', 'build.sh'), image]);
     report(built.code === 0 ? ok('image build', image) : fail('image build', lastLine(built.stderr || built.stdout), 'see the output of images/agent/build.sh'));
+    if (built.code === 0) {
+      // The images it replaces, about 2 GB each, once no container uses them.
+      const { removed, kept } = await removeOldAgentImages(image);
+      if (kept.length > 0) report(warn('old images', `${removed.length > 0 ? `removed ${removed.join(', ')}; ` : ''}kept ${kept.join(', ')}, which a container uses`, 'once the sandboxes that use them are gone, `harness doctor --build-images` removes them'));
+      else if (removed.length > 0) report(ok('old images', `removed ${removed.join(', ')}`));
+      const cache = await buildCache();
+      if (cache) report(ok('build cache', `Docker's build cache holds ${cache.size}, ${cache.reclaimable} of it reclaimable: \`docker builder prune\` frees it, for every build on this machine`));
+    }
   }
   const label = await run('docker', ['image', 'inspect', image, '--format', '{{index .Config.Labels "dev.razzou-harness.claude-code"}}']).catch(() => undefined);
   if (label?.code !== 0) {

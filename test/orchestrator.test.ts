@@ -1,5 +1,5 @@
 import { strict as assert } from 'node:assert';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { request } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
@@ -9,7 +9,7 @@ import { detach, type AgentAdapter, type AgentRun } from '../src/agents/claude-c
 import type { SubscriptionUsage } from '../src/anthropic/usage.ts';
 import { Orchestrator } from '../src/daemon/orchestrator.ts';
 import { handleRequest } from '../src/daemon/requests.ts';
-import type { SandboxOverview, UsageReading } from '../src/dashboard/sandboxes.ts';
+import type { SandboxOverview, UsageReading } from '../src/daemon/sandboxes.ts';
 import { startDashboard, type DashboardState } from '../src/dashboard/server.ts';
 import { Terminals, type Pty } from '../src/dashboard/terminals.ts';
 import { recover } from '../src/setup/recover.ts';
@@ -155,6 +155,8 @@ const usageLimitOn = (feature: string, attempts: number[]) => (stub: AgentAdapte
   },
 });
 const feature = (o: Orchestrator, id: string) => o.state.features[`demo/P1/${id}`];
+/** The git bundles left in `.harness/modules/`: each sandbox has its own copy, so none should be. */
+const bundlesIn = (harnessDir: string) => (existsSync(join(harnessDir, 'modules')) ? readdirSync(join(harnessDir, 'modules'), { recursive: true, encoding: 'utf8' }).filter((f) => f.endsWith('.bundle')) : []);
 const completed = (o: Orchestrator) => () => o.state.plans['demo/P1']?.status === 'completed';
 
 describe('orchestrator', () => {
@@ -318,6 +320,44 @@ describe('orchestrator', () => {
     assert.match(failed, /\n- example\.com:443 from \/usr\/bin\/node, 1 time: transparent tcp policy denied\n/);
     assert.match(failed, /If it can't, ask_owner to allow the host, with blocking: true when no attempt can succeed without it: only the owner widens the policy\.$/m);
     assert.doesNotMatch(failed, /escalate_to_architect/);
+  });
+
+  it('keeps no git bundle once a sandbox has its copy, and deletes those earlier versions left when it starts', async () => {
+    const old = ['demo/attempts/P1-F01-a1/plan.bundle', 'demo/attempts/P1-F01-a1/candidate.bundle', 'demo/reviews/P1-security-0123abcd/plan.bundle'];
+    const { orchestrator: o, harnessDir } = await setup((f) => solved(f), {
+      prepare: async (dir) => {
+        for (const file of old) {
+          mkdirSync(join(dir, '.harness', 'modules', file, '..'), { recursive: true });
+          writeFileSync(join(dir, '.harness', 'modules', file), 'a bundle an earlier version kept');
+        }
+        writeFileSync(join(dir, '.harness', 'modules', 'demo', 'attempts', 'P1-F01-a1', 'stream.jsonl'), '{}\n');
+      },
+    });
+    assert.deepEqual(bundlesIn(harnessDir), []);
+    assert.ok(existsSync(join(harnessDir, 'modules', 'demo', 'attempts', 'P1-F01-a1', 'stream.jsonl')), 'only bundles go');
+    await until(o, completed(o));
+    assert.deepEqual(bundlesIn(harnessDir), []);
+    assert.equal(o.state.features['demo/P1/F02']!.status, 'accepted', 'the commits came back through their bundles');
+  });
+
+  it("deletes its left-over sandboxes when it starts and every hour, never an Architect's or another project's", async () => {
+    let skew = 0;
+    const { orchestrator: o, driver } = await setup((f) => solved(f), { now: () => Date.now() + skew });
+    const spec = (name: string, project?: string) => ({ name, image: 'x', providers: [], env: {}, ...(project ? { labels: { 'harness.project': project } } : {}) });
+    for (const [name, project] of [['dev-0000aaaa-a9', 'toy'], ['arc-0000bbbb', 'toy'], ['dev-1111cccc-a1', 'elsewhere'], ['prb-12345678', undefined]] as const) await driver.create(spec(name, project));
+    await o.tick();
+    const status = async (names: string[]) => Promise.all(names.map(async (name) => [name, await driver.status(name)]));
+    assert.deepEqual(await status(['dev-0000aaaa-a9', 'arc-0000bbbb', 'dev-1111cccc-a1', 'prb-12345678']), [
+      ['dev-0000aaaa-a9', 'missing'], ['arc-0000bbbb', 'ready'], ['dev-1111cccc-a1', 'ready'], ['prb-12345678', 'ready'],
+    ]);
+    // One left within the hour waits for the next sweep.
+    await driver.create(spec('chk-2222dddd-a1', 'toy'));
+    await o.tick();
+    assert.equal(await driver.status('chk-2222dddd-a1'), 'ready');
+    skew += 61 * 60_000;
+    await o.tick();
+    assert.equal(await driver.status('chk-2222dddd-a1'), 'missing');
+    await until(o, completed(o));
   });
 
   it('escalates a feature whose checks pass before anything is built', async () => {
@@ -796,9 +836,10 @@ describe('pull requests', () => {
   });
 
   it('in Swarm, both reviewers read the head, their verdicts are posted and set as statuses, and the plan merges itself', async () => {
-    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true });
+    const { orchestrator: o, fake, harnessDir } = await setup((f) => solved(f), { github: true });
     o.setMode('swarm');
     await until(o, completed(o));
+    assert.deepEqual(bundlesIn(harnessDir), [], "the reviewers' and the Managers' bundles are gone too");
 
     const head = plan(o)!.pushed!;
     assert.deepEqual(plan(o)!.reviews!.map((r) => [r.role, r.head === head, r.status, r.verdict, r.posted?.status]), [
@@ -1028,6 +1069,7 @@ describe('architect', () => {
     assert.equal(asked!.ok, true);
     await until(o, () => module(o)?.escalations[0]?.decision !== undefined);
     assert.equal(module(o)!.escalations[0]!.decision, 'Use two scripts.');
+    assert.deepEqual(bundlesIn(harnessDir), [], "the Architect's bundles are gone too");
   });
 
   it('builds on a design change: the plan branch takes it, and the work it redefines starts afresh', async () => {

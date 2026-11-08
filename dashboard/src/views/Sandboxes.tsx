@@ -86,7 +86,7 @@ export function Sandboxes({ go, selected }: { go: Go; selected?: string }) {
             </tbody>
           </table>
         )}
-        {leftOver > 0 && <p className="muted small">A left-over sandbox is this project's, but nothing uses it any more: a crash or a failed delete left it. It still holds its container until deleted.</p>}
+        {leftOver > 0 && <p className="muted small">A left-over sandbox is this project's, but nothing uses it any more: a crash or a failed delete left it. The daemon deletes them when it starts and every hour, except an Architect's, which holds your conversation with it; Delete removes one now.</p>}
       </section>
 
       {current && <Refused sandbox={current} />}
