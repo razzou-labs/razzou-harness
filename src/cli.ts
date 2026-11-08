@@ -9,7 +9,7 @@ import { isRunning, packageRoot, runDaemon, runningDaemon, version } from './dae
 import { ConfigSchema, requiredChecks } from './design/schemas.ts';
 import { loadAppCredentials } from './github/app.ts';
 import { applyRepositoryRules, checkApp, createApp, installCi, type RulesetOptions } from './github/setup.ts';
-import { doctor } from './setup/doctor.ts';
+import { askSecret, doctor } from './setup/doctor.ts';
 import { CHECKLIST, init } from './setup/init.ts';
 import { recover } from './setup/recover.ts';
 import { setup } from './setup/setup.ts';
@@ -185,6 +185,7 @@ async function main(): Promise<void> {
         ...(values.owner ? { owner: values.owner } : {}),
         say: (line) => console.log(line),
         ask: (question) => ask(question),
+        askSecret: (question) => askSecret(question),
         open: (url) => spawn('xdg-open', [url], { stdio: 'ignore', detached: true }).on('error', () => {}).unref(),
         interactive: (file, args) => spawnSync(file, args, { stdio: 'inherit' }).status ?? 1,
         up: async () => {

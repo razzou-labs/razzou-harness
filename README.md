@@ -135,20 +135,21 @@ such as the Harness.io CLI, comes first on the PATH.
 `harness setup` does every step it can and asks only for what is yours: a `gh` login,
 the token from `claude setup-token` at a hidden prompt, two clicks on GitHub for the
 App, since GitHub creates and installs Apps only in the browser, two questions (AWS or
-not, the hours of your time), and, with AWS, the role ARNs from your bootstrap and the
-gateway key. In order, it logs you in to `gh`; creates
-the repository on GitHub if the project has no remote; creates the App from its
-manifest when this machine has none, and waits for you to install it; writes the
-harness's files; asks the questions and writes `harness/config.json`, with the
-`staging` environment and the variables on GitHub for AWS, and the Terraform scaffold in
-`iac/` that your bootstrap expects; commits the files it wrote,
-and only those, with your git once you agree, and pushes them when you are on `main`;
-runs `harness doctor` and fixes what it can (starts the OpenShell gateway, builds the
-agents' image, imports the Claude profile and creates the provider with your token,
-applies the ruleset on `main`, creates the AWS provider with your key); runs the probe;
-and offers to start the daemon. Run it again at any time: what is done is skipped, and a
-setup commit that wasn't pushed is offered again. On a private repository of a free
-plan, where GitHub has no rulesets, it says so and goes on.
+not, the hours of your time), and, with AWS, the role ARNs from your bootstrap, the
+gateway key and, if you want cost estimates, an Infracost token. In order, it logs you
+in to `gh`; creates the repository on GitHub if the project has no remote; creates the
+App from its manifest when this machine has none, and waits for you to install it;
+writes the harness's files; asks the questions and writes `harness/config.json`, with
+the `staging` environment and the variables on GitHub for AWS, the Terraform scaffold in
+`iac/` that your bootstrap expects, and the cost job's Infracost token as a repository
+secret; commits the files it wrote, and only those, with your git once you agree, and
+pushes them when you are on `main`; runs `harness doctor` and fixes what it can (starts
+the OpenShell gateway, builds the agents' image, imports the Claude profile and creates
+the provider with your token, applies the ruleset on `main`, creates the AWS provider
+with your key); runs the probe; and offers to start the daemon. Run it again at any
+time: what is done is skipped, and a setup commit that wasn't pushed is offered again.
+On a private repository of a free plan, where GitHub has no rulesets, it says so and
+goes on.
 
 The same by hand: `harness init` writes the harness's files into the repository, never
 over existing ones, and prints the setup checklist:
@@ -377,12 +378,17 @@ as before.
 **The cost job.** `harness install-ci` adds a `cost` job to the workflow: on a pull
 request that has `iac/`, it runs [Infracost](https://www.infracost.io) on the base and
 the head and uploads the estimate as the `cost` artifact, which the daemon reads once
-CI passed and the `cost` job itself succeeded. It needs the repository secret `INFRACOST_API_KEY`, a free key from
-`infracost auth login`; without it the job does nothing, no estimate exists, and
-`INFRA` and `MIXED` plans wait for you with that reason. Infracost sees your Terraform's
-resource types and sizes, not your code or state. The cost reviewer gets the estimate in
-its brief. The job is not a required check: verify it on your first `INFRA` pull request
-in a real repository, since the harness's tests only fake its artifact.
+CI passed and the `cost` job itself succeeded. It needs the repository secret
+`INFRACOST_API_KEY`: a free token from your Infracost organization's Settings, CLI tokens,
+on [dashboard.infracost.io](https://dashboard.infracost.io). `harness setup` asks for it
+once the project has Terraform, and gives it to `gh secret set`; the doctor says whether
+it is set. Infracost's current CLI, 2.x, logs in through the browser and stores no key,
+and the job runs its own pinned 0.10.47, so you don't need the CLI. Without the secret the
+job does nothing, no estimate exists, and `INFRA` and `MIXED` plans wait for you with that
+reason. Infracost sees your Terraform's resource types and sizes, not your code or state,
+and prices fixed resources only: pay-per-use charges count as zero. The cost reviewer
+gets the estimate in its brief. The job is not a required check. It was checked on a real
+repository with such a token: a KMS key came out at 1 USD a month, which the daemon read.
 
 **Where it stands.** The scanners in CI that the security reviewer would start from,
 gitleaks, semgrep and checkov, are still to come (proposal v3 §5.5): the reviewer reads
@@ -435,7 +441,7 @@ through an `Arch:` pull request, or a commit of your own on `main`.
 
 ```json
 {
-  "harnessVersion": "0.4.5",
+  "harnessVersion": "0.4.6",
   "project": { "name": "shop", "repo": "<org>/shop", "bot": "<org>-harness[bot]" },
   "roles": {
     "architect": { "model": "claude-opus-5-5", "effort": "max" },

@@ -1,13 +1,13 @@
 import { strict as assert } from 'node:assert';
-import { chmodSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { computeLock, directoryReader } from '../src/ci/harness-ci.ts';
-import { granted, mainRuleset } from '../src/setup/doctor.ts';
+import { granted, mainRuleset, repositorySecret } from '../src/setup/doctor.ts';
 import { init } from '../src/setup/init.ts';
 import { recover } from '../src/setup/recover.ts';
-import { awsProviderName, commitAndPush, fixFor, linkRepo, type SetupOptions } from '../src/setup/setup.ts';
+import { awsProviderName, commitAndPush, fixFor, infracostKey, linkRepo, type SetupOptions } from '../src/setup/setup.ts';
 import { writeTerraformScaffold } from '../src/setup/terraform.ts';
 import { run, runOk } from '../src/util.ts';
 import { FakeForge } from './helpers/fake-forge.ts';
@@ -97,7 +97,7 @@ describe('harness setup (v4 §4)', () => {
 describe('the setup links the project to GitHub on a later run', () => {
   let dir: string;
   const options = (): SetupOptions => ({
-    projectDir: dir, packageDir: '', version: '0', say: () => {}, ask: async () => '', open: () => {}, interactive: () => 0, up: async () => {},
+    projectDir: dir, packageDir: '', version: '0', say: () => {}, ask: async () => '', askSecret: async () => '', open: () => {}, interactive: () => 0, up: async () => {},
   });
 
   before(async () => {
@@ -224,6 +224,71 @@ describe("the doctor's GitHub checks", () => {
       conditions(['refs/heads/release']);
       assert.equal((await mainRuleset('acme/shop'))?.offMain, "doesn't apply to main");
     });
+  });
+});
+
+describe("the cost job's key", () => {
+  const path = process.env.PATH;
+  const github = tempDir('github');
+  const secret = join(github, 'INFRACOST_API_KEY');
+  const calls = join(github, 'calls');
+  const asked: string[] = [];
+  const said: string[] = [];
+  const owner = (answer: string) => ({ say: (line: string) => void said.push(line), askSecret: async (question: string) => (asked.push(question), answer) });
+
+  before(() => {
+    // gh, as the owner's login answers for acme/shop: the secret's value is its standard input, and a missing one is a 404.
+    const bin = tempDir('bin');
+    writeFileSync(join(bin, 'gh'), [
+      '#!/bin/bash',
+      `echo "$*" >> ${calls}`,
+      'case "$*" in',
+      `  "api repos/acme/shop/actions/secrets/INFRACOST_API_KEY") [ -f ${secret} ] && echo '{"name":"INFRACOST_API_KEY"}' && exit 0; echo 'gh: Not Found (HTTP 404)' >&2; exit 1 ;;`,
+      `  "secret set INFRACOST_API_KEY --repo acme/shop") cat > ${secret} ;;`,
+      "  *) echo 'gh: Must have admin rights to Repository. (HTTP 403)' >&2; exit 1 ;;",
+      'esac',
+      '',
+    ].join('\n'));
+    chmodSync(join(bin, 'gh'), 0o755);
+    process.env.PATH = `${bin}:${path}`;
+  });
+  after(() => {
+    process.env.PATH = path;
+  });
+  const reset = () => {
+    rmSync(secret, { force: true });
+    rmSync(calls, { force: true });
+    asked.length = 0;
+    said.length = 0;
+  };
+
+  it("asks for Infracost's token while the repository has no secret, and gives it to gh's input only", async () => {
+    reset();
+    await infracostKey(owner('ico-token'), 'acme/shop');
+    assert.equal(readFileSync(secret, 'utf8'), 'ico-token');
+    assert.match(asked[0]!, /Infracost token \(hidden, or Enter to skip\)/);
+    assert.match(said.join('\n'), /your organization's Settings, CLI tokens/);
+    assert.equal(said.at(-1), 'GitHub: the secret INFRACOST_API_KEY is set: the cost job estimates each pull request.');
+    assert.doesNotMatch(readFileSync(calls, 'utf8') + said.join('\n'), /ico-token/, "never in gh's arguments, nor said");
+    assert.equal(await repositorySecret('acme/shop', 'INFRACOST_API_KEY'), true);
+  });
+
+  it('asks nothing once the secret is set, or when gh cannot tell', async () => {
+    reset();
+    writeFileSync(secret, 'ico-earlier');
+    await infracostKey(owner('ico-token'), 'acme/shop');
+    assert.equal(readFileSync(secret, 'utf8'), 'ico-earlier');
+    await infracostKey(owner('ico-token'), 'acme/other');
+    assert.deepEqual(asked, []);
+    assert.equal(await repositorySecret('acme/other', 'INFRACOST_API_KEY'), undefined);
+  });
+
+  it('sets nothing when the owner skips it, and says what that means', async () => {
+    reset();
+    await infracostKey(owner(''), 'acme/shop');
+    assert.equal(existsSync(secret), false);
+    assert.equal(await repositorySecret('acme/shop', 'INFRACOST_API_KEY'), false);
+    assert.match(said.at(-1)!, /^Skipped: the cost job estimates nothing, and Swarm leaves INFRA and MIXED plans to you/);
   });
 });
 
