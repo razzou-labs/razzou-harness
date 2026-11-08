@@ -3,6 +3,7 @@ import { dirname } from 'node:path';
 import type { CheckResult } from '../checks/runner.ts';
 import type { ReviewFinding, ReviewerRole } from '../design/schemas.ts';
 import type { Party, Role } from '../roles.ts';
+import type { Denial } from '../sandbox/refusals.ts';
 import type { ActionState, FeatureState, InfraMerge, Mode, PlanState } from './state.ts';
 
 /** What an event is about. Ids repeat across modules, so a feature is always addressed with its module and plan. */
@@ -59,6 +60,8 @@ interface Payloads {
   ATTEMPT_STARTED: Record<string, never>;
   BASELINE_FAILED: { reason: string; results: CheckResult[] };
   ATTEMPT_ENDED: { outcome: AttemptOutcome; summary?: string; notes?: string; finding?: Finding; usage?: Usage };
+  /** What the attempt's sandbox policy refused, read from OpenShell's log before the sandbox went: for the Manager and the owner. */
+  NETWORK_REFUSED: { requests: Denial[] };
   ATTEMPT_INTERRUPTED: { reason: string; counts: boolean };
   CHECKS_STARTED: { head: string; files: string[] };
   /** Another feature landed first (v3 §6.3): the plan's head was merged into the attempt, and the checks passed again on the result. */
@@ -114,6 +117,8 @@ interface Payloads {
   OWNER_HOURS_SET: { hours: number | null };
   /** The owner set, or cleared, the threshold the agent-hours meter turns red at (v3 §4.2). */
   AGENT_HOURS_SET: { hours: number | null };
+  /** The owner capped what each new sandbox may use of the machine, CPUs and memory; null lifts a cap. */
+  SANDBOX_LIMITS_SET: { cpu: number | null; memoryGiB: number | null };
   /** In Swarm, the merge policy left a plan's PR to the owner, and why (v3 §3.2). */
   PR_LEFT_TO_OWNER: { number: number; head: string; reason: string };
   /** The cost job's estimate of the monthly cost the PR's head adds, read from its artifact (v3 §5.3); `source` names the field it came from. */

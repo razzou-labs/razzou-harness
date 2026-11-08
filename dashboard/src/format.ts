@@ -14,6 +14,15 @@ export function duration(ms: number): string {
   return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
 }
 
+/** Bytes in MiB or GiB, as Docker counts them. */
+export function size(bytes: number): string {
+  const mib = bytes / 1024 ** 2;
+  return mib >= 1024 ? `${(mib / 1024).toFixed(1)} GiB` : `${Math.round(mib)} MiB`;
+}
+
+/** CPUs busy, like 1.2, or 0.04 when it is next to nothing. */
+export const cpus = (n: number) => (n < 0.1 ? n.toFixed(2) : n.toFixed(1));
+
 /** Only GitHub's own https links are followed: agents choose the rest of the text. */
 export const isGithubLink = (url?: string) => url !== undefined && /^https:\/\/github\.com\//.test(url);
 

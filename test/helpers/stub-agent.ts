@@ -19,6 +19,8 @@ export interface StubBehavior {
   crashAtStart?: boolean;
   /** Asks the Manager first, and commits its answer as `answer.txt`. */
   ask?: string;
+  /** Hosts and ports its sandbox's policy refuses it, logged as OpenShell would. */
+  refused?: string[];
 }
 
 /**
@@ -74,6 +76,10 @@ export function stubAgent(
         return detach(run.workDir, steps.join('\n'));
       }
       if (behavior.ask) steps.push(...askManager(dirname(run.mcpConfigFile), behavior.ask));
+      for (const target of behavior.refused ?? []) {
+        const line = `[${(Date.now() / 1000).toFixed(3)}] [sandbox] [OCSF ] [ocsf] NET:OPEN [MED] DENIED /usr/bin/node(7) -> ${target} [reason:transparent_tcp_policy_denied]`;
+        steps.push(`printf '%s\\n' ${sh(line)} >> ${sh(join(dirname(run.pidFile), 'openshell.log'))}`);
+      }
       if (behavior.sleepSec) steps.push(`sleep ${behavior.sleepSec}`);
       for (const [path, content] of Object.entries(behavior.files ?? {})) {
         steps.push(`mkdir -p "$(dirname ${sh(path)})"`, `printf %s ${sh(content)} > ${sh(path)}`);

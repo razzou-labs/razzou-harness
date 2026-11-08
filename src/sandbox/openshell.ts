@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { run, runOk } from '../util.ts';
-import type { ExecResult, Follower, SandboxDriver, SandboxSpec, SandboxStatus } from './driver.ts';
+import type { ExecResult, Follower, GatewayStatus, SandboxDriver, SandboxInfo, SandboxSpec, SandboxStatus } from './driver.ts';
 
 /** Longer lines from a sandbox are dropped: an agent could otherwise grow the daemon's memory without end. */
 export const MAX_FOLLOWED_LINE = 1024 * 1024;
@@ -44,6 +44,9 @@ export class OpenShellDriver implements SandboxDriver {
     for (const provider of spec.providers) args.push('--provider', provider);
     if (spec.policyFile) args.push('--policy', spec.policyFile);
     for (const [key, value] of Object.entries(spec.env)) args.push('--env', `${key}=${value}`);
+    for (const [key, value] of Object.entries(spec.labels ?? {})) args.push('--label', `${key}=${value}`);
+    if (spec.cpu) args.push('--cpu', spec.cpu);
+    if (spec.memory) args.push('--memory', spec.memory);
     if (spec.tty) args.push('--tty');
     if (spec.command) args.push('--', ...spec.command);
     await runOk(this.bin, args);
@@ -131,4 +134,42 @@ export class OpenShellDriver implements SandboxDriver {
   async remove(name: string): Promise<void> {
     await run(this.bin, ['sandbox', 'delete', name]);
   }
+
+  async list(): Promise<SandboxInfo[]> {
+    const sandboxes: SandboxInfo[] = [];
+    let token = '';
+    // A page holds 100: a gateway that keeps answering with more pages is cut off at 20 of them.
+    for (let page = 0; page < 20; page++) {
+      const args = ['sandbox', 'list', '--output', 'json', ...(token ? ['--page-token', token] : [])];
+      const result = await run(this.bin, args, { timeout: 30_000, killSignal: 'SIGKILL' });
+      if (result.code !== 0) throw new Error(`openshell sandbox list failed: ${(result.stderr || result.stdout).trim().slice(0, 300)}`);
+      const listed = JSON.parse(result.stdout) as { sandboxes?: unknown[]; next_page_token?: string };
+      sandboxes.push(...(listed.sandboxes ?? []).map(sandboxInfo));
+      token = listed.next_page_token ?? '';
+      if (!token) break;
+    }
+    return sandboxes;
+  }
+
+  async logs(name: string, lines: number): Promise<string> {
+    const result = await run(this.bin, ['logs', name, '-n', String(lines), '--source', 'sandbox', '--color', 'never'], { timeout: 30_000, killSignal: 'SIGKILL' });
+    if (result.code !== 0) throw new Error(`openshell logs failed: ${(result.stderr || result.stdout).trim().slice(0, 300)}`);
+    return result.stdout;
+  }
+
+  async gateway(): Promise<GatewayStatus> {
+    const result = await run(this.bin, ['status', '--output', 'json'], { timeout: 15_000, killSignal: 'SIGKILL' }).catch((error: Error) => ({ code: 1, stdout: '', stderr: error.message }));
+    if (result.code !== 0) return { status: 'unreachable', problem: (result.stderr || result.stdout).trim().slice(0, 300) || `openshell status exited with ${result.code}` };
+    const status = JSON.parse(result.stdout) as { status?: string; version?: string };
+    return { status: status.status ?? 'unknown', ...(status.version ? { version: status.version } : {}) };
+  }
+}
+
+/** One entry of `openshell sandbox list --output json`. Its `created_at` is UTC, without the zone. */
+function sandboxInfo(raw: unknown): SandboxInfo {
+  const item = raw as { name?: unknown; phase?: unknown; created_at?: unknown; labels?: unknown };
+  const created = typeof item.created_at === 'string' ? item.created_at : '';
+  const createdAt = /^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$/.test(created) ? `${created.replace(' ', 'T')}Z` : created || undefined;
+  const labels = item.labels && typeof item.labels === 'object' ? Object.fromEntries(Object.entries(item.labels).filter(([, v]) => typeof v === 'string')) as Record<string, string> : {};
+  return { name: String(item.name ?? ''), phase: typeof item.phase === 'string' ? item.phase : 'unknown', ...(createdAt ? { createdAt } : {}), labels };
 }

@@ -261,7 +261,17 @@ behind a token. Its views:
 - **Project:** modules, proposals, plans and features, with attempts, findings, CI,
   deploys and `progress.txt`.
 - **Agents:** the Architect's terminal, the Manager's and the Developers' live
-  transcripts, a message box for the Manager, and a shell in any agent's sandbox.
+  transcripts, a message box for the Manager, and a shell in any agent's sandbox. An
+  attempt's card keeps the network requests its sandbox's policy refused.
+- **Sandboxes:** what runs on the OpenShell gateway. This project's sandboxes, with what
+  each is for, whether anything still uses it, and the CPUs and memory it uses now,
+  read from `docker stats` every five seconds; a left-over one, which a crash or a
+  failed delete left, has a button to delete it. Select one to see the network requests
+  its policy refused, from its log: the program, the host, why, and how often. Then the
+  other projects' sandboxes, which the dashboard only lists, and the gateway's status.
+  Above them, the caps on each new sandbox: how many CPUs and how much memory it may
+  use, so that agents and checks in parallel leave the machine usable. There is no cap
+  until you set one.
 - **Events:** the event log, live, with a filter.
 
 The header pauses and resumes the pipeline: a pause lets what runs finish, and starts

@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
-import type { ExecResult, Follower, SandboxDriver, SandboxSpec, SandboxStatus } from '../../src/sandbox/driver.ts';
+import type { ExecResult, Follower, GatewayStatus, SandboxDriver, SandboxInfo, SandboxSpec, SandboxStatus } from '../../src/sandbox/driver.ts';
 import { splitLines } from '../../src/sandbox/openshell.ts';
 import { run } from '../../src/util.ts';
 
@@ -10,6 +10,7 @@ export class LocalDriver implements SandboxDriver {
   readonly base: string;
   readonly created: SandboxSpec[] = [];
   private readonly env = new Map<string, Record<string, string>>();
+  private readonly labels = new Map<string, Record<string, string>>();
 
   constructor(base: string) {
     this.base = base;
@@ -26,6 +27,7 @@ export class LocalDriver implements SandboxDriver {
     const root = this.rootOf(spec.name);
     mkdirSync(join(root, '.harness'), { recursive: true });
     this.env.set(spec.name, spec.env);
+    this.labels.set(spec.name, spec.labels ?? {});
     this.created.push(spec);
     // A main command other than `sleep infinity` runs, detached, like a container's.
     if (spec.command && spec.command.join(' ') !== 'sleep infinity') {
@@ -90,5 +92,20 @@ export class LocalDriver implements SandboxDriver {
 
   async removeAll(): Promise<void> {
     for (const name of readdirSync(this.base)) await this.remove(name);
+  }
+
+  /** Every directory is a sandbox; one made outside `create`, by a test, has no labels. */
+  async list(): Promise<SandboxInfo[]> {
+    return readdirSync(this.base).map((name) => ({ name, phase: 'Ready', labels: this.labels.get(name) ?? {} }));
+  }
+
+  /** What a test wrote to the sandbox's `.harness/openshell.log`, as OpenShell would log it. */
+  async logs(name: string, lines: number): Promise<string> {
+    const file = join(this.rootOf(name), '.harness', 'openshell.log');
+    return existsSync(file) ? readFileSync(file, 'utf8').split('\n').slice(-lines - 1).join('\n') : '';
+  }
+
+  async gateway(): Promise<GatewayStatus> {
+    return { status: 'connected', version: 'local' };
   }
 }

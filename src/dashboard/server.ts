@@ -10,6 +10,8 @@ import type { SubscriptionUsage } from '../anthropic/usage.ts';
 import type { OwnerTime } from '../design/owner-time.ts';
 import { planDependencies } from '../design/schemas.ts';
 import type { State } from '../state/state.ts';
+import { readDockerUsage, type UsageReading } from '../sandbox/docker.ts';
+import { removeLeftOver, sandboxDenials, sandboxOverview, sharedReading } from './sandboxes.ts';
 import { Terminals, type Size } from './terminals.ts';
 
 export interface DashboardOptions {
@@ -25,6 +27,8 @@ export interface DashboardOptions {
   /** The built front end: `index.html` and its assets. */
   webRoot: string;
   terminals: Terminals;
+  /** What the sandboxes use of the machine; by default, Docker's reading. Tests replace it. */
+  usage?: () => Promise<UsageReading>;
 }
 
 /** What `GET /api/state` returns. */
@@ -59,7 +63,7 @@ const TYPES: Record<string, string> = {
  * content security policy. Server-sent events carry the live updates, WebSockets the
  * terminals, and POST requests the owner's actions.
  */
-export function startDashboard({ orchestrator, port, token, loginCode, webRoot, terminals }: DashboardOptions): Promise<Server> {
+export function startDashboard({ orchestrator, port, token, loginCode, webRoot, terminals, usage = () => readDockerUsage() }: DashboardOptions): Promise<Server> {
   let allowedHosts = new Set<string>();
   // Named for the port: cookies don't tell ports apart, and every project's dashboard has its own token.
   let cookie = 'harness_token';
@@ -67,6 +71,7 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
   const started = Date.now();
   const clients = new Set<ServerResponse>();
   const transcripts = new Transcripts(orchestrator);
+  const sandboxUsage = sharedReading(usage);
 
   const broadcast = (kind: string, data: unknown) => {
     for (const client of clients) client.write(`event: ${kind}\ndata: ${JSON.stringify(data)}\n\n`);
@@ -139,6 +144,14 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
           const items = transcripts.get(url.searchParams.get('agent') ?? '');
           return items ? sendJson(res, items) : send(res, 404, 'no such agent');
         }
+        case 'GET /api/sandboxes':
+          return sendJson(res, await sandboxOverview(orchestrator));
+        case 'GET /api/sandboxes/usage':
+          return sendJson(res, await sandboxUsage());
+        case 'GET /api/sandboxes/denials': {
+          const denials = await sandboxDenials(orchestrator, url.searchParams.get('name') ?? '');
+          return denials ? sendJson(res, denials) : send(res, 404, "not one of this project's sandboxes");
+        }
         case 'GET /api/proposal': {
           // Only files the state names: a module that exists, and one of its versions.
           const module = orchestrator.state.modules[url.searchParams.get('module') ?? ''];
@@ -146,6 +159,17 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
           if (!module || !module.proposals.some((p) => p.version === version)) return send(res, 404, 'no such proposal');
           const file = join(orchestrator.options.harnessDir, 'modules', module.module, 'proposals', `v${version}.md`);
           return send(res, existsSync(file) ? 200 : 404, existsSync(file) ? readFileSync(file, 'utf8') : 'not found');
+        }
+        case 'POST /api/sandboxes/remove':
+          return sendJson(res, typeof body.name === 'string' ? await removeLeftOver(orchestrator, body.name) : { done: false, error: 'which sandbox?' });
+        case 'POST /api/sandboxes/limits': {
+          // A number caps, null lifts the cap.
+          const cap = (key: string) => (body[key] === null ? null : typeof body[key] === 'number' ? body[key] : undefined);
+          const cpu = cap('cpu');
+          const memoryGiB = cap('memoryGiB');
+          if (cpu === undefined || memoryGiB === undefined) return sendJson(res, { done: false, error: 'cpu and memoryGiB: a number, or null for no cap' });
+          const error = orchestrator.setSandboxLimits({ cpu, memoryGiB });
+          return sendJson(res, error ? { done: false, error } : { done: true });
         }
         case 'POST /api/pause':
           return sendJson(res, { done: orchestrator.pause() });

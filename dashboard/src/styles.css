@@ -70,6 +70,10 @@ button.selected { background: var(--accent); }
 .cards { display: grid; gap: 8px; }
 .card { text-align: left; background: var(--panel); padding: 8px 10px; display: grid; gap: 4px; }
 .card.selected { border-color: var(--run); background: var(--accent); }
+tr.selected td { background: var(--accent); }
+details.refused { margin-bottom: 10px; }
+details.refused summary { cursor: pointer; color: var(--warn); }
+tr.clickable { cursor: pointer; }
 .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; min-width: 0; }
 .terminal { height: 70vh; background: #141413; border-radius: 6px; padding: 4px; }
 .transcript { height: 62vh; overflow: auto; border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; background: var(--bg); display: grid; grid-auto-rows: max-content; gap: 4px; align-content: start; }
