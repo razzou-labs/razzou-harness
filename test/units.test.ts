@@ -298,7 +298,7 @@ describe('sandbox policy', () => {
       { host: 'api.example.com', port: 443, protocol: 'rest', enforcement: 'enforce', access: 'full' },
     ]);
     assert.equal(hosts(policy).filter((host) => host === 'api.github.com').length, 1, "the API's rule replaces core's read-only one");
-    assert.ok(!hosts(policy).includes('api.stripe.com'), 'an API with a key is opened by its provider\'s profile');
+    assert.equal(hosts(policy).filter((host) => host === 'api.stripe.com').length, 0, 'an API with a key is opened by its provider\'s profile');
     assert.equal((buildPolicy({ bundles: ['core'], extraHosts: [] }) as Policy).network_policies.third_party_apis, undefined);
   });
 
