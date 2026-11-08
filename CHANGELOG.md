@@ -3,7 +3,12 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
-## Unreleased
+## 0.4.2 (2026-11-08)
+
+**Upgrading a project from 0.4.1:** install the new version, then rebuild the agents'
+image with `harness doctor --build-images`: its tag follows the harness's version. A
+project's AWS services stay as its `harness/config.json` lists them; for every one, set
+`"services": ["all"]` under `aws`.
 
 - **Every AWS service by default.** `"all"` in `aws.services` is every service the AWS
   SDK knows, about 420 endpoints in a region with the global ones, each signed with the
