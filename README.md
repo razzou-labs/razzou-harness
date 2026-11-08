@@ -558,13 +558,19 @@ and Terraform applies only in CI, after you merge.
 1. In `harness/config.json`, add `aws` and `terraform`:
 
    ```json
-   "aws": { "region": "us-east-1", "provider": "aws-view-<org>-shop", "services": ["sts", "s3", "iam", "sqs"] },
+   "aws": { "region": "us-east-1", "provider": "aws-view-<org>-shop", "services": ["all"] },
    "terraform": { "dir": "iac", "backendConfig": "backend-configs/staging.hcl", "varFile": "env/staging.tfvars" }
    ```
 
-   `services` lists the AWS services the project uses: their endpoints become reachable,
-   and signed. Keep the `terraform` paths as they are: the CI workflow uses the same
-   ones. `harness github-setup` then requires `tf-plan` as well.
+   `services` lists the AWS services whose endpoints the sandboxes reach, signed with
+   the view role. `all`, the default, is every service the AWS SDK knows, so the view
+   role alone decides what agents read; a list of names narrows it. OpenShell 0.1.2
+   signs `GET` requests to AWS wrongly, except S3's: services that read with `GET`, such
+   as Lambda, API Gateway, EKS, Route 53, CloudFront and Bedrock, answer
+   `SignatureDoesNotMatch` in the sandboxes, and a `terraform plan` there fails on their
+   resources. CI's plan, outside OpenShell, isn't affected. Keep the `terraform` paths
+   as they are: the CI workflow uses the same ones. `harness github-setup` then requires
+   `tf-plan` as well.
 2. Set the repository variables the workflow reads: `AWS_REGION_STAGING`,
    `AWS_ROLE_PLAN_ARN_STAGING` and `AWS_ROLE_APPLY_ARN_STAGING`.
 3. `harness doctor` creates the OpenShell AWS provider: it asks for the view role's ARN,

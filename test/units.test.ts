@@ -278,6 +278,26 @@ describe('sandbox policy', () => {
     assert.equal((buildPolicy({ bundles: ['core'], extraHosts: [] }) as { network_policies: Record<string, unknown> }).network_policies.aws_view, undefined);
   });
 
+  it('signs every AWS service for all, each with its own signing name, the global ones for their region', () => {
+    type Endpoint = { host: string; signing_service: string; signing_region?: string; credential_binding: { provider: string } };
+    const endpoints = (services: string[]) => (buildPolicy({ bundles: ['core'], extraHosts: [], aws: { region: 'eu-west-1', provider: 'aws-view-shop', services } }) as {
+      network_policies: { aws_view: { endpoints: Endpoint[] } };
+    }).network_policies.aws_view.endpoints;
+    const all = endpoints(['all']);
+    const find = (host: string) => all.find((e) => e.host === host);
+    assert.ok(all.length > 400, `${all.length} endpoints`);
+    assert.equal(new Set(all.map((e) => e.host)).size, all.length, 'one rule per host');
+    all.forEach((e) => checkHost(e.host));
+    assert.ok(all.every((e) => e.credential_binding.provider === 'aws-view-shop'));
+    assert.deepEqual([find('lambda.eu-west-1.amazonaws.com')?.signing_service, find('api.ecr.eu-west-1.amazonaws.com')?.signing_service, find('bedrock-runtime.eu-west-1.amazonaws.com')?.signing_service, find('monitoring.eu-west-1.amazonaws.com')?.signing_service], ['lambda', 'ecr', 'bedrock', 'monitoring']);
+    assert.deepEqual([find('iam.amazonaws.com')?.signing_region, find('route53.amazonaws.com')?.signing_region, find('lambda.eu-west-1.amazonaws.com')?.signing_region], ['us-east-1', 'us-east-1', undefined]);
+    assert.ok(find('*.s3.eu-west-1.amazonaws.com') && find('*.s3-control.eu-west-1.amazonaws.com'), "buckets' and accounts' hosts");
+    const mixed = endpoints(['all', 'cloudwatch', 'newservice']);
+    assert.equal(mixed.length, all.length + 1, 'a named service the table lacks is added, and one it has is not repeated');
+    assert.equal(mixed.find((e) => e.host === 'newservice.eu-west-1.amazonaws.com')?.signing_service, 'newservice');
+    assert.deepEqual(endpoints(['sts']).map((e) => e.host), ['sts.eu-west-1.amazonaws.com'], 'a list without all names only its services');
+  });
+
   it('rejects hosts OpenShell would reject', () => {
     assert.throws(() => checkHost('**.com'));
     assert.throws(() => checkHost('docs.**.example.com'));

@@ -102,6 +102,10 @@ application code, and never `.github/`: CI refuses both.
   - `aws`: the AWS CLI, as a read-only role that sees what exists and how it's
     configured, never data or secrets. Give `post-deploy` checks this, to test the real
     resources. CI doesn't run checks that need `aws`.
+  - Until OpenShell signs AWS `GET` requests correctly, a sandbox can't read services
+    that read with `GET` (Lambda, API Gateway, EKS, Route 53, CloudFront, Bedrock):
+    their calls answer `SignatureDoesNotMatch` in sandboxes, and a `tfplan` plan there
+    fails once resources of theirs exist. CI's plan isn't affected.
 - Project-wide checks, such as `npm run lint`, go in `harness/config.json` under
   `checks`. The npm scripts they run become protected.
 - Third-party APIs the code calls, such as a payment provider's test API, go in

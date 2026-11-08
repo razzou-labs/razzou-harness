@@ -3,6 +3,20 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## Unreleased
+
+- **Every AWS service by default.** `"all"` in `aws.services` is every service the AWS
+  SDK knows, about 420 endpoints in a region with the global ones, each signed with the
+  view role under its own signing name, as OpenShell requires. It is the default, and
+  `harness setup` no longer asks which services the project uses: the view role alone
+  decides what agents read. The table comes from the AWS SDK's own data
+  (`scripts/aws-services.ts` writes it).
+- **Known issue, in OpenShell 0.1.2:** it signs AWS `GET` requests wrongly, except
+  S3's. Services that read with `GET`, such as Lambda, API Gateway, EKS, Route 53,
+  CloudFront and Bedrock, answer `SignatureDoesNotMatch` in the sandboxes, and a
+  `terraform plan` there fails on their resources; every `POST`, as most AWS APIs use,
+  and S3 work. CI's plan isn't affected.
+
 ## 0.4.1 (2026-11-08)
 
 **Upgrading a project from 0.4.0:** install the new version, then rebuild the agents'
