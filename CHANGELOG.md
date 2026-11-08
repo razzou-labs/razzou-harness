@@ -3,7 +3,12 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
-## Unreleased
+## 0.4.0 (2026-11-08)
+
+**Upgrading a project from 0.3.x:** install the new version, then rebuild the agents'
+image with `harness doctor --build-images`, or run `harness setup`, which does it: the
+image's tag follows the harness's version. The doctor now removes the 0.3.0 image once
+no container uses it. Nothing else changes in a project.
 
 - A **Sandboxes** view in the dashboard lists the sandboxes on the OpenShell gateway:
   this project's, with what each is for and whether anything still uses it, then the
