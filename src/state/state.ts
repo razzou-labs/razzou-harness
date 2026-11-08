@@ -220,6 +220,12 @@ export interface State {
   infraMerge: InfraMerge;
   /** What the owner set in the dashboard (v3 §4): their hours for the whole project, and the agent-hours threshold. */
   budgets: { ownerHours?: number; ownerHoursSetAt?: string; agentHours?: number };
+  /**
+   * The tokens of the Managers and Architects, by agent (`manager:<key>`, `architect:<module>`):
+   * the total so far, and the last reading of their sandbox. A Developer's and a reviewer's
+   * are on their attempt and review.
+   */
+  agentTokens?: Record<string, { total: Usage; reading: Usage }>;
   /** What each new sandbox may use of the machine, as the owner set it in the dashboard; no cap without one. */
   sandboxLimits?: { cpu?: number; memoryGiB?: number };
   plans: Record<string, PlanState>;
@@ -352,6 +358,20 @@ export function apply(state: State, event: HarnessEvent): State {
       if (event.payload.hours === null) delete state.budgets.agentHours;
       else state.budgets.agentHours = event.payload.hours;
       break;
+    case 'AGENT_TOKENS': {
+      const { agent, reading } = event.payload;
+      const tokens = (state.agentTokens ??= {});
+      const known = tokens[agent];
+      // A reading below the last is a new sandbox, whose count starts from zero.
+      const grew = known !== undefined && reading.inputTokens >= known.reading.inputTokens && reading.outputTokens >= known.reading.outputTokens;
+      const base = grew ? known.reading : { inputTokens: 0, outputTokens: 0 };
+      const total = known?.total ?? { inputTokens: 0, outputTokens: 0 };
+      tokens[agent] = {
+        total: { inputTokens: total.inputTokens + reading.inputTokens - base.inputTokens, outputTokens: total.outputTokens + reading.outputTokens - base.outputTokens },
+        reading: { inputTokens: reading.inputTokens, outputTokens: reading.outputTokens },
+      };
+      break;
+    }
     case 'SANDBOX_LIMITS_SET': {
       const { cpu, memoryGiB } = event.payload;
       if (cpu === null && memoryGiB === null) delete state.sandboxLimits;

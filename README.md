@@ -261,7 +261,8 @@ behind a token. Its views:
 - **Needs you:** questions from the Manager, proposals to accept, pull requests to merge,
   escalations, owner actions, a paused pipeline. Each has its button or form.
 - **Project:** modules, proposals, plans and features, with attempts, findings, CI,
-  deploys and `progress.txt`.
+  deploys and `progress.txt`; and the budgets: your hours, the agents' hours, and the
+  tokens Claude used, written and read, by role.
 - **Agents:** the Architect's terminal, the Manager's and the Developers' live
   transcripts, a message box for the Manager, and a shell in any agent's sandbox. An
   attempt's card keeps the network requests its sandbox's policy refused.
@@ -434,7 +435,7 @@ through an `Arch:` pull request, or a commit of your own on `main`.
 
 ```json
 {
-  "harnessVersion": "0.4.3",
+  "harnessVersion": "0.4.4",
   "project": { "name": "shop", "repo": "<org>/shop", "bot": "<org>-harness[bot]" },
   "roles": {
     "architect": { "model": "claude-opus-5-5", "effort": "max" },

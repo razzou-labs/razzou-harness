@@ -413,6 +413,17 @@ describe('manager', () => {
     assert.equal(o.state.managers.demo!.exits.length, 1);
   });
 
+  it("records its tokens from the conversations in its sandbox, at the latest before the sandbox goes", async () => {
+    const { orchestrator: o, driver } = await setup((f) => solved(f));
+    await until(o, () => o.state.managers.demo !== undefined && existsSync(driver.rootOf(o.state.managers.demo.sandbox)));
+    const dir = join(driver.rootOf(o.state.managers.demo!.sandbox), '.claude', 'projects', '-sandbox-work');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'session.jsonl'), `${JSON.stringify({ type: 'assistant', message: { id: 'msg_1', usage: { input_tokens: 5, cache_creation_input_tokens: 0, cache_read_input_tokens: 95, output_tokens: 12 } } })}\n`);
+    await until(o, completed(o));
+    assert.equal(o.state.managers.demo!.status, 'stopped');
+    assert.deepEqual(o.state.agentTokens?.['manager:demo']?.total, { inputTokens: 100, outputTokens: 12 });
+  });
+
   it('pauses the pipeline when it never starts', async () => {
     const { orchestrator: o } = await setup((f) => solved(f), { manager: { failStart: true } });
     await until(o, () => o.state.pipeline.paused !== undefined);

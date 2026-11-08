@@ -3,6 +3,19 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## 0.4.4 (2026-11-08)
+
+**Upgrading from 0.4.3:** install the new version, then rebuild the agents' image with
+`harness doctor --build-images`: its tag follows the harness's version.
+
+- **Claude's tokens, in the dashboard.** A meter beside the agents' hours counts every
+  token Claude used for the project, written and read (the prompt cache included), and
+  splits it by role. A Developer's and a reviewer's come from Claude Code's report when
+  their session ends. A Manager's and an Architect's, which run on without one, are read
+  every five minutes from the conversations Claude Code saves in their sandbox, and once
+  more before a Manager's sandbox goes; a sandbox made again counts from zero, added to
+  the total so far.
+
 ## 0.4.3 (2026-11-08)
 
 **Upgrading from 0.4.2:** install the new version, then rebuild the agents' image with

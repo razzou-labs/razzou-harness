@@ -74,6 +74,7 @@ export class Architects {
     }
     this.attach(module);
     await this.sendNotes(module);
+    await o.noteTokens(`architect:${module.module}`, module.architect.sandbox);
     if (module.submission && !this.busy.has(module.module)) await this.process(module);
     if (module.status === 'in_review' && module.design?.pr) await this.followPullRequest(module);
   }

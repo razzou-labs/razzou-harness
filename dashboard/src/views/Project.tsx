@@ -82,6 +82,31 @@ function agentMs(state: State, now: number): number {
   return total;
 }
 
+type Tokens = { input: number; output: number };
+
+/** Claude's tokens by role: a Developer's and a reviewer's from their sessions' end, a Manager's and an Architect's from the daemon's readings of their sandboxes. */
+function tokensByRole(state: State): Array<[string, Tokens]> {
+  const roles: Record<string, Tokens> = { Developers: { input: 0, output: 0 }, Managers: { input: 0, output: 0 }, Architects: { input: 0, output: 0 }, reviewers: { input: 0, output: 0 } };
+  const add = (role: string, usage?: { inputTokens: number; outputTokens: number }) => {
+    if (!usage) return;
+    roles[role]!.input += usage.inputTokens;
+    roles[role]!.output += usage.outputTokens;
+  };
+  for (const feature of Object.values(state.features)) for (const attempt of feature.attempts) add('Developers', attempt.usage);
+  for (const plan of Object.values(state.plans)) for (const review of plan.reviews ?? []) add('reviewers', review.usage);
+  for (const [agent, tokens] of Object.entries(state.agentTokens ?? {})) {
+    add(agent.startsWith('manager:') ? 'Managers' : agent.startsWith('architect:') ? 'Architects' : 'Developers', tokens.total);
+  }
+  return Object.entries(roles);
+}
+
+/** 1234567 is 1.2 M; 45678 is 46 k. */
+function count(n: number): string {
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)} M`;
+  if (n >= 1e3) return `${Math.round(n / 1e3)} k`;
+  return String(n);
+}
+
 /** The owner's hours for the whole project, and the agent-hours threshold (v3 §4): set here, recorded by the daemon. */
 function Budgets({ state, ownerTime, usage, ceiling }: { state: State; ownerTime?: OwnerTime; usage?: { at: string; usage: SubscriptionUsage }; ceiling: number | null }) {
   const budgets = state.budgets ?? {};
@@ -128,6 +153,7 @@ function Budgets({ state, ownerTime, usage, ceiling }: { state: State; ownerTime
           <HoursForm field="agentHours" value={budgets.agentHours} placeholder="threshold" />
           <p className="muted small">The Developers' attempt clocks, summed. Over the threshold the number turns red; nothing stops.</p>
         </div>
+        <TokensMeter state={state} />
         {usage && (
           <div className="meter">
             <h3>Subscription</h3>
@@ -146,6 +172,25 @@ function Budgets({ state, ownerTime, usage, ceiling }: { state: State; ownerTime
         )}
       </div>
     </section>
+  );
+}
+
+/** Every token Claude used for the project, written and read, and by role. */
+function TokensMeter({ state }: { state: State }) {
+  const roles = tokensByRole(state);
+  const total = roles.reduce((sum, [, t]) => ({ input: sum.input + t.input, output: sum.output + t.output }), { input: 0, output: 0 });
+  return (
+    <div className="meter">
+      <h3>Claude tokens</h3>
+      <p>
+        <b>{count(total.input + total.output)}</b>
+        <span className="muted"> · {count(total.output)} written, {count(total.input)} read, cache included</span>
+      </p>
+      <p className="small">{roles.map(([role, t]) => `${role} ${count(t.input + t.output)}`).join(' · ')}</p>
+      <p className="muted small">
+        Claude Code's own counts: an attempt's and a review's when it ends, a Manager's and an Architect's every five minutes. Most of what is read comes from the prompt cache.
+      </p>
+    </div>
   );
 }
 

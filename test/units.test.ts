@@ -10,7 +10,9 @@ import { DEVELOPER, HARNESS, Repo } from '../src/git/repo.ts';
 import { checkHost } from '../src/sandbox/allowlist.ts';
 import { githubRepo, init } from '../src/setup/init.ts';
 import { apiProfile, apiProviderName, buildPolicy } from '../src/sandbox/policy.ts';
-import { EventStore } from '../src/state/events.ts';
+import type { Orchestrator } from '../src/daemon/orchestrator.ts';
+import { readTokens } from '../src/daemon/tokens.ts';
+import { EventStore, type HarnessEvent } from '../src/state/events.ts';
 import { activeAttempts, attemptInSandbox, countedAttempts, project } from '../src/state/state.ts';
 import { clip, runOk } from '../src/util.ts';
 import { createToyRepo, tempDir } from './helpers/toy-repo.ts';
@@ -122,6 +124,42 @@ describe('design', () => {
     const config = (extra: object) => ConfigSchema.parse({ harnessVersion: '0.1.0', project: { name: 'p' }, ...extra });
     assert.deepEqual(requiredChecks(config({})), ['verify', 'checks']);
     assert.deepEqual(requiredChecks(config({ terraform: {} })), ['verify', 'checks', 'tf-plan']);
+  });
+});
+
+describe('agent tokens', () => {
+  it("adds up a long-lived agent's readings, a new sandbox counting again from zero", () => {
+    let id = 0;
+    const event = (reading: { inputTokens: number; outputTokens: number }, agent = 'manager:demo') =>
+      ({ v: 1, id: `e${++id}`, ts: '2026-11-08T00:00:00Z', type: 'AGENT_TOKENS', payload: { agent, reading } }) as unknown as HarnessEvent;
+    const state = project([
+      event({ inputTokens: 1000, outputTokens: 100 }),
+      event({ inputTokens: 1500, outputTokens: 180 }),
+      event({ inputTokens: 200, outputTokens: 20 }),
+      event({ inputTokens: 300, outputTokens: 30 }),
+      event({ inputTokens: 50, outputTokens: 5 }, 'architect:demo'),
+    ]);
+    assert.deepEqual(state.agentTokens!['manager:demo'], { total: { inputTokens: 1800, outputTokens: 210 }, reading: { inputTokens: 300, outputTokens: 30 } });
+    assert.deepEqual(state.agentTokens!['architect:demo']!.total, { inputTokens: 50, outputTokens: 5 });
+  });
+
+  it("counts every reply of a sandbox's saved conversations once, at its final count", async () => {
+    const driver = new LocalDriver(tempDir('tokens'));
+    await driver.create({ name: 'mgr-tokens', image: 'x', providers: [], env: {} });
+    const dir = join(driver.rootOf('mgr-tokens'), '.claude', 'projects', '-sandbox-work');
+    mkdirSync(join(dir, 'subagents'), { recursive: true });
+    const reply = (id: string, output: number, input = 10) => JSON.stringify({ type: 'assistant', message: { id, usage: { input_tokens: input, cache_creation_input_tokens: 100, cache_read_input_tokens: 1000, output_tokens: output } } });
+    writeFileSync(join(dir, 'session.jsonl'), [
+      JSON.stringify({ type: 'user', message: { content: 'hi' } }),
+      reply('msg_1', 5), reply('msg_1', 40),
+      reply('msg_2', 7),
+      '{"type":"assistant","message":{"id":"msg_3","usa',
+    ].join('\n'));
+    writeFileSync(join(dir, 'subagents', 'agent-a.jsonl'), `${reply('msg_4', 3, 1)}\n`);
+    const o = { exec: (sandbox: string, script: string) => driver.exec(sandbox, script) } as unknown as Orchestrator;
+    assert.deepEqual(await readTokens(o, 'mgr-tokens'), { inputTokens: 2 * 1110 + 1101, outputTokens: 40 + 7 + 3 });
+    assert.equal(await readTokens(o, 'no-such-sandbox'), undefined);
+    await driver.removeAll();
   });
 });
 
