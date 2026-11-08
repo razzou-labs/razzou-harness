@@ -3,6 +3,19 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## 0.4.5 (2026-11-08)
+
+**Upgrading from 0.4.4:** install the new version, rebuild the agents' image with
+`harness doctor --build-images` (its tag follows the harness's version), then restart the
+daemon with `harness down` and `harness up`.
+
+- **Agents start again on OpenShell 0.1.7.** Its `sandbox upload` applies `.gitignore`
+  inside a Git work tree, and every file the harness uploads is in the project's ignored
+  `.harness/` folder, so every upload stopped: no Architect, Manager or Developer could
+  start. The Architect's sandbox was made again after each try, which broke its terminal
+  on the dashboard. The harness now uploads with `--no-git-ignore`. Downloads weren't
+  affected.
+
 ## 0.4.4 (2026-11-08)
 
 **Upgrading from 0.4.3:** install the new version, then rebuild the agents' image with

@@ -1,7 +1,7 @@
 import { strict as assert } from 'node:assert';
 import { spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createServer, request, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import type { NetworkInterfaceInfo } from 'node:os';
@@ -225,6 +225,34 @@ describe('the OpenShell driver', () => {
     await sleep(50);
     follower.stop();
     await follower.done;
+  });
+
+  it('uploads a file Git ignores, as every file the harness keeps under .harness is', async () => {
+    // OpenShell 0.1.7's upload: inside a Git work tree, .gitignore applies unless --no-git-ignore.
+    const bin = join(tempDir('openshell'), 'openshell');
+    writeFileSync(bin, [
+      '#!/bin/sh',
+      'filter=1',
+      'shift 2',
+      'for arg do',
+      '  shift',
+      '  if [ "$arg" = --no-git-ignore ]; then filter=0; else set -- "$@" "$arg"; fi',
+      'done',
+      'if [ $filter = 1 ] && git -C "$(dirname "$2")" check-ignore -q "$2"; then',
+      '  echo "Git filtering selected no files for $2; upload stopped." >&2',
+      '  exit 1',
+      'fi',
+      'mkdir -p "$3" && cp "$2" "$3"',
+      '',
+    ].join('\n'), { mode: 0o755 });
+    const project = tempDir('ignored');
+    spawnSync('git', ['init', '--quiet', project]);
+    writeFileSync(join(project, '.gitignore'), '.harness/\n');
+    mkdirSync(join(project, '.harness'));
+    writeFileSync(join(project, '.harness', 'main.bundle'), 'history');
+    const sandbox = tempDir('sandbox');
+    await new OpenShellDriver(bin).upload('sb', join(project, '.harness', 'main.bundle'), join(sandbox, 'harness'));
+    assert.equal(readFileSync(join(sandbox, 'harness', 'main.bundle'), 'utf8'), 'history');
   });
 });
 
