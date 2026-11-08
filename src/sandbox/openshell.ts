@@ -114,8 +114,13 @@ export class OpenShellDriver implements SandboxDriver {
     };
   }
 
+  /**
+   * Inside a Git work tree, OpenShell 0.1.7 uploads only what `.gitignore` lets through, and
+   * the harness keeps the files it uploads under `.harness/`, which the project ignores:
+   * without `--no-git-ignore` every upload stops. The trailing slash puts the file in the folder.
+   */
   async upload(name: string, localFile: string, remoteDir: string): Promise<void> {
-    await runOk(this.bin, ['sandbox', 'upload', name, localFile, remoteDir.endsWith('/') ? remoteDir : `${remoteDir}/`]);
+    await runOk(this.bin, ['sandbox', 'upload', '--no-git-ignore', name, localFile, remoteDir.endsWith('/') ? remoteDir : `${remoteDir}/`]);
   }
 
   async download(name: string, remoteFile: string, localFile: string): Promise<void> {
