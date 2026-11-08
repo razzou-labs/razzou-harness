@@ -22,12 +22,14 @@ under `aws`.
   `harness setup` no longer asks which services the project uses: the view role alone
   decides what agents read. The table comes from the AWS SDK's own data
   (`scripts/aws-services.ts` writes it).
-- **Known issue, in OpenShell up to 0.1.7 at least**
-  ([NVIDIA/OpenShell#5375](https://github.com/NVIDIA/OpenShell/issues/5375)): it signs
-  AWS `GET` requests wrongly, except S3's. Services that read with `GET`, such as
-  Lambda, API Gateway, EKS, Route 53, CloudFront and Bedrock, answer
-  `SignatureDoesNotMatch` in the sandboxes, and a `terraform plan` there fails on their
-  resources; every `POST`, as most AWS APIs use, and S3 work. CI's plan isn't affected.
+- **AWS reads with `GET` work.** OpenShell's automatic `sigv4` mode signs a request
+  with neither a body nor `x-amz-content-sha256` as `UNSIGNED-PAYLOAD`, which only S3
+  accepts ([NVIDIA/OpenShell#5375](https://github.com/NVIDIA/OpenShell/issues/5375)):
+  every service that reads with `GET`, such as Lambda, API Gateway, EKS, Route 53,
+  CloudFront and Bedrock, answered `SignatureDoesNotMatch` in the sandboxes, and a
+  `terraform plan` there failed on their resources. Every AWS endpoint but S3's is now
+  signed with `sigv4:body`, the hash of the request's body, empty for a `GET`: the AWS
+  CLI's calls to those services and a `terraform plan` reading them work.
 
 ## 0.4.1 (2026-11-08)
 

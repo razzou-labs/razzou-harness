@@ -30,11 +30,6 @@ owner merges, and AWS refuses your writes.
 - Run `terraform fmt -recursive` and `terraform validate` before you commit, as CI does.
   Commit `.terraform.lock.hcl` when `init` changes it.
 - The AWS CLI works, as a read-only role.
-- A known OpenShell issue: AWS `GET` requests are signed wrongly, except S3's, so
-  services that read with `GET` (Lambda, API Gateway, EKS, Route 53, CloudFront,
-  Bedrock) answer `SignatureDoesNotMatch`, and a plan that reads such resources fails.
-  Don't try to fix it: if your work needs it, finish as `blocked`, category
-  `environment`, and name the call.
 
 ## Your harness tools
 

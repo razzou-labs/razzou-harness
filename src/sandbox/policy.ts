@@ -35,6 +35,11 @@ export const ALL_SERVICES = 'all';
  * named with their service, with no rule for every AWS host, so `all` names every one
  * the AWS SDK knows (aws-services.ts), with the hosts that carry a bucket's or an
  * account's name in front.
+ *
+ * Every service but S3 is signed with `sigv4:body`: the hash of the request's body, an
+ * empty one for a GET. OpenShell's automatic `sigv4` signs a request with neither a body
+ * nor `x-amz-content-sha256` as UNSIGNED-PAYLOAD, which only S3 accepts, so every other
+ * service's GET failed (NVIDIA/OpenShell#5375). S3 keeps it: its SDKs say how to sign.
  */
 function awsEndpoints(aws: NonNullable<PolicyOptions['aws']>): object[] {
   const signed = (host: string, service: string, region?: string): { host: string } => ({
@@ -44,7 +49,7 @@ function awsEndpoints(aws: NonNullable<PolicyOptions['aws']>): object[] {
     enforcement: 'enforce',
     access: 'full',
     credential_binding: { provider: aws.provider },
-    credential_signing: 'sigv4',
+    credential_signing: service === 's3' ? 'sigv4' : 'sigv4:body',
     signing_service: service,
     ...(region ? { signing_region: region } : {}),
   } as { host: string });

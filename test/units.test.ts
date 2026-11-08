@@ -272,7 +272,8 @@ describe('sandbox policy', () => {
     assert.deepEqual(endpoints.map((e) => e.host), ['sts.ap-southeast-2.amazonaws.com', 's3.ap-southeast-2.amazonaws.com', '*.s3.ap-southeast-2.amazonaws.com', 'iam.amazonaws.com']);
     for (const endpoint of endpoints) {
       assert.deepEqual(endpoint.credential_binding, { provider: 'aws-view-shop' });
-      assert.equal(endpoint.credential_signing, 'sigv4');
+      // S3 signs as its SDK says; every other service, a GET included, with the hash of its body (NVIDIA/OpenShell#5375).
+      assert.equal(endpoint.credential_signing, String(endpoint.host).includes('.s3.') || String(endpoint.host).startsWith('s3.') ? 'sigv4' : 'sigv4:body', String(endpoint.host));
     }
     assert.equal(endpoints[3]!.signing_region, 'us-east-1');
     assert.equal((buildPolicy({ bundles: ['core'], extraHosts: [] }) as { network_policies: Record<string, unknown> }).network_policies.aws_view, undefined);
@@ -292,6 +293,8 @@ describe('sandbox policy', () => {
     assert.deepEqual([find('lambda.eu-west-1.amazonaws.com')?.signing_service, find('api.ecr.eu-west-1.amazonaws.com')?.signing_service, find('bedrock-runtime.eu-west-1.amazonaws.com')?.signing_service, find('monitoring.eu-west-1.amazonaws.com')?.signing_service], ['lambda', 'ecr', 'bedrock', 'monitoring']);
     assert.deepEqual([find('iam.amazonaws.com')?.signing_region, find('route53.amazonaws.com')?.signing_region, find('lambda.eu-west-1.amazonaws.com')?.signing_region], ['us-east-1', 'us-east-1', undefined]);
     assert.ok(find('*.s3.eu-west-1.amazonaws.com') && find('*.s3-control.eu-west-1.amazonaws.com'), "buckets' and accounts' hosts");
+    const signing = (host: string) => (find(host) as { credential_signing?: string } | undefined)?.credential_signing;
+    assert.deepEqual([signing('lambda.eu-west-1.amazonaws.com'), signing('route53.amazonaws.com'), signing('s3.eu-west-1.amazonaws.com'), signing('*.s3-control.eu-west-1.amazonaws.com')], ['sigv4:body', 'sigv4:body', 'sigv4', 'sigv4']);
     const mixed = endpoints(['all', 'cloudwatch', 'newservice']);
     assert.equal(mixed.length, all.length + 1, 'a named service the table lacks is added, and one it has is not repeated');
     assert.equal(mixed.find((e) => e.host === 'newservice.eu-west-1.amazonaws.com')?.signing_service, 'newservice');

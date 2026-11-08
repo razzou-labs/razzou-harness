@@ -564,12 +564,10 @@ and Terraform applies only in CI, after you merge.
 
    `services` lists the AWS services whose endpoints the sandboxes reach, signed with
    the view role. `all`, the default, is every service the AWS SDK knows, so the view
-   role alone decides what agents read; a list of names narrows it. OpenShell, up to
-   0.1.7 at least, signs `GET` requests to AWS wrongly, except S3's
-   ([NVIDIA/OpenShell#5375](https://github.com/NVIDIA/OpenShell/issues/5375)): services
-   that read with `GET`, such as Lambda, API Gateway, EKS, Route 53, CloudFront and
-   Bedrock, answer `SignatureDoesNotMatch` in the sandboxes, and a `terraform plan`
-   there fails on their resources. CI's plan, outside OpenShell, isn't affected. Keep the `terraform` paths
+   role alone decides what agents read; a list of names narrows it. Every service but S3
+   is signed with the hash of the request's body, empty for a `GET`: OpenShell's
+   automatic mode signs a bodiless `GET` in a way only S3 accepts
+   ([NVIDIA/OpenShell#5375](https://github.com/NVIDIA/OpenShell/issues/5375)). Keep the `terraform` paths
    as they are: the CI workflow uses the same ones. `harness github-setup` then requires
    `tf-plan` as well.
 2. Set the repository variables the workflow reads: `AWS_REGION_STAGING`,
