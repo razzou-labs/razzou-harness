@@ -7,6 +7,8 @@ export type { HarnessEvent };
 export type { Attempt, FeatureState, ManagerState, ModuleState, PlanState, State } from '../../src/state/state.ts';
 export type { OwnerTime } from '../../src/design/owner-time.ts';
 export type { SubscriptionUsage } from '../../src/anthropic/usage.ts';
+export type { Denial, SandboxOverview, SandboxRow, UsageReading } from '../../src/dashboard/sandboxes.ts';
+export type { SandboxUsage } from '../../src/sandbox/docker.ts';
 export type Design = DashboardState['design'];
 
 /** A line of an agent's stream-json, as the daemon relayed it. */

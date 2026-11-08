@@ -3,6 +3,30 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## Unreleased
+
+- A **Sandboxes** view in the dashboard lists the sandboxes on the OpenShell gateway:
+  this project's, with what each is for and whether anything still uses it, then the
+  others'. A left-over sandbox of this project, which a crash or a failed delete left,
+  can be deleted there; one in use, or another project's, can't. Selecting a sandbox
+  shows the network requests its policy refused, from its log: the program, the host,
+  why, and how often. The daemon labels the sandboxes it makes with the project's name
+  (`harness.project`) to tell them apart; a left-over sandbox from 0.3.0 or earlier has
+  no label, so it shows among the others.
+- The view shows what each sandbox uses of the machine now, its CPUs and memory against
+  its caps, and the total for every OpenShell sandbox, read from `docker stats` every
+  five seconds while the view is open.
+- **Caps on each sandbox**, set in the Sandboxes view: how many CPUs and how much memory
+  each new sandbox may use, so that Developers, check runs and reviewers in parallel
+  leave the machine usable. The daemon records them, and creates every sandbox with
+  them from then on; those already there keep theirs. There is no cap until you set one.
+- An attempt keeps the network requests its sandbox's policy refused. OpenShell keeps
+  only a sandbox's last 2,000 log lines, so the daemon reads the log every minute while
+  the Developer works, and once more before the sandbox goes. The attempt's card shows
+  them, and the Manager gets them with a failed attempt. A refused host is the
+  Manager's to resolve: it guides the next Developer around the host, or asks the owner
+  to allow it, since only the owner widens the network policy.
+
 ## 0.3.0 (2026-11-07)
 
 **Upgrading a project from 0.2.x:** install the new version, then run `harness setup`

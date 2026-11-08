@@ -2,6 +2,7 @@ import { mkdirSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { CheckResult } from '../checks/runner.ts';
 import type { ReviewFinding, ReviewerRole } from '../design/schemas.ts';
+import type { Denial } from '../sandbox/refusals.ts';
 import type { AttemptOutcome, CiJob, Finding, HarnessEvent, Ref, Usage } from './events.ts';
 
 export type AttemptStatus = 'starting' | 'running' | 'collecting' | 'checking' | 'reviewing' | 'accepted' | 'failed' | 'interrupted';
@@ -47,6 +48,8 @@ export interface Attempt {
   /** The attempt merged with the plan's head that moved under it, and checked again, ready to land (v3 §6.3). */
   rebased?: { onto: string; commit: string };
   questions?: Question[];
+  /** The requests its sandbox's network policy refused, the latest first. */
+  refused?: Denial[];
   reviewSince?: string;
   /** The Manager's verdict after a review. The daemon acts on it in its next step. */
   decision?: { kind: 'accept' | 'reject'; text?: string; requestId: string; at: string };
@@ -217,6 +220,8 @@ export interface State {
   infraMerge: InfraMerge;
   /** What the owner set in the dashboard (v3 §4): their hours for the whole project, and the agent-hours threshold. */
   budgets: { ownerHours?: number; ownerHoursSetAt?: string; agentHours?: number };
+  /** What each new sandbox may use of the machine, as the owner set it in the dashboard; no cap without one. */
+  sandboxLimits?: { cpu?: number; memoryGiB?: number };
   plans: Record<string, PlanState>;
   features: Record<string, FeatureState>;
   managers: Record<string, ManagerState>;
@@ -347,6 +352,12 @@ export function apply(state: State, event: HarnessEvent): State {
       if (event.payload.hours === null) delete state.budgets.agentHours;
       else state.budgets.agentHours = event.payload.hours;
       break;
+    case 'SANDBOX_LIMITS_SET': {
+      const { cpu, memoryGiB } = event.payload;
+      if (cpu === null && memoryGiB === null) delete state.sandboxLimits;
+      else state.sandboxLimits = { ...(cpu !== null ? { cpu } : {}), ...(memoryGiB !== null ? { memoryGiB } : {}) };
+      break;
+    }
     case 'PR_LEFT_TO_OWNER':
       state.plans[planKey(ref!)]!.leftToOwner = { head: event.payload.head, reason: event.payload.reason, at: event.ts };
       digest(state, event.id, ref!, `Pull request #${event.payload.number} of plan ${ref!.plan} waits for the owner: ${event.payload.reason}`);
@@ -499,6 +510,9 @@ export function apply(state: State, event: HarnessEvent): State {
       break;
     case 'ATTEMPT_ENDED':
       Object.assign(attemptOf(state, ref!), { status: 'collecting', endedAt: event.ts, ...event.payload });
+      break;
+    case 'NETWORK_REFUSED':
+      attemptOf(state, ref!).refused = event.payload.requests;
       break;
     case 'ATTEMPT_INTERRUPTED': {
       const attempt = attemptOf(state, ref!);

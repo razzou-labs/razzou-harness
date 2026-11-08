@@ -16,15 +16,16 @@ import { GitHubClient, loadAppCredentials } from '../github/app.ts';
 import { GitHubForge, LocalForge, type CheckRun, type Forge, type PullRequest } from '../github/forge.ts';
 import { rulesProblems } from '../github/setup.ts';
 import { toolsManifest, type Role } from '../roles.ts';
-import type { ExecResult, Follower, SandboxDriver } from '../sandbox/driver.ts';
+import { PROJECT_LABEL, type ExecResult, type Follower, type SandboxDriver, type SandboxSpec } from '../sandbox/driver.ts';
 import { BUNDLES } from '../sandbox/allowlist.ts';
 import { buildPolicy } from '../sandbox/policy.ts';
+import { Denials, LOG_LINES } from '../sandbox/refusals.ts';
 import { EventStore, type CiJob, type HarnessEvent, type NewEvent, type Ref } from '../state/events.ts';
 import {
   activeAttempts, apply, countedAttempts, featureKey, interruptions, isActive, managersOf, planKey, planMerged, project, writeSnapshot,
   type Attempt, type FeatureState, type InfraMerge, type ManagerState, type Mode, type PlanState, type ReviewState, type State,
 } from '../state/state.ts';
-import { clip, sh, sleep } from '../util.ts';
+import { clip, machineSize, sh, sleep } from '../util.ts';
 import { Architects } from './architects.ts';
 import { AgentChannel, type AgentRequest } from './channel.ts';
 import { architectRef } from './design.ts';
@@ -93,6 +94,8 @@ export class Orchestrator {
   repo!: Repo;
   readonly options: OrchestratorOptions;
   readonly driver: SandboxDriver;
+  /** The check sandboxes in use, with the ref each checks: the state doesn't name them. */
+  readonly checking = new Map<string, string>();
   readonly agent: AgentAdapter;
   readonly managers: Managers;
   readonly architects: Architects;
@@ -120,6 +123,8 @@ export class Orchestrator {
   private readonly developers = new Map<string, { follower: Follower; channel: AgentChannel }>();
   /** The reviewers under way, by sandbox: plans in parallel can be reviewed at once. */
   private readonly reviewers = new Map<string, { follower: Follower; channel: AgentChannel }>();
+  /** What the policy refused the attempts under way, by sandbox, added up from their logs every minute. */
+  private readonly refusals = new Map<string, { denials: Denials; readAt: number }>();
 
   constructor(options: OrchestratorOptions) {
     this.options = options;
@@ -303,6 +308,20 @@ export class Orchestrator {
       changed = true;
     }
     return changed;
+  }
+
+  /**
+   * The owner caps what each new sandbox may use of the machine, CPUs and memory; null
+   * lifts a cap. The sandboxes already there keep theirs. Returns why not, if not.
+   */
+  setSandboxLimits(limits: { cpu: number | null; memoryGiB: number | null }): string | undefined {
+    const { cpu, memoryGiB } = limits;
+    const machine = machineSize();
+    if (cpu !== null && !(Number.isFinite(cpu) && cpu >= 0.5 && cpu <= machine.cpus)) return `CPUs: from 0.5 to ${machine.cpus}, this machine's`;
+    if (memoryGiB !== null && !(Number.isFinite(memoryGiB) && memoryGiB >= 1 && memoryGiB <= machine.memoryGiB)) return `memory: from 1 to ${Math.floor(machine.memoryGiB)} GiB, this machine's`;
+    const current = this.state.sandboxLimits;
+    if ((current?.cpu ?? null) !== cpu || (current?.memoryGiB ?? null) !== memoryGiB) this.record({ type: 'SANDBOX_LIMITS_SET', payload: { cpu, memoryGiB } });
+    return undefined;
   }
 
   /** The owner grants one more attempt to an escalated feature (`module/plan/feature`). */
@@ -825,7 +844,10 @@ export class Orchestrator {
         this.record({ type: 'ATTEMPT_ENDED', ref, payload: { outcome: 'aborted', summary: attempt.abort.reason } });
         return 'progress';
       }
-      if (this.now() < Date.parse(attempt.deadline)) return 'wait';
+      if (this.now() < Date.parse(attempt.deadline)) {
+        await this.readRefusals(attempt.sandbox);
+        return 'wait';
+      }
       await this.killAgent(attempt.sandbox);
       this.record({ type: 'ATTEMPT_ENDED', ref, payload: { outcome: 'timed_out' } });
       return 'progress';
@@ -855,6 +877,7 @@ export class Orchestrator {
   /** Step 7: take the Developer's commits out as a bundle, whatever the outcome, and refuse changes to protected files. */
   private async collect(state: FeatureState, attempt: Attempt): Promise<Step> {
     this.stopFollowing(attempt.sandbox);
+    await this.keepRefusals(state, attempt);
     const ref = refOf(state, attempt);
     if (attempt.outcome === 'usage_limit') {
       // Not the Developer's doing, but the sandbox writes the stream it is read from: like any
@@ -1351,28 +1374,34 @@ export class Orchestrator {
   /** Runs checks on a commit of the daemon's repository, in a fresh sandbox with no agent and no credentials. */
   async runChecksIn(name: string, gitRef: string, dir: string, checks: Check[]): Promise<CheckResult[]> {
     const p = this.paths(name);
-    await this.driver.remove(name);
-    await this.driver.create({
-      name,
-      image: this.design.config.sandbox.image,
-      ...this.access({ claude: false, aws: checks.some((c) => c.needs.length > 0) }),
-      command: ['sleep', 'infinity'],
-    });
+    // In use from before its creation to after its removal, so the dashboard never offers to delete it.
+    this.checking.set(name, gitRef.replace(/^refs\/(heads\/)?/, ''));
     try {
-      await this.repo.bundle(gitRef, join(dir, 'candidate.bundle'));
-      await this.driver.upload(name, join(dir, 'candidate.bundle'), p.harness);
-      const fetch = await this.exec(name, [
-        `git init --quiet ${sh(p.work)}`,
-        `cd ${sh(p.work)}`,
-        `git fetch --quiet ${sh(`${p.harness}/candidate.bundle`)} ${sh(`${gitRef}:refs/heads/candidate`)}`,
-        'git checkout --quiet candidate',
-      ].join(' && '));
-      if (fetch.code !== 0) throw new Error(`could not check out the candidate: ${fetch.stderr.trim()}`);
-      const init = await initEnvironment(this.driver, name, p.work);
-      if (init && init.exit !== 0) return [init];
-      return await runChecks(this.driver, name, p.work, checks, this.checkOptions(name));
-    } finally {
       await this.driver.remove(name);
+      await this.driver.create({
+        name,
+        image: this.design.config.sandbox.image,
+        ...this.access({ claude: false, aws: checks.some((c) => c.needs.length > 0) }),
+        command: ['sleep', 'infinity'],
+      });
+      try {
+        await this.repo.bundle(gitRef, join(dir, 'candidate.bundle'));
+        await this.driver.upload(name, join(dir, 'candidate.bundle'), p.harness);
+        const fetch = await this.exec(name, [
+          `git init --quiet ${sh(p.work)}`,
+          `cd ${sh(p.work)}`,
+          `git fetch --quiet ${sh(`${p.harness}/candidate.bundle`)} ${sh(`${gitRef}:refs/heads/candidate`)}`,
+          'git checkout --quiet candidate',
+        ].join(' && '));
+        if (fetch.code !== 0) throw new Error(`could not check out the candidate: ${fetch.stderr.trim()}`);
+        const init = await initEnvironment(this.driver, name, p.work);
+        if (init && init.exit !== 0) return [init];
+        return await runChecks(this.driver, name, p.work, checks, this.checkOptions(name));
+      } finally {
+        await this.driver.remove(name);
+      }
+    } finally {
+      this.checking.delete(name);
     }
   }
 
@@ -1390,6 +1419,7 @@ export class Orchestrator {
 
   /** Not the Developer's fault: doesn't count, except from the third interruption of the same feature. */
   private async interrupt(state: FeatureState, attempt: Attempt, reason: string): Promise<Step> {
+    await this.keepRefusals(state, attempt);
     const counts = interruptions(state, attempt.definitionHash) >= 2;
     this.record({ type: 'ATTEMPT_INTERRUPTED', ref: refOf(state, attempt), payload: { reason, counts } });
     // Followers start again when their stream ends: one left on a removed sandbox would go on trying.
@@ -1400,6 +1430,7 @@ export class Orchestrator {
 
   /** Claude Code exited before writing anything: a flag, the token or the image is wrong, and retrying can't help. */
   private async agentDidNotStart(state: FeatureState, attempt: Attempt, stderr: string): Promise<Step> {
+    await this.keepRefusals(state, attempt);
     const reason = `Claude Code did not start: ${clip(stderr.trim().replace(/\s+/g, ' ') || 'it wrote nothing', 400)}`;
     this.record({ type: 'ATTEMPT_INTERRUPTED', ref: refOf(state, attempt), payload: { reason, counts: false } });
     this.pausePipeline(`environment: ${reason}`);
@@ -1409,6 +1440,8 @@ export class Orchestrator {
   }
 
   private async baselineFailed(state: FeatureState, attempt: Attempt, reason: string, results: CheckResult[]): Promise<Step> {
+    // init.sh runs in the attempt's sandbox: a dependency it couldn't fetch shows here.
+    await this.keepRefusals(state, attempt);
     const ref = refOf(state, attempt);
     this.record({ type: 'BASELINE_FAILED', ref, payload: { reason, results } });
     this.record({ type: 'ATTEMPT_INTERRUPTED', ref, payload: { reason, counts: false } });
@@ -1416,6 +1449,36 @@ export class Orchestrator {
     this.stopFollowing(attempt.sandbox);
     await this.driver.remove(attempt.sandbox);
     return 'progress';
+  }
+
+  /**
+   * Reads the sandbox's log for the requests its policy refused, at most once a minute
+   * unless `now`: OpenShell keeps only a sandbox's last lines, which a long attempt
+   * outgrows. Never throws; what was read before stays.
+   */
+  private async readRefusals(sandbox: string, now = false): Promise<Denials> {
+    const known = this.refusals.get(sandbox) ?? { denials: new Denials(), readAt: 0 };
+    this.refusals.set(sandbox, known);
+    if (!now && this.now() - known.readAt < 60_000) return known.denials;
+    known.readAt = this.now();
+    try {
+      known.denials.add(await this.driver.logs(sandbox, LOG_LINES));
+    } catch (error) {
+      this.log(`the log of ${sandbox} could not be read: ${(error as Error).message}`);
+    }
+    return known.denials;
+  }
+
+  /**
+   * Before the attempt's sandbox goes, what its policy refused is recorded with the
+   * attempt: the Manager sees it with a failure, the owner on the attempt's card. Only
+   * while the sandbox is there, before its checks start; once per attempt.
+   */
+  private async keepRefusals(state: FeatureState, attempt: Attempt): Promise<void> {
+    if (attempt.refused || !['starting', 'running', 'collecting'].includes(attempt.status)) return;
+    const requests = (await this.readRefusals(attempt.sandbox, true)).list();
+    this.refusals.delete(attempt.sandbox);
+    if (requests.length > 0) this.record({ type: 'NETWORK_REFUSED', ref: refOf(state, attempt), payload: { requests } });
   }
 
   /** An error outside any attempt: logged, and the loop goes on. */
@@ -1632,12 +1695,18 @@ export class Orchestrator {
    * project, they and the checks that need it also get the view role, which OpenShell
    * holds and signs with (§12.1). A provider is only attached where its endpoints are.
    */
-  access(options: { claude: boolean; aws: boolean; allBundles?: boolean }): { providers: string[]; policyFile: string; env: Record<string, string> } {
+  access(options: { claude: boolean; aws: boolean; allBundles?: boolean }): Pick<SandboxSpec, 'providers' | 'env' | 'labels' | 'cpu' | 'memory'> & { policyFile: string } {
     const aws = options.aws ? this.design.config.aws : undefined;
+    const limits = this.state.sandboxLimits;
     return {
       providers: [...(options.claude ? [this.design.config.sandbox.claudeProvider] : []), ...(aws ? [aws.provider] : [])],
       policyFile: this.policyFile({ allBundles: options.allBundles ?? false, aws: aws !== undefined }),
       env: this.sandboxEnv(),
+      // Every sandbox the daemon makes says whose it is: the dashboard tells them from other projects'.
+      labels: { [PROJECT_LABEL]: this.design.config.project.name },
+      // The owner's caps, so that agents and checks in parallel leave the machine usable.
+      ...(limits?.cpu !== undefined ? { cpu: `${Math.round(limits.cpu * 1000)}m` } : {}),
+      ...(limits?.memoryGiB !== undefined ? { memory: `${Math.round(limits.memoryGiB * 1024)}Mi` } : {}),
     };
   }
 

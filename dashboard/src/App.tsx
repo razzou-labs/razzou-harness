@@ -5,12 +5,13 @@ import { Agents } from './views/Agents.tsx';
 import { Events } from './views/Events.tsx';
 import { collectNeeds, NeedsYou } from './views/NeedsYou.tsx';
 import { Project } from './views/Project.tsx';
+import { Sandboxes } from './views/Sandboxes.tsx';
 
-export type View = 'needs' | 'project' | 'agents' | 'events';
+export type View = 'needs' | 'project' | 'agents' | 'sandboxes' | 'events';
 /** Opens a view, and what to select in it, through the URL: a reload keeps it. */
 export type Go = (view: View, detail?: string) => void;
 
-const TABS: Array<[View, string]> = [['needs', 'Needs you'], ['project', 'Project'], ['agents', 'Agents'], ['events', 'Events']];
+const TABS: Array<[View, string]> = [['needs', 'Needs you'], ['project', 'Project'], ['agents', 'Agents'], ['sandboxes', 'Sandboxes'], ['events', 'Events']];
 
 function route(hash: string): { view: View; detail?: string } {
   const [view, ...rest] = hash.replace(/^#/, '').split('/');
@@ -113,6 +114,7 @@ export function App() {
         {current.view === 'needs' && <NeedsYou data={data} go={go} />}
         {current.view === 'project' && <Project data={data} />}
         {current.view === 'agents' && <Agents data={data} go={go} {...(current.detail ? { selected: current.detail } : {})} />}
+        {current.view === 'sandboxes' && <Sandboxes go={go} {...(current.detail ? { selected: current.detail } : {})} />}
         {current.view === 'events' && <Events />}
       </main>
     </>

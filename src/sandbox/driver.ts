@@ -9,6 +9,30 @@ export interface SandboxSpec {
   command?: string[];
   /** Gives the main process a terminal the owner can attach to: the Architect's. */
   tty?: boolean;
+  /** Labels on the sandbox, which OpenShell's list shows: the project it belongs to. */
+  labels?: Record<string, string>;
+  /** Caps on what it may use of the machine, in OpenShell's quantities: `1500m` CPUs, `4096Mi` of memory. */
+  cpu?: string;
+  memory?: string;
+}
+
+/** The label that tells which project a sandbox belongs to: names are hashes, and every project shares the gateway. */
+export const PROJECT_LABEL = 'harness.project';
+
+/** A sandbox as the gateway lists it, whichever project made it. */
+export interface SandboxInfo {
+  name: string;
+  /** OpenShell's word for its state: Ready, Provisioning, Stopped, Error… */
+  phase: string;
+  createdAt?: string;
+  labels: Record<string, string>;
+}
+
+/** Whether the CLI reaches the gateway, and its version; `problem` says why not. */
+export interface GatewayStatus {
+  status: string;
+  version?: string;
+  problem?: string;
 }
 
 export interface ExecResult {
@@ -40,4 +64,9 @@ export interface SandboxDriver {
   download(name: string, remoteFile: string, localFile: string): Promise<void>;
   status(name: string): Promise<SandboxStatus>;
   remove(name: string): Promise<void>;
+  /** Every sandbox on the gateway, this project's and any other's. */
+  list(): Promise<SandboxInfo[]>;
+  /** The sandbox's last `lines` log lines, among them the network requests its policy refused. */
+  logs(name: string, lines: number): Promise<string>;
+  gateway(): Promise<GatewayStatus>;
 }

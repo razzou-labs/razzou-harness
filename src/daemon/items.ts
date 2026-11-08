@@ -135,6 +135,7 @@ function reviewItem(o: Orchestrator, feature: FeatureState, attempt: Attempt): I
         `The Developer reports done: ${attempt.summary ?? '(no summary)'}`,
         ...(attempt.notes ? ['', `Its notes: ${attempt.notes}`] : []),
         ...questionsAsked(attempt),
+        ...refusedLines(attempt, false),
         '',
         'Every check passed in a fresh sandbox:',
         ...checkLines(attempt.checks ?? []),
@@ -175,6 +176,7 @@ function failureItem(o: Orchestrator, feature: FeatureState, attempt: Attempt): 
           ? ['', `Its finding (${finding.category}): ${finding.summary}`, ...(finding.tried?.length ? [`Tried: ${finding.tried.join('; ')}`] : []), ...(finding.needs ? [`Needs: ${finding.needs}`] : [])]
           : []),
         ...questionsAsked(attempt),
+        ...refusedLines(attempt, true),
         ...(failing.length ? ['', 'Failing checks:', ...checkLines(failing, true)] : []),
         '',
         head
@@ -264,6 +266,26 @@ function questionsAsked(attempt: Attempt): string[] {
   const asked = attempt.questions ?? [];
   if (asked.length === 0) return [];
   return ['', 'Its questions:', ...asked.map((q) => `- ${clip(q.text, 500)} → ${q.answer === undefined ? '(unanswered)' : clip(q.answer, 500)}`)];
+}
+
+/**
+ * The requests the attempt's sandbox policy refused. A host the feature needs and the
+ * policy doesn't allow explains many failures; the Manager resolves it, around the host
+ * or with the owner, who alone widens the policy.
+ */
+function refusedLines(attempt: Attempt, failed: boolean): string[] {
+  const refused = attempt.refused ?? [];
+  if (refused.length === 0) return [];
+  const shown = refused.slice(0, 12);
+  return [
+    '',
+    "Its sandbox's network policy refused:",
+    ...shown.map((d) => `- ${d.target} ${d.program ? `from ${d.program}` : '(a DNS query)'}, ${d.count} time${d.count === 1 ? '' : 's'}: ${d.reason.replace(/_/g, ' ')}`),
+    ...(refused.length > shown.length ? [`- and ${refused.length - shown.length} more`] : []),
+    ...(failed
+      ? ["A sandbox reaches only the hosts of network.bundles and network.extraHosts in harness/config.json, and the next attempt meets the same policy. If the feature can do without a host, give the way around it in your guidance. If it can't, ask_owner to allow the host, with blocking: true when no attempt can succeed without it: only the owner widens the policy."]
+      : []),
+  ];
 }
 
 function checkLines(results: CheckResult[], withOutput = false): string[] {

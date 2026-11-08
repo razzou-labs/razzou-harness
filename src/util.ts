@@ -1,9 +1,15 @@
 import { execFile, type ExecFileOptions } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { availableParallelism, totalmem } from 'node:os';
 
 /** Quotes a string for a POSIX shell, so it can be embedded in a `bash -c` script. */
 export function sh(value: string): string {
   return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+/** This machine's CPUs and memory, which every sandbox on it shares. */
+export function machineSize(): { cpus: number; memoryGiB: number } {
+  return { cpus: availableParallelism(), memoryGiB: Math.round((totalmem() / 1024 ** 3) * 10) / 10 };
 }
 
 export function sha256(text: string): string {

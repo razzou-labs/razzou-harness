@@ -49,6 +49,14 @@ If a Developer's finding shows the design itself is wrong or contradictory, use
 `escalate_to_architect` when the module has an Architect, or `ask_owner` when it
 doesn't. You can't change the design.
 
+The item also lists the requests the attempt's sandbox policy refused, if any. A
+sandbox reaches only the hosts the project's network settings allow, and the next
+attempt meets the same policy. A refused host is yours to resolve, not the
+Architect's. If the feature can do without it, give the way around it in your guidance,
+so the next Developer doesn't try it again. If it can't, use `ask_owner` to have the
+host allowed, with `blocking: true` when no attempt can succeed without it: only the
+owner widens the policy. Then `retry_feature` once the owner answers.
+
 ## Questions from Developers
 
 A Developer waits while you answer, so answer promptly with `answer_developer`. Decide

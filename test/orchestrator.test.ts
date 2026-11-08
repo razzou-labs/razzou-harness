@@ -9,6 +9,7 @@ import { detach, type AgentAdapter, type AgentRun } from '../src/agents/claude-c
 import type { SubscriptionUsage } from '../src/anthropic/usage.ts';
 import { Orchestrator } from '../src/daemon/orchestrator.ts';
 import { handleRequest } from '../src/daemon/requests.ts';
+import type { SandboxOverview, UsageReading } from '../src/dashboard/sandboxes.ts';
 import { startDashboard, type DashboardState } from '../src/dashboard/server.ts';
 import { Terminals, type Pty } from '../src/dashboard/terminals.ts';
 import { recover } from '../src/setup/recover.ts';
@@ -291,6 +292,32 @@ describe('orchestrator', () => {
     const { orchestrator: o } = await setup((f, attempt) => (attempt === 1 ? { outcome: 'blocked', commit: false } : solved(f)));
     await until(o, () => feature(o, 'F01')?.status === 'accepted');
     assert.equal(feature(o, 'F01')!.attempts[0]!.reason, 'blocked: stub cannot proceed');
+  });
+
+  it("keeps what an attempt's sandbox policy refused, for its card and the Manager's guidance", async () => {
+    const refused = ['pypi.org:443', 'pypi.org:443', 'example.com:443'];
+    const { orchestrator: o } = await setup((f, attempt) => (f === 'F01' && attempt === 1 ? { outcome: 'blocked', commit: false, refused } : solved(f)));
+    const sent: string[] = [];
+    o.events.on('transcript', ({ agent, line }: { agent: string; line: string }) => {
+      try {
+        const item = JSON.parse(line) as { type?: string; message?: { content?: unknown } };
+        if (agent === 'manager:demo' && item.type === 'user' && typeof item.message?.content === 'string') sent.push(item.message.content);
+      } catch {
+        // Not a line of JSON.
+      }
+    });
+    await until(o, () => feature(o, 'F01')?.status === 'accepted');
+    const [first, second] = feature(o, 'F01')!.attempts;
+    const kept = first!.refused!.map((d) => [d.program, d.target, d.count]).sort((a, b) => String(a[1]).localeCompare(String(b[1])));
+    assert.deepEqual(kept, [['/usr/bin/node', 'example.com:443', 1], ['/usr/bin/node', 'pypi.org:443', 2]]);
+    assert.equal(second!.refused, undefined, 'nothing refused, nothing kept');
+    const failed = sent.find((text) => text.startsWith('[harness] ATTEMPT FAILED demo/P1/F01 attempt 1'));
+    assert.ok(failed, `the Manager was sent the failure; it got: ${sent.map((t) => t.split('\n')[0]).join(' | ')}`);
+    assert.match(failed, /\nIts sandbox's network policy refused:\n/);
+    assert.match(failed, /\n- pypi\.org:443 from \/usr\/bin\/node, 2 times: transparent tcp policy denied\n/);
+    assert.match(failed, /\n- example\.com:443 from \/usr\/bin\/node, 1 time: transparent tcp policy denied\n/);
+    assert.match(failed, /If it can't, ask_owner to allow the host, with blocking: true when no attempt can succeed without it: only the owner widens the policy\.$/m);
+    assert.doesNotMatch(failed, /escalate_to_architect/);
   });
 
   it('escalates a feature whose checks pass before anything is built', async () => {
@@ -1180,18 +1207,96 @@ describe('dashboard', () => {
     });
 
   const token = 'ab'.repeat(16);
-  async function dashboard(terminals = new Terminals(undefined)) {
-    const { orchestrator: o } = await setup((f) => solved(f));
+  async function dashboard(terminals = new Terminals(undefined), usage?: () => Promise<UsageReading>) {
+    const { orchestrator: o, driver } = await setup((f) => solved(f));
     const webRoot = tempDir('web');
     writeFileSync(join(webRoot, 'index.html'), '<!doctype html><title>harness</title>');
     mkdirSync(join(webRoot, 'assets'));
     writeFileSync(join(webRoot, 'assets', 'app.js'), 'console.log("app")');
-    const server = await startDashboard({ orchestrator: o, port: 0, token, webRoot, terminals });
+    const server = await startDashboard({ orchestrator: o, port: 0, token, webRoot, terminals, ...(usage ? { usage } : {}) });
     cleanup.push(async () => void server.close());
     const port = (server.address() as AddressInfo).port;
     const host = `127.0.0.1:${port}`;
-    return { o, port, host, bearer: { host, authorization: `Bearer ${token}` } };
+    return { o, driver, port, host, bearer: { host, authorization: `Bearer ${token}` } };
   }
+
+  it("lists the gateway's sandboxes, labels its own, shows what a policy refused, and deletes only a left-over one", async () => {
+    const { o, driver, port, bearer } = await dashboard();
+    await until(o, completed(o), 60_000);
+    assert.ok(driver.created.length > 0 && driver.created.every((spec) => spec.labels?.['harness.project'] === 'toy'), 'every sandbox the daemon made says whose it is');
+    const spec = (name: string, project: string) => ({ name, image: 'x', providers: [], env: {}, labels: { 'harness.project': project } });
+    await driver.create(spec('dev-0000aaaa-a9', 'toy'));
+    await driver.create(spec('dev-1111bbbb-a1', 'elsewhere'));
+    await driver.create(spec('chk-2222cccc-plan', 'toy'));
+    o.checking.set('chk-2222cccc-plan', 'plan/demo/P1');
+    mkdirSync(join(driver.base, 'prb-12345678'));
+    writeFileSync(join(driver.rootOf('dev-0000aaaa-a9'), '.harness', 'openshell.log'), '[1794077355.601] [sandbox] [OCSF ] [ocsf] NET:OPEN [MED] DENIED /usr/bin/node(7) -> pypi.org:443 [reason:transparent_tcp_policy_denied]\n');
+
+    const overview = JSON.parse((await call(port, '/api/sandboxes', bearer)).body) as { gateway: { status: string }; sandboxes: Array<{ name: string; use: string; role?: string; title?: string; project?: string }> };
+    assert.equal(overview.gateway.status, 'connected');
+    assert.deepEqual(overview.sandboxes.map((s) => [s.name, s.use, s.role ?? s.project ?? '']), [
+      ['chk-2222cccc-plan', 'in use', 'Checks'],
+      ['dev-0000aaaa-a9', 'left over', 'Developer'],
+      ['dev-1111bbbb-a1', 'other', 'elsewhere'],
+      ['prb-12345678', 'other', ''],
+    ]);
+
+    const denials = await call(port, '/api/sandboxes/denials?name=dev-0000aaaa-a9', bearer);
+    assert.deepEqual(JSON.parse(denials.body).map((d: { program: string; target: string; count: number }) => [d.program, d.target, d.count]), [['/usr/bin/node', 'pypi.org:443', 1]]);
+    assert.equal((await call(port, '/api/sandboxes/denials?name=dev-1111bbbb-a1', bearer)).status, 404);
+
+    const remove = async (name: string) => JSON.parse((await callWith(port, '/api/sandboxes/remove', bearer, { name })).body) as { done: boolean; error?: string };
+    assert.deepEqual(await remove('chk-2222cccc-plan'), { done: false, error: 'it is in use' });
+    assert.deepEqual(await remove('dev-1111bbbb-a1'), { done: false, error: "it isn't this project's" });
+    assert.deepEqual(await remove('prb-12345678'), { done: false, error: "it isn't this project's" });
+    assert.deepEqual(await remove('dev-0000aaaa-a9'), { done: true });
+    assert.equal(await driver.status('dev-0000aaaa-a9'), 'missing');
+    assert.deepEqual(await remove('dev-0000aaaa-a9'), { done: false, error: 'the gateway has no such sandbox' });
+  });
+
+  it("caps each new sandbox as the owner sets it, within the machine, and relays Docker's reading of what they use", async () => {
+    let reads = 0;
+    const reading: UsageReading = {
+      at: new Date().toISOString(),
+      sandboxes: { 'dev-0000aaaa-a1': { cpu: 1.2, memoryBytes: 812 * 1024 ** 2, cpuLimit: 1.5, memoryLimitBytes: 2 * 1024 ** 3 } },
+      total: { cpu: 1.3, memoryBytes: 850 * 1024 ** 2 },
+    };
+    const { o, driver, port, bearer } = await dashboard(undefined, async () => {
+      reads += 1;
+      return reading;
+    });
+    const limits = async (body: object) => JSON.parse((await callWith(port, '/api/sandboxes/limits', bearer, body)).body) as { done: boolean; error?: string };
+    const overview = async () => JSON.parse((await call(port, '/api/sandboxes', bearer)).body) as SandboxOverview;
+
+    const { machine } = await overview();
+    assert.ok(machine.cpus >= 1 && machine.memoryGiB > 0);
+    assert.deepEqual((await overview()).limits, {});
+    assert.match((await limits({ cpu: 0.2, memoryGiB: 2 })).error!, /^CPUs: from 0\.5 to \d+, this machine's$/);
+    assert.match((await limits({ cpu: 1, memoryGiB: machine.memoryGiB + 1 })).error!, /^memory: from 1 to \d+ GiB, this machine's$/);
+    assert.deepEqual(await limits({ cpu: 1 }), { done: false, error: 'cpu and memoryGiB: a number, or null for no cap' });
+    assert.equal(o.state.sandboxLimits, undefined, 'a refused cap changes nothing');
+
+    assert.deepEqual(await limits({ cpu: 0.5, memoryGiB: 2 }), { done: true });
+    assert.deepEqual((await overview()).limits, { cpu: 0.5, memoryGiB: 2 });
+    const before = driver.created.length;
+    await until(o, completed(o), 60_000);
+    const made = driver.created.slice(before);
+    assert.ok(made.length > 0 && made.every((spec) => spec.cpu === '500m' && spec.memory === '2048Mi'), 'every sandbox made after the change is capped');
+
+    assert.deepEqual(await limits({ cpu: null, memoryGiB: 2 }), { done: true });
+    assert.deepEqual(o.state.sandboxLimits, { memoryGiB: 2 });
+    assert.deepEqual(await limits({ cpu: null, memoryGiB: null }), { done: true });
+    assert.equal(o.state.sandboxLimits, undefined);
+    assert.equal(o.store.readAll().filter((e) => e.type === 'SANDBOX_LIMITS_SET').length, 3);
+    assert.deepEqual(await limits({ cpu: null, memoryGiB: null }), { done: true });
+    assert.equal(o.store.readAll().filter((e) => e.type === 'SANDBOX_LIMITS_SET').length, 3, 'the same caps again record nothing');
+
+    // Two dashboards asking at once share one reading.
+    const [one, two] = await Promise.all([call(port, '/api/sandboxes/usage', bearer), call(port, '/api/sandboxes/usage', bearer)]);
+    assert.deepEqual(JSON.parse(one.body), reading);
+    assert.deepEqual(JSON.parse(two.body), reading);
+    assert.equal(reads, 1);
+  });
 
   it('in Swarm, says which setup steps are left, and drops the note once none is', async () => {
     let skew = 0;

@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
-import { post, type DashboardState } from '../api.ts';
+import { post, type DashboardState, type Denial } from '../api.ts';
+import { DenialTable } from '../components/Denials.tsx';
 import { Terminal } from '../components/Terminal.tsx';
 import { Transcript } from '../components/Transcript.tsx';
 import { Badge, Reply } from '../components/ui.tsx';
@@ -16,6 +17,8 @@ interface Card {
   sandbox?: string;
   /** The deadline of a running attempt, against its start. */
   clock?: { start: number; deadline: number };
+  /** What an attempt's sandbox policy refused, kept when its sandbox went. */
+  refused?: Denial[];
 }
 
 const LIVE = ['starting', 'running', 'collecting', 'checking', 'reviewing'];
@@ -45,6 +48,7 @@ export function Agents({ data, selected, go }: { data: DashboardState; selected?
           {current.sandbox && data.terminals && (
             <button onClick={() => setShell(!shell)}>{shell ? 'Back' : `Shell in ${current.sandbox}`}</button>
           )}
+          {current.sandbox && <button onClick={() => go('sandboxes', current.sandbox)}>Its sandbox</button>}
         </div>
         {shell && current.sandbox ? <Terminal sandbox={current.sandbox} /> : <AgentView card={current} data={data} />}
       </div>
@@ -73,7 +77,17 @@ function AgentView({ card, data }: { card: Card; data: DashboardState }) {
       </>
     );
   }
-  return <Transcript agent={card.id} />;
+  return (
+    <>
+      {card.refused && card.refused.length > 0 && (
+        <details className="refused">
+          <summary>Its sandbox's network policy refused {refusedHosts(card.refused)}</summary>
+          <DenialTable denials={card.refused} />
+        </details>
+      )}
+      <Transcript agent={card.id} />
+    </>
+  );
 }
 
 function agentCards({ state }: DashboardState): Card[] {
@@ -124,16 +138,24 @@ function agentCards({ state }: DashboardState): Card[] {
   for (const { feature, attempt } of attempts) {
     const live = LIVE.includes(attempt.status);
     const usage = attempt.usage ? ` · ${attempt.usage.outputTokens.toLocaleString()} tokens written` : '';
+    const refused = attempt.refused?.length ? ` · refused ${refusedHosts(attempt.refused)}` : '';
     cards.push({
       id: `developer:${feature.module}/${feature.plan}/${feature.feature}/a${attempt.n}`,
       role: 'Developer',
       title: `${feature.module}/${feature.plan}/${feature.feature} #${attempt.n}`,
       status: attempt.status,
-      detail: live ? '' : `${attempt.outcome ?? ''}${usage}`,
+      detail: live ? refused.slice(3) : `${attempt.outcome ?? ''}${usage}${refused}`,
       ...(live ? { sandbox: attempt.sandbox, clock: { start: Date.parse(attempt.startedAt), deadline: Date.parse(attempt.deadline) } } : {}),
+      ...(attempt.refused ? { refused: attempt.refused } : {}),
     });
   }
   return cards;
+}
+
+/** `pypi.org:443`, or `pypi.org:443 and 2 more`: the hosts refused, the latest first. */
+function refusedHosts(denials: Denial[]): string {
+  const targets = [...new Set(denials.map((d) => d.target))];
+  return targets.length > 1 ? `${targets[0]} and ${targets.length - 1} more` : targets[0] ?? '';
 }
 
 function Deadline({ now, start, deadline }: { now: number; start: number; deadline: number }) {
