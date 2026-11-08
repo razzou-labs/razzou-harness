@@ -3,6 +3,21 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## 0.4.7 (2026-11-08)
+
+**Upgrading from 0.4.6:** install the new version, rebuild the agents' image with
+`harness doctor --build-images` (its tag follows the harness's version), then restart the
+daemon with `harness down` and `harness up`.
+
+- **The Architect runs Fable 5.1 by default, and every role runs at `max` effort.** The
+  Architect's default model is now `claude-fable-5-1`, the most capable model: a better
+  design saves the Developers' attempts. The Manager, the reviewers, who run on the
+  Manager's settings, and the Developers stay on `claude-opus-5-5`. Every role's default
+  effort is now `max`; it was `high` for the Manager and `xhigh` for the Developers. At API
+  prices Fable costs 2.5 times as much as Opus per token, so the Architect's sessions use
+  your plan fastest. A project whose config sets `roles` keeps its own models and efforts,
+  and an Architect already running keeps its model until its sandbox is made again.
+
 ## 0.4.6 (2026-11-08)
 
 **Upgrading from 0.4.5:** install the new version, rebuild the agents' image with

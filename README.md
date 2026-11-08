@@ -212,7 +212,7 @@ plans it finds there (see [Configuration](#configuration)).
   the one under way is finished before the next starts, and only it has Developers,
   Managers and reviewers. Every module's Architect stays available, so you can design the
   next module while one is built; its plans wait their turn. Size a module
-  so that its design fits in one conversation. With the default model, Opus 5.5, the
+  so that its design fits in one conversation. With its default model, Fable 5.1, the
   Architect's context holds up to a million tokens, and a well-sized module never fills
   it. If a module's design keeps growing, split it into smaller modules: each gets its
   own Architect, with a fresh context.
@@ -444,9 +444,9 @@ through an `Arch:` pull request, or a commit of your own on `main`.
   "harnessVersion": "0.4.6",
   "project": { "name": "shop", "repo": "<org>/shop", "bot": "<org>-harness[bot]" },
   "roles": {
-    "architect": { "model": "claude-opus-5-5", "effort": "max" },
-    "manager": { "model": "claude-opus-5-5", "effort": "high" },
-    "developer": { "model": "claude-opus-5-5", "effort": "xhigh", "attemptTimeoutMinutes": 90, "maxAttempts": 2 }
+    "architect": { "model": "claude-fable-5-1", "effort": "max" },
+    "manager": { "model": "claude-opus-5-5", "effort": "max" },
+    "developer": { "model": "claude-opus-5-5", "effort": "max", "attemptTimeoutMinutes": 90, "maxAttempts": 2 }
   },
   "network": { "bundles": ["all"], "apis": [{ "host": "api.stripe.com", "key": "STRIPE_API_KEY" }] },
   "checks": [{ "id": "unit", "run": "npm test", "phase": "pre-merge" }]
@@ -457,8 +457,8 @@ through an `Arch:` pull request, or a commit of your own on `main`.
 |---|---|---|
 | `project.name` | the folder's name, from `init` | Names the sandboxes and the dashboard |
 | `project.repo`, `project.bot` | none | The GitHub repository, and the App's bot login. Without them, the project stays local. |
-| `roles.<role>.model` | `claude-opus-5-5` | The model of the Architect, the Manager and the Developers |
-| `roles.<role>.effort` | `max`, `high`, `xhigh` | Claude Code's `--effort`; `null` for a model without effort levels, such as Haiku |
+| `roles.<role>.model` | `claude-fable-5-1` for the Architect, `claude-opus-5-5` for the Manager and the Developers | The role's model. The reviewers run on the Manager's model and effort. |
+| `roles.<role>.effort` | `max` | Claude Code's `--effort`; `null` for a model without effort levels, such as Haiku |
 | `roles.developer.attemptTimeoutMinutes` | 120 | An attempt's deadline |
 | `roles.developer.maxAttempts` | 2 | Attempts per feature before it is escalated to you |
 | `network.bundles` | `["all"]` | The hosts sandboxes reach directly, read-only, by bundle: `core`, `node`, `python`, `aws`, `terraform`, `go`, `rust`, `jvm`, `opentofu`, `browsers`, or `all` for every one, those later versions add included. The Architect gets them all. |
@@ -647,9 +647,11 @@ To report a vulnerability, see `SECURITY.md` in the source repository.
   daemon also reads the usage before each launch, and waits above
   `swarm.usageCeilingPercent` until the window resets; the Project view shows the
   windows.
-- By default, all three roles run Opus 5.5 at a high effort. To try the harness, or to
-  use less of your plan, set each role's `model` to Haiku 4.5
-  (`claude-haiku-4-5-20251001`) and its `effort` to `null`.
+- By default, the Architect runs Fable 5.1, the most capable model, and the Manager,
+  the reviewers and the Developers run Opus 5.5, all at the highest effort, `max`. At API
+  prices Fable costs 2.5 times as much as Opus per token, so the Architect's sessions use
+  your plan fastest. To try the harness, or to use less of your plan, set each role's
+  `model` to Haiku 4.5 (`claude-haiku-4-5-20251001`) and its `effort` to `null`.
 - With Haiku 4.5 in our test runs, a Developer attempt took under 90 seconds and 17 to
   23 turns: 150,000 to 310,000 input tokens, mostly read from the cache, and 2,000 to
   6,000 output tokens. Claude Code estimated $0.08 to $0.12 per attempt at API prices.

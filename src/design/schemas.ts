@@ -112,22 +112,24 @@ export const ConfigSchema = z.object({
           agent: z.enum(['claude-code']).default('claude-code'),
           model: z.string().default('claude-opus-5-5'),
           /** Claude Code's `--effort`; `null` leaves it to Claude Code, for models without effort levels. */
-          effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).nullable().default('xhigh'),
+          effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).nullable().default('max'),
           attemptTimeoutMinutes: z.number().int().positive().max(600).default(120),
           maxAttempts: z.number().int().min(1).max(5).default(2),
         })
         .prefault({}),
+      // The reviewers run on the Manager's model and effort.
       manager: z
         .object({
           agent: z.enum(['claude-code']).default('claude-code'),
           model: z.string().default('claude-opus-5-5'),
-          effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).nullable().default('high'),
+          effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).nullable().default('max'),
         })
         .prefault({}),
+      // The most capable model designs: a better design saves Developers' attempts.
       architect: z
         .object({
           agent: z.enum(['claude-code']).default('claude-code'),
-          model: z.string().default('claude-opus-5-5'),
+          model: z.string().default('claude-fable-5-1'),
           effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).nullable().default('max'),
         })
         .prefault({}),

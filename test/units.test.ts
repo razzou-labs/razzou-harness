@@ -90,7 +90,10 @@ describe('design', () => {
     const repo = await Repo.open(join(dir, '.bare'));
     await repo.fetchMain(dir);
     const design = await loadDesign(repo, 'refs/heads/main');
-    assert.equal(design.config.roles.developer.model, 'claude-opus-5-5');
+    const { architect, manager, developer } = design.config.roles;
+    assert.deepEqual([architect.model, architect.effort], ['claude-fable-5-1', 'max']);
+    assert.deepEqual([manager.model, manager.effort], ['claude-opus-5-5', 'max']);
+    assert.deepEqual([developer.model, developer.effort], ['claude-opus-5-5', 'max']);
     assert.equal(design.config.sandbox.claudeProvider, 'claude-sub');
     assert.deepEqual(design.modules[0]!.plans[0]!.features.map((f) => f.id), ['F01', 'F02']);
   });
