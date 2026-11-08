@@ -3,7 +3,12 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
-## Unreleased
+## 0.4.1 (2026-11-08)
+
+**Upgrading a project from 0.4.0:** install the new version, then rebuild the agents'
+image with `harness doctor --build-images`: its tag follows the harness's version. A
+project's network stays as its `harness/config.json` lists it; for every bundle, set
+`"bundles": ["all"]`.
 
 - **Every network bundle by default.** `"all"` in `network.bundles` stands for every
   bundle, those later versions add included, and it is the default: `harness init`
