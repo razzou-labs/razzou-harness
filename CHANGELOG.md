@@ -3,6 +3,22 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## 0.4.8 (2026-11-08)
+
+**Upgrading from 0.4.7:** install the new version, rebuild the agents' image with
+`harness doctor --build-images` (its tag follows the harness's version), then restart the
+daemon with `harness down` and `harness up`. Run `harness setup` once to store the usage
+token, if your Claude provider is older than the harness's copy of it.
+
+- **`harness setup` makes the project ready for Swarm, in either mode.** It asks for the
+  token Swarm reads your subscription's usage with, from `claude setup-token`, when it
+  isn't stored: on a setup whose Claude provider an older version created. It also walks
+  you through giving the App "Commit statuses: write" when the App lacks it. Both used to
+  wait until the project was in Swarm. A switch to Swarm then needs only its rules, which
+  `harness mode swarm` applies. A token skipped with Enter isn't asked for again in the
+  same run, and `harness doctor` now warns in Manual too when the App can't write
+  statuses.
+
 ## 0.4.7 (2026-11-08)
 
 **Upgrading from 0.4.6:** install the new version, rebuild the agents' image with

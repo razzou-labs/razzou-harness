@@ -40,6 +40,13 @@ export interface DoctorOptions {
   interactive: boolean;
   /** The AWS view role's ARN, when `harness setup` asked for it already: the AWS provider takes it without asking again. */
   awsViewRole?: string;
+  /**
+   * The optional secrets the owner skipped during this run, by check name: not asked for
+   * again, since `harness setup` runs the doctor up to three times.
+   */
+  skipped?: Set<string>;
+  /** Asks for a secret without echoing it; the terminal's hidden prompt by default. */
+  askSecret?: (question: string) => Promise<string>;
   report: (check: Check) => void;
 }
 
@@ -143,7 +150,7 @@ async function claude(options: DoctorOptions, provider: string, report: (c: Chec
   if (!options.interactive) {
     return report(fail('Claude provider', `${provider} is missing`, 'run `claude setup-token`, then `harness doctor` in a terminal: it asks for the token'));
   }
-  const token = await askSecret(`Claude provider ${provider} is missing. Paste the token from \`claude setup-token\` (hidden): `);
+  const token = await (options.askSecret ?? askSecret)(`Claude provider ${provider} is missing. Paste the token from \`claude setup-token\` (hidden): `);
   if (!token) return report(fail('Claude provider', 'no token given', 'run `harness doctor` again'));
   // The token reaches OpenShell through the environment of one command, never its arguments.
   const created = await run('openshell', ['provider', 'create', '--name', provider, '--type', 'claude-code-subscription', '--from-existing'], {
@@ -154,27 +161,36 @@ async function claude(options: DoctorOptions, provider: string, report: (c: Chec
   if (created.code === 0) await storeClaudeToken(token, report);
 }
 
-/** The stored token (v3 §4.3), asked for when Swarm needs it and the provider was created before the harness stored tokens. */
-async function claudeToken(options: DoctorOptions, report: (c: Check) => void): Promise<void> {
+/**
+ * The stored token (v3 §4.3), which only Swarm's usage ceiling reads: the Claude provider's
+ * creation stores it, and an older setup's provider came without it. At a terminal it is
+ * asked for in either mode, so the project is ready for Swarm before the switch; skipped,
+ * it is a warning in Swarm only.
+ */
+export async function claudeToken(options: Pick<DoctorOptions, 'projectDir' | 'interactive' | 'skipped' | 'askSecret'>, report: (c: Check) => void, read: typeof readUsage = readUsage): Promise<void> {
   if (loadClaudeToken()) return report(ok('Claude token', `stored in ${claudeTokenFile()}: the daemon reads the subscription's usage with it`));
-  if (projectMode(options.projectDir) !== 'swarm') {
-    return report({ status: 'skip', name: 'Claude token', detail: "not stored; Swarm reads the subscription's usage with it before a launch" });
+  const swarm = projectMode(options.projectDir) === 'swarm';
+  const missing = (detail: string, fix: string): Check => (swarm
+    ? warn('Claude token', detail, fix)
+    : { status: 'skip', name: 'Claude token', detail: "not stored; Swarm reads the subscription's usage with it before a launch. `harness setup` asks for it" });
+  if (!options.interactive || options.skipped?.has('Claude token')) {
+    return report(missing("not stored: Swarm can't read the subscription's usage before a launch", 'run `harness doctor` in a terminal: it asks for the token from `claude setup-token`'));
   }
-  if (!options.interactive) {
-    return report(warn('Claude token', "not stored: Swarm can't read the subscription's usage before a launch", 'run `harness doctor` in a terminal: it asks for the token from `claude setup-token`'));
+  const token = await (options.askSecret ?? askSecret)("Swarm reads the subscription's usage before a launch. Paste the token from `claude setup-token` (hidden), or press Enter to skip: ");
+  if (!token) {
+    options.skipped?.add('Claude token');
+    return report(missing('not stored: the daemon learns of a limit only when an attempt hits it', 'run `harness doctor` again to store it'));
   }
-  const token = await askSecret("Swarm reads the subscription's usage before a launch. Paste the token from `claude setup-token` (hidden), or press Enter to skip: ");
-  if (!token) return report(warn('Claude token', 'not stored: the daemon learns of a limit only when an attempt hits it', 'run `harness doctor` again to store it'));
-  await storeClaudeToken(token, report);
+  await storeClaudeToken(token, report, read);
 }
 
 /**
  * Stores the token for the daemon, after one reading of the usage with it. A token the
  * endpoint refuses is stored all the same: only Swarm's usage ceiling needs the reading.
  */
-async function storeClaudeToken(token: string, report: (c: Check) => void): Promise<void> {
+async function storeClaudeToken(token: string, report: (c: Check) => void, read: typeof readUsage = readUsage): Promise<void> {
   const file = saveClaudeToken(token);
-  const refused = await readUsage(token).then(() => undefined, (error: Error) => (/answered 40[13]$/.test(error.message) ? error.message : undefined));
+  const refused = await read(token).then(() => undefined, (error: Error) => (/answered 40[13]$/.test(error.message) ? error.message : undefined));
   report(refused
     ? warn('Claude token', `stored in ${file}, but ${refused}: Swarm's usage ceiling can't read the subscription's usage with this token`, `Swarm then learns of a limit only when an attempt hits it. For another token, delete ${file} and run \`harness doctor\` again`)
     : ok('Claude token', `stored in ${file}: the daemon reads the subscription's usage with it`));
@@ -196,7 +212,8 @@ async function project(options: DoctorOptions, config: Config, report: (c: Check
       const lines = await checkApp(repo);
       report(ok('GitHub App', lines.find((l) => l.startsWith('App:'))?.slice(5) ?? 'installed'));
       // In Swarm the reviewers' verdicts are commit statuses the App posts (v3 §3.4), once the installation accepted the permission.
-      if (mode === 'swarm' && granted(lines, 'statuses') !== 'write') {
+      // Checked in Manual too, so that `harness setup` makes the project ready for Swarm.
+      if (granted(lines, 'statuses') !== 'write') {
         report(warn('GitHub App', "can't write commit statuses, which the reviewers' verdicts need in Swarm", 'give the App "Commit statuses: write" on GitHub, and accept the new permission on its installation'));
       }
     } catch (error) {
@@ -263,7 +280,7 @@ async function apis(options: DoctorOptions, config: Config, report: (c: Check) =
       report(fail('API', `no key stored for ${api.host}`, 'run `harness doctor` in a terminal: it asks for the key'));
       continue;
     }
-    const secret = await askSecret(`The key of ${api.host}, which the project's code reads as ${api.key} (hidden, or Enter to skip): `);
+    const secret = await (options.askSecret ?? askSecret)(`The key of ${api.host}, which the project's code reads as ${api.key} (hidden, or Enter to skip): `);
     if (!secret) {
       report(fail('API', `no key stored for ${api.host}`, 'run `harness doctor` again with the key at hand'));
       continue;
@@ -321,7 +338,7 @@ async function aws(options: DoctorOptions, config: Config, report: (c: Check) =>
   console.log(`AWS provider ${provider} is missing. It needs the project's read-only role, and the gateway user's key (see the README's AWS section).`);
   const role = options.awsViewRole ?? (await ask('The project\'s view role ARN: '));
   const keyId = await ask('The harness-gateway user\'s AccessKeyId: ');
-  const secret = await askSecret('Its SecretAccessKey (hidden): ');
+  const secret = await (options.askSecret ?? askSecret)('Its SecretAccessKey (hidden): ');
   if (!/^arn:aws:iam::\d{12}:role\/harness-[\w+=,.@-]+-view$/.test(role) || !keyId || !secret) {
     return report(fail('AWS provider', 'a value is missing or malformed', 'run `harness doctor` again'));
   }

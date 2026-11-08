@@ -94,10 +94,13 @@ export async function setup(options: SetupOptions): Promise<void> {
   const config = loadConfig(projectDir);
   if (!config) throw new Error('harness/config.json is missing after init: run `harness setup` again');
   let buildImages = false;
+  // An optional secret skipped in one round isn't asked for again in the next.
+  const skipped = new Set<string>();
   for (let round = 1; round <= 3; round++) {
     say(round === 1 ? '\nChecking this machine and the project:' : '\nChecking again:');
     const checks = await doctor({
       projectDir, packageDir: options.packageDir, version: options.version, probe: false, buildImages, interactive: true,
+      skipped, askSecret: options.askSecret,
       ...(settings.viewRole ? { awsViewRole: settings.viewRole } : {}), report: (c) => say(line(c)),
     });
     buildImages = false;

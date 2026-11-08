@@ -1,10 +1,11 @@
 import { strict as assert } from 'node:assert';
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { after, before, describe, it } from 'node:test';
+import { after, before, beforeEach, describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { computeLock, directoryReader } from '../src/ci/harness-ci.ts';
-import { granted, mainRuleset, repositorySecret } from '../src/setup/doctor.ts';
+import { claudeTokenFile, loadClaudeToken } from '../src/anthropic/usage.ts';
+import { claudeToken, granted, mainRuleset, repositorySecret, type Check } from '../src/setup/doctor.ts';
 import { init } from '../src/setup/init.ts';
 import { recover } from '../src/setup/recover.ts';
 import { awsProviderName, commitAndPush, fixFor, infracostKey, linkRepo, type SetupOptions } from '../src/setup/setup.ts';
@@ -289,6 +290,49 @@ describe("the cost job's key", () => {
     assert.equal(existsSync(secret), false);
     assert.equal(await repositorySecret('acme/shop', 'INFRACOST_API_KEY'), false);
     assert.match(said.at(-1)!, /^Skipped: the cost job estimates nothing, and Swarm leaves INFRA and MIXED plans to you/);
+  });
+});
+
+describe('the usage token Swarm reads', () => {
+  let projectDir: string;
+  const reports: Check[] = [];
+  const asked: string[] = [];
+  const report = (check: Check) => void reports.push(check);
+  const options = (answer: string, interactive = true, skipped = new Set<string>()) => ({
+    projectDir, interactive, skipped, askSecret: async (question: string) => (asked.push(question), answer),
+  });
+  // The usage endpoint, as it answers a good token: nothing leaves the machine.
+  const read = async () => ({ percent: 10, resetsAt: '2026-11-09T00:00:00Z', limits: [{ kind: 'session', percent: 10, resetsAt: '2026-11-09T00:00:00Z' }] });
+  beforeEach(() => {
+    rmSync(claudeTokenFile(), { force: true });
+    projectDir = tempDir('mode');
+    reports.length = 0;
+    asked.length = 0;
+  });
+  after(() => rmSync(claudeTokenFile(), { force: true }));
+
+  it('is asked for in Manual too, at a terminal, so the project is ready for Swarm', async () => {
+    await claudeToken(options('sk-ant-oat-token'), report, read);
+    assert.match(asked[0]!, /Paste the token from `claude setup-token` \(hidden\), or press Enter to skip/);
+    assert.equal(loadClaudeToken(), 'sk-ant-oat-token');
+    assert.equal(reports.at(-1)!.status, 'ok');
+    await claudeToken(options('sk-ant-other'), report, read);
+    assert.equal(asked.length, 1, 'never asked for again once stored');
+  });
+
+  it("once skipped, isn't asked for again in the same run: a skip in Manual, a warning in Swarm", async () => {
+    const skipped = new Set<string>();
+    await claudeToken(options('', true, skipped), report, read);
+    await claudeToken(options('', true, skipped), report, read);
+    assert.equal(asked.length, 1);
+    assert.deepEqual(reports.map((c) => c.status), ['skip', 'skip']);
+    assert.match(reports[0]!.detail, /`harness setup` asks for it$/);
+    mkdirSync(join(projectDir, '.harness'));
+    writeFileSync(join(projectDir, '.harness', 'state.json'), JSON.stringify({ mode: 'swarm' }));
+    await claudeToken(options('sk-ant-oat-token', false), report, read);
+    assert.equal(reports.at(-1)!.status, 'warn');
+    assert.equal(asked.length, 1, 'never asked for away from a terminal');
+    assert.equal(loadClaudeToken(), undefined);
   });
 });
 

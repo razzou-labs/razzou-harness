@@ -145,11 +145,12 @@ the `staging` environment and the variables on GitHub for AWS, the Terraform sca
 secret; commits the files it wrote, and only those, with your git once you agree, and
 pushes them when you are on `main`; runs `harness doctor` and fixes what it can (starts
 the OpenShell gateway, builds the agents' image, imports the Claude profile and creates
-the provider with your token, applies the ruleset on `main`, creates the AWS provider
-with your key); runs the probe; and offers to start the daemon. Run it again at any
-time: what is done is skipped, and a setup commit that wasn't pushed is offered again.
-On a private repository of a free plan, where GitHub has no rulesets, it says so and
-goes on.
+the provider with your token, gives the App the permission to write commit statuses and
+stores the token Swarm reads your usage with, whatever the mode, applies the ruleset on
+`main`, creates the AWS provider with your key); runs the probe; and offers to start the
+daemon. Run it again at any time: what is done is skipped, and a setup commit that
+wasn't pushed is offered again. On a private repository of a free plan, where GitHub has
+no rulesets, it says so and goes on.
 
 The same by hand: `harness init` writes the harness's files into the repository, never
 over existing ones, and prints the setup checklist:
@@ -299,7 +300,8 @@ command, with your own `gh`; after a switch from the dashboard, run
 The daemon reads the rules in effect on `main` through the App and the dashboard's
 note lists what is still to do, the commands ready to copy: the rules, the App's
 "Commit statuses: write", and the token for the usage probe. The note goes once all
-three are done; `harness doctor` checks the same.
+three are done; `harness doctor` checks the same. `harness setup` prepares the last two
+in either mode, so a switch to Swarm needs only its rules.
 
 **What merges itself.** In Swarm the daemon merges a plan's pull request, as the App,
 once CI passed and every status in `swarm.requiredStatuses` is green on its head:
@@ -326,8 +328,9 @@ without bypassing the rules, and CI still gates it.
 starts an attempt, and at or above `swarm.usageCeilingPercent` the pipeline waits for
 the window to reset. It reads it with the token `harness doctor` stores in
 `~/.config/harness/claude.token` when it creates the Claude provider; on an older
-setup, the doctor asks for the token again once Swarm is on. Without it, the daemon
-learns of a limit only when an attempt hits it, as in Manual.
+setup, `harness setup` asks for the token again, in either mode, and so does
+`harness doctor` in a terminal. Without it, the daemon learns of a limit only when an
+attempt hits it, as in Manual.
 
 **The reviewers.** Once CI passed on a plan's pull request, two reviewers read it, one
 after the other, each in a fresh read-only sandbox with the Manager's permissions: a
@@ -345,8 +348,9 @@ blocks, whatever the verdict says. After `swarm.securityFixRounds` or
 `swarm.reviewersInManual` runs them as comments and statuses that gate nothing.
 
 The App needs **Commit statuses: write** for the verdicts. An App created before this
-version has read only: give it the permission on GitHub, accept it on the installation,
-and `harness doctor` stops warning. Until then, a plan whose reviewer passed waits for
+version has read only: `harness setup` opens the App's permissions page, in either mode,
+and waits until you have given it the permission and accepted it on the installation;
+`harness doctor` warns until then. Until then, a plan whose reviewer passed waits for
 you with the reason.
 
 **Parallel Developers.** In Swarm, up to `swarm.maxDevelopers` Developers build the
@@ -441,7 +445,7 @@ through an `Arch:` pull request, or a commit of your own on `main`.
 
 ```json
 {
-  "harnessVersion": "0.4.7",
+  "harnessVersion": "0.4.8",
   "project": { "name": "shop", "repo": "<org>/shop", "bot": "<org>-harness[bot]" },
   "roles": {
     "architect": { "model": "claude-fable-5-1", "effort": "max" },
