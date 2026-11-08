@@ -1,4 +1,4 @@
-import type { Orchestrator } from '../daemon/orchestrator.ts';
+import type { Orchestrator } from './orchestrator.ts';
 import type { UsageReading } from '../sandbox/docker.ts';
 import { PROJECT_LABEL, type GatewayStatus, type SandboxInfo } from '../sandbox/driver.ts';
 import { LOG_LINES, parseDenials, type Denial } from '../sandbox/refusals.ts';
@@ -119,6 +119,24 @@ export function sharedReading(read: () => Promise<UsageReading>, ttlMs = 3000, n
     last = { at: now(), reading };
     return reading;
   };
+}
+
+/**
+ * Deletes this project's left-over sandboxes, those the Sandboxes view offers to delete:
+ * a crash or a failed delete leaves them, each holding its container's disk. The daemon
+ * runs it when it starts and every hour, so a delete that failed is tried again. It
+ * spares an Architect's, which holds the owner's conversation with it: only a lost
+ * `.harness/` leaves one, and the owner deletes it from the view. Every sandbox is in
+ * the state, or among the check runs, before it is created, so none being made is
+ * taken for a left-over one. Returns the names deleted.
+ */
+export async function sweepLeftOvers(o: Orchestrator): Promise<string[]> {
+  const leftOver = (await sandboxRows(o)).filter((s) => s.use === 'left over' && s.role !== 'Architect');
+  for (const sandbox of leftOver) {
+    await o.driver.remove(sandbox.name);
+    o.log(`deleting the left-over sandbox ${sandbox.name}${sandbox.role ? `, ${sandbox.role}${sandbox.title ? ` · ${sandbox.title}` : ''}` : ''}`);
+  }
+  return leftOver.map((s) => s.name);
 }
 
 /** Deletes a left-over sandbox of this project, judged afresh: never one in use, nor another project's. */

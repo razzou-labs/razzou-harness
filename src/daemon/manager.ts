@@ -139,7 +139,8 @@ export class Managers {
     await o.repo.bundle(`refs/heads/${branch}`, join(dir, 'clone.bundle'));
     copyFileSync(join(o.options.packageDir, 'roles', 'manager.md'), join(dir, 'manager.md'));
     writeFileSync(join(dir, 'settings.json'), managerSettings());
-    for (const file of ['clone.bundle', 'manager.md', 'settings.json']) await o.driver.upload(manager.sandbox, join(dir, file), p.harness);
+    await o.uploadBundle(manager.sandbox, join(dir, 'clone.bundle'), p.harness);
+    for (const file of ['manager.md', 'settings.json']) await o.driver.upload(manager.sandbox, join(dir, file), p.harness);
     await o.uploadAgentFiles(manager.sandbox, 'manager', dir);
     const clone = await o.exec(manager.sandbox, `git clone --quiet --branch ${sh(branch)} ${sh(`${p.harness}/clone.bundle`)} ${sh(p.work)}`);
     if (clone.code !== 0) throw new Error(`could not clone the plan branch for the Manager: ${clone.stderr.trim()}`);
@@ -261,7 +262,7 @@ export class Managers {
     const local = join(this.localDir(manager), 'review.bundle');
     await o.repo.bundle([`refs/heads/${branch}`, ...(head && attemptRef ? [attemptRef] : [])], local);
     const p = this.paths(manager);
-    await o.driver.upload(manager.sandbox, local, p.harness);
+    await o.uploadBundle(manager.sandbox, local, p.harness);
     const result = await o.exec(manager.sandbox, [
       `cd ${sh(p.work)}`,
       `git fetch --quiet --force ${sh(`${p.harness}/review.bundle`)} '+refs/heads/*:refs/remotes/harness/*' '+refs/attempts/*:refs/remotes/harness/attempts/*'`,

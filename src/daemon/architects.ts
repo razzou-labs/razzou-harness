@@ -63,7 +63,7 @@ export class Architects {
     if (result.code !== 0) throw new Error(`could not take the design: ${(result.stderr || result.stdout).trim()}`);
     const local = join(this.localDir(module.module), 'design.bundle');
     await o.driver.download(module.architect.sandbox, `${p.out}/design.bundle`, local);
-    return { head: await o.repo.fetchBundle(local, `refs/architect/${module.module}`) };
+    return { head: await o.fetchBundle(local, `refs/architect/${module.module}`) };
   }
 
   private async syncModule(module: ModuleState): Promise<void> {
@@ -101,7 +101,7 @@ export class Architects {
     const branch = `arch/${module.module}`;
     const reviewing = module.status === 'in_review' && (await o.repo.revParse(`refs/heads/${branch}`)) !== undefined;
     await o.repo.bundle(reviewing ? ['refs/heads/main', `refs/heads/${branch}`] : 'refs/heads/main', join(dir, 'main.bundle'));
-    await o.driver.upload(sandbox, join(dir, 'main.bundle'), p.harness);
+    await o.uploadBundle(sandbox, join(dir, 'main.bundle'), p.harness);
     const clone = await o.exec(sandbox, [
       `git clone --quiet --branch main ${sh(`${p.harness}/main.bundle`)} ${sh(p.work)}`,
       `cd ${sh(p.work)}`,
@@ -207,7 +207,7 @@ export class Architects {
     const p = o.paths(module.architect.sandbox);
     const local = join(this.localDir(module.module), 'arch.bundle');
     await o.repo.bundle(`refs/heads/arch/${module.module}`, local);
-    await o.driver.upload(module.architect.sandbox, local, p.harness);
+    await o.uploadBundle(module.architect.sandbox, local, p.harness);
     const result = await o.exec(module.architect.sandbox, [
       `cd ${sh(p.work)}`,
       `git fetch --quiet --force ${sh(`${p.harness}/arch.bundle`)} ${sh(`refs/heads/arch/${module.module}:refs/remotes/harness/arch`)}`,
@@ -258,7 +258,7 @@ export class Architects {
     await o.forge.fetchMain(o.repo);
     const local = join(this.localDir(module.module), 'main.bundle');
     await o.repo.bundle('refs/heads/main', local);
-    await o.driver.upload(module.architect.sandbox, local, p.harness);
+    await o.uploadBundle(module.architect.sandbox, local, p.harness);
     await o.exec(module.architect.sandbox, [
       `cd ${sh(p.work)}`,
       `git fetch --quiet --force ${sh(`${p.harness}/main.bundle`)} refs/heads/main:refs/heads/main`,

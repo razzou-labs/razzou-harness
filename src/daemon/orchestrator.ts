@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { claudeCode, mcpConfig, readResult, reportJsonSchema, type AgentAdapter, type AgentRun } from '../agents/claude-code.ts';
 import { loadClaudeToken, readUsage, type SubscriptionUsage } from '../anthropic/usage.ts';
@@ -32,6 +32,7 @@ import { architectRef } from './design.ts';
 import { parseCostEstimate } from '../review/cost-estimate.ts';
 import { activeReview, reviewStep, stepReview } from './review.ts';
 import { Managers } from './manager.ts';
+import { sweepLeftOvers } from './sandboxes.ts';
 import { attemptRefName, preMerge, probeScript, refOf, sandboxName, waitForFile } from './refs.ts';
 import { handleRequest, type AgentIdentity, type Reply } from './requests.ts';
 import { buildTask } from './task.ts';
@@ -64,6 +65,9 @@ type Step = 'progress' | 'wait';
 
 /** After this many errors in a row on the same attempt or plan (infrastructure, not the agent), the attempt is interrupted, or the pipeline pauses. */
 const STEP_ERROR_LIMIT = 5;
+
+/** How often the daemon deletes this project's left-over sandboxes, besides when it starts. */
+const SWEEP_EVERY_MS = 3_600_000;
 
 /** Where the Swarm setup stands, for the dashboard's note (v4 §6): read through the App, at most every five minutes. */
 export interface SetupStatus {
@@ -115,6 +119,8 @@ export class Orchestrator {
   private again = false;
   private stopping = false;
   private stepErrors = { key: '', count: 0 };
+  /** When the left-over sandboxes are next deleted: at the first pass, then every hour. */
+  private nextSweep = 0;
   /** Errors in a row of each plan's step, and when it is tried again: one plan that keeps failing never stops the others. */
   private readonly planErrors = new Map<string, { count: number; retryAt: number }>();
   /** The heads of Arch and Fix PRs already given the reviewers' statuses as "not reviewed". */
@@ -154,8 +160,30 @@ export class Orchestrator {
       throw new Error(`harness/config.json says the bot is ${config.project.bot}, but the App here is ${this.forge.bot}`);
     }
     await this.refreshDesign();
+    this.deleteOldBundles();
     this.record({ type: 'DAEMON_STARTED', payload: { version: this.options.version, pid: process.pid } });
     this.takePendingSetup();
+  }
+
+  /**
+   * The git bundles earlier versions kept in `.harness/modules/`: a copy of the plan
+   * branch's history for each attempt and each review, though each was read once, by the
+   * sandbox. Nothing uses one before the first pass, so all of them go.
+   */
+  private deleteOldBundles(): void {
+    const modules = join(this.options.harnessDir, 'modules');
+    if (!existsSync(modules)) return;
+    let count = 0;
+    let bytes = 0;
+    for (const file of readdirSync(modules, { recursive: true, encoding: 'utf8' }).filter((f) => f.endsWith('.bundle'))) {
+      const path = join(modules, file);
+      const stat = statSync(path, { throwIfNoEntry: false });
+      if (!stat?.isFile()) continue;
+      rmSync(path, { force: true });
+      bytes += stat.size;
+      count += 1;
+    }
+    if (count > 0) this.log(`deleted ${count} git bundle${count === 1 ? '' : 's'} left in .harness/modules, ${(bytes / 1024 ** 2).toFixed(1)} MiB`);
   }
 
   /**
@@ -249,6 +277,10 @@ export class Orchestrator {
       if (!this.stopping) await this.managers.sync();
       if (!this.stopping) await this.architects.sync();
       if (!this.stopping) await this.verifyActions().catch((error: Error) => this.log(`owner action: ${error.message}`));
+      if (!this.stopping && this.now() >= this.nextSweep) {
+        this.nextSweep = this.now() + SWEEP_EVERY_MS;
+        await sweepLeftOvers(this).catch((error: Error) => this.log(`left-over sandboxes: ${error.message}`));
+      }
     } while (this.again && !this.stopping);
   }
 
@@ -792,7 +824,8 @@ export class Orchestrator {
     }));
     copyFileSync(join(this.options.packageDir, 'roles', 'developer.md'), join(dir, 'developer.md'));
     writeFileSync(join(dir, 'report.schema.json'), reportJsonSchema());
-    for (const file of ['plan.bundle', 'task.md', 'developer.md', 'report.schema.json']) {
+    await this.uploadBundle(sandbox, join(dir, 'plan.bundle'), p.harness);
+    for (const file of ['task.md', 'developer.md', 'report.schema.json']) {
       await this.driver.upload(sandbox, join(dir, file), p.harness);
     }
     await this.uploadAgentFiles(sandbox, 'developer', dir);
@@ -1386,7 +1419,7 @@ export class Orchestrator {
       });
       try {
         await this.repo.bundle(gitRef, join(dir, 'candidate.bundle'));
-        await this.driver.upload(name, join(dir, 'candidate.bundle'), p.harness);
+        await this.uploadBundle(name, join(dir, 'candidate.bundle'), p.harness);
         const fetch = await this.exec(name, [
           `git init --quiet ${sh(p.work)}`,
           `cd ${sh(p.work)}`,
@@ -1639,6 +1672,28 @@ export class Orchestrator {
     };
   }
 
+  /**
+   * Uploads a git bundle the daemon wrote for a sandbox, then deletes it here: the
+   * sandbox clones or fetches from its own copy, and the daemon's repository has the
+   * history. Kept, they would grow without end, a copy per attempt and per review.
+   */
+  async uploadBundle(sandbox: string, file: string, remoteDir: string): Promise<void> {
+    try {
+      await this.driver.upload(sandbox, file, remoteDir);
+    } finally {
+      rmSync(file, { force: true });
+    }
+  }
+
+  /** Fetches a bundle a sandbox made into `ref`, then deletes it: the ref holds its commits. */
+  async fetchBundle(file: string, ref: string): Promise<string> {
+    try {
+      return await this.repo.fetchBundle(file, ref);
+    } finally {
+      rmSync(file, { force: true });
+    }
+  }
+
   /** The shim and the role's tools, so the agent can reach the daemon. */
   async uploadAgentFiles(sandbox: string, role: Role, localDir: string): Promise<void> {
     const p = this.paths(sandbox);
@@ -1761,7 +1816,7 @@ export class Orchestrator {
     if (bundle.code !== 0) throw new Error(`could not bundle the attempt's commits: ${(bundle.stderr || bundle.stdout).trim()}`);
     const local = join(this.attemptDir(ref), 'result.bundle');
     await this.driver.download(attempt.sandbox, `${p.out}/result.bundle`, local);
-    return this.repo.fetchBundle(local, attemptRefName(ref));
+    return this.fetchBundle(local, attemptRefName(ref));
   }
 
   async killAgent(sandbox: string): Promise<void> {
