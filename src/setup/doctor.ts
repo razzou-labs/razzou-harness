@@ -228,7 +228,7 @@ async function project(options: DoctorOptions, config: Config, report: (c: Check
   if (config.terraform) {
     const tf = config.terraform;
     for (const file of [tf.backendConfig, tf.varFile]) {
-      report(existsSync(join(options.projectDir, tf.dir, file)) ? ok('Terraform', `${tf.dir}/${file}`) : fail('Terraform', `${tf.dir}/${file} is missing`, 'see harness/config.json under terraform'));
+      report(existsSync(join(options.projectDir, tf.dir, file)) ? ok('Terraform', `${tf.dir}/${file}`) : fail('Terraform', `${tf.dir}/${file} is missing`, '`harness setup` writes the missing Terraform scaffold, or see the README\'s AWS section'));
     }
   }
 }

@@ -140,7 +140,8 @@ gateway key. In order, it logs you in to `gh`; creates
 the repository on GitHub if the project has no remote; creates the App from its
 manifest when this machine has none, and waits for you to install it; writes the
 harness's files; asks the questions and writes `harness/config.json`, with the
-`staging` environment and the variables on GitHub for AWS; commits the files it wrote,
+`staging` environment and the variables on GitHub for AWS, and the Terraform scaffold in
+`iac/` that your bootstrap expects; commits the files it wrote,
 and only those, with your git once you agree, and pushes them when you are on `main`;
 runs `harness doctor` and fixes what it can (starts the OpenShell gateway, builds the
 agents' image, imports the Claude profile and creates the provider with your token,
@@ -433,7 +434,7 @@ through an `Arch:` pull request, or a commit of your own on `main`.
 
 ```json
 {
-  "harnessVersion": "0.4.2",
+  "harnessVersion": "0.4.3",
   "project": { "name": "shop", "repo": "<org>/shop", "bot": "<org>-harness[bot]" },
   "roles": {
     "architect": { "model": "claude-opus-5-5", "effort": "max" },
@@ -554,7 +555,8 @@ and Terraform applies only in CI, after you merge.
    `harness-*` roles and to the gateway user, so your project's own Terraform can't widen
    the agents' access.
 
-**Then, in the project:**
+**Then, in the project** (`harness setup` does steps 1 to 3 when you answer its AWS
+questions):
 1. In `harness/config.json`, add `aws` and `terraform`:
 
    ```json
@@ -570,6 +572,13 @@ and Terraform applies only in CI, after you merge.
    ([NVIDIA/OpenShell#5375](https://github.com/NVIDIA/OpenShell/issues/5375)). Keep the `terraform` paths
    as they are: the CI workflow uses the same ones. `harness github-setup` then requires
    `tf-plan` as well.
+
+   In `iac/`, the Terraform scaffold: a partial `backend "s3" {}` block, the backend
+   config with the state bucket, the project's key, the region and `use_lockfile = true`,
+   and the variables file. `harness setup` writes whatever of it is missing, from the
+   variables your bootstrap set on GitHub. Its backend config sets no encryption, so the
+   bucket's default, your KMS key, applies: `encrypt = true` without `kms_key_id` would
+   replace it with SSE-S3.
 2. Set the repository variables the workflow reads: `AWS_REGION_STAGING`,
    `AWS_ROLE_PLAN_ARN_STAGING` and `AWS_ROLE_APPLY_ARN_STAGING`.
 3. `harness doctor` creates the OpenShell AWS provider: it asks for the view role's ARN,
