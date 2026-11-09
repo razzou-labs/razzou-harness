@@ -3,6 +3,18 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## 0.4.9 (2026-11-09)
+
+**Upgrading from 0.4.8:** optional, since no code changed. If you install it, rebuild
+the agents' image with `harness doctor --build-images` (its tag follows the harness's
+version), then restart the daemon with `harness down` and `harness up`.
+
+- **razzou-harness says it is alpha.** The README opens with what that means: expect
+  bugs, and expect a new minor version to change how a project is set up. The package's
+  description on npm ends with "In alpha: expect bugs and breaking changes." Releases
+  still go to npm's `latest` tag, so `npm install -g razzou-harness` installs the newest
+  one, as before.
+
 ## 0.4.8 (2026-11-08)
 
 **Upgrading from 0.4.7:** install the new version, rebuild the agents' image with

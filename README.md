@@ -2,6 +2,10 @@
 
 **Your AI dev team, with you in charge.**
 
+> **Alpha.** razzou-harness is young: expect bugs, and expect a new minor version to
+> change how a project is set up. Each release's [changelog](CHANGELOG.md) entry says
+> how to upgrade.
+
 You describe a module, a part of the system you want to build. An Architect designs it
 with you, Developers build it one feature at a time, and a Manager reviews each one.
 Every agent works in its own [OpenShell](https://github.com/NVIDIA/OpenShell) sandbox
@@ -445,7 +449,7 @@ through an `Arch:` pull request, or a commit of your own on `main`.
 
 ```json
 {
-  "harnessVersion": "0.4.8",
+  "harnessVersion": "0.4.9",
   "project": { "name": "shop", "repo": "<org>/shop", "bot": "<org>-harness[bot]" },
   "roles": {
     "architect": { "model": "claude-fable-5-1", "effort": "max" },
