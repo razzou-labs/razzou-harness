@@ -276,7 +276,10 @@ behind a token. Its views:
   Architect is Claude Code itself, in a terminal; the others run without a screen, so
   the page draws their sessions. A Developer's transcript opens with its task, and a
   reviewer's with its brief: click the first line for the whole text. An attempt's
-  card keeps the network requests its sandbox's policy refused. To copy
+  card keeps the network requests its sandbox's policy refused. **Only agents with a
+  sandbox**, above the list, hides the agents whose sandbox is gone, such as a stopped
+  Manager, or a Developer whose work went to its checks; the browser remembers the
+  choice. To copy
   from the Architect's terminal, select with the mouse: Claude Code copies the
   selection as you release the button, and `/copy` copies its last answer. Elsewhere,
   or with Shift held as you drag (Option on a Mac), the page selects, and Ctrl+C
