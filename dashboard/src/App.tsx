@@ -77,12 +77,14 @@ export function App() {
       : 'INFRA and MIXED plans will merge themselves once CI, the security reviewer and the cost reviewer pass, like CODE plans. An estimate over the ceiling still waits for you. Let the daemon merge infra?';
     return window.confirm(question) ? post('/api/infra-merge', { by: infraByDaemon ? 'ceiling' : 'daemon' }) : Promise.resolve({ done: true });
   };
-  // The switch takes effect at item boundaries; the daemon records it (v3 §2.1).
-  const switchMode = () => {
+  // The switch takes effect at item boundaries; the daemon records it, and applies main's rules with the owner's gh, as `harness mode` does (v3 §2.1).
+  const switchMode = async () => {
     const question = swarm
       ? 'In Manual you review and merge every pull request yourself. Switch to Manual?'
       : 'In Swarm the daemon merges plans that pass CI and the reviewers, without your review. Switch to Swarm?';
-    return window.confirm(question) ? post('/api/mode', { mode: swarm ? 'manual' : 'swarm' }) : Promise.resolve({ done: true });
+    if (!window.confirm(question)) return { done: true };
+    const result = (await post('/api/mode', { mode: swarm ? 'manual' : 'swarm' })) as { done: boolean; error?: string; problem?: string };
+    return result.problem ? { ...result, warning: `GitHub's rules on main were not changed: ${result.problem}` } : result;
   };
   return (
     <>

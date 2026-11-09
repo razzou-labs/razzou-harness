@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert';
 import { spawn } from 'node:child_process';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
@@ -113,40 +113,48 @@ describe('the CLI', () => {
     }
   });
 
-  it("applies Swarm's rules before the daemon enters Swarm, and Manual's once it has left", async () => {
-    const order: string[] = [];
+  it("leaves main's rules to a running daemon, which switches as the dashboard does, and applies them itself while it is down", async () => {
+    let answer: object = { done: true, rules: ['ruleset "harness: main" (Swarm)'] };
     const server = createServer((req, res) => {
       let body = '';
       req.on('data', (chunk: Buffer) => (body += String(chunk))).on('end', () => {
         appendFileSync(log, `daemon ${req.url} ${body}\n`);
-        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ done: true }));
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(answer));
       });
     });
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
     const dir = daemonJson({ pid: process.pid, processStart: processStart(process.pid)!, port: (server.address() as AddressInfo).port });
-    const log = join(dir, 'order.log');
+    const log = join(dir, 'calls.log');
+    writeFileSync(log, '');
     mkdirSync(join(dir, 'harness'));
     writeFileSync(join(dir, 'harness', 'config.json'), JSON.stringify({ harnessVersion: '0.1.0', project: { name: 'shop', repo: 'acme/shop', bot: 'acme-harness[bot]' } }));
-    // A gh that says what it was asked, and fails: the CLI says the rules weren't changed, and goes on.
+    // A gh that says what it was asked, and fails.
     const bin = tempDir('bin');
     writeFileSync(join(bin, 'gh'), `#!/bin/sh\necho "gh $1" >> '${log}'\nexit 1\n`, { mode: 0o755 });
     const mode = (to: string) => run(process.execPath, [CLI, 'mode', to, '--dir', dir], { env: { ...env, PATH: `${bin}:${process.env.PATH}` } });
+    const calls = () => readFileSync(log, 'utf8').trim().split('\n');
     try {
-      for (const to of ['swarm', 'manual']) {
-        writeFileSync(log, '');
-        const result = await mode(to);
-        assert.equal(result.code, 0, result.stderr);
-        assert.match(result.stdout, /GitHub's rules on main were not changed/);
-        const lines = readFileSync(log, 'utf8').trim().split('\n');
-        order.push(`${to}: ${lines[0]} … ${lines.at(-1)}`);
-      }
+      const swarm = await mode('swarm');
+      assert.deepEqual([swarm.code, swarm.stdout.trim().split('\n')], [0, ['done', 'set: ruleset "harness: main" (Swarm)']]);
+      assert.deepEqual(calls(), ['daemon /api/mode {"mode":"swarm"}'], "the daemon applied the rules: the CLI's gh wasn't asked");
+
+      answer = { done: true, rules: [], problem: 'gh: not an admin of acme/shop' };
+      const manual = await mode('manual');
+      assert.equal(manual.code, 0);
+      assert.match(manual.stdout, /^done\nGitHub's rules on main were not changed: gh: not an admin of acme\/shop\nRun `harness github-setup --repo acme\/shop`/);
     } finally {
       server.close();
     }
-    assert.deepEqual(order, [
-      'swarm: gh api … daemon /api/mode {"mode":"swarm"}',
-      'manual: daemon /api/mode {"mode":"manual"} … gh api',
-    ]);
+
+    // The daemon is down: the CLI applies them with the owner's gh, and the switch waits for the daemon.
+    rmSync(join(dir, '.harness', 'daemon.json'));
+    writeFileSync(log, '');
+    const down = await mode('swarm');
+    assert.equal(down.code, 0, down.stderr);
+    assert.match(down.stdout, /GitHub's rules on main were not changed/);
+    assert.match(down.stdout, /swarm: the daemon switches when it starts/);
+    assert.equal(calls()[0], 'gh api');
+    assert.equal(JSON.parse(readFileSync(join(dir, '.harness', 'setup.json'), 'utf8')).mode, 'swarm');
   });
 
   it('records the hours and the mode for the daemon while it is down (v4 §5)', async () => {

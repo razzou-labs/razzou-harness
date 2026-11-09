@@ -305,17 +305,21 @@ gives the agents more autonomy and you less to read. Its design is
 exists today.
 
 **The switch.** The dashboard's header switches the mode; so do `harness mode swarm`
-and `harness mode manual`. A switch takes effect at item boundaries: what runs
-finishes under the rules it started with. GitHub's rules on `main` differ per mode, and
-only you can change them: `harness mode` applies the mode's ruleset in the same
-command, with your own `gh`, before the daemon enters Swarm and after it leaves it; after
-a switch from the dashboard, run `harness github-setup --repo <org>/<repo>` once. Until
-the rules match nothing merges. The daemon reads the rules in effect on `main` through
-the App and the dashboard's note lists what is still to do, the commands ready to copy:
-the rules, the App's "Commit statuses: write", and the token for the usage probe. While
-a step is left, the daemon checks again every 30 seconds, so the note goes soon after
-the last one; `harness doctor` checks the same. `harness setup` prepares the last two
-in either mode, so a switch to Swarm needs only its rules.
+and `harness mode manual`, and both do the same. A switch takes effect at item
+boundaries: what runs finishes under the rules it started with. GitHub's rules on
+`main` differ per mode, and only a repository admin can change them: the App has no
+administration permission, on purpose. So the switch applies the mode's ruleset with
+your own `gh`, which the daemon runs on your machine: Swarm's rules before the daemon
+enters Swarm, Manual's once it has left, so it never merges under the other mode's
+rules. If your `gh` isn't logged in as an admin, the switch still happens and says why
+the rules didn't change; `harness github-setup --repo <org>/<repo>` applies them once
+it is. With the daemon down, `harness mode` applies them, and the daemon switches when
+it starts. Until the rules match nothing merges. The daemon reads the rules in effect
+on `main` through the App and the dashboard's note lists what is still to do, the
+commands ready to copy: the rules, the App's "Commit statuses: write", and the token
+for the usage probe. While a step is left, the daemon checks again every 30 seconds, so
+the note goes soon after the last one; `harness doctor` checks the same. `harness
+setup` prepares the last two in either mode, so a switch to Swarm needs only its rules.
 
 **What merges itself.** In Swarm the daemon merges a plan's pull request, as the App,
 once CI passed and every status in `swarm.requiredStatuses` is green on its head:
@@ -449,7 +453,7 @@ too.
 | `harness message <text>` | Writes to the Manager of the module being built |
 | `harness retry <module>/<plan>/<feature>` | Gives an escalated feature one more attempt; `--note` adds guidance |
 | `harness resume` | Lifts a pause |
-| `harness mode [manual\|swarm]` | Shows the mode, or switches it; with the daemon down, it records the switch for when it starts |
+| `harness mode [manual\|swarm]` | Shows the mode, or switches it as the dashboard's switch does, with `main`'s rules applied through your own `gh`; with the daemon down, it applies the rules and records the switch for when it starts |
 | `harness recover` | Rebuilds a lost `.harness/` from GitHub's `main` and branches, and lists what it can't: the mode, the budgets, the owner tasks done |
 
 ## Configuration

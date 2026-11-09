@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
+import { ConfigSchema, requiredChecks, type Config } from '../design/schemas.ts';
 import type { Mode } from '../state/state.ts';
 import { run } from '../util.ts';
 import { APP_PERMISSIONS, configDir, GitHubClient, loadAppCredentials } from './app.ts';
@@ -266,4 +267,27 @@ export async function applyRepositoryRules(repo: string, requiredChecks: string[
     done.push(`ruleset "harness: main" (Manual): PRs only, one approval from a code owner, no force push or deletion, and ${checks}`);
   }
   return done;
+}
+
+/**
+ * The ruleset of `mode` on main, with the owner's own gh (v3 §2.1): what `harness mode`,
+ * the dashboard's switch and `harness github-setup` apply. The App never can: it has no
+ * administration permission, on purpose.
+ */
+export async function applyModeRules(config: Config | undefined, repo: string, mode: Mode): Promise<string[]> {
+  const required = config ? requiredChecks(config) : ['verify', 'checks'];
+  if (mode === 'manual') return applyRepositoryRules(repo, required, { mode });
+  const statuses = (config?.swarm ?? ConfigSchema.shape.swarm.parse(undefined)).requiredStatuses;
+  let appId: number | undefined;
+  try {
+    appId = loadAppCredentials().appId;
+  } catch {
+    appId = undefined;
+  }
+  return applyRepositoryRules(repo, required, { mode, statuses, ...(appId !== undefined ? { appId } : {}) });
+}
+
+/** What the owner reads when the rules couldn't be applied: the fix is theirs, with gh. */
+export function rulesNotChanged(problem: string, repo: string): string {
+  return `GitHub's rules on main were not changed: ${problem}\nRun \`harness github-setup --repo ${repo}\` with gh logged in as an admin of the repository.`;
 }

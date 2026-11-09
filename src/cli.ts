@@ -6,9 +6,8 @@ import { createInterface } from 'node:readline/promises';
 import { parseArgs } from 'node:util';
 import { computeLock, directoryReader } from './ci/harness-ci.ts';
 import { isRunning, packageRoot, runDaemon, runningDaemon, version } from './daemon/main.ts';
-import { ConfigSchema, requiredChecks } from './design/schemas.ts';
-import { loadAppCredentials } from './github/app.ts';
-import { applyRepositoryRules, checkApp, createApp, installCi, type RulesetOptions } from './github/setup.ts';
+import { ConfigSchema } from './design/schemas.ts';
+import { applyModeRules, checkApp, createApp, installCi, rulesNotChanged } from './github/setup.ts';
 import { askSecret, doctor } from './setup/doctor.ts';
 import { CHECKLIST, init } from './setup/init.ts';
 import { recover } from './setup/recover.ts';
@@ -104,27 +103,26 @@ async function main(): Promise<void> {
         return;
       }
       if (argument !== 'manual' && argument !== 'swarm') throw new Error('usage: harness mode [manual|swarm]');
-      const running = runningDaemon(harnessDir) !== undefined;
-      // GitHub's rules on main differ per mode, and only the owner's gh may change them (v3 §2.1): done here, in the
-      // same command, so that the daemon never runs a mode against the other's rules. Swarm's rules come before the
-      // daemon enters Swarm, and the daemon leaves Swarm, which stops its merges, before Manual's come back.
+      // GitHub's rules on main differ per mode, and only the owner's gh may change them (v3 §2.1). A running daemon
+      // switches and applies them itself, as the dashboard's switch does, in the order that never leaves it merging
+      // against the other mode's rules.
       const repo = projectConfig(projectDir)?.project.repo;
-      const rules = async () => {
-        if (!repo) return;
+      if (runningDaemon(harnessDir)) {
+        const result = (await ownerAction(harnessDir, '/api/mode', { mode: argument }, `already ${argument}`)) as ModeSwitch;
+        for (const line of result.rules ?? []) console.log(`set: ${line}`);
+        if (result.problem && repo) console.log(rulesNotChanged(result.problem, repo));
+        return;
+      }
+      // The daemon is down, so it merges nothing: the rules change now, and the switch waits for it in .harness/setup.json (v4 §5).
+      if (repo) {
         try {
           await applyRules(projectDir, harnessDir, repo, argument);
         } catch (error) {
-          console.log(`GitHub's rules on main were not changed: ${(error as Error).message}\nRun \`harness github-setup --repo ${repo}\` with gh logged in as an admin of the repository.`);
+          console.log(rulesNotChanged((error as Error).message, repo));
         }
-      };
-      if (argument === 'swarm') await rules();
-      if (running && (await ownerAction(harnessDir, '/api/mode', { mode: argument }, `already ${argument}`)).error) return;
-      if (argument === 'manual') await rules();
-      if (!running) {
-        // The daemon is down: the switch waits for it in .harness/setup.json (v4 §5).
-        recordForDaemon(harnessDir, { mode: argument });
-        console.log(`${argument}: the daemon switches when it starts (harness up).`);
       }
+      recordForDaemon(harnessDir, { mode: argument });
+      console.log(`${argument}: the daemon switches when it starts (harness up).`);
       return;
     }
     case 'budget': {
@@ -257,23 +255,17 @@ function projectConfig(projectDir: string) {
 
 /** Merge settings and the ruleset of the mode on main, with the owner's own gh: the daemon's mode, unless `mode` says otherwise (v3 §2.1). */
 async function applyRules(projectDir: string, harnessDir: string, repo: string, mode?: Mode): Promise<void> {
-  const config = projectConfig(projectDir);
-  const required = config ? requiredChecks(config) : ['verify', 'checks'];
   const stateFile = join(harnessDir, 'state.json');
   const snapshot = existsSync(stateFile) ? (JSON.parse(readFileSync(stateFile, 'utf8')) as State) : undefined;
-  const effective = mode ?? snapshot?.mode ?? 'manual';
-  let options: RulesetOptions = { mode: effective };
-  if (effective === 'swarm') {
-    const statuses = (config?.swarm ?? ConfigSchema.shape.swarm.parse(undefined)).requiredStatuses;
-    let appId: number | undefined;
-    try {
-      appId = loadAppCredentials().appId;
-    } catch {
-      appId = undefined;
-    }
-    options = { mode: effective, statuses, ...(appId !== undefined ? { appId } : {}) };
-  }
-  for (const line of await applyRepositoryRules(repo, required, options)) console.log(`set: ${line}`);
+  for (const line of await applyModeRules(projectConfig(projectDir), repo, mode ?? snapshot?.mode ?? 'manual')) console.log(`set: ${line}`);
+}
+
+/** The daemon's answer to a switch: whether the mode changed, the rules it applied on main, or why it couldn't. */
+interface ModeSwitch {
+  done: boolean;
+  error?: string;
+  rules?: string[];
+  problem?: string;
 }
 
 async function githubApp(action: string | undefined, values: { org?: string; name?: string; repo?: string }): Promise<void> {

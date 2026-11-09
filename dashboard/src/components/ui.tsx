@@ -60,8 +60,8 @@ export function Command({ text }: { text: string }) {
   );
 }
 
-/** A button for an owner action; it reports a refusal next to itself. */
-export function Action({ label, onClick, danger }: { label: string; onClick: () => Promise<{ done: boolean; error?: string }>; danger?: boolean }) {
+/** A button for an owner action; it reports a refusal next to itself, or what went wrong beside an action that was done. */
+export function Action({ label, onClick, danger }: { label: string; onClick: () => Promise<{ done: boolean; error?: string; warning?: string }>; danger?: boolean }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
   return (
@@ -73,7 +73,7 @@ export function Action({ label, onClick, danger }: { label: string; onClick: () 
           setBusy(true);
           const result = await onClick();
           setBusy(false);
-          setError(result.done ? undefined : result.error ?? 'refused');
+          setError(result.done ? result.warning : result.error ?? 'refused');
         }}
       >
         {label}
