@@ -3,6 +3,25 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## 0.4.18 (2026-11-09)
+
+**Upgrading from 0.4.17:** install the new version, rebuild the agents' image with
+`harness doctor --build-images` (its tag follows the harness's version), then restart the
+daemon with `harness down` and `harness up`, and reload the dashboard.
+
+- **One dashboard, the Vue and Quasar one.** The classic dashboard is gone: the URL
+  `harness up` prints opens the new one, and so does `/next/`, where 0.4.17 served it.
+- **Light or dark.** The button at the right of the header switches the dashboard
+  between light and dark. The browser remembers your choice; until you make one, the
+  dashboard follows your system's.
+- **Quasar throughout.** A transcript's tool calls and results, a failed CI job's log, a
+  finding and the post-deploy checks open as Quasar's expansion items; a proposal's
+  versions are one toggle; the deadline bar's tooltip and the loading spinners are
+  Quasar's. Quasar's own icons are SVG now: without the icon font, 0.4.17 showed some as
+  words, such as "cancel" for the Events filter's clear button.
+- **Long transcripts stay fast.** A new line renders only itself: past a thousand lines,
+  each new one made the page redraw them all.
+
 ## 0.4.17 (2026-11-09)
 
 **Upgrading from 0.4.16:** install the new version, rebuild the agents' image with
