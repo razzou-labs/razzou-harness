@@ -271,10 +271,13 @@ behind a token. Its views:
   tokens Claude used, written and read, by role.
 - **Agents:** the Architect's terminal, the Manager's and the Developers' live
   transcripts, a message box for the Manager, and a shell in any agent's sandbox. An
-  attempt's card keeps the network requests its sandbox's policy refused. In a
-  terminal, Ctrl+C copies the text you selected (Cmd+C on a Mac), and with nothing
-  selected it still interrupts the program. If a drag selects nothing, because the
-  program uses the mouse, hold Shift as you drag, or Option on a Mac.
+  attempt's card keeps the network requests its sandbox's policy refused. To copy
+  from the Architect's terminal, select with the mouse: Claude Code copies the
+  selection as you release the button, and `/copy` copies its last answer. Elsewhere,
+  or with Shift held as you drag (Option on a Mac), the page selects, and Ctrl+C
+  copies (Cmd+C on a Mac); with nothing selected, Ctrl+C still interrupts the program.
+  Only the Architect's terminal may set your clipboard, within five seconds of a key
+  or click of yours there, and no program can read it.
 - **Sandboxes:** what runs on the OpenShell gateway. This project's sandboxes, with what
   each is for, whether anything still uses it, and the CPUs and memory it uses now,
   read from `docker stats` every five seconds. A left-over one, which a crash or a
