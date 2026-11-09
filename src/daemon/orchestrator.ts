@@ -30,7 +30,7 @@ import { Architects } from './architects.ts';
 import { AgentChannel, type AgentRequest } from './channel.ts';
 import { architectRef } from './design.ts';
 import { parseCostEstimate } from '../review/cost-estimate.ts';
-import { activeReview, reviewStep, stepReview } from './review.ts';
+import { activeReview, pollRunningReviews, reviewStep, stepReview } from './review.ts';
 import { Managers } from './manager.ts';
 import { sweepLeftOvers } from './sandboxes.ts';
 import { readTokens } from './tokens.ts';
@@ -67,6 +67,12 @@ const STEP_ERROR_LIMIT = 5;
 
 /** How often the daemon deletes this project's left-over sandboxes, besides when it starts. */
 const SWEEP_EVERY_MS = 3_600_000;
+/**
+ * How long past a reset the subscription reports before work starts again. The reports
+ * give Unix times, so the laptop's timezone never enters; its clock may run a little
+ * ahead of Anthropic's, and an attempt started before the real reset would hit the limit.
+ */
+const RESET_MARGIN_MS = 60_000;
 
 /** Where the Swarm setup stands, for the dashboard's note (v4 §6): read through the App, at most every five minutes. */
 export interface SetupStatus {
@@ -495,7 +501,8 @@ export class Orchestrator {
       if ((await this.stepAttempt(feature, attempt)) === 'progress') progressed = true;
     }
     if (progressed) return 'progress';
-    if (paused) return 'wait';
+    // Paused, the reviewers already running are followed to their end too, as attempts are; none starts.
+    if (paused) return (await pollRunningReviews(this)) ? 'progress' : 'wait';
     if (await this.apiKeysMissing()) return 'wait';
     // Manual builds one feature at a time, and looks at nothing else while it runs. Swarm starts
     // more while others run, up to its limit, and follows its other plans meanwhile (v3 §6.2).
@@ -773,11 +780,30 @@ export class Orchestrator {
     const ceiling = this.design.config.swarm.usageCeilingPercent;
     if (this.state.mode !== 'swarm' || ceiling === null || !this.usage) return false;
     const binding = this.usage.usage.limits
-      .filter((limit) => Date.parse(limit.resetsAt) > this.now())
+      .filter((limit) => Date.parse(limit.resetsAt) + RESET_MARGIN_MS > this.now())
       .reduce<UsageLimit | undefined>((top, limit) => (!top || limit.percent > top.percent ? limit : top), undefined);
     if (!binding || binding.percent < ceiling) return false;
-    this.pausePipeline(`the subscription's usage is at ${binding.percent}% (${binding.kind}), at or above the ${ceiling}% ceiling (swarm.usageCeilingPercent)`, binding.resetsAt);
+    this.pausePipeline(
+      `the subscription's usage is at ${binding.percent}% (${binding.kind}), at or above the ${ceiling}% ceiling (swarm.usageCeilingPercent)`,
+      new Date(Date.parse(binding.resetsAt) + RESET_MARGIN_MS).toISOString(),
+    );
     return true;
+  }
+
+  /**
+   * Until when the pipeline waits after an agent hit the subscription's limit: a minute
+   * past the reset of a window the latest report shows full, or of the time an older
+   * Claude Code names in its message, as "…|<Unix seconds>"; an hour without either. Only
+   * Unix times are read: a newer Claude Code's "resets 3pm" is the sandbox's clock, in UTC.
+   */
+  usageLimitUntil(message = ''): string {
+    const now = this.now();
+    const epoch = /\|(\d{10})\b/.exec(message)?.[1];
+    const resets = [
+      ...(epoch ? [Number(epoch) * 1000] : []),
+      ...(this.usage?.usage.limits ?? []).filter((limit) => limit.percent >= 100).map((limit) => Date.parse(limit.resetsAt)),
+    ].filter((at) => Number.isFinite(at) && at + RESET_MARGIN_MS > now);
+    return new Date(resets.length > 0 ? Math.max(...resets) + RESET_MARGIN_MS : now + 3_600_000).toISOString();
   }
 
   /** An agent's stream line: a `rate_limit_event` is the subscription's usage as of now, which the pages and the next restart get. */
@@ -981,7 +1007,7 @@ export class Orchestrator {
       // interruption, it counts from the third one of the same definition, so it can't buy attempts.
       const counts = interruptions(state, attempt.definitionHash) >= 2;
       this.record({ type: 'ATTEMPT_INTERRUPTED', ref, payload: { reason: 'the subscription usage limit was reached', counts } });
-      this.pausePipeline('usage limit reached', new Date(this.now() + 3_600_000).toISOString());
+      this.pausePipeline('usage limit reached', this.usageLimitUntil(attempt.summary));
       await this.driver.remove(attempt.sandbox);
       return 'progress';
     }

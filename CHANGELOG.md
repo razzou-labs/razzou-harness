@@ -3,6 +3,27 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## 0.4.21 (2026-11-09)
+
+**Upgrading from 0.4.20:** install the new version, rebuild the agents' image with
+`harness doctor --build-images` (its tag follows the harness's version), then restart the
+daemon with `harness down` and `harness up`, and reload the dashboard.
+
+- **A usage limit waits for its reset.** When an agent hits the subscription's limit,
+  the pipeline pauses until the reset, not for a flat hour. The reset comes from a window
+  at 100% in the agents' last usage report, or from the Unix time an older Claude Code
+  writes after its message. Without either, the pause still lasts an hour. In Manual,
+  which has no ceiling, this stops new attempts from hitting the limit every hour, which
+  from the third one of a feature counted as failures.
+- **A minute's margin.** The ceiling's pause and the limit's both end a minute past the
+  reset. The reports give Unix times, so your timezone never enters, but a clock a
+  little ahead would start an attempt before the real reset. A newer Claude Code's
+  "resets 3pm" is the sandbox's clock, in UTC, and is never read.
+- **Reviewers finish during a pause.** A paused pipeline still follows the reviewers
+  already running, as it does the Developers, and starts none. A reviewer that hit the
+  limit during a pause counts at once. Before, it counted when the pause lifted, and
+  paused the pipeline for another hour.
+
 ## 0.4.20 (2026-11-09)
 
 **Upgrading from 0.4.19:** install the new version, rebuild the agents' image with

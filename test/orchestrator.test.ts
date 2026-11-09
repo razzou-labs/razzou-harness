@@ -146,15 +146,19 @@ const alphaDesign: Record<string, string> = {
 };
 const alphaOrSolved = (f: string): StubBehavior => (f === 'A01' ? { files: { 'src/alpha.txt': '1\n' } } : solved(f));
 
-/** The stub, except that the listed attempts of a feature end on a usage limit, as Claude Code reports one. */
-const usageLimitOn = (feature: string, attempts: number[]) => (stub: AgentAdapter): AgentAdapter => ({
+/**
+ * The stub, except that the listed attempts of a feature end on a usage limit, as Claude
+ * Code reports one: by default in a newer version's words, whose "resets 3pm" is the
+ * sandbox's clock and gives no Unix time.
+ */
+const usageLimitOn = (feature: string, attempts: number[], message = "You've hit your 5-hour limit · resets 3pm") => (stub: AgentAdapter): AgentAdapter => ({
   ...stub,
   launch(run: AgentRun) {
     const task = readFileSync(run.taskFile, 'utf8');
     const which = /^# Feature [^/]+\/[^/]+\/([^:]+):/m.exec(task)?.[1];
     const attempt = Number(/This is attempt (\d+)\./.exec(task)?.[1] ?? 0);
     if (which !== feature || !attempts.includes(attempt)) return stub.launch(run);
-    const result = { type: 'result', subtype: 'error_during_execution', is_error: true, result: 'Claude AI usage limit reached|1900000000' };
+    const result = { type: 'result', subtype: 'error_during_execution', is_error: true, result: message };
     return detach(run.workDir, [`echo $$ > ${sh(run.pidFile)}`, 'sleep 1', `printf '%s\\n' ${sh(JSON.stringify(result))} > ${sh(run.streamFile)}`, `echo 1 > ${sh(run.exitFile)}`].join('\n'));
   },
 });
@@ -839,11 +843,15 @@ describe('pull requests', () => {
     o.setMode('swarm');
     await until(o, () => o.state.pipeline.paused !== undefined);
     assert.equal(o.state.pipeline.paused!.reason, "the subscription's usage is at 85% (weekly_all), at or above the 80% ceiling (swarm.usageCeilingPercent)");
-    assert.equal(o.state.pipeline.paused!.until, new Date(resetsAt * 1000).toISOString());
+    assert.equal(o.state.pipeline.paused!.until, new Date(resetsAt * 1000 + 60_000).toISOString(), 'a minute past the reset, for a clock a little ahead');
     assert.equal(Object.keys(o.state.features).length, 0);
 
-    // The window resets: the report no longer binds, the pause lifts, and the build goes on.
+    // At the reset itself, the window still binds: the laptop's clock may be ahead of Anthropic's.
     skew += 10 * 60_000 + 1000;
+    for (let i = 0; i < 3; i++) await o.tick();
+    assert.equal(Object.keys(o.state.features).length, 0);
+    // A minute later the report no longer binds, the pause lifts, and the build goes on, with no new report.
+    skew += 60_000;
     await until(o, completed(o));
   });
 
@@ -1613,9 +1621,59 @@ describe('pauses', () => {
     for (let n = 1; n <= 3; n++) {
       await until(o, () => feature(o, 'F01')?.attempts[n - 1]?.status === 'interrupted');
       assert.equal(o.state.pipeline.paused?.reason, 'usage limit reached');
+      // No Unix time anywhere: an hour, whatever "resets 3pm" says.
+      assert.ok(Math.abs(Date.parse(o.state.pipeline.paused!.until!) - (Date.now() + skew + 3_600_000)) < 10_000);
       skew += 61 * 60_000;
     }
     assert.deepEqual(feature(o, 'F01')!.attempts.map((a) => a.counts), [false, false, true]);
+  });
+
+  it("waits after a usage limit until a minute past the reset of the window an agent's latest report shows full", async () => {
+    let skew = 0;
+    const { orchestrator: o } = await setup((f) => solved(f), { agent: usageLimitOn('F01', [1]), now: () => Date.now() + skew });
+    // A Unix time in the report, whatever the laptop's timezone: 20 minutes from now.
+    const resetsAt = Math.floor((Date.now() + 20 * 60_000) / 1000);
+    o.events.emit('transcript', { agent: 'manager:demo', line: rateLimitEvent({ five_hour: 1, seven_day: 0.4 }, resetsAt) });
+    await until(o, () => feature(o, 'F01')?.attempts[0]?.status === 'interrupted');
+    assert.equal(o.state.pipeline.paused?.until, new Date(resetsAt * 1000 + 60_000).toISOString());
+    skew += 21 * 60_000 + 1000;
+    await until(o, completed(o));
+    assert.equal(feature(o, 'F01')!.attempts.length, 2);
+  });
+
+  it('reads the Unix time an older Claude Code writes after its usage limit message', async () => {
+    const epoch = Math.floor((Date.now() + 30 * 60_000) / 1000);
+    const { orchestrator: o } = await setup((f) => solved(f), { agent: usageLimitOn('F01', [1], `Claude AI usage limit reached|${epoch}`) });
+    await until(o, () => feature(o, 'F01')?.attempts[0]?.status === 'interrupted');
+    assert.equal(o.state.pipeline.paused?.until, new Date(epoch * 1000 + 60_000).toISOString());
+  });
+
+  it('follows a reviewer already running while paused, so a usage limit it hits counts at once, and starts none', async () => {
+    let gate = '';
+    const epoch = Math.floor((Date.now() + 20 * 60_000) / 1000);
+    // The security reviewer runs until the test lets it end, then reports a usage limit.
+    const held = (stub: AgentAdapter): AgentAdapter => ({
+      ...stub,
+      launchReviewer(run: AgentRun) {
+        if (!/as the security reviewer/.test(readFileSync(run.taskFile, 'utf8'))) return stub.launchReviewer(run);
+        gate = join(run.workDir, 'gate');
+        const result = { type: 'result', subtype: 'error_during_execution', is_error: true, result: `Claude AI usage limit reached|${epoch}` };
+        return detach(run.workDir, [`echo $$ > ${sh(run.pidFile)}`, `while [ ! -f ${sh(gate)} ]; do sleep 0.1; done`, `printf '%s\\n' ${sh(JSON.stringify(result))} > ${sh(run.streamFile)}`, `echo 1 > ${sh(run.exitFile)}`].join('\n'));
+      },
+    });
+    const { orchestrator: o } = await setup((f) => solved(f), { github: true, agent: held });
+    o.setMode('swarm');
+    const plan = () => o.state.plans['demo/P1'];
+    const security = () => plan()?.reviews?.find((r) => r.role === 'security');
+    await until(o, () => security()?.status === 'running');
+    assert.equal(o.pause(), true);
+    const starting = plan()!.reviews!.filter((r) => r.status === 'starting').map((r) => r.sandbox);
+    writeFileSync(gate, '');
+    await until(o, () => security()?.status !== 'running');
+    assert.equal(security()!.outcome, 'usage_limit');
+    assert.equal(o.state.pipeline.paused?.reason, 'the owner paused the pipeline', "the owner's pause holds: a timed one never replaces it");
+    // Paused, a reviewer still starting got no sandbox.
+    for (const name of starting) assert.equal(await o.driver.status(name), 'missing', name);
   });
 
   it('takes the hours harness budget left while it was down over earlier ones, and the mode harness mode left', async () => {
