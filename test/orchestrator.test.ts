@@ -1287,7 +1287,7 @@ describe('dashboard', () => {
     cleanup.push(async () => void server.close());
     const port = (server.address() as AddressInfo).port;
     const host = `127.0.0.1:${port}`;
-    return { o, driver, port, host, bearer: { host, authorization: `Bearer ${token}` } };
+    return { o, driver, port, host, webRoot, bearer: { host, authorization: `Bearer ${token}` } };
   }
 
   it("lists the gateway's sandboxes, labels its own, shows what a policy refused, and deletes only a left-over one", async () => {
@@ -1455,6 +1455,18 @@ describe('dashboard', () => {
     assert.equal((await call(port, '/agents', bearer)).body, page.body);
     assert.equal((await call(port, '/assets/../../../../etc/passwd', bearer)).body, page.body);
     assert.equal((await call(port, '/%2e%2e/%2e%2e/package.json', bearer)).body, page.body);
+  });
+
+  it('serves the second dashboard under /next/, and the first one there while it is not built', async () => {
+    const { port, bearer, webRoot } = await dashboard();
+    const classic = (await call(port, '/', bearer)).body;
+    assert.equal((await call(port, '/next/', bearer)).body, classic, 'not built: the first dashboard answers');
+    mkdirSync(join(webRoot, 'next', 'assets'), { recursive: true });
+    writeFileSync(join(webRoot, 'next', 'index.html'), '<!doctype html><title>next</title>');
+    writeFileSync(join(webRoot, 'next', 'assets', 'next.js'), 'console.log("next")');
+    for (const path of ['/next', '/next/', '/next/agents']) assert.equal((await call(port, path, bearer)).body, '<!doctype html><title>next</title>', path);
+    assert.equal((await call(port, '/next/assets/next.js', bearer)).body, 'console.log("next")');
+    for (const path of ['/', '/agents', '/nextish']) assert.equal((await call(port, path, bearer)).body, classic, `${path} stays the first dashboard's`);
   });
 
   it('pauses and resumes for the owner, and shows the agents\' transcripts', async () => {

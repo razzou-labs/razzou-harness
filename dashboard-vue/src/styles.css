@@ -1,0 +1,48 @@
+/* The second dashboard's own styles, beside Quasar's: what its components don't draw. */
+:root { --h-text: #1d1d1b; --h-muted: #6b6b66; --h-line: rgba(127, 127, 127, 0.28); --h-soft: rgba(127, 127, 127, 0.08); --h-amber: #b07800; }
+.body--dark { --h-text: #ececea; --h-muted: #9c9c96; --h-amber: #e0a43a; }
+body { font-size: 14px; }
+.harness-header { background: #fff; color: var(--h-text); }
+.body--dark .harness-header { background: var(--q-dark); }
+.harness-page { max-width: 1400px; margin: 0 auto; }
+.mono, pre, code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+pre { margin: 4px 0; white-space: pre-wrap; word-break: break-word; max-height: 420px; overflow: auto; background: var(--h-soft); padding: 6px 8px; border-radius: 6px; }
+code { background: var(--h-soft); padding: 1px 5px; border-radius: 4px; }
+.command { white-space: nowrap; }
+.command code { user-select: all; }
+.status { font-weight: 500; }
+.document { border: 1px solid var(--h-line); border-radius: 6px; padding: 4px 14px; margin: 8px 0; max-height: 60vh; overflow: auto; }
+.markdown p, .markdown ul, .markdown ol { margin: 6px 0; }
+.markdown img { max-width: 100%; }
+.text-warning { color: var(--h-amber) !important; }
+.events td:not(:last-child) { white-space: nowrap; }
+.row-selected, .agent-active { background: rgba(25, 118, 210, 0.1); }
+
+/* The module's graph (v3 §6.7): tones set the color, the shapes take it from currentColor. */
+.graph-wrap { overflow-x: auto; margin: 12px 0; }
+.graph { display: block; font-size: 12px; }
+.graph .ok { color: var(--q-positive); }
+.graph .bad { color: var(--q-negative); }
+.graph .warn { color: var(--h-amber); }
+.graph .run { color: var(--q-primary); }
+.graph .muted { color: #9e9e9e; }
+.graph .plan-box > rect { fill: var(--h-soft); stroke: currentColor; stroke-width: 1; }
+.graph .plan-title { font-weight: 600; fill: var(--h-text); }
+.graph .plan-status { fill: currentColor; font-size: 11px; }
+.graph .node rect { fill: color-mix(in srgb, currentColor 16%, transparent); stroke: currentColor; stroke-width: 1; }
+.graph .node text { fill: var(--h-text); }
+.graph .edge { fill: none; stroke: var(--h-text); stroke-opacity: 0.45; stroke-width: 1.2; }
+.graph marker path { fill: var(--h-text); fill-opacity: 0.6; }
+
+/* Terminals draw for a dark screen; transcripts follow the page. */
+.terminal { height: 70vh; background: #141413; border-radius: 6px; padding: 4px; }
+.transcript { height: 62vh; overflow: auto; border: 1px solid var(--h-line); border-radius: 6px; padding: 8px 10px; display: grid; grid-auto-rows: max-content; gap: 4px; align-content: start; }
+.t-meta { color: var(--h-muted); font-size: 12px; }
+.t-input { color: var(--h-muted); white-space: pre-wrap; max-height: 200px; overflow: auto; }
+.t-prompt { white-space: normal; max-height: none; }
+.t-prompt summary { cursor: pointer; }
+.t-prompt :is(h1, h2, h3, h4) { font-size: 14px; margin: 10px 0 2px; }
+.t-text { border-left: 2px solid var(--q-primary); padding-left: 8px; }
+.t-tool summary, .t-result summary { cursor: pointer; font-size: 13px; }
+.t-result summary { color: var(--h-muted); }
+.t-result.bad summary { color: var(--q-negative); }
