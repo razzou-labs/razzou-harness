@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { post, type Attempt, type DashboardState, type FeatureState, type OwnerTime, type PlanState, type State, type SubscriptionUsage } from '../api.ts';
+import { post, type Attempt, type DashboardState, type FeatureState, type OwnerTime, type PlanState, type State, type SubscriptionUsage, type UsageLimit } from '../api.ts';
 import { Graph } from '../components/Graph.tsx';
 import { Action, Badge, GithubLink } from '../components/ui.tsx';
 import { duration } from '../format.ts';
@@ -154,25 +154,63 @@ function Budgets({ state, ownerTime, usage, ceiling }: { state: State; ownerTime
           <p className="muted small">The Developers' attempt clocks, summed. Over the threshold the number turns red; nothing stops.</p>
         </div>
         <TokensMeter state={state} />
-        {usage && (
-          <div className="meter">
-            <h3>Subscription</h3>
-            <p>
-              {usage.usage.limits.map((limit, i) => (
-                <span key={limit.kind}>
-                  {i > 0 && ' · '}
-                  <b className={ceiling !== null && limit.percent >= ceiling ? 'bad' : undefined}>{limit.percent}%</b> {limit.kind.replace(/_/g, ' ')}, resets {new Date(limit.resetsAt).toLocaleString()}
-                </span>
-              ))}
-            </p>
-            <p className="muted small">
-              Read {new Date(usage.at).toLocaleTimeString()}. In Swarm no attempt starts at or above {ceiling === null ? 'the ceiling, which is off' : `${ceiling}%`}; the pipeline waits for the window to reset.
-            </p>
-          </div>
-        )}
+        {usage && <SubscriptionMeter usage={usage} ceiling={ceiling} />}
       </div>
     </section>
   );
+}
+
+/** The subscription's windows as bars: the current session, the weekly limit, and a weekly limit on one model. */
+function SubscriptionMeter({ usage, ceiling }: { usage: { at: string; usage: SubscriptionUsage }; ceiling: number | null }) {
+  const now = useNow(true);
+  return (
+    <div className="meter">
+      <h3>Subscription</h3>
+      {usage.usage.limits.map((limit) => {
+        const hot = ceiling !== null && limit.percent >= ceiling;
+        return (
+          <div key={`${limit.kind}:${limit.model ?? ''}`} className="usage-bar">
+            <div className="usage-label">
+              <span>{limitLabel(limit)}</span>
+              <b className={hot ? 'bad' : undefined}>{limit.percent}%</b>
+            </div>
+            <div className="bar"><div className={hot ? 'fill hot' : 'fill'} style={{ width: `${Math.max(0, Math.min(100, limit.percent))}%` }} /></div>
+            <div className="muted small">resets {resetsIn(limit.resetsAt, now)}</div>
+          </div>
+        );
+      })}
+      <p className="muted small">
+        Read {new Date(usage.at).toLocaleTimeString()}, every five minutes while a page is open. In Swarm no attempt starts at or above {ceiling === null ? 'the ceiling, which is off' : `${ceiling}%`}; the pipeline waits for the window to reset.
+      </p>
+    </div>
+  );
+}
+
+function limitLabel(limit: UsageLimit): string {
+  switch (limit.kind) {
+    case 'session':
+      return 'Current session';
+    case 'weekly_all':
+      return 'Weekly · all models';
+    case 'weekly_scoped':
+      return `Weekly · ${limit.model ?? 'one model'}`;
+    default:
+      return limit.kind.replace(/_/g, ' ');
+  }
+}
+
+/** Within a day, "in 2 h 10 min"; further, the day and the time: "Fri 09:00". */
+function resetsIn(at: string, now: number): string {
+  const ms = Date.parse(at) - now;
+  if (!Number.isFinite(ms)) return 'at a time the endpoint did not give';
+  if (ms <= 0) return 'now';
+  if (ms < 24 * 3_600_000) {
+    const total = Math.ceil(ms / 60_000);
+    const hours = Math.floor(total / 60);
+    const minutes = total % 60;
+    return `in ${hours > 0 ? `${hours} h${minutes > 0 ? ` ${minutes} min` : ''}` : `${minutes} min`}`;
+  }
+  return new Date(at).toLocaleString(undefined, { weekday: 'short', hour: '2-digit', minute: '2-digit' });
 }
 
 /** Every token Claude used for the project, written and read, and by role. */

@@ -3,6 +3,19 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## 0.4.14 (2026-11-09)
+
+**Upgrading from 0.4.13:** install the new version, rebuild the agents' image with
+`harness doctor --build-images` (its tag follows the harness's version), then restart the
+daemon with `harness down` and `harness up`, and reload the dashboard.
+
+- **The Project tab shows your subscription's usage as bars.** One bar per window: the
+  current session, the weekly limit, and a weekly limit on one model, such as
+  "Weekly · Fable", each with its percentage and when it resets. A window at or above
+  the Swarm ceiling turns red. It showed as a line of text, and only in Swarm, where
+  the daemon read the usage before a launch. Now the daemon reads it every five
+  minutes while a page is open, in either mode, with the token `harness doctor` stores.
+
 ## 0.4.13 (2026-11-09)
 
 **Upgrading from 0.4.12:** install the new version, rebuild the agents' image with

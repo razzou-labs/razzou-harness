@@ -77,6 +77,8 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
     for (const client of clients) client.write(`event: ${kind}\ndata: ${JSON.stringify(data)}\n\n`);
   };
   orchestrator.events.on('event', (event: HarnessEvent) => broadcast('event', event));
+  // A new reading of the subscription's usage: the pages fetch the state again.
+  orchestrator.events.on('usage', () => broadcast('usage', {}));
   orchestrator.events.on('transcript', ({ agent, line }: { agent: string; line: string }) => {
     for (const item of transcripts.add(agent, line)) broadcast('transcript', { agent, item });
   });
@@ -120,6 +122,8 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
       const text = (key: string) => (typeof body[key] === 'string' && (body[key] as string).trim() !== '' ? (body[key] as string) : undefined);
       switch (`${req.method} ${url.pathname}`) {
         case 'GET /api/state':
+          // The meters' reading is five minutes old at most, in either mode, while a page is open.
+          orchestrator.refreshUsage();
           return sendJson(res, {
             state: orchestrator.state,
             design: designSummary(orchestrator),

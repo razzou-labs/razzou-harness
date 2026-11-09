@@ -267,8 +267,11 @@ behind a token. Its views:
 - **Needs you:** questions from the Manager, proposals to accept, pull requests to merge,
   escalations, owner actions, a paused pipeline. Each has its button or form.
 - **Project:** modules, proposals, plans and features, with attempts, findings, CI,
-  deploys and `progress.txt`; and the budgets: your hours, the agents' hours, and the
-  tokens Claude used, written and read, by role.
+  deploys and `progress.txt`; and the budgets: your hours, the agents' hours, the
+  tokens Claude used, written and read, by role, and your subscription's usage as
+  bars: the current session, the weekly limit, and a weekly limit on one model, each
+  with when it resets. The daemon reads the usage every five minutes while a page is
+  open, in either mode, with the token `harness doctor` stores.
 - **Agents:** the Architect's terminal, the Manager's and the Developers' live
   transcripts, a message box for the Manager, and a shell in any agent's sandbox. The
   Architect is Claude Code itself, in a terminal; the others run without a screen, so
@@ -463,7 +466,7 @@ through an `Arch:` pull request, or a commit of your own on `main`.
 
 ```json
 {
-  "harnessVersion": "0.4.13",
+  "harnessVersion": "0.4.14",
   "project": { "name": "shop", "repo": "<org>/shop", "bot": "<org>-harness[bot]" },
   "roles": {
     "architect": { "model": "claude-fable-5-1", "effort": "max" },

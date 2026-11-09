@@ -112,6 +112,10 @@ export class Orchestrator {
   private readonly readUsage: () => Promise<SubscriptionUsage | undefined>;
   /** The last reading of the subscription's usage, for the dashboard; not state. */
   usage?: { at: string; usage: SubscriptionUsage };
+  /** When a reading last failed: the endpoint isn't asked again for five minutes. */
+  private usageFailedAt?: number;
+  /** The reading under way, which the loop and the dashboard share. */
+  private usageReading?: Promise<SubscriptionUsage | undefined>;
   forge!: Forge;
   private readonly tokenStored: () => boolean;
   private setup?: { at: number; mode: Mode; status: SetupStatus };
@@ -786,17 +790,36 @@ export class Orchestrator {
     return true;
   }
 
-  /** The subscription's usage, read at most every five minutes. */
+  /**
+   * The subscription's usage, read at most every five minutes, a failed reading included.
+   * A new reading is announced as a `usage` event, so the open pages fetch it.
+   */
   private async subscriptionUsage(): Promise<SubscriptionUsage | undefined> {
-    if (this.usage && this.now() - Date.parse(this.usage.at) < 5 * 60_000) return this.usage.usage;
-    try {
-      const usage = await this.readUsage();
-      if (usage) this.usage = { at: new Date(this.now()).toISOString(), usage };
-      return usage;
-    } catch (error) {
-      this.log(`the subscription's usage could not be read: ${(error as Error).message}`);
-      return undefined;
-    }
+    const recent = (at: number | undefined) => at !== undefined && this.now() - at < 5 * 60_000;
+    if (this.usage && recent(Date.parse(this.usage.at))) return this.usage.usage;
+    if (recent(this.usageFailedAt)) return undefined;
+    this.usageReading ??= this.readUsage()
+      .then((usage) => {
+        this.usageFailedAt = undefined;
+        if (usage) {
+          this.usage = { at: new Date(this.now()).toISOString(), usage };
+          this.events.emit('usage');
+        }
+        return usage;
+      }, (error: Error) => {
+        this.usageFailedAt = this.now();
+        this.log(`the subscription's usage could not be read: ${error.message}`);
+        return undefined;
+      })
+      .finally(() => {
+        this.usageReading = undefined;
+      });
+    return this.usageReading;
+  }
+
+  /** For the dashboard's meters, in either mode: reads the usage again in the background once the last reading is five minutes old. */
+  refreshUsage(): void {
+    void this.subscriptionUsage();
   }
 
   /**

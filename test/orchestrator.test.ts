@@ -855,7 +855,7 @@ describe('pull requests', () => {
     assert.equal(o.usage!.usage.percent, 30);
   });
 
-  it('in Manual, never reads the usage', async () => {
+  it("in Manual, the loop never reads the usage: only an open dashboard's meters do", async () => {
     let reads = 0;
     const { orchestrator: o } = await setup((f) => solved(f), {
       usage: async () => {
@@ -1433,6 +1433,48 @@ describe('dashboard', () => {
     assert.deepEqual(await switchTo('manual'), { done: true, rules: [], problem: 'gh: not an admin of acme/toy' });
     assert.equal(o.state.mode, 'manual', "a ruleset gh couldn't apply doesn't stop the switch");
     assert.deepEqual(order, ["swarm's rules on acme/toy, the daemon in manual", "manual's rules on acme/toy, the daemon in manual"]);
+  });
+
+  it("reads the usage for the dashboard's meters in either mode, at most every five minutes, a failed reading included", async () => {
+    let skew = 0;
+    let reads = 0;
+    let failing = false;
+    const resetsAt = new Date(Date.now() + 3 * 3_600_000).toISOString();
+    const usage = async () => {
+      reads++;
+      if (failing) throw new Error('the usage endpoint answered 500');
+      return { percent: 40, resetsAt, limits: [{ kind: 'session', percent: 40, resetsAt }, { kind: 'weekly_scoped', percent: 8, resetsAt, model: 'Fable' }] };
+    };
+    const { orchestrator: o } = await setup((f) => solved(f), { usage, now: () => Date.now() + skew });
+    let announced = 0;
+    o.events.on('usage', () => announced++);
+    const server = await startDashboard({ orchestrator: o, port: 0, token, webRoot: tempDir('web'), terminals: new Terminals(undefined) });
+    cleanup.push(async () => void server.close());
+    const port = (server.address() as AddressInfo).port;
+    const bearer = { host: `127.0.0.1:${port}`, authorization: `Bearer ${token}` };
+    const state = async () => JSON.parse((await call(port, '/api/state', bearer)).body) as DashboardState;
+
+    // In Manual, an open page has it read in the background, and hears of the reading.
+    await state();
+    await until(o, () => announced === 1);
+    const first = (await state()).usage!;
+    assert.deepEqual(first.usage.limits.map((l) => [l.kind, l.percent, l.model]), [['session', 40, undefined], ['weekly_scoped', 8, 'Fable']]);
+    await state();
+    assert.equal(reads, 1, 'a reading under five minutes old is kept');
+
+    // Five minutes on, a failed reading keeps the last one, and isn't tried again for five minutes.
+    failing = true;
+    skew += 5 * 60_000 + 1000;
+    await state();
+    await until(o, () => reads === 2);
+    await state();
+    assert.equal(reads, 2);
+    assert.equal((await state()).usage!.at, first.at);
+    failing = false;
+    skew += 5 * 60_000 + 1000;
+    await state();
+    await until(o, () => announced === 2);
+    assert.equal(reads, 3);
   });
 
   it('serves only the token holder on localhost, and survives a malformed request', async () => {
