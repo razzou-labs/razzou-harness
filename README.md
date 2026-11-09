@@ -271,7 +271,10 @@ behind a token. Its views:
   tokens Claude used, written and read, by role.
 - **Agents:** the Architect's terminal, the Manager's and the Developers' live
   transcripts, a message box for the Manager, and a shell in any agent's sandbox. An
-  attempt's card keeps the network requests its sandbox's policy refused.
+  attempt's card keeps the network requests its sandbox's policy refused. In a
+  terminal, Ctrl+C copies the text you selected (Cmd+C on a Mac), and with nothing
+  selected it still interrupts the program. If a drag selects nothing, because the
+  program uses the mouse, hold Shift as you drag, or Option on a Mac.
 - **Sandboxes:** what runs on the OpenShell gateway. This project's sandboxes, with what
   each is for, whether anything still uses it, and the CPUs and memory it uses now,
   read from `docker stats` every five seconds. A left-over one, which a crash or a
