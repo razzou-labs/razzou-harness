@@ -13,7 +13,8 @@ import type { SandboxOverview, UsageReading } from '../src/daemon/sandboxes.ts';
 import { startDashboard, type DashboardState } from '../src/dashboard/server.ts';
 import { Terminals, type Pty } from '../src/dashboard/terminals.ts';
 import { recover } from '../src/setup/recover.ts';
-import { activeAttempts } from '../src/state/state.ts';
+import type { Config } from '../src/design/schemas.ts';
+import { activeAttempts, type Mode } from '../src/state/state.ts';
 import { runOk, sh, sleep } from '../src/util.ts';
 import { FAKE_BOT, FakeForge } from './helpers/fake-forge.ts';
 import { LocalDriver } from './helpers/local-driver.ts';
@@ -50,6 +51,8 @@ interface SetupOptions {
   architect?: ArchitectBehavior;
   /** Whether the usage probe's token is stored (v4 §6); never the machine's real file. */
   tokenStored?: () => boolean;
+  /** Applies main's rules on a switch; never the machine's real gh. */
+  applyRules?: (config: Config, repo: string, mode: Mode) => Promise<string[]>;
   /** Wraps the stub agent, to make some of its sessions end otherwise. */
   agent?: (stub: AgentAdapter) => AgentAdapter;
 }
@@ -80,6 +83,7 @@ async function setup(decide: Decide, options: SetupOptions = {}) {
       },
       ...(options.usage ? { usage: options.usage } : {}),
       tokenStored: options.tokenStored ?? (() => false),
+      applyRules: options.applyRules ?? (async () => []),
       ...(options.now ? { now: options.now } : {}),
       ...(fake ? { forge: () => fake } : {}),
     });
@@ -1368,9 +1372,10 @@ describe('dashboard', () => {
     assert.equal(reads, 1);
   });
 
-  it('in Swarm, says which setup steps are left, and drops the note once none is', async () => {
+  it('in Swarm, says which setup steps are left, reads them again every 30 seconds until none is, then every five minutes', async () => {
     let skew = 0;
-    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true, now: () => Date.now() + skew });
+    let stored = false;
+    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true, now: () => Date.now() + skew, tokenStored: () => stored });
     const server = await startDashboard({ orchestrator: o, port: 0, token, webRoot: tempDir('web'), terminals: new Terminals(undefined) });
     cleanup.push(async () => void server.close());
     const port = (server.address() as AddressInfo).port;
@@ -1385,13 +1390,49 @@ describe('dashboard', () => {
     assert.equal(manual.tokenStored, false);
     assert.equal(manual.statusesWritable, undefined);
 
-    // The rules are read again after five minutes: now they are Swarm's, the App can't write statuses, and the token is stored.
+    // With steps left, it is read again after 30 seconds: now the rules are Swarm's, and the App can't write statuses.
     fake.rules = { approvals: 0, codeOwners: false, checks: [...fake.rules!.checks, { context: 'harness/security', integrationId: 4242 }, { context: 'harness/cost', integrationId: 4242 }] };
     fake.writable = false;
-    skew += 6 * 60_000;
+    skew += 31_000;
     const swarm = (await read())!;
     assert.deepEqual(swarm.rules, { ok: true, problems: [] });
     assert.equal(swarm.statusesWritable, false);
+
+    // With none left, it is kept for five minutes.
+    fake.writable = true;
+    stored = true;
+    skew += 31_000;
+    const done = (await read())!;
+    assert.deepEqual([done.rules!.ok, done.statusesWritable, done.tokenStored], [true, true, true]);
+    fake.rules = { ...fake.rules, approvals: 1 };
+    skew += 60_000;
+    assert.equal((await read())!.rules!.ok, true, 'a finished list is kept');
+    skew += 5 * 60_000;
+    assert.equal((await read())!.rules!.ok, false, 'then read again');
+  });
+
+  it("switches with main's rules, as harness mode does: Swarm's before the daemon enters Swarm, Manual's once it left", async () => {
+    const order: string[] = [];
+    let refuse = false;
+    const { orchestrator: o } = await setup((f) => solved(f), {
+      github: true,
+      applyRules: async (_config, repo, mode) => {
+        order.push(`${mode}'s rules on ${repo}, the daemon in ${o.state.mode}`);
+        if (refuse) throw new Error('gh: not an admin of acme/toy');
+        return [`ruleset "harness: main" (${mode})`];
+      },
+    });
+    const server = await startDashboard({ orchestrator: o, port: 0, token, webRoot: tempDir('web'), terminals: new Terminals(undefined) });
+    cleanup.push(async () => void server.close());
+    const port = (server.address() as AddressInfo).port;
+    const bearer = { host: `127.0.0.1:${port}`, authorization: `Bearer ${token}` };
+    const switchTo = async (mode: string) => JSON.parse((await callWith(port, '/api/mode', bearer, { mode })).body) as unknown;
+
+    assert.deepEqual(await switchTo('swarm'), { done: true, rules: ['ruleset "harness: main" (swarm)'] });
+    refuse = true;
+    assert.deepEqual(await switchTo('manual'), { done: true, rules: [], problem: 'gh: not an admin of acme/toy' });
+    assert.equal(o.state.mode, 'manual', "a ruleset gh couldn't apply doesn't stop the switch");
+    assert.deepEqual(order, ["swarm's rules on acme/toy, the daemon in manual", "manual's rules on acme/toy, the daemon in manual"]);
   });
 
   it('serves only the token holder on localhost, and survives a malformed request', async () => {

@@ -112,14 +112,16 @@ async function prepare(o: Orchestrator, plan: PlanState, review: ReviewState): P
     return fail(`could not clone the plan branch: ${clip(clone.stderr.trim(), 300)}`);
   }
 
-  // The Terraform plan's JSON, made the way a check that needs it gets it (§12.4).
+  // The Terraform plan's JSON, made the way a check that needs it gets it (§12.4). It goes in the
+  // clone's .harness/, which projects ignore: --restricted keeps the reviewer's file tools in the clone.
   let plannedAt: string | undefined;
   let planProblem: string | undefined;
   if (terraform) {
+    const planFile = `${p.work}/.harness/tfplan.json`;
     const [result] = await runChecks(o.driver, sandbox, p.work, [
-      { id: 'tfplan', run: `cp "$HARNESS_PLAN_JSON" ${sh(`${p.harness}/tfplan.json`)}`, phase: 'pre-merge', timeoutSec: 900, needs: ['tfplan'] },
+      { id: 'tfplan', run: `mkdir -p ${sh(`${p.work}/.harness`)} && cp "$HARNESS_PLAN_JSON" ${sh(planFile)}`, phase: 'pre-merge', timeoutSec: 900, needs: ['tfplan'] },
     ], o.checkOptions(sandbox));
-    if (result && result.exit === 0) plannedAt = `${p.harness}/tfplan.json`;
+    if (result && result.exit === 0) plannedAt = planFile;
     else planProblem = clip((result?.output ?? 'no output').trim(), 1500);
   }
 

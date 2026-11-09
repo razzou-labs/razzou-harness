@@ -177,7 +177,8 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
         case 'POST /api/infra-merge':
           return sendJson(res, body.by === 'daemon' || body.by === 'ceiling' ? { done: orchestrator.setInfraMerge(body.by) } : { done: false, error: 'by is daemon or ceiling' });
         case 'POST /api/mode':
-          return sendJson(res, body.mode === 'manual' || body.mode === 'swarm' ? { done: orchestrator.setMode(body.mode) } : { done: false, error: 'the mode is manual or swarm' });
+          // The dashboard's switch and `harness mode` alike: the mode, and main's rules with the owner's gh.
+          return sendJson(res, body.mode === 'manual' || body.mode === 'swarm' ? await orchestrator.switchMode(body.mode) : { done: false, error: 'the mode is manual or swarm' });
         case 'POST /api/budgets': {
           // A positive number sets a budget, null clears it, anything else leaves it alone.
           const hours = (key: string) => (body[key] === null ? null : typeof body[key] === 'number' && Number.isFinite(body[key]) && (body[key] as number) > 0 ? (body[key] as number) : undefined);

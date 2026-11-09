@@ -14,7 +14,7 @@ import {
 import { DEVELOPER, HARNESS, Repo } from '../git/repo.ts';
 import { GitHubClient, loadAppCredentials } from '../github/app.ts';
 import { GitHubForge, LocalForge, type CheckRun, type Forge, type PullRequest } from '../github/forge.ts';
-import { rulesProblems } from '../github/setup.ts';
+import { applyModeRules, rulesProblems } from '../github/setup.ts';
 import { toolsManifest, type Role } from '../roles.ts';
 import { PROJECT_LABEL, type ExecResult, type Follower, type SandboxDriver, type SandboxSpec } from '../sandbox/driver.ts';
 import { BUNDLES } from '../sandbox/allowlist.ts';
@@ -57,6 +57,8 @@ export interface OrchestratorOptions {
   usage?: () => Promise<SubscriptionUsage | undefined>;
   /** Tests replace GitHub. By default: GitHub through the App when the project names a repository, else the project's own folder. */
   forge?: (config: Config) => Forge;
+  /** Applies a mode's ruleset on main, as the owner's switch does. By default, with the owner's own gh (v3 §2.1); tests replace it. */
+  applyRules?: (config: Config, repo: string, mode: Mode) => Promise<string[]>;
   now?: () => number;
   log?: (message: string) => void;
 }
@@ -211,12 +213,14 @@ export class Orchestrator {
 
   /**
    * Where the Swarm setup stands (v4 §6): main's rules against the mode, read through
-   * the App's metadata permission at most every five minutes, whether the App may write
-   * statuses, and whether the usage probe's token is stored.
+   * the App's metadata permission, whether the App may write statuses, and whether the
+   * usage probe's token is stored. A list with steps left is read again after 30 seconds,
+   * so that a step the owner took drops soon; a finished one after five minutes.
    */
   async setupStatus(): Promise<SetupStatus> {
     const mode = this.state.mode;
-    if (this.setup && this.setup.mode === mode && this.now() - this.setup.at < 5 * 60_000) return this.setup.status;
+    const fresh = this.setup && this.now() - this.setup.at < (setupFinished(this.setup.status) ? 5 * 60_000 : 30_000);
+    if (this.setup && this.setup.mode === mode && fresh) return this.setup.status;
     const config = this.design.config;
     let rules: SetupStatus['rules'];
     if (config.project.repo) {
@@ -323,6 +327,35 @@ export class Orchestrator {
     this.record({ type: 'MODE_CHANGED', payload: { mode } });
     this.kick();
     return true;
+  }
+
+  /**
+   * The owner's switch, from the dashboard or `harness mode` (v3 §2.1): the mode, and the
+   * ruleset of main that goes with it, applied with the owner's own gh, never the App's.
+   * The daemon never runs a mode against the other's rules: Swarm's rules come before it
+   * enters Swarm, and it leaves Swarm, which stops its merges, before Manual's come back.
+   * A ruleset gh couldn't apply doesn't stop the switch; the dashboard's note keeps the
+   * step. The mode it is in already gets its rules again.
+   */
+  async switchMode(mode: Mode): Promise<{ done: boolean; rules: string[]; problem?: string }> {
+    const repo = this.design.config.project.repo;
+    const apply = async (): Promise<{ rules: string[]; problem?: string }> => {
+      if (!repo) return { rules: [] };
+      try {
+        const rules = await (this.options.applyRules ?? applyModeRules)(this.design.config, repo, mode);
+        this.log(`main's rules, for ${mode}: ${rules.join('; ')}`);
+        return { rules };
+      } catch (error) {
+        this.log(`main's rules were not changed: ${(error as Error).message}`);
+        return { rules: [], problem: (error as Error).message };
+      }
+    };
+    const before = mode === 'swarm' ? await apply() : undefined;
+    const done = this.setMode(mode);
+    const applied = before ?? (await apply());
+    // The note reads main's rules again at once.
+    this.setup = undefined;
+    return { done, ...applied };
   }
 
   /** The owner lets the daemon merge INFRA and MIXED plans like CODE ones, or takes them back (v3 D36). Open PRs are looked at again at once. */
@@ -2015,6 +2048,11 @@ function minutesOf(action: { estimatedMinutes?: number | undefined }): { minutes
 function ensureDir(dir: string): string {
   mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+/** Whether Swarm's setup has no step left, as the dashboard's note counts them. */
+function setupFinished(status: SetupStatus): boolean {
+  return status.rules?.ok !== false && status.statusesWritable !== false && status.tokenStored;
 }
 
 function outcomeReason(attempt: Attempt): string {
