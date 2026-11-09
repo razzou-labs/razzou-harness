@@ -19,3 +19,22 @@ const C = 67;
 export function copiesSelection(key: Key, selected: boolean, mac: boolean): boolean {
   return !mac && selected && key.ctrlKey && !key.altKey && !key.metaKey && key.keyCode === C;
 }
+
+/** How long after the owner's last key or click in a terminal a program there may set the clipboard. */
+export const COPY_WINDOW_MS = 5000;
+
+/**
+ * The text a program copies with OSC 52, `ESC ] 52 ; <targets> ; <base64> BEL`, from what
+ * follows `52;`. Claude Code copies its own selections that way, and `/copy`. A query, `?`,
+ * which asks what the clipboard holds, gives nothing, as do an empty payload, which would
+ * clear it, and one that isn't base64 of UTF-8 text.
+ */
+export function copiedText(data: string): string | undefined {
+  const payload = data.slice(data.indexOf(';') + 1);
+  if (payload === '' || payload === '?') return undefined;
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(Uint8Array.from(atob(payload), (c) => c.charCodeAt(0)));
+  } catch {
+    return undefined;
+  }
+}

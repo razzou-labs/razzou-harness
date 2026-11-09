@@ -2,7 +2,7 @@ import { FitAddon } from '@xterm/addon-fit';
 import { Terminal as XTerm } from '@xterm/xterm';
 import '@xterm/xterm/css/xterm.css';
 import { useEffect, useRef } from 'react';
-import { copiesSelection } from '../keys.ts';
+import { COPY_WINDOW_MS, copiedText, copiesSelection } from '../clipboard.ts';
 
 const MAC = /Mac|iPhone|iPad/.test(navigator.platform);
 
@@ -15,9 +15,24 @@ const MAC = /Mac|iPhone|iPad/.test(navigator.platform);
 export function Terminal({ module, sandbox }: { module?: string; sandbox?: string }) {
   const element = useRef<HTMLDivElement>(null);
   useEffect(() => {
+    const box = element.current!;
     const term = new XTerm({ fontSize: 13, cursorBlink: true, scrollback: 5000, theme: theme(), macOptionClickForcesSelection: true });
+    // When the owner last pressed a key or a mouse button here, or released one pressed here.
+    let used = 0;
+    let pressed = false;
+    const press = (event: MouseEvent) => {
+      pressed = box.contains(event.target as Node);
+      if (pressed) used = Date.now();
+    };
+    const release = () => {
+      if (pressed) used = Date.now();
+      pressed = false;
+    };
+    window.addEventListener('mousedown', press, true);
+    window.addEventListener('mouseup', release, true);
     // Ctrl+C and Ctrl+Shift+C copy the selection; the next Ctrl+C, with nothing selected, interrupts.
     term.attachCustomKeyEventHandler((event) => {
+      if (event.type === 'keydown') used = Date.now();
       if (!copiesSelection(event, term.hasSelection(), MAC)) return true;
       if (event.type === 'keydown') {
         event.preventDefault();
@@ -25,9 +40,19 @@ export function Terminal({ module, sandbox }: { module?: string; sandbox?: strin
       }
       return false;
     });
+    // Claude Code copies what the owner selects in it, and `/copy`, with OSC 52. The
+    // Architect's terminal writes it to the clipboard while the owner is at it, and never
+    // tells a program what the clipboard holds. A shell's programs can't set it at all.
+    if (module) {
+      term.parser.registerOscHandler(52, (data) => {
+        const text = copiedText(data);
+        if (text !== undefined && Date.now() - used < COPY_WINDOW_MS) navigator.clipboard.writeText(text).catch(() => {});
+        return true;
+      });
+    }
     const fit = new FitAddon();
     term.loadAddon(fit);
-    term.open(element.current!);
+    term.open(box);
     fit.fit();
     const target = module ? `module=${encodeURIComponent(module)}` : `sandbox=${encodeURIComponent(sandbox ?? '')}`;
     const socket = new WebSocket(`ws://${location.host}/api/terminal?${target}&cols=${term.cols}&rows=${term.rows}`);
@@ -36,9 +61,11 @@ export function Terminal({ module, sandbox }: { module?: string; sandbox?: strin
     const keys = term.onData((data) => socket.readyState === WebSocket.OPEN && socket.send(JSON.stringify({ i: data })));
     const resized = term.onResize(({ cols, rows }) => socket.readyState === WebSocket.OPEN && socket.send(JSON.stringify({ cols, rows })));
     const observer = new ResizeObserver(() => fit.fit());
-    observer.observe(element.current!);
+    observer.observe(box);
     term.focus();
     return () => {
+      window.removeEventListener('mousedown', press, true);
+      window.removeEventListener('mouseup', release, true);
       observer.disconnect();
       keys.dispose();
       resized.dispose();
