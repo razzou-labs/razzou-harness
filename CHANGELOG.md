@@ -3,6 +3,20 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## 0.4.19 (2026-11-09)
+
+**Upgrading from 0.4.18:** install the new version, rebuild the agents' image with
+`harness doctor --build-images` (its tag follows the harness's version), then restart the
+daemon with `harness down` and `harness up`, and reload the dashboard.
+
+- **Only the agents with a sandbox.** A switch above the Agents list hides the agents
+  whose sandbox is gone, such as a stopped Manager or a Developer whose work went to its
+  checks, and counts those shown. The browser remembers the choice.
+- **No shell into a deleted sandbox.** The daemon deletes a Developer's sandbox once it
+  has taken the commits out, before the checks, but the card still offered **Shell in …**
+  and its deadline bar while the attempt was checked and reviewed. Both now go with the
+  sandbox.
+
 ## 0.4.18 (2026-11-09)
 
 **Upgrading from 0.4.17:** install the new version, rebuild the agents' image with
