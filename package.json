@@ -1,6 +1,6 @@
 {
   "name": "razzou-harness",
-  "version": "0.4.19",
+  "version": "0.4.20",
   "description": "Your AI dev team, with you in charge: sandboxed Claude Code agents design, build and review your project, and you merge. In alpha: expect bugs and breaking changes.",
   "license": "MIT",
   "author": "razzou",

@@ -267,7 +267,7 @@ behind a token. Its views:
   escalations, owner actions, a paused pipeline. Each has its button or form.
 - **Project:** modules, proposals, plans and features, with attempts, findings, CI,
   deploys and `progress.txt`; and the budgets: your hours, the agents' hours, the
-  tokens Claude used, written and read, by role, and your subscription's usage as
+  tokens Claude used, written and read, in a table by role, and your subscription's usage as
   bars: the current session and the weekly limit, each with when it resets. The
   Developers, the Manager and the reviewers report it with each model call, in either
   mode; the daemon keeps the last report across a restart.
@@ -399,10 +399,12 @@ in the Agents view. When one merges, `main` is merged into the others, `progress
 keeping both sides' lines; a conflict in other files is resolved in that plan's pull
 request. A
 feature may also depend on a feature of an earlier plan, as `P1/F03`, and then waits
-for that plan's merge. The Project view draws each module's features as a graph, plan
-by plan, with an edge per dependency: green accepted, blue under way, red escalated,
-grey not started. Manual mode builds one plan at a time with one Manager per module,
-as before.
+for that plan's merge. The Project view draws each module's features as trees, one per
+plan: a feature hangs from the feature it waits for, the end of the longest chain when it
+waits for several, and the others, an earlier plan's included, are named beside it. Green
+is accepted, blue under way, amber waiting for a decision, red escalated, grey not started;
+hover a feature for where it stands. Manual mode builds one plan at a time with one Manager
+per module, as before.
 
 **The cost job.** `harness install-ci` adds a `cost` job to the workflow: on a pull
 request that has `iac/`, it runs [Infracost](https://www.infracost.io) on the base and
@@ -470,7 +472,7 @@ through an `Arch:` pull request, or a commit of your own on `main`.
 
 ```json
 {
-  "harnessVersion": "0.4.19",
+  "harnessVersion": "0.4.20",
   "project": { "name": "shop", "repo": "<org>/shop", "bot": "<org>-harness[bot]" },
   "roles": {
     "architect": { "model": "claude-fable-5-1", "effort": "max" },

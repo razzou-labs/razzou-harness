@@ -1,7 +1,7 @@
-import { QBtn, QBtnToggle, QCard, QCardSection, QInput, QLinearProgress, QMarkupTable } from 'quasar';
+import { QBtn, QBtnToggle, QCard, QCardSection, QInput, QLinearProgress, QTable, QTd, QTr, type QTableProps } from 'quasar';
 import { defineComponent, onUnmounted, ref, watchEffect, type PropType, type Ref } from 'vue';
 import { post, type Attempt, type DashboardState, type FeatureState, type OwnerTime, type PlanState, type State, type SubscriptionUsage, type UsageLimit } from '../api.ts';
-import { Graph } from '../components/Graph.tsx';
+import { Dependencies } from '../components/Dependencies.tsx';
 import { duration } from '../format.ts';
 import { Action, Badge, Fold, GithubLink, text } from '../ui.tsx';
 import { Proposal } from './NeedsYou.tsx';
@@ -46,7 +46,7 @@ export const Project = defineComponent({
                     </div>
                   )}
                   {open?.module === id && <Proposal module={id} version={open.version} />}
-                  {designed && plans.length > 0 && <Graph module={designed} state={state} />}
+                  {designed && plans.length > 0 && <Dependencies module={designed} state={state} />}
                   {plans.map((plan) => <Plan key={plan.id} data={props.data} module={id} plan={plan} />)}
                 </QCardSection>
               </QCard>
@@ -94,14 +94,14 @@ type Tokens = { input: number; output: number };
 
 /** Claude's tokens by role: a Developer's and a reviewer's from their sessions' end, a Manager's and an Architect's from the daemon's readings of their sandboxes. */
 function tokensByRole(state: State): Array<[string, Tokens]> {
-  const roles: Record<string, Tokens> = { Developers: { input: 0, output: 0 }, Managers: { input: 0, output: 0 }, Architects: { input: 0, output: 0 }, reviewers: { input: 0, output: 0 } };
+  const roles: Record<string, Tokens> = { Developers: { input: 0, output: 0 }, Managers: { input: 0, output: 0 }, Architects: { input: 0, output: 0 }, Reviewers: { input: 0, output: 0 } };
   const add = (role: string, usage?: { inputTokens: number; outputTokens: number }) => {
     if (!usage) return;
     roles[role]!.input += usage.inputTokens;
     roles[role]!.output += usage.outputTokens;
   };
   for (const feature of Object.values(state.features)) for (const attempt of feature.attempts) add('Developers', attempt.usage);
-  for (const plan of Object.values(state.plans)) for (const review of plan.reviews ?? []) add('reviewers', review.usage);
+  for (const plan of Object.values(state.plans)) for (const review of plan.reviews ?? []) add('Reviewers', review.usage);
   for (const [agent, tokens] of Object.entries(state.agentTokens ?? {})) {
     add(agent.startsWith('manager:') ? 'Managers' : agent.startsWith('architect:') ? 'Architects' : 'Developers', tokens.total);
   }
@@ -194,6 +194,15 @@ const Budgets = defineComponent({
   },
 });
 
+type Columns = NonNullable<QTableProps['columns']>;
+
+const TOKEN_COLUMNS: Columns = [
+  { name: 'role', label: 'Role', field: 'role', align: 'left' },
+  { name: 'written', label: 'Written', field: 'output', align: 'right', format: count },
+  { name: 'read', label: 'Read', field: 'input', align: 'right', format: count },
+  { name: 'total', label: 'Total', field: 'total', align: 'right', format: count },
+];
+
 /** Every token Claude used for the project, written and read, and by role. */
 const TokensMeter = defineComponent({
   props: { state: { type: Object as PropType<State>, required: true } },
@@ -201,13 +210,14 @@ const TokensMeter = defineComponent({
     return () => {
       const roles = tokensByRole(props.state);
       const total = roles.reduce((sum, [, t]) => ({ input: sum.input + t.input, output: sum.output + t.output }), { input: 0, output: 0 });
+      const rows = roles.map(([role, t]) => ({ role, input: t.input, output: t.output, total: t.input + t.output }));
       return (
         <Meter title="Claude tokens">
           <p>
             <b>{count(total.input + total.output)}</b>
             <span class="text-muted"> · {count(total.output)} written, {count(total.input)} read, cache included</span>
           </p>
-          <p class="text-caption">{roles.map(([role, t]) => `${role} ${count(t.input + t.output)}`).join(' · ')}</p>
+          <QTable class="tokens q-mb-sm" flat bordered dense hideBottom rowKey="role" rows={rows} columns={TOKEN_COLUMNS} pagination={{ rowsPerPage: 0 }} />
           <p class="text-caption text-muted">
             Claude Code's own counts: an attempt's and a review's when it ends, a Manager's and an Architect's every five minutes. Most of what is read comes from the prompt cache.
           </p>
@@ -351,6 +361,15 @@ const NewModule = defineComponent({
 
 type PlanDesign = DashboardState['design']['modules'][number]['plans'][number];
 
+/** The same widths in every plan's table, laid out fixed: the columns line up from one plan to the next. */
+const FEATURE_COLUMNS: Columns = [
+  { name: 'feature', label: 'Feature', field: 'id', align: 'left', headerStyle: 'width: 30%' },
+  { name: 'status', label: 'Status', field: 'id', align: 'left', headerStyle: 'width: 14%' },
+  { name: 'attempts', label: 'Attempts', field: 'id', align: 'left', headerStyle: 'width: 13%' },
+  { name: 'last', label: 'Last attempt', field: 'id', align: 'left', headerStyle: 'width: 33%' },
+  { name: 'commit', label: 'Commit', field: 'id', align: 'left', headerStyle: 'width: 10%' },
+];
+
 const Plan = defineComponent({
   props: {
     data: { type: Object as PropType<DashboardState>, required: true },
@@ -378,14 +397,13 @@ const Plan = defineComponent({
             {planState?.ci && <Badge status={planState.ci.status} label={`CI ${planState.ci.status}`} />}
           </div>
           {planState && <PlanDetails plan={planState} />}
-          <QMarkupTable flat bordered dense wrapCells class="q-mt-sm">
-            <thead>
-              <tr><th class="text-left">Feature</th><th class="text-left">Status</th><th class="text-left">Attempts</th><th class="text-left">Last attempt</th><th class="text-left">Commit</th></tr>
-            </thead>
-            <tbody>
-              {rows.map((row) => <FeatureRow key={row.id} id={row.id} title={row.title} kind={row.kind} max={design.maxAttempts} {...(row.state ? { feature: row.state } : {})} />)}
-            </tbody>
-          </QMarkupTable>
+          <QTable class="features q-mt-sm" flat bordered dense wrapCells hideBottom rowKey="id" rows={rows} columns={FEATURE_COLUMNS} pagination={{ rowsPerPage: 0 }} tableStyle="table-layout: fixed">
+            {{
+              body: ({ row }: { row: (typeof rows)[number] }) => (
+                <FeatureRow key={row.id} id={row.id} title={row.title} kind={row.kind} max={design.maxAttempts} {...(row.state ? { feature: row.state } : {})} />
+              ),
+            }}
+          </QTable>
         </div>
       );
     };
@@ -454,16 +472,16 @@ const FeatureRow = defineComponent({
       const counted = last ? feature!.attempts.filter((a) => a.definitionHash === last.definitionHash && a.counts).length : 0;
       const ended = last?.endedAt ? Date.parse(last.endedAt) : Date.now();
       return (
-        <tr>
-          <td>
+        <QTr>
+          <QTd>
             <b>{props.id}</b> {props.title} {props.kind === 'infra' && <span class="text-muted text-caption">infra</span>}
-          </td>
-          <td>
+          </QTd>
+          <QTd>
             <Badge status={feature?.status ?? 'pending'} />
             {feature?.awaitingGuidanceSince && <div class="text-muted text-caption">waiting for the Manager's guidance</div>}
-          </td>
-          <td class="mono">{feature ? `${feature.attempts.length}${counted ? ` (${counted} of ${props.max + feature.extraAttempts} counted)` : ''}` : '0'}</td>
-          <td>
+          </QTd>
+          <QTd class="mono">{feature ? `${feature.attempts.length}${counted ? ` (${counted} of ${props.max + feature.extraAttempts} counted)` : ''}` : '0'}</QTd>
+          <QTd>
             {last && (
               <>
                 {last.status}
@@ -480,9 +498,9 @@ const FeatureRow = defineComponent({
                 ))}
               </>
             )}
-          </td>
-          <td class="mono">{feature?.commit?.slice(0, 8) ?? ''}</td>
-        </tr>
+          </QTd>
+          <QTd class="mono">{feature?.commit?.slice(0, 8) ?? ''}</QTd>
+        </QTr>
       );
     };
   },

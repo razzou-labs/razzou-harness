@@ -3,6 +3,23 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## 0.4.20 (2026-11-09)
+
+**Upgrading from 0.4.19:** install the new version, rebuild the agents' image with
+`harness doctor --build-images` (its tag follows the harness's version), then restart the
+daemon with `harness down` and `harness up`, and reload the dashboard.
+
+- **Dependency trees.** The Project view draws each plan's features as a Quasar tree
+  rather than a graph with arrows. A feature hangs from the feature it waits for: of
+  several, the one at the end of the longest chain, with the others, an earlier plan's
+  included, named beside it. The boxes keep their colors, titles are no longer cut, and
+  hovering a feature still says where it stands. A branch folds and opens.
+- **Tables that line up.** Each plan's features are a Quasar table with the same column
+  widths, so the columns line up from one plan to the next. The tokens by role are a
+  table too, with what each role wrote and read.
+- **A robot in the tab.** The dashboard's tab has an icon: Material Icons' robot, in the
+  dashboard's blue.
+
 ## 0.4.19 (2026-11-09)
 
 **Upgrading from 0.4.18:** install the new version, rebuild the agents' image with
