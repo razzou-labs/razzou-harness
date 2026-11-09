@@ -160,7 +160,13 @@ describe('web_read', () => {
     const options = { allowAddress: (ip: string) => ip === '127.0.0.1', allowPort: () => true };
 
     it('starts', async () => {
-      server = createServer((req, res) => (pages.get(req.url ?? '') ?? ((r) => { r.writeHead(404); r.end(); }))(res));
+      server = createServer((req, res) => {
+        // Only a page this test defines answers, and only once it is checked to be one; anything else is a 404.
+        const page = pages.get(req.url ?? '');
+        if (typeof page === 'function') return page(res);
+        res.writeHead(404);
+        res.end();
+      });
       await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
       base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
     });
