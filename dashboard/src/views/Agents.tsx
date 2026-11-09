@@ -1,12 +1,12 @@
 import { matTerminal } from '@quasar/extras/material-icons';
-import { QBtn, QCard, QCardSection, QItem, QItemLabel, QItemSection, QLinearProgress, QList, QTooltip } from 'quasar';
+import { QBtn, QCard, QCardSection, QItem, QItemLabel, QItemSection, QLinearProgress, QList, QToggle, QTooltip } from 'quasar';
 import { defineComponent, onUnmounted, ref, watch, type PropType } from 'vue';
 import { post, type DashboardState, type Denial } from '../api.ts';
 import { DenialTable } from '../components/Denials.tsx';
 import { Terminal } from '../components/Terminal.tsx';
 import { Transcript } from '../components/Transcript.tsx';
 import { clock, duration } from '../format.ts';
-import { Badge, Fold, Reply } from '../ui.tsx';
+import { Badge, Fold, model, Reply } from '../ui.tsx';
 import type { Go } from '../App.tsx';
 
 interface Card {
@@ -23,7 +23,14 @@ interface Card {
   refused?: Denial[];
 }
 
-const LIVE = ['starting', 'running', 'collecting', 'checking', 'reviewing'];
+/**
+ * An attempt's statuses while its sandbox is there: the daemon deletes it once the
+ * Developer's commits are out, before the checks, which run in a sandbox of their own.
+ */
+const WITH_SANDBOX = ['starting', 'running', 'collecting'];
+
+/** Whether the list shows only the agents whose sandbox is there: the owner's choice, kept in this browser. */
+const ONLY_WITH_SANDBOX = 'harness-agents-with-sandbox';
 
 /** One card per agent, and the selected one's terminal, transcript or shell (§14.1, §14.3). */
 export const Agents = defineComponent({
@@ -38,16 +45,25 @@ export const Agents = defineComponent({
     onUnmounted(() => window.clearInterval(timer));
     const shell = ref(false);
     watch(() => props.selected, () => (shell.value = false));
+    const onlyWithSandbox = ref(localStorage.getItem(ONLY_WITH_SANDBOX) === 'yes');
+    watch(onlyWithSandbox, (on) => localStorage.setItem(ONLY_WITH_SANDBOX, on ? 'yes' : 'no'));
     return () => {
       const cards = agentCards(props.data);
-      const current = cards.find((c) => c.id === props.selected) ?? cards[0];
-      if (!current) return <p class="text-muted">No agent yet: start a module in the Project view.</p>;
+      if (cards.length === 0) return <p class="text-muted">No agent yet: start a module in the Project view.</p>;
+      const shown = onlyWithSandbox.value ? cards.filter((c) => c.sandbox) : cards;
+      const current = shown.find((c) => c.id === props.selected) ?? shown[0];
       return (
         <div class="row q-col-gutter-md items-start">
           <div class="col-12 col-md-4 col-lg-3">
-            <QList bordered separator class="rounded-borders agent-list">
-              {cards.map((card) => (
-                <QItem key={card.id} clickable active={card.id === current.id} activeClass="agent-active" onClick={() => props.go('agents', card.id)}>
+            <div class="row items-center no-wrap q-mb-sm">
+              <QToggle {...model(onlyWithSandbox)} dense label="Only agents with a sandbox" />
+              <div class="col" />
+              <span class="text-caption text-muted">{shown.length} of {cards.length}</span>
+            </div>
+            {shown.length === 0 && <p class="text-muted">No agent has a sandbox now.</p>}
+            {shown.length > 0 && <QList bordered separator class="rounded-borders agent-list">
+              {shown.map((card) => (
+                <QItem key={card.id} clickable active={card.id === current?.id} activeClass="agent-active" onClick={() => props.go('agents', card.id)}>
                   <QItemSection>
                     <QItemLabel><b>{card.role}</b> · {card.title}</QItemLabel>
                     <QItemLabel caption class="row items-center q-gutter-xs">
@@ -57,9 +73,9 @@ export const Agents = defineComponent({
                   </QItemSection>
                 </QItem>
               ))}
-            </QList>
+            </QList>}
           </div>
-          <div class="col-12 col-md">
+          {current && <div class="col-12 col-md">
             <QCard flat bordered>
               <QCardSection>
                 <div class="row items-center q-gutter-sm q-mb-sm">
@@ -76,7 +92,7 @@ export const Agents = defineComponent({
                   : <AgentView card={current} data={props.data} />}
               </QCardSection>
             </QCard>
-          </div>
+          </div>}
         </div>
       );
     };
@@ -174,7 +190,7 @@ function agentCards({ state }: DashboardState): Card[] {
     .sort((a, b) => Date.parse(b.attempt.startedAt) - Date.parse(a.attempt.startedAt))
     .slice(0, 8);
   for (const { feature, attempt } of attempts) {
-    const live = LIVE.includes(attempt.status);
+    const live = WITH_SANDBOX.includes(attempt.status);
     const usage = attempt.usage ? ` · ${attempt.usage.outputTokens.toLocaleString()} tokens written` : '';
     const refused = attempt.refused?.length ? ` · refused ${refusedHosts(attempt.refused)}` : '';
     cards.push({
