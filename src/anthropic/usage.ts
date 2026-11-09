@@ -12,6 +12,8 @@ export interface UsageLimit {
   kind: string;
   percent: number;
   resetsAt: string;
+  /** The model a scoped limit counts, as the endpoint names it: `Fable`. */
+  model?: string;
 }
 
 export interface SubscriptionUsage {
@@ -41,7 +43,11 @@ export function parseUsage(body: unknown): SubscriptionUsage {
   const listed = Array.isArray(data.limits) ? (data.limits as Array<Record<string, unknown>>) : [];
   for (const limit of listed) {
     if (typeof limit.percent === 'number' && typeof limit.resets_at === 'string') {
-      limits.push({ kind: typeof limit.kind === 'string' ? limit.kind : 'limit', percent: limit.percent, resetsAt: limit.resets_at });
+      const model = ((limit.scope as { model?: { display_name?: unknown } } | undefined)?.model)?.display_name;
+      limits.push({
+        kind: typeof limit.kind === 'string' ? limit.kind : 'limit', percent: limit.percent, resetsAt: limit.resets_at,
+        ...(typeof model === 'string' && model ? { model } : {}),
+      });
     }
   }
   if (limits.length === 0) {

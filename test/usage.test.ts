@@ -21,6 +21,7 @@ describe('the subscription\'s usage', () => {
     assert.equal(usage.percent, 55);
     assert.equal(usage.resetsAt, '2026-11-06T07:59:59+00:00');
     assert.deepEqual(usage.limits.map((l) => [l.kind, l.percent]), [['session', 51], ['weekly_all', 55], ['weekly_scoped', 8]]);
+    assert.deepEqual(usage.limits.map((l) => l.model), [undefined, undefined, 'Fable'], 'the scoped limit names its model');
   });
 
   it('falls back to the two windows the body always carries, and refuses a body without any', () => {

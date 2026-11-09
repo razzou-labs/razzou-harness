@@ -6,7 +6,7 @@ export type { DashboardState };
 export type { HarnessEvent };
 export type { Attempt, FeatureState, ManagerState, ModuleState, PlanState, State } from '../../src/state/state.ts';
 export type { OwnerTime } from '../../src/design/owner-time.ts';
-export type { SubscriptionUsage } from '../../src/anthropic/usage.ts';
+export type { SubscriptionUsage, UsageLimit } from '../../src/anthropic/usage.ts';
 export type { Denial, SandboxOverview, SandboxRow, UsageReading } from '../../src/daemon/sandboxes.ts';
 export type { SandboxUsage } from '../../src/sandbox/docker.ts';
 export type Design = DashboardState['design'];
@@ -66,6 +66,8 @@ export function useHarness(): { data?: DashboardState; problem?: string; connect
       listeners.forEach((l) => l.event?.(event));
       refresh();
     });
+    // The daemon read the subscription's usage again: the meters follow.
+    source.addEventListener('usage', () => refresh());
     source.addEventListener('transcript', (message) => {
       const { agent, item } = JSON.parse(message.data) as { agent: string; item: TranscriptItem };
       listeners.forEach((l) => l.transcript?.(agent, item));
