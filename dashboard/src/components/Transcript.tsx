@@ -1,128 +1,150 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { getJson, useLive, type TranscriptItem } from '../api.ts';
+import { computed, defineComponent, nextTick, onMounted, onUnmounted, ref, watch, type PropType } from 'vue';
+import { getJson, listen, type TranscriptItem } from '../api.ts';
 import { duration } from '../format.ts';
-import { Markdown } from './Markdown.tsx';
+import { Fold, Markdown } from '../ui.tsx';
 
 type Part = { type?: string; text?: string; name?: string; input?: Record<string, unknown>; content?: unknown; is_error?: boolean };
+/** An item, numbered as it arrives: a stable key, so a new line renders only itself. */
+type Entry = { n: number; item: TranscriptItem };
 
 /**
  * An agent's session as it happens (§14.3): what it was asked, its messages, tool calls
  * with their arguments and results, and usage. `agent` is "manager:<module>",
  * "developer:<module>/<plan>/<feature>/a<n>", or a reviewer's "<role>:<head>".
  */
-export function Transcript({ agent }: { agent: string }) {
-  const [items, setItems] = useState<TranscriptItem[]>([]);
-  const box = useRef<HTMLDivElement>(null);
-  const following = useRef(true);
-  useEffect(() => {
-    setItems([]);
-    void getJson<TranscriptItem[]>(`/api/transcript?agent=${encodeURIComponent(agent)}`).then((list) => setItems(list ?? []));
-  }, [agent]);
-  useLive({ transcript: (from, item) => from === agent && setItems((list) => [...list.slice(-999), item]) });
-  // Stays at the bottom while the owner hasn't scrolled up.
-  useLayoutEffect(() => {
-    if (following.current && box.current) box.current.scrollTop = box.current.scrollHeight;
-  }, [items]);
-  const usage = totals(items);
-  return (
-    <div className="transcript-wrap">
-      <div
-        className="transcript"
-        ref={box}
-        onScroll={(e) => {
-          const el = e.currentTarget;
-          following.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
-        }}
-      >
-        {items.length === 0 && <div className="muted">Nothing yet.</div>}
-        {firstInits(items).map((item, i) => <Item key={i} item={item} />)}
-      </div>
-      <div className="muted small">
-        {usage.turns} model calls · {usage.written && `${usage.written} · `}context {usage.context.toLocaleString()} tokens
-      </div>
-    </div>
-  );
-}
-
-function Item({ item }: { item: TranscriptItem }) {
-  const message = item.message as { content?: string | Part[] } | undefined;
-  switch (item.type) {
-    case 'prompt': {
-      // What a Developer or a reviewer was asked, which the daemon adds: its stream doesn't repeat it.
-      const text = String(item.text ?? '');
-      const title = text.split('\n').find((line) => line.trim())?.replace(/^#+\s*/, '') ?? 'its prompt';
-      return (
-        <details className="t-input t-prompt">
-          <summary>→ {title}</summary>
-          <Markdown text={text} />
-        </details>
-      );
-    }
-    case 'system':
-      if (item.subtype === 'init') return <div className="t-meta">session started · {String(item.model ?? '')}</div>;
-      if (item.subtype === 'api_retry') {
-        return (
-          <div className="t-meta warn">
-            a model call failed ({String(item.error_status ?? item.error ?? 'unknown')}): retry {String(item.attempt ?? '?')} of {String(item.max_retries ?? '?')}
-          </div>
-        );
-      }
-      return null;
-    case 'assistant':
-      return (
-        <>
-          {(Array.isArray(message?.content) ? message.content : []).map((part, i) => {
-            if (part.type === 'text' && part.text) return <div key={i} className="t-text"><Markdown text={part.text} /></div>;
-            if (part.type === 'tool_use') return <ToolUse key={i} name={part.name ?? '?'} input={part.input ?? {}} />;
-            return null;
-          })}
-        </>
-      );
-    case 'user': {
-      if (typeof message?.content === 'string') return <div className="t-input">→ {message.content}</div>;
-      return (
-        <>
-          {(message?.content ?? []).filter((p) => p.type === 'tool_result').map((part, i) => {
-            const text = resultText(part.content);
-            return (
-              <details key={i} className={part.is_error ? 't-result bad' : 't-result'}>
-                <summary>{part.is_error ? 'error: ' : '↳ '}{text.split('\n')[0]!.slice(0, 160) || '(empty)'}</summary>
-                <pre>{text}</pre>
-              </details>
-            );
-          })}
-        </>
-      );
-    }
-    case 'result':
-      return (
-        <div className={item.is_error ? 't-meta bad' : 't-meta'}>
-          finished: {String(item.subtype ?? '')} · {String(item.num_turns ?? '?')} turns
-          {typeof item.duration_ms === 'number' ? ` · ${duration(item.duration_ms)}` : ''}
-          {typeof item.total_cost_usd === 'number' ? ` · $${item.total_cost_usd.toFixed(2)}` : ''}
+export const Transcript = defineComponent({
+  props: { agent: { type: String, required: true } },
+  setup(props) {
+    const entries = ref<Entry[]>([]);
+    const box = ref<HTMLDivElement>();
+    let following = true;
+    let count = 0;
+    const entry = (item: TranscriptItem): Entry => ({ n: count++, item });
+    const load = () => {
+      const agent = props.agent;
+      entries.value = [];
+      void getJson<TranscriptItem[]>(`/api/transcript?agent=${encodeURIComponent(agent)}`).then((list) => {
+        if (agent === props.agent) entries.value = (list ?? []).map(entry);
+      });
+    };
+    onMounted(load);
+    watch(() => props.agent, load);
+    const stop = listen({ transcript: (from, item) => { if (from === props.agent) entries.value = [...entries.value.slice(-999), entry(item)]; } });
+    onUnmounted(stop);
+    // Stays at the bottom while the owner hasn't scrolled up.
+    watch(entries, () => void nextTick(() => {
+      if (following && box.value) box.value.scrollTop = box.value.scrollHeight;
+    }));
+    const usage = computed(() => totals(entries.value.map((e) => e.item)));
+    return () => (
+      <div class="transcript-wrap">
+        <div
+          class="transcript"
+          ref={box}
+          onScroll={(e: Event) => {
+            const el = e.currentTarget as HTMLDivElement;
+            following = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+          }}
+        >
+          {entries.value.length === 0 && <div class="text-muted">Nothing yet.</div>}
+          {firstInits(entries.value).map((e) => <Item key={e.n} item={e.item} />)}
         </div>
-      );
-    default:
-      return null;
-  }
-}
+        <div class="text-caption text-muted q-mt-xs">
+          {usage.value.turns} model calls · {usage.value.written && `${usage.value.written} · `}context {usage.value.context.toLocaleString()} tokens
+        </div>
+      </div>
+    );
+  },
+});
 
-function ToolUse({ name, input }: { name: string; input: Record<string, unknown> }) {
-  const short = ['command', 'file_path', 'pattern', 'url', 'description', 'path'].map((k) => input[k]).find((v) => typeof v === 'string');
-  return (
-    <details className="t-tool">
-      <summary>
-        <b>{name.replace(/^mcp__harness__/, '')}</b> <span className="mono">{String(short ?? '').split('\n')[0]!.slice(0, 200)}</span>
-      </summary>
-      <pre>{JSON.stringify(input, null, 2)}</pre>
-    </details>
-  );
-}
+const Item = defineComponent({
+  props: { item: { type: Object as PropType<TranscriptItem>, required: true } },
+  setup(props) {
+    return () => {
+      const item = props.item;
+      const message = item.message as { content?: string | Part[] } | undefined;
+      switch (item.type) {
+        case 'prompt': {
+          // What a Developer or a reviewer was asked, which the daemon adds: its stream doesn't repeat it.
+          const prompt = String(item.text ?? '');
+          const title = prompt.split('\n').find((line) => line.trim())?.replace(/^#+\s*/, '') ?? 'its prompt';
+          return (
+            <Fold class="t-input t-prompt" label={() => `→ ${title}`}>
+              <Markdown text={prompt} />
+            </Fold>
+          );
+        }
+        case 'system':
+          if (item.subtype === 'init') return <div class="t-meta">session started · {String(item.model ?? '')}</div>;
+          if (item.subtype === 'api_retry') {
+            return (
+              <div class="t-meta text-warning">
+                a model call failed ({String(item.error_status ?? item.error ?? 'unknown')}): retry {String(item.attempt ?? '?')} of {String(item.max_retries ?? '?')}
+              </div>
+            );
+          }
+          return null;
+        case 'assistant':
+          return (
+            <>
+              {(Array.isArray(message?.content) ? message.content : []).map((part, i) => {
+                if (part.type === 'text' && part.text) return <div key={i} class="t-text"><Markdown text={part.text} /></div>;
+                if (part.type === 'tool_use') return <ToolUse key={i} name={part.name ?? '?'} input={part.input ?? {}} />;
+                return null;
+              })}
+            </>
+          );
+        case 'user': {
+          if (typeof message?.content === 'string') return <div class="t-input">→ {message.content}</div>;
+          return (
+            <>
+              {(message?.content ?? []).filter((p) => p.type === 'tool_result').map((part, i) => {
+                const output = resultText(part.content);
+                const first = output.split('\n')[0]!.slice(0, 160) || '(empty)';
+                return (
+                  <Fold key={i} class={part.is_error ? 't-result bad' : 't-result'} label={() => `${part.is_error ? 'error: ' : '↳ '}${first}`}>
+                    <pre>{output}</pre>
+                  </Fold>
+                );
+              })}
+            </>
+          );
+        }
+        case 'result':
+          return (
+            <div class={item.is_error ? 't-meta text-negative' : 't-meta'}>
+              finished: {String(item.subtype ?? '')} · {String(item.num_turns ?? '?')} turns
+              {typeof item.duration_ms === 'number' ? ` · ${duration(item.duration_ms)}` : ''}
+              {typeof item.total_cost_usd === 'number' ? ` · $${item.total_cost_usd.toFixed(2)}` : ''}
+            </div>
+          );
+        default:
+          return null;
+      }
+    };
+  },
+});
+
+const ToolUse = defineComponent({
+  props: { name: { type: String, required: true }, input: { type: Object as PropType<Record<string, unknown>>, required: true } },
+  setup(props) {
+    return () => {
+      const short = ['command', 'file_path', 'pattern', 'url', 'description', 'path'].map((k) => props.input[k]).find((v) => typeof v === 'string');
+      const name = props.name.replace(/^mcp__harness__/, '');
+      const line = String(short ?? '').split('\n')[0]!.slice(0, 200);
+      return (
+        <Fold class="t-tool" label={() => <><b>{name}</b> <span class="mono">{line}</span></>}>
+          <pre>{JSON.stringify(props.input, null, 2)}</pre>
+        </Fold>
+      );
+    };
+  },
+});
 
 /** Claude Code repeats its init at every turn of a long-lived session: only a session's first one shows. */
-function firstInits(items: TranscriptItem[]): TranscriptItem[] {
+function firstInits(entries: Entry[]): Entry[] {
   const sessions = new Set<unknown>();
-  return items.filter((item) => {
+  return entries.filter(({ item }) => {
     if (item.type !== 'system' || item.subtype !== 'init') return true;
     if (sessions.has(item.session_id)) return false;
     sessions.add(item.session_id);
@@ -132,8 +154,8 @@ function firstInits(items: TranscriptItem[]): TranscriptItem[] {
 
 /** A tool's output, without the color codes that terminals would interpret. */
 function resultText(content: unknown): string {
-  const text = typeof content === 'string' ? content : Array.isArray(content) ? content.map((c) => (typeof c?.text === 'string' ? c.text : '')).join('\n') : '';
-  return text.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
+  const output = typeof content === 'string' ? content : Array.isArray(content) ? content.map((c: { text?: unknown }) => (typeof c?.text === 'string' ? c.text : '')).join('\n') : '';
+  return output.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
 }
 
 /**

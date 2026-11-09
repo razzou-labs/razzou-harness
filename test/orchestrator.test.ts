@@ -1457,16 +1457,10 @@ describe('dashboard', () => {
     assert.equal((await call(port, '/%2e%2e/%2e%2e/package.json', bearer)).body, page.body);
   });
 
-  it('serves the second dashboard under /next/, and the first one there while it is not built', async () => {
-    const { port, bearer, webRoot } = await dashboard();
-    const classic = (await call(port, '/', bearer)).body;
-    assert.equal((await call(port, '/next/', bearer)).body, classic, 'not built: the first dashboard answers');
-    mkdirSync(join(webRoot, 'next', 'assets'), { recursive: true });
-    writeFileSync(join(webRoot, 'next', 'index.html'), '<!doctype html><title>next</title>');
-    writeFileSync(join(webRoot, 'next', 'assets', 'next.js'), 'console.log("next")');
-    for (const path of ['/next', '/next/', '/next/agents']) assert.equal((await call(port, path, bearer)).body, '<!doctype html><title>next</title>', path);
-    assert.equal((await call(port, '/next/assets/next.js', bearer)).body, 'console.log("next")');
-    for (const path of ['/', '/agents', '/nextish']) assert.equal((await call(port, path, bearer)).body, classic, `${path} stays the first dashboard's`);
+  it('serves the dashboard at /next/ too, where 0.4.17 served the Vue one: a tab left open there still loads', async () => {
+    const { port, bearer } = await dashboard();
+    const page = (await call(port, '/', bearer)).body;
+    for (const path of ['/next', '/next/']) assert.equal((await call(port, path, bearer)).body, page, path);
   });
 
   it('pauses and resumes for the owner, and shows the agents\' transcripts', async () => {

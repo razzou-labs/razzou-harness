@@ -296,13 +296,9 @@ behind a token. Its views:
 - **Events:** the event log, live, with a filter.
 
 The header pauses and resumes the pipeline: a pause lets what runs finish, and starts
-nothing new. It also shows the mode, Manual or Swarm, and switches it.
-
-**A second dashboard.** The same views, from the same daemon, also come in Vue and
-Quasar at `/next/`, while you compare the two. **New dashboard** in the first one's
-header opens it on the view you were on, and **Classic dashboard** in its own goes back.
-The browser remembers your choice: the URL `harness up` prints opens the dashboard you
-used last. Both stay until you choose one.
+nothing new. It also shows the mode, Manual or Swarm, and switches it. Its last button
+switches between light and dark: the browser remembers your choice, and until you make
+one, the dashboard follows your system's.
 
 ## Swarm mode
 
@@ -471,7 +467,7 @@ through an `Arch:` pull request, or a commit of your own on `main`.
 
 ```json
 {
-  "harnessVersion": "0.4.17",
+  "harnessVersion": "0.4.18",
   "project": { "name": "shop", "repo": "<org>/shop", "bot": "<org>-harness[bot]" },
   "roles": {
     "architect": { "model": "claude-fable-5-1", "effort": "max" },
@@ -734,15 +730,16 @@ While the daemon runs:
 ```sh
 npm install
 npm test            # unit tests and the daemon end to end, with a local stand-in for OpenShell
-npm run typecheck   # the daemon and both dashboards
-npm run build       # dist/: the daemon, the dashboard in dist/web, and the second one in dist/web/next
+npm run typecheck   # the daemon and the dashboard
+npm run build       # dist/: the daemon, and the dashboard in dist/web
 npm pack            # a package of these sources: npm install -g ./razzou-harness-<version>.tgz --allow-scripts=node-pty
 npm run harness -- up --dir path/to/project   # from the sources; run `npm run build` once for the dashboard
 ```
 
-The second dashboard, in `dashboard-vue/`, writes its Vue components in TSX rather than
-`.vue` files: TypeScript 7 has no JavaScript API for `vue-tsc`, and `tsc` checks TSX
-itself. It uses Quasar's prebuilt CSS and SVG icons, so neither Sass nor font files.
+The dashboard, in `dashboard/`, is built with Vue and Quasar. It writes its components in
+TSX rather than `.vue` files: TypeScript 7 has no JavaScript API for `vue-tsc`, and `tsc`
+checks TSX itself. It uses Quasar's prebuilt CSS and SVG icons, Quasar's own included, so
+neither Sass nor font files.
 
 A GitHub release tagged with the package's version, such as `v0.1.2`, publishes it to
 npm. The release workflow checks the tag against `package.json`, runs the typecheck and

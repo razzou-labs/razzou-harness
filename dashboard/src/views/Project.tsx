@@ -1,71 +1,79 @@
-import { useEffect, useState } from 'react';
+import { QBtn, QBtnToggle, QCard, QCardSection, QInput, QLinearProgress, QMarkupTable } from 'quasar';
+import { defineComponent, onUnmounted, ref, watchEffect, type PropType, type Ref } from 'vue';
 import { post, type Attempt, type DashboardState, type FeatureState, type OwnerTime, type PlanState, type State, type SubscriptionUsage, type UsageLimit } from '../api.ts';
 import { Graph } from '../components/Graph.tsx';
-import { Action, Badge, GithubLink } from '../components/ui.tsx';
 import { duration } from '../format.ts';
+import { Action, Badge, Fold, GithubLink, text } from '../ui.tsx';
 import { Proposal } from './NeedsYou.tsx';
 
 /** Modules, proposals, plans and features, with CI, deploys and progress (§14.1). */
-export function Project({ data }: { data: DashboardState }) {
-  const { state, design, progress } = data;
-  const [reading, setReading] = useState<{ module: string; version: number }>();
-  const moduleIds = [...new Set([...Object.keys(state.modules), ...design.modules.map((m) => m.id)])];
-  return (
-    <div className="stack">
-      <Budgets
-        state={state}
-        ceiling={design.swarm?.usageCeilingPercent ?? null}
-        {...(data.ownerTime ? { ownerTime: data.ownerTime } : {})}
-        {...(data.usage ? { usage: data.usage } : {})}
-      />
-      <NewModule />
-      {moduleIds.length === 0 && <p className="muted">No module yet.</p>}
-      {moduleIds.map((id) => {
-        const module = state.modules[id];
-        const designed = design.modules.find((m) => m.id === id);
-        const plans = designed?.plans ?? [];
-        return (
-          <section key={id}>
-            <h2>
-              {id} {module && <span className="muted">· {module.title}</span>} {module && <Badge status={module.status} />}
-              {module?.design?.pr && <> · <GithubLink url={module.design.pr.url}>Arch PR #{module.design.pr.number}</GithubLink></>}
-            </h2>
-            {module && module.proposals.length > 0 && (
-              <div className="row">
-                <span className="muted">Proposals:</span>
-                {module.proposals.map((p) => (
-                  <button key={p.version} className={reading?.module === id && reading.version === p.version ? 'selected' : undefined}
-                    onClick={() => setReading(reading?.module === id && reading.version === p.version ? undefined : { module: id, version: p.version })}>
-                    v{p.version}{p.acceptedAt ? ' ✓' : ''}
-                  </button>
-                ))}
-              </div>
-            )}
-            {reading?.module === id && <Proposal module={id} version={reading.version} />}
-            {designed && plans.length > 0 && <Graph module={designed} state={state} />}
-            {plans.map((plan) => (
-              <Plan key={plan.id} data={data} module={id} plan={plan} />
-            ))}
-          </section>
-        );
-      })}
-      <section>
-        <h2>progress.txt</h2>
-        <pre>{progress.join('\n') || '(nothing accepted yet)'}</pre>
-      </section>
-    </div>
-  );
-}
+export const Project = defineComponent({
+  props: { data: { type: Object as PropType<DashboardState>, required: true } },
+  setup(props) {
+    const reading = ref<{ module: string; version: number }>();
+    return () => {
+      const { state, design, progress } = props.data;
+      const moduleIds = [...new Set([...Object.keys(state.modules), ...design.modules.map((m) => m.id)])];
+      return (
+        <div class="column q-gutter-md">
+          <Budgets state={state} ceiling={design.swarm?.usageCeilingPercent ?? null} {...(props.data.ownerTime ? { ownerTime: props.data.ownerTime } : {})} {...(props.data.usage ? { usage: props.data.usage } : {})} />
+          <NewModule />
+          {moduleIds.length === 0 && <p class="text-muted">No module yet.</p>}
+          {moduleIds.map((id) => {
+            const module = state.modules[id];
+            const designed = design.modules.find((m) => m.id === id);
+            const plans = designed?.plans ?? [];
+            const open = reading.value;
+            return (
+              <QCard key={id} flat bordered>
+                <QCardSection>
+                  <div class="text-h6 row items-center q-gutter-sm">
+                    <span>{id}</span>
+                    {module && <span class="text-muted text-subtitle1">· {module.title}</span>}
+                    {module && <Badge status={module.status} />}
+                    {module?.design?.pr && <span class="text-subtitle2">· <GithubLink url={module.design.pr.url}>Arch PR #{module.design.pr.number}</GithubLink></span>}
+                  </div>
+                  {module && module.proposals.length > 0 && (
+                    <div class="row items-center q-gutter-sm q-mt-sm">
+                      <span class="text-muted">Proposals:</span>
+                      <QBtnToggle
+                        class="versions"
+                        modelValue={open?.module === id ? open.version : null}
+                        {...{ 'onUpdate:modelValue': (version: number | null) => (reading.value = version === null ? undefined : { module: id, version }) }}
+                        options={module.proposals.map((p) => ({ label: `v${p.version}${p.acceptedAt ? ' ✓' : ''}`, value: p.version }))}
+                        clearable unelevated dense noCaps padding="2px 10px" textColor="primary" toggleColor="primary" toggleTextColor="white"
+                      />
+                    </div>
+                  )}
+                  {open?.module === id && <Proposal module={id} version={open.version} />}
+                  {designed && plans.length > 0 && <Graph module={designed} state={state} />}
+                  {plans.map((plan) => <Plan key={plan.id} data={props.data} module={id} plan={plan} />)}
+                </QCardSection>
+              </QCard>
+            );
+          })}
+          <QCard flat bordered>
+            <QCardSection>
+              <div class="text-h6">progress.txt</div>
+              <pre>{progress.join('\n') || '(nothing accepted yet)'}</pre>
+            </QCardSection>
+          </QCard>
+        </div>
+      );
+    };
+  },
+});
 
-/** Now, refreshed every `everyMs` while `ticking`: for clocks that must move without an event. */
-function useNow(ticking: boolean, everyMs = 60_000): number {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    setNow(Date.now());
-    if (!ticking) return undefined;
-    const timer = window.setInterval(() => setNow(Date.now()), everyMs);
-    return () => window.clearInterval(timer);
-  }, [ticking, everyMs]);
+/** Now, refreshed every `everyMs` while `ticking()`: for clocks that must move without an event. */
+function useNow(ticking: () => boolean, everyMs = 60_000): Ref<number> {
+  const now = ref(Date.now());
+  let timer: number | undefined;
+  watchEffect(() => {
+    window.clearInterval(timer);
+    now.value = Date.now();
+    if (ticking()) timer = window.setInterval(() => (now.value = Date.now()), everyMs);
+  });
+  onUnmounted(() => window.clearInterval(timer));
   return now;
 }
 
@@ -107,95 +115,151 @@ function count(n: number): string {
   return String(n);
 }
 
-/** The owner's hours for the whole project, and the agent-hours threshold (v3 §4): set here, recorded by the daemon. */
-function Budgets({ state, ownerTime, usage, ceiling }: { state: State; ownerTime?: OwnerTime; usage?: { at: string; usage: SubscriptionUsage }; ceiling: number | null }) {
-  const budgets = state.budgets ?? {};
-  const overPlanned = ownerTime !== undefined && ownerTime.committedHours > ownerTime.plannableHours;
-  const overUsed = ownerTime !== undefined && ownerTime.usedHours > ownerTime.hours;
-  const running = Object.values(state.features).some((f) => f.attempts.some((a) => !a.endedAt));
-  const now = useNow(running);
-  const agentHours = agentMs(state, now) / 3_600_000;
-  const over = budgets.agentHours !== undefined && agentHours > budgets.agentHours;
-  return (
-    <section>
-      <h2>Budgets</h2>
-      <div className="meters">
-        <div className="meter">
-          <h3>Your time</h3>
-          <p>
-            {budgets.ownerHours !== undefined
-              ? <><b>{budgets.ownerHours} h</b> for the whole project{budgets.ownerHoursSetAt && <span className="muted">, set {new Date(budgets.ownerHoursSetAt).toLocaleDateString()}</span>}</>
-              : <span className="muted">Not set: the Architect designs without a limit on your time.</span>}
-          </p>
-          {ownerTime && (
-            <p>
-              <b className={overUsed ? 'bad' : undefined}>{ownerTime.usedHours} h used</b>
-              {' · '}
-              <span className={overPlanned ? 'bad' : undefined}>{ownerTime.committedHours} h planned by the designs</span>
-              {' · '}
-              <span className="muted">{ownerTime.plannableHours} h plannable after the {ownerTime.reservePercent}% reserve</span>
-            </p>
-          )}
-          <HoursForm field="ownerHours" value={budgets.ownerHours} placeholder="hours" />
-          <p className="muted small">
-            {ownerTime
-              ? 'Planned: the estimates of the owner actions in submitted designs, gates and tasks. Used: the actions you marked done. What you read, proposals and pull requests, doesn\'t count.'
-              : 'Once set, the Architect must estimate every owner action and design within your hours; a design over them is refused.'}
-          </p>
-        </div>
-        <div className="meter">
-          <h3>Agent hours</h3>
-          <p>
-            <b className={over ? 'bad' : undefined}>{agentHours.toFixed(1)} h</b>
-            {budgets.agentHours !== undefined ? <> of {budgets.agentHours} h</> : <span className="muted"> · no threshold</span>}
-            {over && <span className="bad small"> · over the threshold</span>}
-          </p>
-          <HoursForm field="agentHours" value={budgets.agentHours} placeholder="threshold" />
-          <p className="muted small">The Developers' attempt clocks, summed. Over the threshold the number turns red; nothing stops.</p>
-        </div>
-        <TokensMeter state={state} />
-        <SubscriptionMeter {...(usage ? { usage } : {})} ceiling={ceiling} />
+const Meter = defineComponent({
+  props: { title: { type: String, required: true } },
+  setup(props, { slots }) {
+    return () => (
+      <div class="col-12 col-sm-6 col-lg-3">
+        <QCard flat bordered class="meter full-height">
+          <QCardSection>
+            <div class="text-subtitle1 text-weight-medium q-mb-xs">{props.title}</div>
+            {slots.default?.()}
+          </QCardSection>
+        </QCard>
       </div>
-    </section>
-  );
-}
+    );
+  },
+});
+
+/** The owner's hours for the whole project, and the agent-hours threshold (v3 §4): set here, recorded by the daemon. */
+const Budgets = defineComponent({
+  props: {
+    state: { type: Object as PropType<State>, required: true },
+    ceiling: { type: Number as PropType<number | null>, default: null },
+    ownerTime: Object as PropType<OwnerTime>,
+    usage: Object as PropType<{ at: string; usage: SubscriptionUsage }>,
+  },
+  setup(props) {
+    const now = useNow(() => Object.values(props.state.features).some((f) => f.attempts.some((a) => !a.endedAt)));
+    return () => {
+      const { state, ownerTime } = props;
+      const budgets = state.budgets ?? {};
+      const overPlanned = ownerTime !== undefined && ownerTime.committedHours > ownerTime.plannableHours;
+      const overUsed = ownerTime !== undefined && ownerTime.usedHours > ownerTime.hours;
+      const agentHours = agentMs(state, now.value) / 3_600_000;
+      const over = budgets.agentHours !== undefined && agentHours > budgets.agentHours;
+      return (
+        <QCard flat bordered>
+          <QCardSection>
+            <div class="text-h6 q-mb-sm">Budgets</div>
+            <div class="row q-col-gutter-md">
+              <Meter title="Your time">
+                <p>
+                  {budgets.ownerHours !== undefined
+                    ? <><b>{budgets.ownerHours} h</b> for the whole project{budgets.ownerHoursSetAt && <span class="text-muted">, set {new Date(budgets.ownerHoursSetAt).toLocaleDateString()}</span>}</>
+                    : <span class="text-muted">Not set: the Architect designs without a limit on your time.</span>}
+                </p>
+                {ownerTime && (
+                  <p>
+                    <b class={overUsed ? 'text-negative' : undefined}>{ownerTime.usedHours} h used</b>
+                    {' · '}
+                    <span class={overPlanned ? 'text-negative' : undefined}>{ownerTime.committedHours} h planned by the designs</span>
+                    {' · '}
+                    <span class="text-muted">{ownerTime.plannableHours} h plannable after the {ownerTime.reservePercent}% reserve</span>
+                  </p>
+                )}
+                <HoursForm field="ownerHours" value={budgets.ownerHours} placeholder="hours" />
+                <p class="text-caption text-muted q-mt-sm">
+                  {ownerTime
+                    ? "Planned: the estimates of the owner actions in submitted designs, gates and tasks. Used: the actions you marked done. What you read, proposals and pull requests, doesn't count."
+                    : 'Once set, the Architect must estimate every owner action and design within your hours; a design over them is refused.'}
+                </p>
+              </Meter>
+              <Meter title="Agent hours">
+                <p>
+                  <b class={over ? 'text-negative' : undefined}>{agentHours.toFixed(1)} h</b>
+                  {budgets.agentHours !== undefined ? <> of {budgets.agentHours} h</> : <span class="text-muted"> · no threshold</span>}
+                  {over && <span class="text-negative text-caption"> · over the threshold</span>}
+                </p>
+                <HoursForm field="agentHours" value={budgets.agentHours} placeholder="threshold" />
+                <p class="text-caption text-muted q-mt-sm">The Developers' attempt clocks, summed. Over the threshold the number turns red; nothing stops.</p>
+              </Meter>
+              <TokensMeter state={state} />
+              <SubscriptionMeter ceiling={props.ceiling} {...(props.usage ? { usage: props.usage } : {})} />
+            </div>
+          </QCardSection>
+        </QCard>
+      );
+    };
+  },
+});
+
+/** Every token Claude used for the project, written and read, and by role. */
+const TokensMeter = defineComponent({
+  props: { state: { type: Object as PropType<State>, required: true } },
+  setup(props) {
+    return () => {
+      const roles = tokensByRole(props.state);
+      const total = roles.reduce((sum, [, t]) => ({ input: sum.input + t.input, output: sum.output + t.output }), { input: 0, output: 0 });
+      return (
+        <Meter title="Claude tokens">
+          <p>
+            <b>{count(total.input + total.output)}</b>
+            <span class="text-muted"> · {count(total.output)} written, {count(total.input)} read, cache included</span>
+          </p>
+          <p class="text-caption">{roles.map(([role, t]) => `${role} ${count(t.input + t.output)}`).join(' · ')}</p>
+          <p class="text-caption text-muted">
+            Claude Code's own counts: an attempt's and a review's when it ends, a Manager's and an Architect's every five minutes. Most of what is read comes from the prompt cache.
+          </p>
+        </Meter>
+      );
+    };
+  },
+});
 
 /**
  * The subscription's windows as bars: the current session and the weekly limit, as an
  * agent's model call last reported them. Before any report, the box says where they come from.
  */
-function SubscriptionMeter({ usage, ceiling }: { usage?: { at: string; usage: SubscriptionUsage }; ceiling: number | null }) {
-  const now = useNow(true);
-  if (!usage) {
-    return (
-      <div className="meter">
-        <h3>Subscription</h3>
-        <p className="muted">No report yet. The Developers, the Manager and the reviewers report your usage with each model call; the bars appear with the first one.</p>
-      </div>
-    );
-  }
-  return (
-    <div className="meter">
-      <h3>Subscription</h3>
-      {usage.usage.limits.map((limit) => {
-        const hot = ceiling !== null && limit.percent >= ceiling;
+const SubscriptionMeter = defineComponent({
+  props: {
+    ceiling: { type: Number as PropType<number | null>, default: null },
+    usage: Object as PropType<{ at: string; usage: SubscriptionUsage }>,
+  },
+  setup(props) {
+    const now = useNow(() => true);
+    return () => {
+      const { usage, ceiling } = props;
+      if (!usage) {
         return (
-          <div key={`${limit.kind}:${limit.model ?? ''}`} className="usage-bar">
-            <div className="usage-label">
-              <span>{limitLabel(limit)}</span>
-              <b className={hot ? 'bad' : undefined}>{limit.percent}%</b>
-            </div>
-            <div className="bar"><div className={hot ? 'fill hot' : 'fill'} style={{ width: `${Math.max(0, Math.min(100, limit.percent))}%` }} /></div>
-            <div className="muted small">resets {resetsIn(limit.resetsAt, now)}</div>
-          </div>
+          <Meter title="Subscription">
+            <p class="text-muted">No report yet. The Developers, the Manager and the reviewers report your usage with each model call; the bars appear with the first one.</p>
+          </Meter>
         );
-      })}
-      <p className="muted small">
-        Reported by an agent's model call at {new Date(usage.at).toLocaleTimeString()}. In Swarm no attempt starts at or above {ceiling === null ? 'the ceiling, which is off' : `${ceiling}%`}; the pipeline waits for the window to reset.
-      </p>
-    </div>
-  );
-}
+      }
+      return (
+        <Meter title="Subscription">
+          {usage.usage.limits.map((limit) => {
+            const hot = ceiling !== null && limit.percent >= ceiling;
+            return (
+              <div key={`${limit.kind}:${limit.model ?? ''}`} class="q-mb-sm">
+                <div class="row justify-between">
+                  <span>{limitLabel(limit)}</span>
+                  <b class={hot ? 'text-negative' : undefined}>{limit.percent}%</b>
+                </div>
+                <QLinearProgress value={Math.max(0, Math.min(100, limit.percent)) / 100} color={hot ? 'negative' : 'primary'} rounded size="8px" class="q-my-xs" />
+                <div class="text-caption text-muted">resets {resetsIn(limit.resetsAt, now.value)}</div>
+              </div>
+            );
+          })}
+          <p class="text-caption text-muted">
+            Reported by an agent's model call at {new Date(usage.at).toLocaleTimeString()}. In Swarm no attempt starts at or above {ceiling === null ? 'the ceiling, which is off' : `${ceiling}%`}; the pipeline waits for the window to reset.
+          </p>
+        </Meter>
+      );
+    };
+  },
+});
 
 function limitLabel(limit: UsageLimit): string {
   switch (limit.kind) {
@@ -224,187 +288,202 @@ function resetsIn(at: string, now: number): string {
   return new Date(at).toLocaleString(undefined, { weekday: 'short', hour: '2-digit', minute: '2-digit' });
 }
 
-/** Every token Claude used for the project, written and read, and by role. */
-function TokensMeter({ state }: { state: State }) {
-  const roles = tokensByRole(state);
-  const total = roles.reduce((sum, [, t]) => ({ input: sum.input + t.input, output: sum.output + t.output }), { input: 0, output: 0 });
-  return (
-    <div className="meter">
-      <h3>Claude tokens</h3>
-      <p>
-        <b>{count(total.input + total.output)}</b>
-        <span className="muted"> · {count(total.output)} written, {count(total.input)} read, cache included</span>
-      </p>
-      <p className="small">{roles.map(([role, t]) => `${role} ${count(t.input + t.output)}`).join(' · ')}</p>
-      <p className="muted small">
-        Claude Code's own counts: an attempt's and a review's when it ends, a Manager's and an Architect's every five minutes. Most of what is read comes from the prompt cache.
-      </p>
-    </div>
-  );
-}
-
 /** A number of hours to save, or clear: null clears it on the daemon. */
-function HoursForm({ field, value, placeholder }: { field: 'ownerHours' | 'agentHours'; value?: number; placeholder: string }) {
-  const [text, setText] = useState('');
-  const hours = Number(text);
-  const valid = text.trim() !== '' && Number.isFinite(hours) && hours > 0;
-  return (
-    <div className="row">
-      <input type="number" min={1} step={1} value={text} placeholder={placeholder} onChange={(e) => setText(e.target.value)} />
-      <Action
-        label="Save"
-        onClick={async () => {
-          if (!valid) return { done: false, error: 'a positive number of hours' };
-          const result = await post('/api/budgets', { [field]: hours });
-          if (result.done) setText('');
-          return result;
-        }}
-      />
-      {value !== undefined && <Action label="Clear" onClick={() => post('/api/budgets', { [field]: null })} />}
-    </div>
-  );
-}
+const HoursForm = defineComponent({
+  props: {
+    field: { type: String as PropType<'ownerHours' | 'agentHours'>, required: true },
+    value: Number,
+    placeholder: { type: String, required: true },
+  },
+  setup(props) {
+    const hours = ref('');
+    return () => {
+      const n = Number(hours.value);
+      const valid = hours.value.trim() !== '' && Number.isFinite(n) && n > 0;
+      return (
+        <div class="row items-center q-gutter-sm">
+          <QInput {...text(hours)} type="number" dense outlined label={props.placeholder} style="width: 120px" />
+          <Action
+            label="Save"
+            run={async () => {
+              if (!valid) return { done: false, error: 'a positive number of hours' };
+              const result = await post('/api/budgets', { [props.field]: n });
+              if (result.done) hours.value = '';
+              return result;
+            }}
+          />
+          {props.value !== undefined && <Action label="Clear" flat run={() => post('/api/budgets', { [props.field]: null })} />}
+        </div>
+      );
+    };
+  },
+});
 
-function NewModule() {
-  const [id, setId] = useState('');
-  const [title, setTitle] = useState('');
-  const [error, setError] = useState<string>();
-  return (
-    <section>
-      <h2>Start a module</h2>
-      <div className="row">
-        <input value={id} placeholder="id, like orders" size={14} onChange={(e) => setId(e.target.value)} />
-        <input value={title} placeholder="what it is for" size={36} onChange={(e) => setTitle(e.target.value)} />
-        <button
-          disabled={!id.trim()}
-          onClick={async () => {
-            const result = await post('/api/modules', { id: id.trim(), title });
-            setError(result.done ? undefined : result.error);
-            if (result.done) {
-              setId('');
-              setTitle('');
-            }
-          }}
-        >
-          Start
-        </button>
-        {error && <span className="bad small">{error}</span>}
-      </div>
-      <p className="muted small">An Architect starts in its own sandbox; talk to it in the Agents view.</p>
-    </section>
-  );
-}
+const NewModule = defineComponent({
+  setup() {
+    const id = ref('');
+    const title = ref('');
+    const error = ref<string>();
+    const start = async () => {
+      const result = await post('/api/modules', { id: id.value.trim(), title: title.value });
+      error.value = result.done ? undefined : result.error;
+      if (result.done) {
+        id.value = '';
+        title.value = '';
+      }
+    };
+    return () => (
+      <QCard flat bordered>
+        <QCardSection>
+          <div class="text-h6 q-mb-sm">Start a module</div>
+          <div class="row items-center q-gutter-sm">
+            <QInput {...text(id)} dense outlined label="id, like orders" style="width: 180px" />
+            <QInput {...text(title)} dense outlined label="what it is for" class="col" style="min-width: 240px; max-width: 480px" />
+            <QBtn label="Start" color="primary" noCaps unelevated disable={!id.value.trim()} onClick={() => void start()} />
+            {error.value && <span class="text-negative text-caption">{error.value}</span>}
+          </div>
+          <p class="text-caption text-muted q-mt-sm">An Architect starts in its own sandbox; talk to it in the Agents view.</p>
+        </QCardSection>
+      </QCard>
+    );
+  },
+});
 
 type PlanDesign = DashboardState['design']['modules'][number]['plans'][number];
 
-function Plan({ data, module, plan }: { data: DashboardState; module: string; plan: PlanDesign }) {
-  const { state, design } = data;
-  const key = `${module}/${plan.id}`;
-  const planState = state.plans[key];
-  const fixes = Object.values(state.features).filter((f) => f.fix && `${f.module}/${f.plan}` === key);
-  const rows = [
-    ...plan.features.map((f) => ({ id: f.id, title: f.title, kind: f.kind, state: state.features[`${key}/${f.id}`] })),
-    ...fixes.map((f) => ({ id: f.feature, title: `Fix after ${f.fix!.kind === 'ci' ? 'CI' : 'the deploy'}, round ${f.fix!.round}`, kind: 'fix', state: f })),
-  ];
-  return (
-    <div className="plan">
-      <h3>
-        {plan.id} · {plan.title} <Badge status={planState?.status ?? 'waiting'} />
-        {planState?.pr && <> <GithubLink url={planState.pr.url}>PR #{planState.pr.number}</GithubLink></>}
-        {planState?.mergedBy === 'daemon' && <> <span className="muted small">merged by the daemon</span></>}
-        {planState?.ci && <> <Badge status={planState.ci.status} label={`CI ${planState.ci.status}`} /></>}
-      </h3>
-      {planState && <PlanDetails plan={planState} />}
-      <table>
-        <thead>
-          <tr><th>Feature</th><th>Status</th><th>Attempts</th><th>Last attempt</th><th>Commit</th></tr>
-        </thead>
-        <tbody>
-          {rows.map((row) => (
-            <FeatureRow key={row.id} id={row.id} title={row.title} kind={row.kind} feature={row.state} max={design.maxAttempts} />
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-}
+const Plan = defineComponent({
+  props: {
+    data: { type: Object as PropType<DashboardState>, required: true },
+    module: { type: String, required: true },
+    plan: { type: Object as PropType<PlanDesign>, required: true },
+  },
+  setup(props) {
+    return () => {
+      const { state, design } = props.data;
+      const plan = props.plan;
+      const key = `${props.module}/${plan.id}`;
+      const planState = state.plans[key];
+      const fixes = Object.values(state.features).filter((f) => f.fix && `${f.module}/${f.plan}` === key);
+      const rows = [
+        ...plan.features.map((f) => ({ id: f.id, title: f.title, kind: f.kind as string, state: state.features[`${key}/${f.id}`] })),
+        ...fixes.map((f) => ({ id: f.feature, title: `Fix after ${f.fix!.kind === 'ci' ? 'CI' : 'the deploy'}, round ${f.fix!.round}`, kind: 'fix', state: f })),
+      ];
+      return (
+        <div class="plan q-mt-md">
+          <div class="text-subtitle1 text-weight-medium row items-center q-gutter-sm">
+            <span>{plan.id} · {plan.title}</span>
+            <Badge status={planState?.status ?? 'waiting'} />
+            {planState?.pr && <GithubLink url={planState.pr.url}>PR #{planState.pr.number}</GithubLink>}
+            {planState?.mergedBy === 'daemon' && <span class="text-muted text-caption">merged by the daemon</span>}
+            {planState?.ci && <Badge status={planState.ci.status} label={`CI ${planState.ci.status}`} />}
+          </div>
+          {planState && <PlanDetails plan={planState} />}
+          <QMarkupTable flat bordered dense wrapCells class="q-mt-sm">
+            <thead>
+              <tr><th class="text-left">Feature</th><th class="text-left">Status</th><th class="text-left">Attempts</th><th class="text-left">Last attempt</th><th class="text-left">Commit</th></tr>
+            </thead>
+            <tbody>
+              {rows.map((row) => <FeatureRow key={row.id} id={row.id} title={row.title} kind={row.kind} max={design.maxAttempts} {...(row.state ? { feature: row.state } : {})} />)}
+            </tbody>
+          </QMarkupTable>
+        </div>
+      );
+    };
+  },
+});
 
-function PlanDetails({ plan }: { plan: PlanState }) {
-  const failedJobs = plan.ci?.jobs?.filter((j) => j.conclusion !== 'success') ?? [];
-  return (
-    <div className="small">
-      {failedJobs.map((job) => (
-        <details key={job.name}>
-          <summary className="bad">CI job {job.name}: {job.conclusion}</summary>
-          <pre>{job.log ?? ''}</pre>
-        </details>
-      ))}
-      {plan.reviews?.filter((r) => r.head === plan.pushed).map((r) => (
-        <p key={`${r.role}-${r.head}`}>
-          {r.role === 'security' ? 'Security' : 'Cost'} review of {r.head.slice(0, 8)}:{' '}
-          {r.status === 'reported'
-            ? <><Badge status={r.verdict === 'pass' ? 'passed' : 'failed'} label={r.verdict} /> {r.findings?.filter((f) => f.severity === 'blocking').length ?? 0} blocking, {r.findings?.filter((f) => f.severity === 'advisory').length ?? 0} advisory{r.posted?.problem ? <span className="bad"> · {r.posted.problem}</span> : null}</>
-            : r.status === 'failed'
-              ? <span className="bad">failed: {r.reason}</span>
-              : <Badge status={r.status} />}
-        </p>
-      ))}
-      {plan.deploy && (
-        <p>
-          Deploy of {plan.deploy.commit.slice(0, 8)}: <Badge status={plan.deploy.status} />
-          {plan.deploy.jobs?.filter((j) => j.conclusion !== 'success').map((j) => <GithubLink key={j.name} url={j.url}> {j.name}</GithubLink>)}
-        </p>
-      )}
-      {plan.postDeploy && (
-        <details>
-          <summary>Post-deploy checks: <Badge status={plan.postDeploy.status} /></summary>
-          {plan.postDeploy.results.map((r) => (
-            <div key={r.id}>
-              <b className={r.exit === 0 ? 'ok' : 'bad'}>{r.id}</b> <span className="muted">{duration(r.durationMs)}</span>
-              <pre>{r.output}</pre>
-            </div>
+const PlanDetails = defineComponent({
+  props: { plan: { type: Object as PropType<PlanState>, required: true } },
+  setup(props) {
+    return () => {
+      const plan = props.plan;
+      const failedJobs = plan.ci?.jobs?.filter((j) => j.conclusion !== 'success') ?? [];
+      const postDeploy = plan.postDeploy;
+      return (
+        <div class="text-caption q-mt-xs">
+          {failedJobs.map((job) => (
+            <Fold key={job.name} headerClass="text-negative" label={() => `CI job ${job.name}: ${job.conclusion}`}>
+              <pre>{job.log ?? ''}</pre>
+            </Fold>
           ))}
-        </details>
-      )}
-    </div>
-  );
-}
+          {plan.reviews?.filter((r) => r.head === plan.pushed).map((r) => (
+            <p key={`${r.role}-${r.head}`} class="q-my-xs">
+              {r.role === 'security' ? 'Security' : 'Cost'} review of {r.head.slice(0, 8)}:{' '}
+              {r.status === 'reported'
+                ? <><Badge status={r.verdict === 'pass' ? 'passed' : 'failed'} label={r.verdict ?? 'reported'} /> {r.findings?.filter((f) => f.severity === 'blocking').length ?? 0} blocking, {r.findings?.filter((f) => f.severity === 'advisory').length ?? 0} advisory{r.posted?.problem ? <span class="text-negative"> · {r.posted.problem}</span> : null}</>
+                : r.status === 'failed'
+                  ? <span class="text-negative">failed: {r.reason}</span>
+                  : <Badge status={r.status} />}
+            </p>
+          ))}
+          {plan.deploy && (
+            <p class="q-my-xs">
+              Deploy of {plan.deploy.commit.slice(0, 8)}: <Badge status={plan.deploy.status} />
+              {plan.deploy.jobs?.filter((j) => j.conclusion !== 'success').map((j) => <GithubLink key={j.name} url={j.url}> {j.name}</GithubLink>)}
+            </p>
+          )}
+          {postDeploy && (
+            <Fold label={() => <>Post-deploy checks: <Badge status={postDeploy.status} /></>}>
+              {postDeploy.results.map((r) => (
+                <div key={r.id}>
+                  <b class={r.exit === 0 ? 'text-positive' : 'text-negative'}>{r.id}</b> <span class="text-muted">{duration(r.durationMs)}</span>
+                  <pre>{r.output}</pre>
+                </div>
+              ))}
+            </Fold>
+          )}
+        </div>
+      );
+    };
+  },
+});
 
-function FeatureRow({ id, title, kind, feature, max }: { id: string; title: string; kind: string; feature?: FeatureState; max: number }) {
-  const last: Attempt | undefined = feature?.attempts.at(-1);
-  // As the daemon counts: failures that count, for the feature's current definition.
-  const counted = last ? feature!.attempts.filter((a) => a.definitionHash === last.definitionHash && a.counts).length : 0;
-  const ended = last?.endedAt ? Date.parse(last.endedAt) : Date.now();
-  return (
-    <tr>
-      <td>
-        <b>{id}</b> {title} {kind === 'infra' && <span className="muted small">infra</span>}
-      </td>
-      <td>
-        <Badge status={feature?.status ?? 'pending'} />
-        {feature?.awaitingGuidanceSince && <div className="muted small">waiting for the Manager's guidance</div>}
-      </td>
-      <td className="mono">{feature ? `${feature.attempts.length}${counted ? ` (${counted} of ${max + feature.extraAttempts} counted)` : ''}` : '0'}</td>
-      <td>
-        {last && (
-          <>
-            {last.status}
-            {last.outcome ? ` · ${last.outcome}` : ''} · {duration(ended - Date.parse(last.startedAt))}
-            {last.reason && <div className="small">{last.reason}</div>}
-            {last.finding && (
-              <details className="small">
-                <summary>Finding: {last.finding.category}</summary>
-                <p>{last.finding.summary}</p>
-                {last.finding.needs && <p>Needs: {last.finding.needs}</p>}
-              </details>
+const FeatureRow = defineComponent({
+  props: {
+    id: { type: String, required: true },
+    title: { type: String, required: true },
+    kind: { type: String, required: true },
+    max: { type: Number, required: true },
+    feature: Object as PropType<FeatureState>,
+  },
+  setup(props) {
+    return () => {
+      const feature = props.feature;
+      const last: Attempt | undefined = feature?.attempts.at(-1);
+      // As the daemon counts: failures that count, for the feature's current definition.
+      const counted = last ? feature!.attempts.filter((a) => a.definitionHash === last.definitionHash && a.counts).length : 0;
+      const ended = last?.endedAt ? Date.parse(last.endedAt) : Date.now();
+      return (
+        <tr>
+          <td>
+            <b>{props.id}</b> {props.title} {props.kind === 'infra' && <span class="text-muted text-caption">infra</span>}
+          </td>
+          <td>
+            <Badge status={feature?.status ?? 'pending'} />
+            {feature?.awaitingGuidanceSince && <div class="text-muted text-caption">waiting for the Manager's guidance</div>}
+          </td>
+          <td class="mono">{feature ? `${feature.attempts.length}${counted ? ` (${counted} of ${props.max + feature.extraAttempts} counted)` : ''}` : '0'}</td>
+          <td>
+            {last && (
+              <>
+                {last.status}
+                {last.outcome ? ` · ${last.outcome}` : ''} · {duration(ended - Date.parse(last.startedAt))}
+                {last.reason && <div class="text-caption">{last.reason}</div>}
+                {last.finding && (
+                  <Fold class="text-caption" label={() => `Finding: ${last.finding!.category}`}>
+                    <p>{last.finding.summary}</p>
+                    {last.finding.needs && <p>Needs: {last.finding.needs}</p>}
+                  </Fold>
+                )}
+                {last.questions?.map((q) => (
+                  <div key={q.requestId} class="text-caption text-muted">Q: {q.text}{q.answer ? ` — A: ${q.answer}` : ''}</div>
+                ))}
+              </>
             )}
-            {last.questions?.map((q) => (
-              <div key={q.requestId} className="small muted">Q: {q.text}{q.answer ? ` — A: ${q.answer}` : ''}</div>
-            ))}
-          </>
-        )}
-      </td>
-      <td className="mono">{feature?.commit?.slice(0, 8) ?? ''}</td>
-    </tr>
-  );
-}
+          </td>
+          <td class="mono">{feature?.commit?.slice(0, 8) ?? ''}</td>
+        </tr>
+      );
+    };
+  },
+});

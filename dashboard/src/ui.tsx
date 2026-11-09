@@ -1,12 +1,12 @@
 import { matCheck, matContentCopy } from '@quasar/extras/material-icons';
 import DOMPurify from 'dompurify';
 import { marked } from 'marked';
-import { Dialog, Notify, QBadge, QBtn, QInput } from 'quasar';
-import { computed, defineComponent, ref, type FunctionalComponent, type PropType, type Ref } from 'vue';
+import { Dark, Dialog, Notify, QBadge, QBtn, QExpansionItem, QInput, QItemSection, QSpinner } from 'quasar';
+import { computed, defineComponent, ref, type FunctionalComponent, type PropType, type Ref, type VNodeChild } from 'vue';
 import type { Outcome } from './api.ts';
 import { isGithubLink, tone } from './format.ts';
 
-/** Quasar's color for a status word, from the tones the first dashboard gave its classes. */
+/** Quasar's color for a status word, by its tone. */
 const COLORS: Record<string, string> = { ok: 'positive', bad: 'negative', warn: 'warning', muted: 'grey-6', run: 'primary' };
 export const colorOf = (status: string): string => COLORS[tone(status)] ?? 'primary';
 /** The text class of a tone, for words in a sentence. */
@@ -32,10 +32,63 @@ export function text(value: Ref<string>): { modelValue: string; 'onUpdate:modelV
   };
 }
 
+/**
+ * The owner's choice of light or dark, kept in this browser; until there is one, the
+ * system's. Quasar's Dark plugin switches the page, and follows the system on 'auto'; it
+ * keeps no choice of its own across a reload.
+ */
+const THEME = 'harness-theme';
+
+export function savedTheme(): boolean | 'auto' {
+  const saved = localStorage.getItem(THEME);
+  return saved === 'dark' ? true : saved === 'light' ? false : 'auto';
+}
+
+export function toggleDark(): void {
+  Dark.toggle();
+  localStorage.setItem(THEME, Dark.isActive ? 'dark' : 'light');
+}
+
+/** What the page waits for, beside a spinner. */
+export const Loading = defineComponent({
+  props: { text: { type: String, required: true } },
+  setup(props) {
+    return () => (
+      <div class="row items-center no-wrap q-gutter-sm text-muted">
+        <QSpinner size="1.2em" color="primary" />
+        <span>{props.text}</span>
+      </div>
+    );
+  },
+});
+
+/**
+ * A line that opens on what it holds, like a tool call in a transcript: Quasar's expansion
+ * item, as compact as a line of text. `label` draws the line; the children, what opens.
+ */
+export const Fold = defineComponent({
+  props: {
+    label: { type: Function as PropType<() => VNodeChild>, required: true },
+    headerClass: String,
+  },
+  setup(props, { slots }) {
+    return () => (
+      <QExpansionItem dense denseToggle switchToggleSide class="fold" headerClass={['fold-header', props.headerClass]}>
+        {{
+          // One block in the section, which stacks its children: the label wraps as a line of text.
+          header: () => <QItemSection class="fold-label"><div>{props.label()}</div></QItemSection>,
+          default: () => <div class="fold-body">{slots.default?.()}</div>,
+        }}
+      </QExpansionItem>
+    );
+  },
+});
+
 /** The owner's yes or no, in a dialog. */
 export function confirm(message: string, ok = 'Yes'): Promise<boolean> {
   return new Promise((resolve) => {
-    Dialog.create({ message, cancel: { flat: true, noCaps: true }, ok: { label: ok, noCaps: true, color: 'primary' }, persistent: true })
+    // In primary in both themes: in dark, Quasar's dialogs default to amber.
+    Dialog.create({ message, color: 'primary', cancel: { flat: true, noCaps: true }, ok: { label: ok, noCaps: true, unelevated: true }, persistent: true })
       .onOk(() => resolve(true))
       .onCancel(() => resolve(false));
   });
