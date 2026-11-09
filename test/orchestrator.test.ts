@@ -1442,7 +1442,7 @@ describe('dashboard', () => {
     const resetsAt = new Date(Date.now() + 3 * 3_600_000).toISOString();
     const usage = async () => {
       reads++;
-      if (failing) throw new Error('the usage endpoint answered 500');
+      if (failing) throw new Error('the usage endpoint answered 401');
       return { percent: 40, resetsAt, limits: [{ kind: 'session', percent: 40, resetsAt }, { kind: 'weekly_scoped', percent: 8, resetsAt, model: 'Fable' }] };
     };
     const { orchestrator: o } = await setup((f) => solved(f), { usage, now: () => Date.now() + skew });
@@ -1462,19 +1462,31 @@ describe('dashboard', () => {
     await state();
     assert.equal(reads, 1, 'a reading under five minutes old is kept');
 
-    // Five minutes on, a failed reading keeps the last one, and isn't tried again for five minutes.
+    // Five minutes on, a failed reading keeps the last one, says why, and isn't tried again for five minutes.
     failing = true;
     skew += 5 * 60_000 + 1000;
     await state();
-    await until(o, () => reads === 2);
+    await until(o, () => reads === 2 && announced === 2);
     await state();
     assert.equal(reads, 2);
-    assert.equal((await state()).usage!.at, first.at);
+    const failed = await state();
+    assert.equal(failed.usage!.at, first.at);
+    assert.equal(failed.usageProblem, 'the usage endpoint refuses the stored token (401)');
     failing = false;
     skew += 5 * 60_000 + 1000;
     await state();
-    await until(o, () => announced === 2);
-    assert.equal(reads, 3);
+    await until(o, () => reads === 3 && announced >= 4);
+    assert.equal((await state()).usageProblem, undefined, 'a good reading clears it');
+
+    // Without a token there is no reading, and the meters say so.
+    const bare = await setup((f) => solved(f), { usage: async () => undefined });
+    const bareServer = await startDashboard({ orchestrator: bare.orchestrator, port: 0, token, webRoot: tempDir('web'), terminals: new Terminals(undefined) });
+    cleanup.push(async () => void bareServer.close());
+    const barePort = (bareServer.address() as AddressInfo).port;
+    const bareState = async () => JSON.parse((await call(barePort, '/api/state', { host: `127.0.0.1:${barePort}`, authorization: `Bearer ${token}` })).body) as DashboardState;
+    await bareState();
+    await until(bare.orchestrator, () => bare.orchestrator.usageProblem !== undefined);
+    assert.equal((await bareState()).usageProblem, 'no token is stored');
   });
 
   it('serves only the token holder on localhost, and survives a malformed request', async () => {

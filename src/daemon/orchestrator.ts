@@ -112,6 +112,8 @@ export class Orchestrator {
   private readonly readUsage: () => Promise<SubscriptionUsage | undefined>;
   /** The last reading of the subscription's usage, for the dashboard; not state. */
   usage?: { at: string; usage: SubscriptionUsage };
+  /** Why the last reading failed, or that no token is stored, for the dashboard's meters. */
+  usageProblem?: string;
   /** When a reading last failed: the endpoint isn't asked again for five minutes. */
   private usageFailedAt?: number;
   /** The reading under way, which the loop and the dashboard share. */
@@ -801,6 +803,7 @@ export class Orchestrator {
     this.usageReading ??= this.readUsage()
       .then((usage) => {
         this.usageFailedAt = undefined;
+        this.usageFailed(usage ? undefined : 'no token is stored');
         if (usage) {
           this.usage = { at: new Date(this.now()).toISOString(), usage };
           this.events.emit('usage');
@@ -808,6 +811,8 @@ export class Orchestrator {
         return usage;
       }, (error: Error) => {
         this.usageFailedAt = this.now();
+        const refused = /answered (40[13])$/.exec(error.message);
+        this.usageFailed(refused ? `the usage endpoint refuses the stored token (${refused[1]})` : `the usage couldn't be read: ${error.message}`);
         this.log(`the subscription's usage could not be read: ${error.message}`);
         return undefined;
       })
@@ -815,6 +820,13 @@ export class Orchestrator {
         this.usageReading = undefined;
       });
     return this.usageReading;
+  }
+
+  /** Records why the usage can't be read, or that it can again; the pages hear of a change. */
+  private usageFailed(problem: string | undefined): void {
+    if (problem === this.usageProblem) return;
+    this.usageProblem = problem;
+    this.events.emit('usage');
   }
 
   /** For the dashboard's meters, in either mode: reads the usage again in the background once the last reading is five minutes old. */
