@@ -38,21 +38,22 @@ code { background: var(--h-soft); padding: 1px 5px; border-radius: 4px; }
 .fold .fold-label { min-width: 0; word-break: break-word; }
 .fold-body { padding: 2px 0 4px 22px; }
 
-/* The module's graph (v3 §6.7): tones set the color, the shapes take it from currentColor. */
-.graph-wrap { overflow-x: auto; margin: 12px 0; }
-.graph { display: block; font-size: 12px; }
-.graph .ok { color: var(--q-positive); }
-.graph .bad { color: var(--q-negative); }
-.graph .warn { color: var(--h-amber); }
-.graph .run { color: var(--q-primary); }
-.graph .muted { color: #9e9e9e; }
-.graph .plan-box > rect { fill: var(--h-soft); stroke: currentColor; stroke-width: 1; }
-.graph .plan-title { font-weight: 600; fill: var(--h-text); }
-.graph .plan-status { fill: currentColor; font-size: 11px; }
-.graph .node rect { fill: color-mix(in srgb, currentColor 16%, transparent); stroke: currentColor; stroke-width: 1; }
-.graph .node text { fill: var(--h-text); }
-.graph .edge { fill: none; stroke: var(--h-text); stroke-opacity: 0.45; stroke-width: 1.2; }
-.graph marker path { fill: var(--h-text); fill-opacity: 0.6; }
+/* A module's dependency trees (v3 §6.7): tones set the color, the boxes take it from currentColor. */
+.deps .ok { color: var(--q-positive); }
+.deps .bad { color: var(--q-negative); }
+.deps .warn { color: var(--h-amber); }
+.deps .run { color: var(--q-primary); }
+.deps .muted { color: #9e9e9e; }
+.deps .q-tree__node-header { padding: 2px 4px; }
+.deps-plan { border: 1px solid currentColor; background: var(--h-soft); border-radius: 8px; padding: 4px 10px; min-width: 220px; }
+.deps-plan-title { font-weight: 600; color: var(--h-text); }
+.deps-plan-status { font-size: 11px; }
+.deps-feature { display: inline-block; border: 1px solid currentColor; background: color-mix(in srgb, currentColor 16%, transparent); border-radius: 5px; padding: 2px 8px; font-size: 13px; }
+.deps-feature-label { color: var(--h-text); }
+.deps-also { font-size: 11px; color: var(--h-muted); margin-left: 8px; }
+
+/* The features' tables: their cells start at the top, as their content grows down. */
+.features td { vertical-align: top; }
 
 /* Terminals draw for a dark screen; transcripts follow the page. */
 .terminal { height: 70vh; background: #141413; border-radius: 6px; padding: 4px; }
