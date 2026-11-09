@@ -13,6 +13,15 @@ export type Go = (view: View, detail?: string) => void;
 
 const TABS: Array<[View, string]> = [['needs', 'Needs you'], ['project', 'Project'], ['agents', 'Agents'], ['sandboxes', 'Sandboxes'], ['events', 'Events']];
 
+/** Which dashboard opens: the choice stays in this browser, and the second dashboard writes it too. */
+export const DASHBOARD_CHOICE = 'harness-dashboard';
+
+/** To the second dashboard, in Vue and Quasar, on the same view; it opens from now on. */
+function toNext(): void {
+  localStorage.setItem(DASHBOARD_CHOICE, 'next');
+  location.href = `/next/${location.hash}`;
+}
+
 function route(hash: string): { view: View; detail?: string } {
   const [view, ...rest] = hash.replace(/^#/, '').split('/');
   const known = TABS.some(([v]) => v === view) ? (view as View) : 'needs';
@@ -94,6 +103,7 @@ export function App() {
         <span className="muted small">
           {!connected ? 'reconnecting…' : data.state.daemon ? `daemon ${data.state.daemon.version}, pid ${data.state.daemon.pid}` : 'daemon stopped'}
         </span>
+        <button type="button" onClick={toNext} title="The same views, in Vue and Quasar: switch back from there at any time">New dashboard</button>
         <nav>
           {TABS.map(([view, label]) => (
             <a key={view} href={`#${view}`} className={current.view === view ? 'active' : undefined}>
