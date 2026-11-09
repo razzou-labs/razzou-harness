@@ -79,6 +79,9 @@ tr.clickable { cursor: pointer; }
 .transcript { height: 62vh; overflow: auto; border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; background: var(--bg); display: grid; grid-auto-rows: max-content; gap: 4px; align-content: start; }
 .t-meta { color: var(--muted); font-size: 12px; }
 .t-input { color: var(--muted); white-space: pre-wrap; max-height: 200px; overflow: auto; }
+.t-prompt { white-space: normal; max-height: none; }
+.t-prompt summary { cursor: pointer; }
+.t-prompt :is(h1, h2, h3, h4) { font-size: 14px; margin: 10px 0 2px; }
 .t-text { border-left: 2px solid var(--run); padding-left: 8px; }
 .t-tool summary, .t-result summary { cursor: pointer; font-size: 13px; }
 .t-result summary { color: var(--muted); }

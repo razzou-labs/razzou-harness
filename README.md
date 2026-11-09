@@ -270,8 +270,11 @@ behind a token. Its views:
   deploys and `progress.txt`; and the budgets: your hours, the agents' hours, and the
   tokens Claude used, written and read, by role.
 - **Agents:** the Architect's terminal, the Manager's and the Developers' live
-  transcripts, a message box for the Manager, and a shell in any agent's sandbox. An
-  attempt's card keeps the network requests its sandbox's policy refused. To copy
+  transcripts, a message box for the Manager, and a shell in any agent's sandbox. The
+  Architect is Claude Code itself, in a terminal; the others run without a screen, so
+  the page draws their sessions. A Developer's transcript opens with its task, and a
+  reviewer's with its brief: click the first line for the whole text. An attempt's
+  card keeps the network requests its sandbox's policy refused. To copy
   from the Architect's terminal, select with the mouse: Claude Code copies the
   selection as you release the button, and `/copy` copies its last answer. Elsewhere,
   or with Shift held as you drag (Option on a Mac), the page selects, and Ctrl+C
@@ -455,7 +458,7 @@ through an `Arch:` pull request, or a commit of your own on `main`.
 
 ```json
 {
-  "harnessVersion": "0.4.11",
+  "harnessVersion": "0.4.12",
   "project": { "name": "shop", "repo": "<org>/shop", "bot": "<org>-harness[bot]" },
   "roles": {
     "architect": { "model": "claude-fable-5-1", "effort": "max" },
