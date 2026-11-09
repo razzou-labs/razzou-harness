@@ -3,6 +3,18 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## 0.4.17 (2026-11-09)
+
+**Upgrading from 0.4.16:** install the new version, rebuild the agents' image with
+`harness doctor --build-images` (its tag follows the harness's version), then restart the
+daemon with `harness down` and `harness up`, and reload the dashboard.
+
+- **A second dashboard, in Vue and Quasar.** The same views, from the same daemon, at
+  `/next/`, while you compare the two. **New dashboard** in the header opens it on the
+  view you were on, and **Classic dashboard** in its header goes back. The browser
+  remembers the choice: the URL `harness up` prints opens the dashboard you used last.
+  Both stay until you choose one.
+
 ## 0.4.16 (2026-11-09)
 
 **Upgrading from 0.4.15:** install the new version, rebuild the agents' image with
