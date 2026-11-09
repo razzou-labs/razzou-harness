@@ -4,8 +4,8 @@ import { join } from 'node:path';
 import { after, before, beforeEach, describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { computeLock, directoryReader } from '../src/ci/harness-ci.ts';
-import { claudeTokenFile, loadClaudeToken } from '../src/anthropic/usage.ts';
-import { claudeToken, granted, mainRuleset, repositorySecret, type Check } from '../src/setup/doctor.ts';
+import { claudeTokenFile, loadClaudeToken, saveClaudeToken } from '../src/anthropic/usage.ts';
+import { claudeToken, granted, mainRuleset, repositorySecret, secretReader, type Check } from '../src/setup/doctor.ts';
 import { init } from '../src/setup/init.ts';
 import { recover } from '../src/setup/recover.ts';
 import { awsProviderName, commitAndPush, fixFor, infracostKey, linkRepo, type SetupOptions } from '../src/setup/setup.ts';
@@ -326,13 +326,86 @@ describe('the usage token Swarm reads', () => {
     await claudeToken(options('', true, skipped), report, read);
     assert.equal(asked.length, 1);
     assert.deepEqual(reports.map((c) => c.status), ['skip', 'skip']);
-    assert.match(reports[0]!.detail, /`harness setup` asks for it$/);
+    assert.match(reports[0]!.detail, /^not stored: the daemon learns of a limit only when an attempt hits it; run `harness doctor` again to store it$/);
     mkdirSync(join(projectDir, '.harness'));
     writeFileSync(join(projectDir, '.harness', 'state.json'), JSON.stringify({ mode: 'swarm' }));
     await claudeToken(options('sk-ant-oat-token', false), report, read);
     assert.equal(reports.at(-1)!.status, 'warn');
     assert.equal(asked.length, 1, 'never asked for away from a terminal');
     assert.equal(loadClaudeToken(), undefined);
+  });
+
+  // The endpoint refuses a token cut short, as a paste from a terminal where it wraps can be.
+  const strict = async (token: string) => {
+    if (token !== 'sk-ant-oat01-whole') throw new Error('the usage endpoint answered 401');
+    return read();
+  };
+  const answering = (answers: string[], interactive = true) => ({
+    projectDir, interactive, skipped: new Set<string>(), askSecret: async (question: string) => (asked.push(question), answers.shift() ?? ''),
+  });
+
+  it("doesn't store a token the endpoint refuses: it asks again, says why, and gives up after three", async () => {
+    await claudeToken(answering(['sk-ant-oat01-who', 'sk-ant-oat01-whole']), report, strict);
+    assert.match(asked[1]!, /^The usage endpoint refused that token \(401\): it may have been cut short\. Copy all of it, from sk-ant-oat01- to its end/);
+    assert.equal(loadClaudeToken(), 'sk-ant-oat01-whole');
+    assert.equal(reports.at(-1)!.status, 'ok');
+
+    rmSync(claudeTokenFile());
+    asked.length = 0;
+    await claudeToken(answering(['a', 'b', 'c', 'never asked']), report, strict);
+    assert.equal(asked.length, 3);
+    assert.equal(loadClaudeToken(), undefined, 'none of the refused ones is kept');
+    assert.equal(reports.at(-1)!.status, 'skip');
+  });
+
+  it('checks the stored token on each run: refused, it is a warning in either mode, and replaced at a terminal', async () => {
+    saveClaudeToken('sk-ant-oat01-cut');
+    await claudeToken(answering([], false), report, strict);
+    assert.equal(reports.at(-1)!.status, 'warn');
+    assert.match(reports.at(-1)!.detail, /^the usage endpoint refuses the stored token \(401\)/);
+    assert.equal(asked.length, 0);
+
+    await claudeToken(answering(['sk-ant-oat01-whole']), report, strict);
+    assert.match(asked[0]!, /^The usage endpoint refuses the stored token \(401\)\. Paste a new one .*or press Enter to keep it/);
+    assert.equal(loadClaudeToken(), 'sk-ant-oat01-whole');
+    assert.match(reports.at(-1)!.detail, /^replaced; stored in /);
+  });
+
+  it("keeps a token the endpoint couldn't be asked about, and says so", async () => {
+    saveClaudeToken('sk-ant-oat01-kept');
+    await claudeToken(answering([]), report, async () => {
+      throw new Error('the usage endpoint answered 503');
+    });
+    assert.equal(reports.at(-1)!.status, 'ok');
+    assert.match(reports.at(-1)!.detail, /couldn't be reached to check it: the usage endpoint answered 503$/);
+    assert.equal(loadClaudeToken(), 'sk-ant-oat01-kept');
+    assert.equal(asked.length, 0);
+  });
+});
+
+describe('a hidden answer', () => {
+  const read = (...chunks: string[]) => {
+    const reader = secretReader();
+    for (const chunk of chunks) {
+      const answer = reader.feed(chunk);
+      if (answer !== undefined) return answer;
+    }
+    return undefined;
+  };
+  const token = 'sk-ant-oat01-' + 'x'.repeat(95);
+
+  it('ends with Enter, and Backspace takes back a character', () => {
+    assert.equal(read('sk-ant', 'x', '\u007f', '-oat01', '\r'), 'sk-ant-oat01');
+    assert.equal(read('abc'), undefined, 'no answer before Enter');
+  });
+
+  it("takes a token a program broke over two lines whole: a marked paste's line breaks and spaces don't end it", () => {
+    assert.equal(read(`\x1b[200~${token.slice(0, 79)}\n ${token.slice(79)}\n\x1b[201~`, '\r'), token);
+  });
+
+  it("does the same where the terminal doesn't mark pastes: a line break with more after it in the same read", () => {
+    assert.equal(read(`${token.slice(0, 79)}\r\n${token.slice(79)}\r`), token);
+    assert.equal(read(`${token}\n`), token, 'a one-line paste with its line break ends the answer');
   });
 });
 

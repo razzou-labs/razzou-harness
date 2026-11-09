@@ -350,8 +350,12 @@ starts an attempt, and at or above `swarm.usageCeilingPercent` the pipeline wait
 the window to reset. It reads it with the token `harness doctor` stores in
 `~/.config/harness/claude.token` when it creates the Claude provider; on an older
 setup, `harness setup` asks for the token again, in either mode, and so does
-`harness doctor` in a terminal. Without it, the daemon learns of a limit only when an
-attempt hits it, as in Manual.
+`harness doctor` in a terminal. The doctor checks a token against the usage endpoint
+before it keeps it, and the stored one on every run: a refused token, most often one cut
+short by a copy across the line break where `claude setup-token` wrapped it, is asked
+for again. A paste that spans two lines comes in whole. Without a token, the daemon
+learns of a limit only when an attempt hits it, as in Manual, and the dashboard's
+Subscription box says why it has no bars.
 
 **The reviewers.** Once CI passed on a plan's pull request, two reviewers read it, one
 after the other, each in a fresh read-only sandbox with the Manager's permissions: a
@@ -466,7 +470,7 @@ through an `Arch:` pull request, or a commit of your own on `main`.
 
 ```json
 {
-  "harnessVersion": "0.4.14",
+  "harnessVersion": "0.4.15",
   "project": { "name": "shop", "repo": "<org>/shop", "bot": "<org>-harness[bot]" },
   "roles": {
     "architect": { "model": "claude-fable-5-1", "effort": "max" },

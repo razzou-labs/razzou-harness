@@ -3,6 +3,26 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## 0.4.15 (2026-11-09)
+
+**Upgrading from 0.4.14:** install the new version, rebuild the agents' image with
+`harness doctor --build-images` (its tag follows the harness's version), then restart the
+daemon with `harness down` and `harness up`, and reload the dashboard. That doctor run
+checks the stored usage token, and asks for a new one if the endpoint refuses it.
+
+- **A token pasted over two lines comes in whole.** `claude setup-token` can print its
+  token over two lines, and the hidden prompt took only the first: the token was cut
+  short, and the usage endpoint refused it. Line breaks and spaces inside a paste no
+  longer end or change the answer.
+- **The doctor checks the usage token before it keeps it, and on every run.** A token
+  the endpoint refuses is asked for again, three times at most, instead of being stored
+  with a warning. A stored one it refuses is a warning in either mode, replaced at a
+  terminal. The Claude provider's token is checked the same way before the provider is
+  made.
+- **The Subscription box says why it has no bars.** When the daemon can't read your
+  usage, with no token stored or one the endpoint refuses, the box stays, with the
+  reason and `harness doctor` ready to copy.
+
 ## 0.4.14 (2026-11-09)
 
 **Upgrading from 0.4.13:** install the new version, rebuild the agents' image with

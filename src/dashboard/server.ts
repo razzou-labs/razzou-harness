@@ -37,8 +37,10 @@ export interface DashboardState {
   design: ReturnType<typeof designSummary>;
   /** The owner's time, planned and used, once they set their hours (v3 §4.1). */
   ownerTime?: OwnerTime;
-  /** The subscription's usage, as last read before a launch in Swarm (v3 §4.3). */
+  /** The subscription's usage, as last read: for the meters, and before a launch in Swarm (v3 §4.3). */
   usage?: { at: string; usage: SubscriptionUsage };
+  /** Why the last reading failed, or that no token is stored. */
+  usageProblem?: string;
   /** In Swarm, where its setup stands, for the note that lists what is left to do (v4 §6). */
   setup?: SetupStatus;
   progress: string[];
@@ -129,6 +131,7 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
             design: designSummary(orchestrator),
             ...(orchestrator.state.budgets.ownerHours !== undefined ? { ownerTime: await orchestrator.ownerTime() } : {}),
             ...(orchestrator.usage ? { usage: orchestrator.usage } : {}),
+            ...(orchestrator.usageProblem ? { usageProblem: orchestrator.usageProblem } : {}),
             ...(orchestrator.state.mode === 'swarm' ? { setup: await orchestrator.setupStatus() } : {}),
             progress: await progressTail(orchestrator),
             terminals: terminals.available,

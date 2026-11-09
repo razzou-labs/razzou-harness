@@ -137,7 +137,7 @@ async function machine(options: DoctorOptions, image: string, report: (c: Check)
 }
 
 /** The Claude subscription provider (§17.3, step 2): the profile, then the provider with the owner's token. */
-async function claude(options: DoctorOptions, provider: string, report: (c: Check) => void): Promise<void> {
+async function claude(options: DoctorOptions, provider: string, report: (c: Check) => void, read: typeof readUsage = readUsage): Promise<void> {
   const profiles = await run('openshell', ['profile', 'list']).catch(() => undefined);
   if (!/^claude-code-subscription\s/m.test(profiles?.stdout ?? '')) {
     const imported = await run('openshell', ['profile', 'import', '-f', join(options.packageDir, 'templates', 'openshell', 'claude-code-subscription.yaml'), '--global']);
@@ -145,55 +145,93 @@ async function claude(options: DoctorOptions, provider: string, report: (c: Chec
   }
   if (await providerExists(provider)) {
     report(ok('Claude provider', provider));
-    return claudeToken(options, report);
+    return claudeToken(options, report, read);
   }
   if (!options.interactive) {
     return report(fail('Claude provider', `${provider} is missing`, 'run `claude setup-token`, then `harness doctor` in a terminal: it asks for the token'));
   }
-  const token = await (options.askSecret ?? askSecret)(`Claude provider ${provider} is missing. Paste the token from \`claude setup-token\` (hidden): `);
-  if (!token) return report(fail('Claude provider', 'no token given', 'run `harness doctor` again'));
+  const asked = await askToken(options, `Claude provider ${provider} is missing. Paste the token from \`claude setup-token\` (hidden): `, read);
+  if (!asked) return report(fail('Claude provider', 'no token given, or the usage endpoint refused each one', 'run `claude setup-token`, then `harness doctor` again'));
   // The token reaches OpenShell through the environment of one command, never its arguments.
   const created = await run('openshell', ['provider', 'create', '--name', provider, '--type', 'claude-code-subscription', '--from-existing'], {
-    env: { ...process.env, CLAUDE_CODE_OAUTH_TOKEN: token },
+    env: { ...process.env, CLAUDE_CODE_OAUTH_TOKEN: asked.token },
   });
   report(created.code === 0 ? ok('Claude provider', `${provider} created`) : fail('Claude provider', firstLine(created.stderr), 'see `openshell provider create --help`'));
-  // The same token lets the daemon read the subscription's usage before a launch in Swarm (v3 §4.3).
-  if (created.code === 0) await storeClaudeToken(token, report);
+  // The same token lets the daemon read the subscription's usage (v3 §4.3).
+  if (created.code === 0) report(said(saveClaudeToken(asked.token), asked.check, 'stored in'));
 }
 
 /**
- * The stored token (v3 §4.3), which only Swarm's usage ceiling reads: the Claude provider's
- * creation stores it, and an older setup's provider came without it. At a terminal it is
- * asked for in either mode, so the project is ready for Swarm before the switch; skipped,
- * it is a warning in Swarm only.
+ * The stored token (v3 §4.3), with which the daemon reads the subscription's usage: for
+ * the dashboard's Subscription bars, and for Swarm's usage ceiling before a launch. The
+ * Claude provider's creation stores it; an older setup's provider came without it. Each
+ * run checks it against the usage endpoint: a token it refuses is asked for again at a
+ * terminal, in either mode. Missing, it is a warning in Swarm only; refused, in both.
  */
 export async function claudeToken(options: Pick<DoctorOptions, 'projectDir' | 'interactive' | 'skipped' | 'askSecret'>, report: (c: Check) => void, read: typeof readUsage = readUsage): Promise<void> {
-  if (loadClaudeToken()) return report(ok('Claude token', `stored in ${claudeTokenFile()}: the daemon reads the subscription's usage with it`));
   const swarm = projectMode(options.projectDir) === 'swarm';
-  const missing = (detail: string, fix: string): Check => (swarm
-    ? warn('Claude token', detail, fix)
-    : { status: 'skip', name: 'Claude token', detail: "not stored; Swarm reads the subscription's usage with it before a launch. `harness setup` asks for it" });
-  if (!options.interactive || options.skipped?.has('Claude token')) {
-    return report(missing("not stored: Swarm can't read the subscription's usage before a launch", 'run `harness doctor` in a terminal: it asks for the token from `claude setup-token`'));
+  const asking = options.interactive && !options.skipped?.has('Claude token');
+  const current = loadClaudeToken();
+  if (current) {
+    const check = await checkToken(current, read);
+    if (check.kind !== 'refused') return report(said(claudeTokenFile(), check, 'stored in'));
+    const refused = `the usage endpoint refuses the stored token (${check.status})`;
+    const fix = 'run `claude setup-token`, then `harness doctor` in a terminal: it asks for the new token';
+    if (!asking) return report(warn('Claude token', `${refused}: the dashboard's Subscription bars and Swarm's usage ceiling can't read the subscription's usage`, fix));
+    const asked = await askToken(options, `The usage endpoint refuses the stored token (${check.status}). Paste a new one from \`claude setup-token\` (hidden), or press Enter to keep it: `, read);
+    if (!asked) {
+      options.skipped?.add('Claude token');
+      return report(warn('Claude token', `${refused}: the dashboard's Subscription bars and Swarm's usage ceiling can't read the subscription's usage`, fix));
+    }
+    return report(said(saveClaudeToken(asked.token), asked.check, 'replaced; stored in'));
   }
-  const token = await (options.askSecret ?? askSecret)("Swarm reads the subscription's usage before a launch. Paste the token from `claude setup-token` (hidden), or press Enter to skip: ");
-  if (!token) {
+  const missing = (detail: string, fix: string): Check => (swarm ? warn('Claude token', detail, fix) : { status: 'skip', name: 'Claude token', detail: `${detail}; ${fix}` });
+  if (!asking) {
+    return report(missing("not stored: the dashboard's Subscription bars and Swarm's usage ceiling can't read the subscription's usage", 'run `harness doctor` in a terminal: it asks for the token from `claude setup-token`'));
+  }
+  const asked = await askToken(options, "The daemon reads the subscription's usage for the dashboard's Subscription bars and Swarm's usage ceiling. Paste the token from `claude setup-token` (hidden), or press Enter to skip: ", read);
+  if (!asked) {
     options.skipped?.add('Claude token');
     return report(missing('not stored: the daemon learns of a limit only when an attempt hits it', 'run `harness doctor` again to store it'));
   }
-  await storeClaudeToken(token, report, read);
+  report(said(saveClaudeToken(asked.token), asked.check, 'stored in'));
+}
+
+/** What the usage endpoint makes of a token: it reads with it, it refuses it, or it couldn't be asked. */
+type TokenCheck = { kind: 'accepted' } | { kind: 'refused'; status: string } | { kind: 'unchecked'; reason: string };
+
+async function checkToken(token: string, read: typeof readUsage): Promise<TokenCheck> {
+  try {
+    await read(token);
+    return { kind: 'accepted' };
+  } catch (error) {
+    const refused = /answered (40[13])$/.exec((error as Error).message);
+    return refused ? { kind: 'refused', status: refused[1]! } : { kind: 'unchecked', reason: (error as Error).message };
+  }
 }
 
 /**
- * Stores the token for the daemon, after one reading of the usage with it. A token the
- * endpoint refuses is stored all the same: only Swarm's usage ceiling needs the reading.
+ * A token from `claude setup-token`, checked before anything keeps it. A refused one, most
+ * often cut short when copied from a terminal where it wraps, is asked for again, three
+ * times in all; Enter gives up. One the endpoint couldn't check is taken as it is.
  */
-async function storeClaudeToken(token: string, report: (c: Check) => void, read: typeof readUsage = readUsage): Promise<void> {
-  const file = saveClaudeToken(token);
-  const refused = await read(token).then(() => undefined, (error: Error) => (/answered 40[13]$/.test(error.message) ? error.message : undefined));
-  report(refused
-    ? warn('Claude token', `stored in ${file}, but ${refused}: Swarm's usage ceiling can't read the subscription's usage with this token`, `Swarm then learns of a limit only when an attempt hits it. For another token, delete ${file} and run \`harness doctor\` again`)
-    : ok('Claude token', `stored in ${file}: the daemon reads the subscription's usage with it`));
+async function askToken(options: Pick<DoctorOptions, 'askSecret'>, question: string, read: typeof readUsage): Promise<{ token: string; check: TokenCheck } | undefined> {
+  let prompt = question;
+  for (let tries = 0; tries < 3; tries++) {
+    const token = (await (options.askSecret ?? askSecret)(prompt)).trim();
+    if (!token) return undefined;
+    const check = await checkToken(token, read);
+    if (check.kind !== 'refused') return { token, check };
+    prompt = `The usage endpoint refused that token (${check.status}): it may have been cut short. Copy all of it, from sk-ant-oat01- to its end, even across a line break, and paste it (hidden), or press Enter to skip: `;
+  }
+  return undefined;
+}
+
+/** What the doctor says of a token the endpoint didn't refuse, kept in `file`. */
+function said(file: string, check: TokenCheck, how: string): Check {
+  return check.kind === 'unchecked'
+    ? ok('Claude token', `${how} ${file}; the usage endpoint couldn't be reached to check it: ${check.reason}`)
+    : ok('Claude token', `${how} ${file}: the daemon reads the subscription's usage with it`);
 }
 
 /** What the App's installation grants of a permission, from checkApp's `Permissions:` line: only what the owner accepted on it. */
@@ -536,30 +574,75 @@ async function ask(question: string): Promise<string> {
   }
 }
 
-/** Reads a secret without echoing it. */
+/** Reads a secret without echoing it, typed or pasted: see `secretReader`. */
 export function askSecret(question: string): Promise<string> {
   process.stdout.write(question);
   const stdin = process.stdin;
   stdin.setRawMode(true);
   stdin.resume();
   stdin.setEncoding('utf8');
+  // Bracketed paste: the terminal marks what is pasted, so a token wrapped over two lines comes in whole.
+  process.stdout.write(PASTE_MODE_ON);
+  const reader = secretReader();
   return new Promise((resolve) => {
-    let value = '';
+    const done = () => {
+      stdin.off('data', onData);
+      process.stdout.write(PASTE_MODE_OFF);
+      stdin.setRawMode(false);
+      stdin.pause();
+      process.stdout.write('\n');
+    };
     const onData = (chunk: string) => {
-      for (const ch of chunk) {
-        if (ch === '\u0003') process.exit(130);
-        if (ch === '\r' || ch === '\n') {
-          stdin.off('data', onData);
-          stdin.setRawMode(false);
-          stdin.pause();
-          process.stdout.write('\n');
-          return resolve(value.trim());
-        }
-        value = ch === '\u007f' ? value.slice(0, -1) : value + ch;
+      if (chunk.includes('\u0003')) {
+        done();
+        process.exit(130);
+      }
+      const answer = reader.feed(chunk);
+      if (answer !== undefined) {
+        done();
+        resolve(answer);
       }
     };
     stdin.on('data', onData);
   });
+}
+
+const PASTE_MODE_ON = '\x1b[?2004h';
+const PASTE_MODE_OFF = '\x1b[?2004l';
+const PASTE_START = '\x1b[200~';
+const PASTE_END = '\x1b[201~';
+
+/**
+ * A hidden answer, from the keys as they arrive. A program that prints a long token may
+ * break it over two lines, and a copy then carries the line break: inside a paste, line
+ * breaks don't end the answer, and neither does one with more of the same read after it,
+ * for terminals that don't mark pastes. Only Enter does. Whitespace is dropped, since no
+ * token or key has any; Backspace takes back a character.
+ */
+export function secretReader(): { feed(chunk: string): string | undefined } {
+  let value = '';
+  let pasting = false;
+  return {
+    feed(chunk) {
+      let rest = chunk;
+      while (rest.length > 0) {
+        if (rest.startsWith(PASTE_START) || rest.startsWith(PASTE_END)) {
+          pasting = rest.startsWith(PASTE_START);
+          rest = rest.slice(PASTE_START.length);
+          continue;
+        }
+        const ch = rest[0]!;
+        rest = rest.slice(1);
+        if (ch === '\r' || ch === '\n') {
+          if (pasting || /[^\r\n]/.test(rest)) continue;
+          return value;
+        }
+        if (ch === '\u007f') value = value.slice(0, -1);
+        else if (!/\s/.test(ch)) value += ch;
+      }
+      return undefined;
+    },
+  };
 }
 
 const ok = (name: string, detail: string): Check => ({ status: 'ok', name, detail });
