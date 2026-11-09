@@ -3,6 +3,25 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## 0.4.13 (2026-11-09)
+
+**Upgrading from 0.4.12:** install the new version, rebuild the agents' image with
+`harness doctor --build-images` (its tag follows the harness's version), then restart the
+daemon with `harness down` and `harness up`, and reload the dashboard.
+
+- **The dashboard's switch does what `harness mode` does.** It switched only the
+  daemon, and you had to run `harness github-setup` afterwards. Now both apply `main`'s
+  rules with your own `gh`, which the daemon runs on your machine; the App still has no
+  administration permission. If `gh` can't, the switch still happens and says why.
+- **Switching to Swarm no longer shows a setup step it is about to take.** The rules
+  now change before the daemon enters Swarm, and after it leaves it. While Swarm's
+  setup has steps left, the daemon checks it every 30 seconds, not every five minutes,
+  so the note goes soon after you take the last one.
+- **The reviewers can read the Terraform plan.** It was outside the folder their tools
+  may read, so they judged an infrastructure change from its `.tf` files alone. It now
+  goes in their copy of the repository, under `.harness/`. Their prompts also give the
+  summary's limit, 2000 characters, which a longer report had to be rewritten for.
+
 ## 0.4.12 (2026-11-09)
 
 **Upgrading from 0.4.11:** install the new version, rebuild the agents' image with
