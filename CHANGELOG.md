@@ -3,6 +3,21 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## 0.4.11 (2026-11-09)
+
+**Upgrading from 0.4.10:** install the new version, rebuild the agents' image with
+`harness doctor --build-images` (its tag follows the harness's version), then restart the
+daemon with `harness down` and `harness up`, and reload the dashboard.
+
+- **Copying from the Architect's terminal works.** A drag there selects text the way
+  Claude Code does it, and Claude Code copies the selection as you release the button,
+  with OSC 52: an escape sequence that asks the terminal to set the clipboard. `/copy`
+  works the same way. The dashboard ignored it, and Ctrl+C then reached Claude Code,
+  since the page had nothing selected. The Architect's terminal now writes what Claude
+  Code copies to your clipboard, within five seconds of a key or click of yours there,
+  and never answers a program asking what the clipboard holds. A sandbox's shell still
+  can't set it.
+
 ## 0.4.10 (2026-11-09)
 
 **Upgrading from 0.4.9:** install the new version, rebuild the agents' image with
