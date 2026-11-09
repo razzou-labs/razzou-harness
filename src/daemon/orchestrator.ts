@@ -211,12 +211,14 @@ export class Orchestrator {
 
   /**
    * Where the Swarm setup stands (v4 §6): main's rules against the mode, read through
-   * the App's metadata permission at most every five minutes, whether the App may write
-   * statuses, and whether the usage probe's token is stored.
+   * the App's metadata permission, whether the App may write statuses, and whether the
+   * usage probe's token is stored. A list with steps left is read again after 30 seconds,
+   * so that a step the owner took drops soon; a finished one after five minutes.
    */
   async setupStatus(): Promise<SetupStatus> {
     const mode = this.state.mode;
-    if (this.setup && this.setup.mode === mode && this.now() - this.setup.at < 5 * 60_000) return this.setup.status;
+    const fresh = this.setup && this.now() - this.setup.at < (setupFinished(this.setup.status) ? 5 * 60_000 : 30_000);
+    if (this.setup && this.setup.mode === mode && fresh) return this.setup.status;
     const config = this.design.config;
     let rules: SetupStatus['rules'];
     if (config.project.repo) {
@@ -2015,6 +2017,11 @@ function minutesOf(action: { estimatedMinutes?: number | undefined }): { minutes
 function ensureDir(dir: string): string {
   mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+/** Whether Swarm's setup has no step left, as the dashboard's note counts them. */
+function setupFinished(status: SetupStatus): boolean {
+  return status.rules?.ok !== false && status.statusesWritable !== false && status.tokenStored;
 }
 
 function outcomeReason(attempt: Attempt): string {

@@ -308,12 +308,13 @@ exists today.
 and `harness mode manual`. A switch takes effect at item boundaries: what runs
 finishes under the rules it started with. GitHub's rules on `main` differ per mode, and
 only you can change them: `harness mode` applies the mode's ruleset in the same
-command, with your own `gh`; after a switch from the dashboard, run
-`harness github-setup --repo <org>/<repo>` once. Until the rules match nothing merges.
-The daemon reads the rules in effect on `main` through the App and the dashboard's
-note lists what is still to do, the commands ready to copy: the rules, the App's
-"Commit statuses: write", and the token for the usage probe. The note goes once all
-three are done; `harness doctor` checks the same. `harness setup` prepares the last two
+command, with your own `gh`, before the daemon enters Swarm and after it leaves it; after
+a switch from the dashboard, run `harness github-setup --repo <org>/<repo>` once. Until
+the rules match nothing merges. The daemon reads the rules in effect on `main` through
+the App and the dashboard's note lists what is still to do, the commands ready to copy:
+the rules, the App's "Commit statuses: write", and the token for the usage probe. While
+a step is left, the daemon checks again every 30 seconds, so the note goes soon after
+the last one; `harness doctor` checks the same. `harness setup` prepares the last two
 in either mode, so a switch to Swarm needs only its rules.
 
 **What merges itself.** In Swarm the daemon merges a plan's pull request, as the App,

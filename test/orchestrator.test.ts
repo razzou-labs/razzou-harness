@@ -1368,9 +1368,10 @@ describe('dashboard', () => {
     assert.equal(reads, 1);
   });
 
-  it('in Swarm, says which setup steps are left, and drops the note once none is', async () => {
+  it('in Swarm, says which setup steps are left, reads them again every 30 seconds until none is, then every five minutes', async () => {
     let skew = 0;
-    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true, now: () => Date.now() + skew });
+    let stored = false;
+    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true, now: () => Date.now() + skew, tokenStored: () => stored });
     const server = await startDashboard({ orchestrator: o, port: 0, token, webRoot: tempDir('web'), terminals: new Terminals(undefined) });
     cleanup.push(async () => void server.close());
     const port = (server.address() as AddressInfo).port;
@@ -1385,13 +1386,25 @@ describe('dashboard', () => {
     assert.equal(manual.tokenStored, false);
     assert.equal(manual.statusesWritable, undefined);
 
-    // The rules are read again after five minutes: now they are Swarm's, the App can't write statuses, and the token is stored.
+    // With steps left, it is read again after 30 seconds: now the rules are Swarm's, and the App can't write statuses.
     fake.rules = { approvals: 0, codeOwners: false, checks: [...fake.rules!.checks, { context: 'harness/security', integrationId: 4242 }, { context: 'harness/cost', integrationId: 4242 }] };
     fake.writable = false;
-    skew += 6 * 60_000;
+    skew += 31_000;
     const swarm = (await read())!;
     assert.deepEqual(swarm.rules, { ok: true, problems: [] });
     assert.equal(swarm.statusesWritable, false);
+
+    // With none left, it is kept for five minutes.
+    fake.writable = true;
+    stored = true;
+    skew += 31_000;
+    const done = (await read())!;
+    assert.deepEqual([done.rules!.ok, done.statusesWritable, done.tokenStored], [true, true, true]);
+    fake.rules = { ...fake.rules, approvals: 1 };
+    skew += 60_000;
+    assert.equal((await read())!.rules!.ok, true, 'a finished list is kept');
+    skew += 5 * 60_000;
+    assert.equal((await read())!.rules!.ok, false, 'then read again');
   });
 
   it('serves only the token holder on localhost, and survives a malformed request', async () => {

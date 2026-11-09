@@ -105,16 +105,21 @@ async function main(): Promise<void> {
       }
       if (argument !== 'manual' && argument !== 'swarm') throw new Error('usage: harness mode [manual|swarm]');
       const running = runningDaemon(harnessDir) !== undefined;
-      if (running && (await ownerAction(harnessDir, '/api/mode', { mode: argument }, `already ${argument}`)).error) return;
-      // GitHub's rules on main differ per mode, and only the owner's gh may change them (v3 §2.1): done here, in the same command.
+      // GitHub's rules on main differ per mode, and only the owner's gh may change them (v3 §2.1): done here, in the
+      // same command, so that the daemon never runs a mode against the other's rules. Swarm's rules come before the
+      // daemon enters Swarm, and the daemon leaves Swarm, which stops its merges, before Manual's come back.
       const repo = projectConfig(projectDir)?.project.repo;
-      if (repo) {
+      const rules = async () => {
+        if (!repo) return;
         try {
           await applyRules(projectDir, harnessDir, repo, argument);
         } catch (error) {
           console.log(`GitHub's rules on main were not changed: ${(error as Error).message}\nRun \`harness github-setup --repo ${repo}\` with gh logged in as an admin of the repository.`);
         }
-      }
+      };
+      if (argument === 'swarm') await rules();
+      if (running && (await ownerAction(harnessDir, '/api/mode', { mode: argument }, `already ${argument}`)).error) return;
+      if (argument === 'manual') await rules();
       if (!running) {
         // The daemon is down: the switch waits for it in .harness/setup.json (v4 §5).
         recordForDaemon(harnessDir, { mode: argument });

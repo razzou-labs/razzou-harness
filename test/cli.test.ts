@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert';
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
@@ -111,6 +111,42 @@ describe('the CLI', () => {
     } finally {
       server.close();
     }
+  });
+
+  it("applies Swarm's rules before the daemon enters Swarm, and Manual's once it has left", async () => {
+    const order: string[] = [];
+    const server = createServer((req, res) => {
+      let body = '';
+      req.on('data', (chunk: Buffer) => (body += String(chunk))).on('end', () => {
+        appendFileSync(log, `daemon ${req.url} ${body}\n`);
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ done: true }));
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const dir = daemonJson({ pid: process.pid, processStart: processStart(process.pid)!, port: (server.address() as AddressInfo).port });
+    const log = join(dir, 'order.log');
+    mkdirSync(join(dir, 'harness'));
+    writeFileSync(join(dir, 'harness', 'config.json'), JSON.stringify({ harnessVersion: '0.1.0', project: { name: 'shop', repo: 'acme/shop', bot: 'acme-harness[bot]' } }));
+    // A gh that says what it was asked, and fails: the CLI says the rules weren't changed, and goes on.
+    const bin = tempDir('bin');
+    writeFileSync(join(bin, 'gh'), `#!/bin/sh\necho "gh $1" >> '${log}'\nexit 1\n`, { mode: 0o755 });
+    const mode = (to: string) => run(process.execPath, [CLI, 'mode', to, '--dir', dir], { env: { ...env, PATH: `${bin}:${process.env.PATH}` } });
+    try {
+      for (const to of ['swarm', 'manual']) {
+        writeFileSync(log, '');
+        const result = await mode(to);
+        assert.equal(result.code, 0, result.stderr);
+        assert.match(result.stdout, /GitHub's rules on main were not changed/);
+        const lines = readFileSync(log, 'utf8').trim().split('\n');
+        order.push(`${to}: ${lines[0]} … ${lines.at(-1)}`);
+      }
+    } finally {
+      server.close();
+    }
+    assert.deepEqual(order, [
+      'swarm: gh api … daemon /api/mode {"mode":"swarm"}',
+      'manual: daemon /api/mode {"mode":"manual"} … gh api',
+    ]);
   });
 
   it('records the hours and the mode for the daemon while it is down (v4 §5)', async () => {
