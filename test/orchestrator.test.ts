@@ -1441,6 +1441,42 @@ describe('dashboard', () => {
     assert.equal((await call(port, '/api/transcript?agent=developer:../../etc/a1', bearer)).status, 404);
   });
 
+  it("opens a Developer's transcript with its task, which Claude Code's stream doesn't repeat, live too", async () => {
+    const { o, port, bearer } = await dashboard();
+    await until(o, completed(o), 60_000);
+    const agent = 'developer:demo/P1/F01/a1';
+    const items = JSON.parse((await call(port, `/api/transcript?agent=${encodeURIComponent(agent)}`, bearer)).body) as Array<{ type: string; text?: string }>;
+    assert.equal(items[0]!.type, 'prompt');
+    assert.match(items[0]!.text ?? '', /^# Feature demo\/P1\/F01: /);
+
+    // A page watching a session from its first line gets the task before it.
+    const web = tempDir('web');
+    writeFileSync(join(web, 'index.html'), '');
+    const fresh = await startDashboard({ orchestrator: o, port: 0, token, webRoot: web, terminals: new Terminals(undefined) });
+    cleanup.push(async () => void fresh.close());
+    const freshPort = (fresh.address() as AddressInfo).port;
+    const live: Array<{ agent: string; item: { type: string } }> = [];
+    const watching = request({ host: '127.0.0.1', port: freshPort, path: '/api/events', headers: { host: `127.0.0.1:${freshPort}`, authorization: `Bearer ${token}` } }, (res) => {
+      let buffer = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk: string) => {
+        buffer += chunk;
+        for (let end = buffer.indexOf('\n\n'); end >= 0; end = buffer.indexOf('\n\n')) {
+          const block = buffer.slice(0, end);
+          buffer = buffer.slice(end + 2);
+          if (block.startsWith('event: transcript\n')) live.push(JSON.parse(block.slice(block.indexOf('data: ') + 6)));
+        }
+      });
+    });
+    watching.end();
+    cleanup.push(async () => void watching.destroy());
+    await sleep(200);
+    o.events.emit('transcript', { agent, line: JSON.stringify({ type: 'system', subtype: 'init', model: 'm' }) });
+    o.events.emit('transcript', { agent, line: JSON.stringify({ type: 'assistant', message: { content: [] } }) });
+    await until(o, () => live.length >= 3, 5_000);
+    assert.deepEqual(live.map((event) => [event.agent, event.item.type]), [[agent, 'prompt'], [agent, 'system'], [agent, 'assistant']]);
+  });
+
   it('opens terminals over a WebSocket only for the token holder, from the dashboard', async () => {
     const { port, host } = await dashboard(new Terminals(() => fakePty().pty));
     const open = (headers: Record<string, string>, query: string) =>

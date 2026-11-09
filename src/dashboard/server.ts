@@ -78,8 +78,7 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
   };
   orchestrator.events.on('event', (event: HarnessEvent) => broadcast('event', event));
   orchestrator.events.on('transcript', ({ agent, line }: { agent: string; line: string }) => {
-    const item = transcripts.add(agent, line);
-    if (item) broadcast('transcript', { agent, item });
+    for (const item of transcripts.add(agent, line)) broadcast('transcript', { agent, item });
   });
   orchestrator.events.on('architect-inbox', ({ sandbox }: { module: string; sandbox: string }) => {
     // At the terminal, the owner's own next prompt delivers it; typing there would mix with theirs.
@@ -308,7 +307,9 @@ function matches(given: string | null | undefined, secret: string): boolean {
 
 /**
  * The agents' stream-json, for the live transcripts (§14.3). Recent lines stay in memory;
- * an attempt that ended, or a Manager's earlier session, is read back from its file.
+ * an attempt that ended, or a Manager's earlier session, is read back from its file. A
+ * Developer's and a reviewer's transcripts open with the prompt they read on stdin, which
+ * their stream-json doesn't repeat; the Manager's messages come back in its own.
  */
 class Transcripts {
   private readonly live = new Map<string, unknown[]>();
@@ -318,9 +319,11 @@ class Transcripts {
     this.orchestrator = orchestrator;
   }
 
-  add(agent: string, line: string): unknown {
+  /** Keeps one line of an agent's stream. Returns what the open pages get: the agent's prompt before its first line. */
+  add(agent: string, line: string): unknown[] {
     const item = parseLine(line);
-    if (item === undefined) return undefined;
+    if (item === undefined) return [];
+    const first = !this.live.has(agent);
     const items = this.live.get(agent) ?? [];
     items.push(item);
     if (items.length > 1000) items.shift();
@@ -328,36 +331,64 @@ class Transcripts {
     this.live.set(agent, items);
     // The oldest agents go first: only recent ones are watched live.
     if (this.live.size > 20) this.live.delete(this.live.keys().next().value!);
-    return item;
+    const prompt = first ? this.prompt(agent) : undefined;
+    return prompt === undefined ? [item] : [prompt, item];
   }
 
   get(agent: string): unknown[] | undefined {
-    const live = this.live.get(agent);
-    if (live) return live;
+    const items = this.live.get(agent) ?? this.saved(agent);
+    if (!items) return undefined;
+    const prompt = this.prompt(agent);
+    return prompt === undefined ? items : [prompt, ...items];
+  }
+
+  private saved(agent: string): unknown[] | undefined {
     const file = this.file(agent);
     if (!file || !existsSync(file)) return undefined;
     return readFileSync(file, 'utf8').split('\n').map(parseLine).filter((item) => item !== undefined).slice(-1000);
   }
 
+  /** What a Developer or a reviewer read on stdin: its task, or its brief. */
+  private prompt(agent: string): unknown {
+    const attempt = this.attemptDir(agent);
+    const review = attempt ? undefined : this.reviewDir(agent);
+    const file = attempt ? join(attempt, 'task.md') : review ? join(review, 'brief.md') : undefined;
+    if (!file || !existsSync(file)) return undefined;
+    return clip({ type: 'prompt', text: readFileSync(file, 'utf8') }, 0);
+  }
+
   /** Only files the state names: the attempt of a known feature, or a module's Manager. */
   private file(agent: string): string | undefined {
-    const harnessDir = this.orchestrator.options.harnessDir;
-    const state = this.orchestrator.state;
-    const developer = /^developer:([^/]+)\/([^/]+)\/([^/]+)\/a(\d+)$/.exec(agent);
-    if (developer) {
-      const [, module, plan, feature, n] = developer;
-      const attempt = state.features[`${module}/${plan}/${feature}`]?.attempts.find((a) => a.n === Number(n));
-      return attempt ? join(harnessDir, 'modules', module!, 'attempts', `${plan}-${feature}-a${n}`, 'stream.jsonl') : undefined;
-    }
+    const attempt = this.attemptDir(agent);
+    if (attempt) return join(attempt, 'stream.jsonl');
     // A module's Manager, or a plan's (v3 §6.4): each keeps its transcripts in its own folder.
     const manager = /^manager:([^/]+)(?:\/([^/]+))?$/.exec(agent);
     if (!manager) return undefined;
     const [, module, plan] = manager;
-    const session = state.managers[plan ? `${module}/${plan}` : module!]?.sessionId;
+    const session = this.orchestrator.state.managers[plan ? `${module}/${plan}` : module!]?.sessionId;
     if (!session) return undefined;
+    const harnessDir = this.orchestrator.options.harnessDir;
     return plan
       ? join(harnessDir, 'modules', module!, 'plans', plan, 'manager', `transcript-${session}.jsonl`)
       : join(harnessDir, 'modules', module!, 'manager', `transcript-${session}.jsonl`);
+  }
+
+  /** The folder of an attempt the state knows, for "developer:<module>/<plan>/<feature>/a<n>". */
+  private attemptDir(agent: string): string | undefined {
+    const developer = /^developer:([^/]+)\/([^/]+)\/([^/]+)\/a(\d+)$/.exec(agent);
+    if (!developer) return undefined;
+    const [, module, plan, feature, n] = developer;
+    const attempt = this.orchestrator.state.features[`${module}/${plan}/${feature}`]?.attempts.find((a) => a.n === Number(n));
+    return attempt ? join(this.orchestrator.options.harnessDir, 'modules', module!, 'attempts', `${plan}-${feature}-a${n}`) : undefined;
+  }
+
+  /** The folder of a review the state knows, for "<role>:<first 8 characters of the head>". */
+  private reviewDir(agent: string): string | undefined {
+    for (const plan of Object.values(this.orchestrator.state.plans)) {
+      const review = plan.reviews?.find((r) => `${r.role}:${r.head.slice(0, 8)}` === agent);
+      if (review) return join(this.orchestrator.options.harnessDir, 'modules', plan.module, 'reviews', `${plan.plan}-${review.role}-${review.head.slice(0, 8)}`);
+    }
+    return undefined;
   }
 }
 

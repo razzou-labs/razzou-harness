@@ -6,9 +6,9 @@ import { Markdown } from './Markdown.tsx';
 type Part = { type?: string; text?: string; name?: string; input?: Record<string, unknown>; content?: unknown; is_error?: boolean };
 
 /**
- * An agent's session as it happens (§14.3): its messages, tool calls with their
- * arguments and results, and usage. `agent` is "manager:<module>" or
- * "developer:<module>/<plan>/<feature>/a<n>".
+ * An agent's session as it happens (§14.3): what it was asked, its messages, tool calls
+ * with their arguments and results, and usage. `agent` is "manager:<module>",
+ * "developer:<module>/<plan>/<feature>/a<n>", or a reviewer's "<role>:<head>".
  */
 export function Transcript({ agent }: { agent: string }) {
   const [items, setItems] = useState<TranscriptItem[]>([]);
@@ -47,6 +47,17 @@ export function Transcript({ agent }: { agent: string }) {
 function Item({ item }: { item: TranscriptItem }) {
   const message = item.message as { content?: string | Part[] } | undefined;
   switch (item.type) {
+    case 'prompt': {
+      // What a Developer or a reviewer was asked, which the daemon adds: its stream doesn't repeat it.
+      const text = String(item.text ?? '');
+      const title = text.split('\n').find((line) => line.trim())?.replace(/^#+\s*/, '') ?? 'its prompt';
+      return (
+        <details className="t-input t-prompt">
+          <summary>→ {title}</summary>
+          <Markdown text={text} />
+        </details>
+      );
+    }
     case 'system':
       if (item.subtype === 'init') return <div className="t-meta">session started · {String(item.model ?? '')}</div>;
       if (item.subtype === 'api_retry') {
