@@ -1,4 +1,4 @@
-import type { HarnessEvent } from './api.ts';
+import type { HarnessEvent } from '../../src/state/events.ts';
 
 export function refText(ref?: { module: string; plan?: string; feature?: string; attempt?: number }): string {
   if (!ref) return '';

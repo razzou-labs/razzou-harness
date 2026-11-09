@@ -1,15 +1,17 @@
-import { useEffect, useState, type ReactNode } from 'react';
+import { QBtn, QCard, QCardSection, QInput } from 'quasar';
+import { defineComponent, onMounted, ref, watch, type PropType, type VNodeChild } from 'vue';
 import { getText, post, type DashboardState, type FeatureState } from '../api.ts';
-import { Markdown } from '../components/Markdown.tsx';
-import { Action, GithubLink, Reply } from '../components/ui.tsx';
 import { clock } from '../format.ts';
+import { Action, GithubLink, Loading, Markdown, Reply, text } from '../ui.tsx';
 import type { Go } from '../App.tsx';
 
 interface Need {
   key: string;
   title: string;
-  body: ReactNode;
+  body: () => VNodeChild;
 }
+
+const key = (f: FeatureState) => `${f.module}/${f.plan}/${f.feature}`;
 
 /** Everything waiting for the owner, most urgent first (§14.1). */
 export function collectNeeds({ state, design }: DashboardState, go: Go): Need[] {
@@ -19,10 +21,10 @@ export function collectNeeds({ state, design }: DashboardState, go: Go): Need[] 
     needs.push({
       key: 'paused',
       title: 'The pipeline is paused',
-      body: (
+      body: () => (
         <>
           <p>{paused.reason}{paused.until ? ` (until ${clock(paused.until)})` : ''}</p>
-          <Action label="Resume" onClick={() => post('/api/resume')} />
+          <Action label="Resume" run={() => post('/api/resume')} />
         </>
       ),
     });
@@ -31,11 +33,11 @@ export function collectNeeds({ state, design }: DashboardState, go: Go): Need[] 
     needs.push({
       key: `request:${request.requestId}`,
       title: `The Manager of ${request.module} asks you`,
-      body: (
+      body: () => (
         <>
           <Markdown text={request.question} />
-          {request.blocking && <p className="muted small">No new attempt starts until you answer.</p>}
-          <Reply label="Answer" placeholder="Your answer" onSend={(text) => post('/api/answer', { id: request.requestId, text })} />
+          {request.blocking && <p class="text-caption text-muted">No new attempt starts until you answer.</p>}
+          <Reply label="Answer" placeholder="Your answer" send={(answer) => post('/api/answer', { id: request.requestId, text: answer })} />
         </>
       ),
     });
@@ -46,31 +48,32 @@ export function collectNeeds({ state, design }: DashboardState, go: Go): Need[] 
       needs.push({
         key: `proposal:${module.module}`,
         title: `The Architect of ${module.module} proposes v${latest.version}`,
-        body: (
+        body: () => (
           <>
             <Proposal module={module.module} version={latest.version} />
-            <div className="row">
-              <Action label={`Accept v${latest.version}`} onClick={() => post('/api/accept', { module: module.module, version: latest.version })} />
-              <button onClick={() => go('agents', `architect:${module.module}`)}>Ask for changes in its terminal</button>
+            <div class="row items-center q-gutter-sm q-mt-sm">
+              <Action label={`Accept v${latest.version}`} run={() => post('/api/accept', { module: module.module, version: latest.version })} />
+              <QBtn flat dense noCaps color="primary" label="Ask for changes in its terminal" onClick={() => go('agents', `architect:${module.module}`)} />
             </div>
           </>
         ),
       });
     }
     if (module.status === 'in_review' && module.design?.pr) {
+      const pr = module.design.pr;
       needs.push({
         key: `design:${module.module}`,
         title: module.frozenCommit ? `A change to the design of ${module.module} is ready for review` : `The design of ${module.module} is ready for review`,
-        body: (
+        body: () => (
           <>
-            {module.frozenCommit && <p>{module.design.summary}</p>}
+            {module.frozenCommit && <p>{module.design?.summary}</p>}
             <p>
-              Review and merge <GithubLink url={module.design.pr.url}>Arch PR #{module.design.pr.number}</GithubLink> on GitHub, with a merge commit.
+              Review and merge <GithubLink url={pr.url}>Arch PR #{pr.number}</GithubLink> on GitHub, with a merge commit.
               Comments go to the Architect, in its terminal.
               {module.frozenCommit && ' No new attempt starts in this module until you merge or close it.'}
             </p>
-            {module.design.suspect.length > 0 && (
-              <p className="warn small">These checks already pass before anything is built, so they may test nothing: {module.design.suspect.join(', ')}</p>
+            {(module.design?.suspect.length ?? 0) > 0 && (
+              <p class="text-caption text-warning">These checks already pass before anything is built, so they may test nothing: {module.design?.suspect.join(', ')}</p>
             )}
           </>
         ),
@@ -80,26 +83,28 @@ export function collectNeeds({ state, design }: DashboardState, go: Go): Need[] 
       needs.push({
         key: `escalation:${escalation.id}`,
         title: `The Manager asks the Architect of ${module.module}${escalation.feature ? ` about ${escalation.feature}` : ''}`,
-        body: (
+        body: () => (
           <>
             <Markdown text={escalation.question} />
-            <p className="muted small">The Architect decides. You can weigh in at its terminal.</p>
-            <button onClick={() => go('agents', `architect:${module.module}`)}>Open its terminal</button>
+            <p class="text-caption text-muted">The Architect decides. You can weigh in at its terminal.</p>
+            <QBtn outline dense noCaps color="primary" padding="2px 10px" label="Open its terminal" onClick={() => go('agents', `architect:${module.module}`)} />
           </>
         ),
       });
     }
   }
   for (const plan of Object.values(state.plans).filter((p) => p.pr && (p.status === 'ready_to_merge' || p.status === 'pr_open'))) {
+    const pr = plan.pr!;
     // In Swarm, the merge policy may leave a PR to the owner, with its reason (v3 §3.2).
     if (plan.leftToOwner) {
+      const reason = plan.leftToOwner.reason;
       needs.push({
         key: `left:${plan.module}/${plan.plan}`,
-        title: `PR #${plan.pr!.number} of ${plan.module}/${plan.plan} waits for you`,
-        body: (
+        title: `PR #${pr.number} of ${plan.module}/${plan.plan} waits for you`,
+        body: () => (
           <>
-            <p>{plan.leftToOwner.reason}</p>
-            <p>Review and merge <GithubLink url={plan.pr!.url}>PR #{plan.pr!.number}</GithubLink> on GitHub, with a merge commit.</p>
+            <p>{reason}</p>
+            <p>Review and merge <GithubLink url={pr.url}>PR #{pr.number}</GithubLink> on GitHub, with a merge commit.</p>
           </>
         ),
       });
@@ -107,12 +112,12 @@ export function collectNeeds({ state, design }: DashboardState, go: Go): Need[] 
       needs.push({
         key: `merge:${plan.module}/${plan.plan}`,
         title: `${plan.module}/${plan.plan} passed CI`,
-        body: <p>Review and merge <GithubLink url={plan.pr!.url}>PR #{plan.pr!.number}</GithubLink> on GitHub, with a merge commit.</p>,
+        body: () => <p>Review and merge <GithubLink url={pr.url}>PR #{pr.number}</GithubLink> on GitHub, with a merge commit.</p>,
       });
     }
   }
   for (const feature of Object.values(state.features).filter((f) => f.status === 'escalated')) {
-    needs.push({ key: `escalated:${key(feature)}`, title: `${key(feature)} is escalated`, body: <Escalated feature={feature} /> });
+    needs.push({ key: `escalated:${key(feature)}`, title: `${key(feature)} is escalated`, body: () => <Escalated feature={feature} /> });
   }
   for (const module of design.modules) {
     for (const action of module.actions) {
@@ -121,17 +126,17 @@ export function collectNeeds({ state, design }: DashboardState, go: Go): Need[] 
       needs.push({
         key: `action:${module.id}/${action.id}`,
         title: `${action.kind === 'gate' ? 'Gate' : 'Task'} ${module.id}/${action.id}: ${action.title}`,
-        body: (
+        body: () => (
           <>
-            {action.blocks.length > 0 && <p className="muted small">Holds back {action.blocks.join(', ')} until it's done.</p>}
+            {action.blocks.length > 0 && <p class="text-caption text-muted">Holds back {action.blocks.join(', ')} until it's done.</p>}
             <Markdown text={action.instructions} />
-            {status?.status === 'verifying' && <p className="run small">Its check is running.</p>}
-            {status?.status === 'refused' && <p className="bad small">Its check failed: {status.reason}</p>}
+            {status?.status === 'verifying' && <p class="text-caption text-primary">Its check is running.</p>}
+            {status?.status === 'refused' && <p class="text-caption text-negative">Its check failed: {status.reason}</p>}
             <Reply
               label={action.verify ? 'Done: run its check' : 'Mark done'}
               placeholder="A note (optional)"
               optional
-              onSend={(note) => post('/api/actions/done', { module: module.id, action: action.id, ...(note ? { note } : {}) })}
+              send={(note) => post('/api/actions/done', { module: module.id, action: action.id, ...(note ? { note } : {}) })}
             />
           </>
         ),
@@ -141,51 +146,72 @@ export function collectNeeds({ state, design }: DashboardState, go: Go): Need[] 
   return needs;
 }
 
-export function NeedsYou({ data, go }: { data: DashboardState; go: Go }) {
-  const needs = collectNeeds(data, go);
-  if (needs.length === 0) return <p className="muted">Nothing needs you.</p>;
-  return (
-    <div className="stack">
-      {needs.map((need) => (
-        <section key={need.key} className="need">
-          <h3>{need.title}</h3>
-          {need.body}
-        </section>
-      ))}
-    </div>
-  );
-}
+export const NeedsYou = defineComponent({
+  props: {
+    data: { type: Object as PropType<DashboardState>, required: true },
+    go: { type: Function as PropType<Go>, required: true },
+  },
+  setup(props) {
+    return () => {
+      const needs = collectNeeds(props.data, props.go);
+      if (needs.length === 0) return <p class="text-muted">Nothing needs you.</p>;
+      return (
+        <div class="column q-gutter-md">
+          {needs.map((need) => (
+            <QCard key={need.key} flat bordered class="need">
+              <QCardSection>
+                <div class="text-subtitle1 text-weight-medium q-mb-sm">{need.title}</div>
+                {need.body()}
+              </QCardSection>
+            </QCard>
+          ))}
+        </div>
+      );
+    };
+  },
+});
 
 /** One more attempt with guidance, the question to the Architect, or a pause (§14.2). */
-function Escalated({ feature }: { feature: FeatureState }) {
-  const [note, setNote] = useState('');
-  return (
-    <>
-      <p>{feature.escalation}</p>
-      <textarea rows={2} value={note} placeholder="Guidance for one more attempt, or a note for the Architect" onChange={(e) => setNote(e.target.value)} />
-      <div className="row">
-        <Action label="One more attempt" onClick={() => post('/api/retry', { feature: key(feature), ...(note.trim() ? { note } : {}) })} />
-        <Action
-          label="Send it to the Architect"
-          onClick={() =>
-            post('/api/architect', {
-              module: feature.module,
-              text: `[owner] ${key(feature)} is escalated: ${feature.escalation ?? ''} ${note.trim() ? `My note: ${note.trim()}` : ''} Should the design change?`,
-            })
-          }
-        />
-        <Action label="Pause the pipeline" onClick={() => post('/api/pause')} />
-      </div>
-    </>
-  );
-}
+const Escalated = defineComponent({
+  props: { feature: { type: Object as PropType<FeatureState>, required: true } },
+  setup(props) {
+    const note = ref('');
+    return () => {
+      const feature = props.feature;
+      return (
+        <>
+          <p>{feature.escalation}</p>
+          <QInput {...text(note)} type="textarea" autogrow outlined dense label="Guidance for one more attempt, or a note for the Architect" />
+          <div class="row items-center q-gutter-sm q-mt-sm">
+            <Action label="One more attempt" run={() => post('/api/retry', { feature: key(feature), ...(note.value.trim() ? { note: note.value } : {}) })} />
+            <Action
+              label="Send it to the Architect"
+              run={() =>
+                post('/api/architect', {
+                  module: feature.module,
+                  text: `[owner] ${key(feature)} is escalated: ${feature.escalation ?? ''} ${note.value.trim() ? `My note: ${note.value.trim()}` : ''} Should the design change?`,
+                })
+              }
+            />
+            <Action label="Pause the pipeline" run={() => post('/api/pause')} />
+          </div>
+        </>
+      );
+    };
+  },
+});
 
-export function Proposal({ module, version }: { module: string; version: number }) {
-  const [text, setText] = useState<string>();
-  useEffect(() => {
-    void getText(`/api/proposal?module=${encodeURIComponent(module)}&version=${version}`).then(setText);
-  }, [module, version]);
-  return <div className="document">{text === undefined ? <p className="muted">Loading…</p> : <Markdown text={text} />}</div>;
-}
-
-const key = (f: FeatureState) => `${f.module}/${f.plan}/${f.feature}`;
+/** A proposal's text, as the Architect submitted it. */
+export const Proposal = defineComponent({
+  props: { module: { type: String, required: true }, version: { type: Number, required: true } },
+  setup(props) {
+    const content = ref<string>();
+    const load = () => {
+      content.value = undefined;
+      void getText(`/api/proposal?module=${encodeURIComponent(props.module)}&version=${props.version}`).then((t) => (content.value = t));
+    };
+    onMounted(load);
+    watch(() => [props.module, props.version], load);
+    return () => <div class="document">{content.value === undefined ? <Loading class="q-py-sm" text="Reading the proposal…" /> : <Markdown text={content.value} />}</div>;
+  },
+});

@@ -413,15 +413,13 @@ function clip(value: unknown, depth: number): unknown {
 }
 
 /**
- * The built front ends: only files under their folder, and a dashboard's `index.html` for
- * anything else. The second dashboard, in Vue and Quasar, has its own under /next/; where
- * it isn't built, the first one answers there too.
+ * The built dashboard: only files under its folder, and its `index.html` for anything else,
+ * /next/ included, where 0.4.17 served it beside the first one.
  */
 function serveFile(res: ServerResponse, webRoot: string, path: string, hosts: string[]): void {
   const root = normalize(webRoot + sep);
   const candidate = normalize(join(webRoot, decodeURIComponent(path)));
-  const next = join(webRoot, 'next', 'index.html');
-  const page = (path === '/next' || path.startsWith('/next/')) && existsSync(next) ? next : join(webRoot, 'index.html');
+  const page = join(webRoot, 'index.html');
   const file = candidate.startsWith(root) && existsSync(candidate) && extname(candidate) !== '' ? candidate : page;
   if (!existsSync(file)) return send(res, 500, 'the dashboard is not built: run `npm run build`');
   const sockets = hosts.map((h) => `ws://${h}`).join(' ');
