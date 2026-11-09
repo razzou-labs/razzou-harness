@@ -6,8 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { webRead } from '../daemon/web-read.ts';
 import { loadPty } from '../dashboard/terminals.ts';
 import { ConfigSchema, requiredChecks, type Config } from '../design/schemas.ts';
-import { claudeTokenFile, loadClaudeToken, readUsage, saveClaudeToken } from '../anthropic/usage.ts';
-import { GitHubClient, loadAppCredentials } from '../github/app.ts';
+import { configDir, GitHubClient, loadAppCredentials } from '../github/app.ts';
 import { checkApp } from '../github/setup.ts';
 import { BUNDLES } from '../sandbox/allowlist.ts';
 import { OpenShellDriver } from '../sandbox/openshell.ts';
@@ -136,102 +135,32 @@ async function machine(options: DoctorOptions, image: string, report: (c: Check)
   report((await loadPty()) ? ok('terminals', 'node-pty loads') : warn('terminals', 'node-pty is missing', 'the dashboard has no terminals; `harness attach` still works. Install build tools and reinstall to get them'));
 }
 
-/** The Claude subscription provider (§17.3, step 2): the profile, then the provider with the owner's token. */
-async function claude(options: DoctorOptions, provider: string, report: (c: Check) => void, read: typeof readUsage = readUsage): Promise<void> {
+/**
+ * The Claude subscription provider (§17.3, step 2): the profile, then the provider with the
+ * owner's token from `claude setup-token`. That token runs models and nothing else: the
+ * daemon takes the subscription's usage from the agents' own reports (usage.ts), so it
+ * needs no token of its own.
+ */
+async function claude(options: DoctorOptions, provider: string, report: (c: Check) => void): Promise<void> {
   const profiles = await run('openshell', ['profile', 'list']).catch(() => undefined);
   if (!/^claude-code-subscription\s/m.test(profiles?.stdout ?? '')) {
     const imported = await run('openshell', ['profile', 'import', '-f', join(options.packageDir, 'templates', 'openshell', 'claude-code-subscription.yaml'), '--global']);
     report(imported.code === 0 ? ok('Claude profile', 'imported') : fail('Claude profile', firstLine(imported.stderr), 'see `openshell profile import --help`'));
   }
-  if (await providerExists(provider)) {
-    report(ok('Claude provider', provider));
-    return claudeToken(options, report, read);
-  }
+  // Up to 0.4.15 the daemon read the usage with a token of its own, which `setup-token` tokens can't do.
+  const leftover = join(configDir(), 'claude.token');
+  if (existsSync(leftover)) report({ status: 'skip', name: 'Claude token', detail: `${leftover} is no longer used: the agents report the subscription's usage. Delete it` });
+  if (await providerExists(provider)) return report(ok('Claude provider', provider));
   if (!options.interactive) {
     return report(fail('Claude provider', `${provider} is missing`, 'run `claude setup-token`, then `harness doctor` in a terminal: it asks for the token'));
   }
-  const asked = await askToken(options, `Claude provider ${provider} is missing. Paste the token from \`claude setup-token\` (hidden): `, read);
-  if (!asked) return report(fail('Claude provider', 'no token given, or the usage endpoint refused each one', 'run `claude setup-token`, then `harness doctor` again'));
+  const token = await (options.askSecret ?? askSecret)(`Claude provider ${provider} is missing. Paste the token from \`claude setup-token\` (hidden; a token over two lines comes in whole): `);
+  if (!token) return report(fail('Claude provider', 'no token given', 'run `harness doctor` again'));
   // The token reaches OpenShell through the environment of one command, never its arguments.
   const created = await run('openshell', ['provider', 'create', '--name', provider, '--type', 'claude-code-subscription', '--from-existing'], {
-    env: { ...process.env, CLAUDE_CODE_OAUTH_TOKEN: asked.token },
+    env: { ...process.env, CLAUDE_CODE_OAUTH_TOKEN: token },
   });
   report(created.code === 0 ? ok('Claude provider', `${provider} created`) : fail('Claude provider', firstLine(created.stderr), 'see `openshell provider create --help`'));
-  // The same token lets the daemon read the subscription's usage (v3 §4.3).
-  if (created.code === 0) report(said(saveClaudeToken(asked.token), asked.check, 'stored in'));
-}
-
-/**
- * The stored token (v3 §4.3), with which the daemon reads the subscription's usage: for
- * the dashboard's Subscription bars, and for Swarm's usage ceiling before a launch. The
- * Claude provider's creation stores it; an older setup's provider came without it. Each
- * run checks it against the usage endpoint: a token it refuses is asked for again at a
- * terminal, in either mode. Missing, it is a warning in Swarm only; refused, in both.
- */
-export async function claudeToken(options: Pick<DoctorOptions, 'projectDir' | 'interactive' | 'skipped' | 'askSecret'>, report: (c: Check) => void, read: typeof readUsage = readUsage): Promise<void> {
-  const swarm = projectMode(options.projectDir) === 'swarm';
-  const asking = options.interactive && !options.skipped?.has('Claude token');
-  const current = loadClaudeToken();
-  if (current) {
-    const check = await checkToken(current, read);
-    if (check.kind !== 'refused') return report(said(claudeTokenFile(), check, 'stored in'));
-    const refused = `the usage endpoint refuses the stored token (${check.status})`;
-    const fix = 'run `claude setup-token`, then `harness doctor` in a terminal: it asks for the new token';
-    if (!asking) return report(warn('Claude token', `${refused}: the dashboard's Subscription bars and Swarm's usage ceiling can't read the subscription's usage`, fix));
-    const asked = await askToken(options, `The usage endpoint refuses the stored token (${check.status}). Paste a new one from \`claude setup-token\` (hidden), or press Enter to keep it: `, read);
-    if (!asked) {
-      options.skipped?.add('Claude token');
-      return report(warn('Claude token', `${refused}: the dashboard's Subscription bars and Swarm's usage ceiling can't read the subscription's usage`, fix));
-    }
-    return report(said(saveClaudeToken(asked.token), asked.check, 'replaced; stored in'));
-  }
-  const missing = (detail: string, fix: string): Check => (swarm ? warn('Claude token', detail, fix) : { status: 'skip', name: 'Claude token', detail: `${detail}; ${fix}` });
-  if (!asking) {
-    return report(missing("not stored: the dashboard's Subscription bars and Swarm's usage ceiling can't read the subscription's usage", 'run `harness doctor` in a terminal: it asks for the token from `claude setup-token`'));
-  }
-  const asked = await askToken(options, "The daemon reads the subscription's usage for the dashboard's Subscription bars and Swarm's usage ceiling. Paste the token from `claude setup-token` (hidden), or press Enter to skip: ", read);
-  if (!asked) {
-    options.skipped?.add('Claude token');
-    return report(missing('not stored: the daemon learns of a limit only when an attempt hits it', 'run `harness doctor` again to store it'));
-  }
-  report(said(saveClaudeToken(asked.token), asked.check, 'stored in'));
-}
-
-/** What the usage endpoint makes of a token: it reads with it, it refuses it, or it couldn't be asked. */
-type TokenCheck = { kind: 'accepted' } | { kind: 'refused'; status: string } | { kind: 'unchecked'; reason: string };
-
-async function checkToken(token: string, read: typeof readUsage): Promise<TokenCheck> {
-  try {
-    await read(token);
-    return { kind: 'accepted' };
-  } catch (error) {
-    const refused = /answered (40[13])$/.exec((error as Error).message);
-    return refused ? { kind: 'refused', status: refused[1]! } : { kind: 'unchecked', reason: (error as Error).message };
-  }
-}
-
-/**
- * A token from `claude setup-token`, checked before anything keeps it. A refused one, most
- * often cut short when copied from a terminal where it wraps, is asked for again, three
- * times in all; Enter gives up. One the endpoint couldn't check is taken as it is.
- */
-async function askToken(options: Pick<DoctorOptions, 'askSecret'>, question: string, read: typeof readUsage): Promise<{ token: string; check: TokenCheck } | undefined> {
-  let prompt = question;
-  for (let tries = 0; tries < 3; tries++) {
-    const token = (await (options.askSecret ?? askSecret)(prompt)).trim();
-    if (!token) return undefined;
-    const check = await checkToken(token, read);
-    if (check.kind !== 'refused') return { token, check };
-    prompt = `The usage endpoint refused that token (${check.status}): it may have been cut short. Copy all of it, from sk-ant-oat01- to its end, even across a line break, and paste it (hidden), or press Enter to skip: `;
-  }
-  return undefined;
-}
-
-/** What the doctor says of a token the endpoint didn't refuse, kept in `file`. */
-function said(file: string, check: TokenCheck, how: string): Check {
-  return check.kind === 'unchecked'
-    ? ok('Claude token', `${how} ${file}; the usage endpoint couldn't be reached to check it: ${check.reason}`)
-    : ok('Claude token', `${how} ${file}: the daemon reads the subscription's usage with it`);
 }
 
 /** What the App's installation grants of a permission, from checkApp's `Permissions:` line: only what the owner accepted on it. */

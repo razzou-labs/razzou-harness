@@ -37,10 +37,8 @@ export interface DashboardState {
   design: ReturnType<typeof designSummary>;
   /** The owner's time, planned and used, once they set their hours (v3 §4.1). */
   ownerTime?: OwnerTime;
-  /** The subscription's usage, as last read: for the meters, and before a launch in Swarm (v3 §4.3). */
+  /** The subscription's usage, as an agent's model call last reported it: for the meters, and the Swarm ceiling (v3 §4.3). */
   usage?: { at: string; usage: SubscriptionUsage };
-  /** Why the last reading failed, or that no token is stored. */
-  usageProblem?: string;
   /** In Swarm, where its setup stands, for the note that lists what is left to do (v4 §6). */
   setup?: SetupStatus;
   progress: string[];
@@ -79,7 +77,7 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
     for (const client of clients) client.write(`event: ${kind}\ndata: ${JSON.stringify(data)}\n\n`);
   };
   orchestrator.events.on('event', (event: HarnessEvent) => broadcast('event', event));
-  // A new reading of the subscription's usage: the pages fetch the state again.
+  // An agent reported the subscription's usage: the pages fetch the state again.
   orchestrator.events.on('usage', () => broadcast('usage', {}));
   orchestrator.events.on('transcript', ({ agent, line }: { agent: string; line: string }) => {
     for (const item of transcripts.add(agent, line)) broadcast('transcript', { agent, item });
@@ -124,14 +122,11 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
       const text = (key: string) => (typeof body[key] === 'string' && (body[key] as string).trim() !== '' ? (body[key] as string) : undefined);
       switch (`${req.method} ${url.pathname}`) {
         case 'GET /api/state':
-          // The meters' reading is five minutes old at most, in either mode, while a page is open.
-          orchestrator.refreshUsage();
           return sendJson(res, {
             state: orchestrator.state,
             design: designSummary(orchestrator),
             ...(orchestrator.state.budgets.ownerHours !== undefined ? { ownerTime: await orchestrator.ownerTime() } : {}),
             ...(orchestrator.usage ? { usage: orchestrator.usage } : {}),
-            ...(orchestrator.usageProblem ? { usageProblem: orchestrator.usageProblem } : {}),
             ...(orchestrator.state.mode === 'swarm' ? { setup: await orchestrator.setupStatus() } : {}),
             progress: await progressTail(orchestrator),
             terminals: terminals.available,

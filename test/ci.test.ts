@@ -3,7 +3,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
 import {
-  computeLock, directoryReader, lockfileProblems, lockMismatches, matches, npmScripts, planKindOf, prKind, protectedChanges, protectionRules, verify,
+  computeLock, directoryReader, lockfileProblems, lockMismatches, matches, npmScripts, parseJson, planKindOf, prKind, protectedChanges, protectionRules, verify,
 } from '../src/ci/harness-ci.ts';
 import { run, runOk } from '../src/util.ts';
 import { tempDir } from './helpers/toy-repo.ts';
@@ -400,5 +400,17 @@ describe('verify', () => {
     const withPlan = await run('node', [script, 'checks', '--definitions', dir, '--dir', dir], { env: { ...process.env, HARNESS_PLAN_JSON: join(dir, 'plan.json') } });
     assert.equal(withPlan.code, 0, withPlan.stdout);
     assert.match(withPlan.stdout, /passed: F01-plan/);
+  });
+});
+
+describe('JSON with comments, as tsconfig allows', () => {
+  it('reads comments and trailing commas, and keeps strings that hold // or escaped quotes', () => {
+    assert.deepEqual(parseJson('{ // a comment\n "a": "x // not one", /* a block */ "b": "say \\"hi\\"", }'), { a: 'x // not one', b: 'say "hi"' });
+  });
+
+  it('refuses an unclosed string at once, however many escaped quotes follow it', () => {
+    const started = Date.now();
+    assert.equal(parseJson(`{ "a": "${'\\"'.repeat(200_000)} // x`), undefined);
+    assert.ok(Date.now() - started < 1000, `took ${Date.now() - started} ms: each quote must not rescan the rest`);
   });
 });

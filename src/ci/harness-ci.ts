@@ -423,7 +423,7 @@ function canonicalJson(value: unknown): string {
 }
 
 /** JSON, or JSON with comments and trailing commas as tsconfig allows. Undefined if absent or unreadable. */
-function parseJson(text: string | undefined): unknown {
+export function parseJson(text: string | undefined): unknown {
   if (text === undefined) return undefined;
   try {
     return JSON.parse(text);
@@ -441,11 +441,12 @@ function stripJsonComments(text: string): string {
   for (let i = 0; i < text.length; i++) {
     const c = text[i]!;
     if (c === '"') {
-      const end = /"(?:[^"\\]|\\.)*"/y;
-      end.lastIndex = i;
-      const string = end.exec(text)?.[0] ?? c;
-      out += string;
-      i += string.length - 1;
+      // A string, escapes and all, copied as it is. Scanned once: an unclosed one runs to
+      // the end, and JSON.parse refuses it, where a regex tried at each quote would rescan.
+      let j = i + 1;
+      while (j < text.length && text[j] !== '"') j += text[j] === '\\' ? 2 : 1;
+      out += text.slice(i, j + 1);
+      i = j;
     } else if (c === '/' && text[i + 1] === '/') {
       while (i < text.length && text[i] !== '\n') i++;
       out += '\n';

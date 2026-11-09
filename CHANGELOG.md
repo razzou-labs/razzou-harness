@@ -3,6 +3,26 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## 0.4.16 (2026-11-09)
+
+**Upgrading from 0.4.15:** install the new version, rebuild the agents' image with
+`harness doctor --build-images` (its tag follows the harness's version), then restart the
+daemon with `harness down` and `harness up`, and reload the dashboard. You can delete
+`~/.config/harness/claude.token`: nothing reads it any more.
+
+- **The subscription's usage comes from the agents.** Each model call of a Developer,
+  the Manager or a reviewer reports the session and weekly windows, and the daemon
+  takes them from the stream it already reads. The Project tab's bars and the Swarm
+  ceiling use the last report, which survives a restart. Before, the daemon read the
+  usage endpoint with a token from `claude setup-token`, but that token may only run
+  models, and the endpoint refused it: the bars and the ceiling never had a reading.
+- **No usage token.** `harness setup` and `harness doctor` no longer ask for one, and
+  Swarm's setup has two steps: its rules, and the App's permission. The doctor asks for
+  the Claude provider's token without checking it against the usage endpoint, which
+  0.4.15 did, refusing every valid token.
+- **CodeQL's alerts.** The CI's reading of JSON with comments scans each string once,
+  so a crafted file can't make it run for long. Two tests no longer trip CodeQL.
+
 ## 0.4.15 (2026-11-09)
 
 **Upgrading from 0.4.14:** install the new version, rebuild the agents' image with

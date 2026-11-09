@@ -146,20 +146,27 @@ describe('web_read', () => {
   describe('against a local server', () => {
     let server: Server;
     let base = '';
-    const pages: Record<string, (res: import('node:http').ServerResponse) => void> = {
-      '/doc': (res) => {
+    // A Map: the requested path picks a page only among these.
+    const pages = new Map<string, (res: import('node:http').ServerResponse) => void>([
+      ['/doc', (res) => {
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
         res.end('<html><head><title>Guide</title><script>alert(1)</script></head><body><h1>Install</h1><p>Run <code>npm i</code> &amp; see <a href="/more">more</a>.</p></body></html>');
-      },
-      '/hop': (res) => { res.writeHead(302, { location: '/doc' }); res.end(); },
-      '/escape': (res) => { res.writeHead(302, { location: 'http://10.0.0.1/admin' }); res.end(); },
-      '/big': (res) => { res.writeHead(200, { 'content-type': 'text/plain' }); res.end('x'.repeat(5000)); },
-      '/image': (res) => { res.writeHead(200, { 'content-type': 'image/png' }); res.end(Buffer.alloc(10)); },
-    };
+      }],
+      ['/hop', (res) => { res.writeHead(302, { location: '/doc' }); res.end(); }],
+      ['/escape', (res) => { res.writeHead(302, { location: 'http://10.0.0.1/admin' }); res.end(); }],
+      ['/big', (res) => { res.writeHead(200, { 'content-type': 'text/plain' }); res.end('x'.repeat(5000)); }],
+      ['/image', (res) => { res.writeHead(200, { 'content-type': 'image/png' }); res.end(Buffer.alloc(10)); }],
+    ]);
     const options = { allowAddress: (ip: string) => ip === '127.0.0.1', allowPort: () => true };
 
     it('starts', async () => {
-      server = createServer((req, res) => (pages[req.url ?? ''] ?? ((r) => { r.writeHead(404); r.end(); }))(res));
+      server = createServer((req, res) => {
+        // Only a page this test defines answers, and only once it is checked to be one; anything else is a 404.
+        const page = pages.get(req.url ?? '');
+        if (typeof page === 'function') return page(res);
+        res.writeHead(404);
+        res.end();
+      });
       await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
       base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
     });

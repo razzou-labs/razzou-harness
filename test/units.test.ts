@@ -302,7 +302,7 @@ describe('sandbox policy', () => {
     assert.match(policy, /"host":"registry.npmjs.org"[^}]*"access":"read-only"[^}]*"allow_encoded_slash":true/);
     assert.match(policy, /git-upload-pack/);
     assert.doesNotMatch(policy, /receive-pack/);
-    assert.match(policy, /docs.example.com/);
+    assert.match(policy, /docs\.example\.com/);
   });
 
   it('signs AWS requests with the view role, IAM for us-east-1', () => {

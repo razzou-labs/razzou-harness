@@ -39,16 +39,11 @@ function SwarmSetup({ repo, setup }: { repo: string; setup?: DashboardState['set
         {setup ? ' The daemon could only get a read token.' : ' An App created with this version has it already.'} Without it the reviewers' verdicts can't be posted, and pull requests wait for you with the reason.
       </li>
     )] : []),
-    ...(!setup?.tokenStored ? [(
-      <li key="token">
-        Store the token the usage probe reads, in a terminal: <Command text="harness doctor" /> asks for the one from <code>claude setup-token</code>. Without it the daemon learns of a limit only when an attempt hits it.
-      </li>
-    )] : []),
   ];
   if (steps.length === 0) return null;
   return (
     <div className="note">
-      <b>Before you use Swarm</b>{setup ? `, ${steps.length === 1 ? 'one step' : `${steps.length} steps`} left` : ', three steps, once'}. Swarm merges only once GitHub's rules match the mode; <code>harness doctor</code> checks all of it.
+      <b>Before you use Swarm</b>{setup ? `, ${steps.length === 1 ? 'one step' : `${steps.length} steps`} left` : ', two steps, once'}. Swarm merges only once GitHub's rules match the mode; <code>harness doctor</code> checks all of it.
       <ol>{steps}</ol>
     </div>
   );
