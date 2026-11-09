@@ -2,16 +2,29 @@ import { FitAddon } from '@xterm/addon-fit';
 import { Terminal as XTerm } from '@xterm/xterm';
 import '@xterm/xterm/css/xterm.css';
 import { useEffect, useRef } from 'react';
+import { copiesSelection } from '../keys.ts';
+
+const MAC = /Mac|iPhone|iPad/.test(navigator.platform);
 
 /**
  * A terminal in the page (§14.3): an Architect's (`module`), or a shell in a sandbox
  * (`sandbox`). Keys go to the daemon over a WebSocket, as `{"i": keys}`; size changes as
- * `{"cols", "rows"}`.
+ * `{"cols", "rows"}`. While the program in it uses the mouse, a drag with Shift held
+ * selects, or with Option on a Mac.
  */
 export function Terminal({ module, sandbox }: { module?: string; sandbox?: string }) {
   const element = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    const term = new XTerm({ fontSize: 13, cursorBlink: true, scrollback: 5000, theme: theme() });
+    const term = new XTerm({ fontSize: 13, cursorBlink: true, scrollback: 5000, theme: theme(), macOptionClickForcesSelection: true });
+    // Ctrl+C and Ctrl+Shift+C copy the selection; the next Ctrl+C, with nothing selected, interrupts.
+    term.attachCustomKeyEventHandler((event) => {
+      if (!copiesSelection(event, term.hasSelection(), MAC)) return true;
+      if (event.type === 'keydown') {
+        event.preventDefault();
+        navigator.clipboard.writeText(term.getSelection()).then(() => term.clearSelection(), () => {});
+      }
+      return false;
+    });
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(element.current!);

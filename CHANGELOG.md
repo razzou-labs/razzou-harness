@@ -3,6 +3,18 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## 0.4.10 (2026-11-09)
+
+**Upgrading from 0.4.9:** install the new version, rebuild the agents' image with
+`harness doctor --build-images` (its tag follows the harness's version), then restart the
+daemon with `harness down` and `harness up`.
+
+- **Copying from a terminal in the dashboard works.** Away from a Mac, Ctrl+C reached
+  the program, which took it as an interrupt, and Ctrl+Shift+C opened the browser's
+  inspector. Both now copy the selected text, and clear the selection, so Ctrl+C with
+  nothing selected still interrupts. On a Mac, Cmd+C copied already, and Option+drag now
+  selects while the program uses the mouse, as Shift+drag does elsewhere.
+
 ## 0.4.9 (2026-11-09)
 
 **Upgrading from 0.4.8:** optional, since no code changed. If you install it, rebuild
