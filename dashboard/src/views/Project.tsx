@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { post, type Attempt, type DashboardState, type FeatureState, type OwnerTime, type PlanState, type State, type SubscriptionUsage, type UsageLimit } from '../api.ts';
 import { Graph } from '../components/Graph.tsx';
-import { Action, Badge, Command, GithubLink } from '../components/ui.tsx';
+import { Action, Badge, GithubLink } from '../components/ui.tsx';
 import { duration } from '../format.ts';
 import { Proposal } from './NeedsYou.tsx';
 
@@ -17,7 +17,6 @@ export function Project({ data }: { data: DashboardState }) {
         ceiling={design.swarm?.usageCeilingPercent ?? null}
         {...(data.ownerTime ? { ownerTime: data.ownerTime } : {})}
         {...(data.usage ? { usage: data.usage } : {})}
-        {...(data.usageProblem ? { usageProblem: data.usageProblem } : {})}
       />
       <NewModule />
       {moduleIds.length === 0 && <p className="muted">No module yet.</p>}
@@ -109,7 +108,7 @@ function count(n: number): string {
 }
 
 /** The owner's hours for the whole project, and the agent-hours threshold (v3 §4): set here, recorded by the daemon. */
-function Budgets({ state, ownerTime, usage, usageProblem, ceiling }: { state: State; ownerTime?: OwnerTime; usage?: { at: string; usage: SubscriptionUsage }; usageProblem?: string; ceiling: number | null }) {
+function Budgets({ state, ownerTime, usage, ceiling }: { state: State; ownerTime?: OwnerTime; usage?: { at: string; usage: SubscriptionUsage }; ceiling: number | null }) {
   const budgets = state.budgets ?? {};
   const overPlanned = ownerTime !== undefined && ownerTime.committedHours > ownerTime.plannableHours;
   const overUsed = ownerTime !== undefined && ownerTime.usedHours > ownerTime.hours;
@@ -155,25 +154,23 @@ function Budgets({ state, ownerTime, usage, usageProblem, ceiling }: { state: St
           <p className="muted small">The Developers' attempt clocks, summed. Over the threshold the number turns red; nothing stops.</p>
         </div>
         <TokensMeter state={state} />
-        {(usage || usageProblem) && <SubscriptionMeter {...(usage ? { usage } : {})} {...(usageProblem ? { problem: usageProblem } : {})} ceiling={ceiling} />}
+        <SubscriptionMeter {...(usage ? { usage } : {})} ceiling={ceiling} />
       </div>
     </section>
   );
 }
 
 /**
- * The subscription's windows as bars: the current session, the weekly limit, and a weekly
- * limit on one model. When the daemon can't read them, the box says why and what to do.
+ * The subscription's windows as bars: the current session and the weekly limit, as an
+ * agent's model call last reported them. Before any report, the box says where they come from.
  */
-function SubscriptionMeter({ usage, problem, ceiling }: { usage?: { at: string; usage: SubscriptionUsage }; problem?: string; ceiling: number | null }) {
+function SubscriptionMeter({ usage, ceiling }: { usage?: { at: string; usage: SubscriptionUsage }; ceiling: number | null }) {
   const now = useNow(true);
-  const fix = <>In a terminal, <Command text="harness doctor" /> checks the stored token and asks for a new one from <code>claude setup-token</code>.</>;
   if (!usage) {
     return (
       <div className="meter">
         <h3>Subscription</h3>
-        <p className="bad">The daemon can't read your usage: {problem}.</p>
-        <p className="muted small">{fix}</p>
+        <p className="muted">No report yet. The Developers, the Manager and the reviewers report your usage with each model call; the bars appear with the first one.</p>
       </div>
     );
   }
@@ -194,9 +191,8 @@ function SubscriptionMeter({ usage, problem, ceiling }: { usage?: { at: string; 
         );
       })}
       <p className="muted small">
-        Read {new Date(usage.at).toLocaleTimeString()}, every five minutes while a page is open. In Swarm no attempt starts at or above {ceiling === null ? 'the ceiling, which is off' : `${ceiling}%`}; the pipeline waits for the window to reset.
+        Reported by an agent's model call at {new Date(usage.at).toLocaleTimeString()}. In Swarm no attempt starts at or above {ceiling === null ? 'the ceiling, which is off' : `${ceiling}%`}; the pipeline waits for the window to reset.
       </p>
-      {problem && <p className="bad small">The last reading failed: {problem}. {fix}</p>}
     </div>
   );
 }

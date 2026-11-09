@@ -42,15 +42,11 @@ interface SetupOptions {
   now?: () => number;
   /** Plays the project on a fake GitHub, with pull requests and CI. */
   github?: boolean;
-  /** Replaces the subscription's usage endpoint (v3 §4.3). */
-  usage?: () => Promise<SubscriptionUsage | undefined>;
   /** What the stub reviewers answer (v3 §5); every review passes by default. */
   review?: ReviewBehavior;
   /** Starts with no design: an Architect writes it. */
   design?: boolean;
   architect?: ArchitectBehavior;
-  /** Whether the usage probe's token is stored (v4 §6); never the machine's real file. */
-  tokenStored?: () => boolean;
   /** Applies main's rules on a switch; never the machine's real gh. */
   applyRules?: (config: Config, repo: string, mode: Mode) => Promise<string[]>;
   /** Wraps the stub agent, to make some of its sessions end otherwise. */
@@ -81,8 +77,6 @@ async function setup(decide: Decide, options: SetupOptions = {}) {
         if (logs.length > 30) logs.shift();
         if (process.env.HARNESS_TEST_LOG) console.error(`[daemon] ${message}`);
       },
-      ...(options.usage ? { usage: options.usage } : {}),
-      tokenStored: options.tokenStored ?? (() => false),
       applyRules: options.applyRules ?? (async () => []),
       ...(options.now ? { now: options.now } : {}),
       ...(fake ? { forge: () => fake } : {}),
@@ -95,6 +89,12 @@ async function setup(decide: Decide, options: SetupOptions = {}) {
   const orchestrator = make();
   await orchestrator.start();
   return { harnessDir, orchestrator, make, driver, fake: fake! };
+}
+
+/** A `rate_limit_event` line, as an agent's Claude Code writes one after a model call. */
+function rateLimitEvent(utilization: { five_hour: number; seven_day: number }, resetsAt: number): string {
+  const window = (u: number) => ({ utilization: u, resetsAt, status: 'allowed' });
+  return JSON.stringify({ type: 'rate_limit_event', rate_limit_info: { status: 'allowed', unifiedWindows: { five_hour: window(utilization.five_hour), seven_day: window(utilization.seven_day) } } });
 }
 
 /** Ticks until `done` holds, giving the detached stubs time to work. */
@@ -829,42 +829,38 @@ describe('pull requests', () => {
     assert.equal(over.orchestrator.state.infraMerge, 'ceiling');
   });
 
-  it('in Swarm, starts no attempt at or above the usage ceiling, and goes on once the window resets', async () => {
+  it('in Swarm, starts no attempt at or above the usage ceiling an agent reported, and goes on once the window resets', async () => {
     let skew = 0;
-    let percent = 85;
-    let reads = 0;
-    // Ten minutes away: past the reading's five-minute cache, and well under the Manager's turn, which event times would trip.
-    const resetsAt = new Date(Date.now() + 10 * 60_000).toISOString();
-    const usage = async () => {
-      reads++;
-      return { percent, resetsAt, limits: [{ kind: 'session', percent: 20, resetsAt }, { kind: 'weekly_all', percent, resetsAt }] };
-    };
-    const { orchestrator: o } = await setup((f) => solved(f), { usage, now: () => Date.now() + skew });
+    // Ten minutes away: well under the Manager's turn, which event times would trip.
+    const resetsAt = Math.floor((Date.now() + 10 * 60_000) / 1000);
+    const { orchestrator: o } = await setup((f) => solved(f), { now: () => Date.now() + skew });
+    // A model call of the Manager's reported 85% of the week.
+    o.events.emit('transcript', { agent: 'manager:demo', line: rateLimitEvent({ five_hour: 0.2, seven_day: 0.85 }, resetsAt) });
     o.setMode('swarm');
     await until(o, () => o.state.pipeline.paused !== undefined);
     assert.equal(o.state.pipeline.paused!.reason, "the subscription's usage is at 85% (weekly_all), at or above the 80% ceiling (swarm.usageCeilingPercent)");
-    assert.equal(o.state.pipeline.paused!.until, resetsAt);
+    assert.equal(o.state.pipeline.paused!.until, new Date(resetsAt * 1000).toISOString());
     assert.equal(Object.keys(o.state.features).length, 0);
-    assert.equal(o.usage!.usage.percent, 85);
 
-    // The window resets: the pause lifts, the usage is read again (the reading is older than five minutes), and the build goes on.
-    percent = 30;
+    // The window resets: the report no longer binds, the pause lifts, and the build goes on.
     skew += 10 * 60_000 + 1000;
     await until(o, completed(o));
-    assert.ok(reads >= 2, `read ${reads} times`);
-    assert.equal(o.usage!.usage.percent, 30);
   });
 
-  it("in Manual, the loop never reads the usage: only an open dashboard's meters do", async () => {
-    let reads = 0;
-    const { orchestrator: o } = await setup((f) => solved(f), {
-      usage: async () => {
-        reads++;
-        return { percent: 99, resetsAt: new Date().toISOString(), limits: [] };
-      },
-    });
-    await until(o, completed(o));
-    assert.equal(reads, 0);
+  it("takes the usage from the agents' reports in either mode, ignores other lines, and keeps it across a restart", async () => {
+    const { orchestrator: o, make } = await setup((f) => solved(f));
+    let announced = 0;
+    o.events.on('usage', () => announced++);
+    const resetsAt = Math.floor((Date.now() + 3 * 3_600_000) / 1000);
+    o.events.emit('transcript', { agent: 'developer:demo/P1/F01/a1', line: JSON.stringify({ type: 'assistant', message: { content: [] } }) });
+    o.events.emit('transcript', { agent: 'developer:demo/P1/F01/a1', line: 'not json, with "rate_limit_event" in it' });
+    assert.equal(o.usage, undefined);
+    o.events.emit('transcript', { agent: 'cost:abcd1234', line: rateLimitEvent({ five_hour: 0.42, seven_day: 0.57 }, resetsAt) });
+    assert.deepEqual(o.usage!.usage.limits.map((l) => [l.kind, l.percent]), [['session', 42], ['weekly_all', 57]]);
+    assert.equal(announced, 1, 'the pages hear of it');
+    await o.stop(0);
+    const restarted = make();
+    assert.deepEqual(restarted.usage, o.usage, 'a restart shows the last report at once');
   });
 
   it('in Swarm, both reviewers read the head, their verdicts are posted and set as statuses, and the plan merges itself', async () => {
@@ -1374,8 +1370,7 @@ describe('dashboard', () => {
 
   it('in Swarm, says which setup steps are left, reads them again every 30 seconds until none is, then every five minutes', async () => {
     let skew = 0;
-    let stored = false;
-    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true, now: () => Date.now() + skew, tokenStored: () => stored });
+    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true, now: () => Date.now() + skew });
     const server = await startDashboard({ orchestrator: o, port: 0, token, webRoot: tempDir('web'), terminals: new Terminals(undefined) });
     cleanup.push(async () => void server.close());
     const port = (server.address() as AddressInfo).port;
@@ -1387,7 +1382,6 @@ describe('dashboard', () => {
     const manual = (await read())!;
     assert.equal(manual.rules!.ok, false);
     assert.deepEqual(manual.rules!.problems, ["1 approval is required, which the daemon can't give", "the harness/security status isn't required", "the harness/cost status isn't required"]);
-    assert.equal(manual.tokenStored, false);
     assert.equal(manual.statusesWritable, undefined);
 
     // With steps left, it is read again after 30 seconds: now the rules are Swarm's, and the App can't write statuses.
@@ -1400,10 +1394,9 @@ describe('dashboard', () => {
 
     // With none left, it is kept for five minutes.
     fake.writable = true;
-    stored = true;
     skew += 31_000;
     const done = (await read())!;
-    assert.deepEqual([done.rules!.ok, done.statusesWritable, done.tokenStored], [true, true, true]);
+    assert.deepEqual([done.rules!.ok, done.statusesWritable], [true, true]);
     fake.rules = { ...fake.rules, approvals: 1 };
     skew += 60_000;
     assert.equal((await read())!.rules!.ok, true, 'a finished list is kept');
@@ -1433,60 +1426,6 @@ describe('dashboard', () => {
     assert.deepEqual(await switchTo('manual'), { done: true, rules: [], problem: 'gh: not an admin of acme/toy' });
     assert.equal(o.state.mode, 'manual', "a ruleset gh couldn't apply doesn't stop the switch");
     assert.deepEqual(order, ["swarm's rules on acme/toy, the daemon in manual", "manual's rules on acme/toy, the daemon in manual"]);
-  });
-
-  it("reads the usage for the dashboard's meters in either mode, at most every five minutes, a failed reading included", async () => {
-    let skew = 0;
-    let reads = 0;
-    let failing = false;
-    const resetsAt = new Date(Date.now() + 3 * 3_600_000).toISOString();
-    const usage = async () => {
-      reads++;
-      if (failing) throw new Error('the usage endpoint answered 401');
-      return { percent: 40, resetsAt, limits: [{ kind: 'session', percent: 40, resetsAt }, { kind: 'weekly_scoped', percent: 8, resetsAt, model: 'Fable' }] };
-    };
-    const { orchestrator: o } = await setup((f) => solved(f), { usage, now: () => Date.now() + skew });
-    let announced = 0;
-    o.events.on('usage', () => announced++);
-    const server = await startDashboard({ orchestrator: o, port: 0, token, webRoot: tempDir('web'), terminals: new Terminals(undefined) });
-    cleanup.push(async () => void server.close());
-    const port = (server.address() as AddressInfo).port;
-    const bearer = { host: `127.0.0.1:${port}`, authorization: `Bearer ${token}` };
-    const state = async () => JSON.parse((await call(port, '/api/state', bearer)).body) as DashboardState;
-
-    // In Manual, an open page has it read in the background, and hears of the reading.
-    await state();
-    await until(o, () => announced === 1);
-    const first = (await state()).usage!;
-    assert.deepEqual(first.usage.limits.map((l) => [l.kind, l.percent, l.model]), [['session', 40, undefined], ['weekly_scoped', 8, 'Fable']]);
-    await state();
-    assert.equal(reads, 1, 'a reading under five minutes old is kept');
-
-    // Five minutes on, a failed reading keeps the last one, says why, and isn't tried again for five minutes.
-    failing = true;
-    skew += 5 * 60_000 + 1000;
-    await state();
-    await until(o, () => reads === 2 && announced === 2);
-    await state();
-    assert.equal(reads, 2);
-    const failed = await state();
-    assert.equal(failed.usage!.at, first.at);
-    assert.equal(failed.usageProblem, 'the usage endpoint refuses the stored token (401)');
-    failing = false;
-    skew += 5 * 60_000 + 1000;
-    await state();
-    await until(o, () => reads === 3 && announced >= 4);
-    assert.equal((await state()).usageProblem, undefined, 'a good reading clears it');
-
-    // Without a token there is no reading, and the meters say so.
-    const bare = await setup((f) => solved(f), { usage: async () => undefined });
-    const bareServer = await startDashboard({ orchestrator: bare.orchestrator, port: 0, token, webRoot: tempDir('web'), terminals: new Terminals(undefined) });
-    cleanup.push(async () => void bareServer.close());
-    const barePort = (bareServer.address() as AddressInfo).port;
-    const bareState = async () => JSON.parse((await call(barePort, '/api/state', { host: `127.0.0.1:${barePort}`, authorization: `Bearer ${token}` })).body) as DashboardState;
-    await bareState();
-    await until(bare.orchestrator, () => bare.orchestrator.usageProblem !== undefined);
-    assert.equal((await bareState()).usageProblem, 'no token is stored');
   });
 
   it('serves only the token holder on localhost, and survives a malformed request', async () => {

@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events';
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { claudeCode, mcpConfig, readResult, reportJsonSchema, type AgentAdapter, type AgentRun } from '../agents/claude-code.ts';
-import { loadClaudeToken, readUsage, type SubscriptionUsage } from '../anthropic/usage.ts';
+import { usageFromEvent, type SubscriptionUsage, type UsageLimit } from '../anthropic/usage.ts';
 import { allPassed, initEnvironment, runChecks, type CheckResult, type RunOptions } from '../checks/runner.ts';
 import { protectedChanges } from '../ci/harness-ci.ts';
 import { ownerTime, type OwnerTime } from '../design/owner-time.ts';
@@ -40,8 +40,6 @@ import { buildTask } from './task.ts';
 import { webRead, type WebReadResult } from './web-read.ts';
 
 export interface OrchestratorOptions {
-  /** Whether the usage probe's token is stored; by default, the token file (v3 §4.3). */
-  tokenStored?: () => boolean;
   /** The project's own repository. In M1 and M2 its main branch is the source of truth. */
   projectDir: string;
   /** The project's `.harness/` directory. */
@@ -53,8 +51,6 @@ export interface OrchestratorOptions {
   agent?: AgentAdapter;
   /** Tests replace the web; the daemon reads it. */
   webRead?: (url: string) => Promise<WebReadResult>;
-  /** Tests replace the subscription's usage endpoint (v3 §4.3). By default: the endpoint, with the token the doctor stored; undefined without one. */
-  usage?: () => Promise<SubscriptionUsage | undefined>;
   /** Tests replace GitHub. By default: GitHub through the App when the project names a repository, else the project's own folder. */
   forge?: (config: Config) => Forge;
   /** Applies a mode's ruleset on main, as the owner's switch does. By default, with the owner's own gh (v3 §2.1); tests replace it. */
@@ -79,8 +75,6 @@ export interface SetupStatus {
   rules?: { ok: boolean; problems: string[] };
   /** False when the App can't write commit statuses; undefined until a token said so. */
   statusesWritable?: boolean;
-  /** The token the usage probe reads is stored on this machine. */
-  tokenStored: boolean;
 }
 
 /**
@@ -109,17 +103,13 @@ export class Orchestrator {
   readonly now: () => number;
   readonly log: (message: string) => void;
   readonly webRead: (url: string) => Promise<WebReadResult>;
-  private readonly readUsage: () => Promise<SubscriptionUsage | undefined>;
-  /** The last reading of the subscription's usage, for the dashboard; not state. */
+  /**
+   * The subscription's usage, as an agent's model call last reported it (v3 §4.3): for the
+   * dashboard's meters and the Swarm ceiling. Not state; kept in .harness/usage.json, so a
+   * restart shows it at once.
+   */
   usage?: { at: string; usage: SubscriptionUsage };
-  /** Why the last reading failed, or that no token is stored, for the dashboard's meters. */
-  usageProblem?: string;
-  /** When a reading last failed: the endpoint isn't asked again for five minutes. */
-  private usageFailedAt?: number;
-  /** The reading under way, which the loop and the dashboard share. */
-  private usageReading?: Promise<SubscriptionUsage | undefined>;
   forge!: Forge;
-  private readonly tokenStored: () => boolean;
   private setup?: { at: number; mode: Mode; status: SetupStatus };
 
   private ticking?: Promise<void>;
@@ -152,12 +142,10 @@ export class Orchestrator {
     this.now = options.now ?? Date.now;
     this.log = options.log ?? (() => {});
     this.webRead = options.webRead ?? ((url) => webRead(url));
-    this.readUsage = options.usage ?? (async () => {
-      const token = loadClaudeToken();
-      return token ? readUsage(token) : undefined;
-    });
-    this.tokenStored = options.tokenStored ?? (() => loadClaudeToken() !== undefined);
     this.store = new EventStore(join(options.harnessDir, 'events.jsonl'), this.now);
+    this.usage = savedUsage(options.harnessDir);
+    // The agents' streams carry the usage: each model call reports it (usage.ts).
+    this.events.on('transcript', ({ line }: { line: string }) => this.noteUsage(line));
     this.state = project(this.store.readAll());
     this.managers = new Managers(this);
     this.architects = new Architects(this);
@@ -219,9 +207,9 @@ export class Orchestrator {
 
   /**
    * Where the Swarm setup stands (v4 §6): main's rules against the mode, read through
-   * the App's metadata permission, whether the App may write statuses, and whether the
-   * usage probe's token is stored. A list with steps left is read again after 30 seconds,
-   * so that a step the owner took drops soon; a finished one after five minutes.
+   * the App's metadata permission, and whether the App may write statuses. A list with
+   * steps left is read again after 30 seconds, so that a step the owner took drops soon;
+   * a finished one after five minutes.
    */
   async setupStatus(): Promise<SetupStatus> {
     const mode = this.state.mode;
@@ -242,7 +230,7 @@ export class Orchestrator {
       rules = { ok: problems.length === 0, problems };
     }
     const writable = this.forge.statusesWritable();
-    const status: SetupStatus = { at: new Date(this.now()).toISOString(), ...(rules ? { rules } : {}), ...(writable === undefined ? {} : { statusesWritable: writable }), tokenStored: this.tokenStored() };
+    const status: SetupStatus = { at: new Date(this.now()).toISOString(), ...(rules ? { rules } : {}), ...(writable === undefined ? {} : { statusesWritable: writable }) };
     this.setup = { at: this.now(), mode, status };
     return status;
   }
@@ -770,68 +758,45 @@ export class Orchestrator {
     // A second attempt never starts without the Manager's guidance (§7.4).
     if (state?.awaitingGuidanceSince) return 'wait';
     if (this.blockedByOwner(ref.module) || this.designChanging(ref.module) || this.gatesHolding(ref.module, ref.plan, definition).length > 0) return 'wait';
-    if (await this.usagePauses()) return 'progress';
+    if (this.usagePauses()) return 'progress';
     return this.startAttempt(ref, hash, state);
   }
 
   /**
    * In Swarm, no attempt starts at or above the usage ceiling (v3 §4.3): the pipeline
    * pauses until the binding window resets, and the existing rule lifts the pause then.
-   * Without a token, or when the endpoint fails, nothing is checked: the pause after a
-   * limit is hit remains the brake.
+   * The agents report the usage with each model call; a window that has reset since no
+   * longer binds. Before any report, nothing is checked: the pause after a limit is hit
+   * remains the brake.
    */
-  private async usagePauses(): Promise<boolean> {
+  private usagePauses(): boolean {
     const ceiling = this.design.config.swarm.usageCeilingPercent;
-    if (this.state.mode !== 'swarm' || ceiling === null) return false;
-    const usage = await this.subscriptionUsage();
-    if (!usage || usage.percent < ceiling) return false;
-    const binding = usage.limits.find((l) => l.percent === usage.percent);
-    const reset = Date.parse(usage.resetsAt);
-    const until = Number.isFinite(reset) && reset > this.now() ? usage.resetsAt : new Date(this.now() + 60 * 60_000).toISOString();
-    this.pausePipeline(`the subscription's usage is at ${usage.percent}%${binding ? ` (${binding.kind})` : ''}, at or above the ${ceiling}% ceiling (swarm.usageCeilingPercent)`, until);
+    if (this.state.mode !== 'swarm' || ceiling === null || !this.usage) return false;
+    const binding = this.usage.usage.limits
+      .filter((limit) => Date.parse(limit.resetsAt) > this.now())
+      .reduce<UsageLimit | undefined>((top, limit) => (!top || limit.percent > top.percent ? limit : top), undefined);
+    if (!binding || binding.percent < ceiling) return false;
+    this.pausePipeline(`the subscription's usage is at ${binding.percent}% (${binding.kind}), at or above the ${ceiling}% ceiling (swarm.usageCeilingPercent)`, binding.resetsAt);
     return true;
   }
 
-  /**
-   * The subscription's usage, read at most every five minutes, a failed reading included.
-   * A new reading is announced as a `usage` event, so the open pages fetch it.
-   */
-  private async subscriptionUsage(): Promise<SubscriptionUsage | undefined> {
-    const recent = (at: number | undefined) => at !== undefined && this.now() - at < 5 * 60_000;
-    if (this.usage && recent(Date.parse(this.usage.at))) return this.usage.usage;
-    if (recent(this.usageFailedAt)) return undefined;
-    this.usageReading ??= this.readUsage()
-      .then((usage) => {
-        this.usageFailedAt = undefined;
-        this.usageFailed(usage ? undefined : 'no token is stored');
-        if (usage) {
-          this.usage = { at: new Date(this.now()).toISOString(), usage };
-          this.events.emit('usage');
-        }
-        return usage;
-      }, (error: Error) => {
-        this.usageFailedAt = this.now();
-        const refused = /answered (40[13])$/.exec(error.message);
-        this.usageFailed(refused ? `the usage endpoint refuses the stored token (${refused[1]})` : `the usage couldn't be read: ${error.message}`);
-        this.log(`the subscription's usage could not be read: ${error.message}`);
-        return undefined;
-      })
-      .finally(() => {
-        this.usageReading = undefined;
-      });
-    return this.usageReading;
-  }
-
-  /** Records why the usage can't be read, or that it can again; the pages hear of a change. */
-  private usageFailed(problem: string | undefined): void {
-    if (problem === this.usageProblem) return;
-    this.usageProblem = problem;
+  /** An agent's stream line: a `rate_limit_event` is the subscription's usage as of now, which the pages and the next restart get. */
+  private noteUsage(line: string): void {
+    if (!line.includes('"rate_limit_event"')) return;
+    let usage: SubscriptionUsage | undefined;
+    try {
+      usage = usageFromEvent(JSON.parse(line));
+    } catch {
+      return;
+    }
+    if (!usage) return;
+    this.usage = { at: new Date(this.now()).toISOString(), usage };
+    try {
+      writeFileSync(join(this.options.harnessDir, 'usage.json'), `${JSON.stringify(this.usage)}\n`);
+    } catch (error) {
+      this.log(`usage.json: ${(error as Error).message}`);
+    }
     this.events.emit('usage');
-  }
-
-  /** For the dashboard's meters, in either mode: reads the usage again in the background once the last reading is five minutes old. */
-  refreshUsage(): void {
-    void this.subscriptionUsage();
   }
 
   /**
@@ -2085,9 +2050,19 @@ function ensureDir(dir: string): string {
   return dir;
 }
 
+/** The last usage an agent reported, as .harness/usage.json kept it; undefined when there is none or it can't be read. */
+function savedUsage(harnessDir: string): { at: string; usage: SubscriptionUsage } | undefined {
+  try {
+    const saved = JSON.parse(readFileSync(join(harnessDir, 'usage.json'), 'utf8')) as { at?: unknown; usage?: { limits?: unknown } };
+    return typeof saved.at === 'string' && Array.isArray(saved.usage?.limits) ? (saved as { at: string; usage: SubscriptionUsage }) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Whether Swarm's setup has no step left, as the dashboard's note counts them. */
 function setupFinished(status: SetupStatus): boolean {
-  return status.rules?.ok !== false && status.statusesWritable !== false && status.tokenStored;
+  return status.rules?.ok !== false && status.statusesWritable !== false;
 }
 
 function outcomeReason(attempt: Attempt): string {

@@ -4,8 +4,7 @@ import { join } from 'node:path';
 import { after, before, beforeEach, describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { computeLock, directoryReader } from '../src/ci/harness-ci.ts';
-import { claudeTokenFile, loadClaudeToken, saveClaudeToken } from '../src/anthropic/usage.ts';
-import { claudeToken, granted, mainRuleset, repositorySecret, secretReader, type Check } from '../src/setup/doctor.ts';
+import { granted, mainRuleset, repositorySecret, secretReader, type Check } from '../src/setup/doctor.ts';
 import { init } from '../src/setup/init.ts';
 import { recover } from '../src/setup/recover.ts';
 import { awsProviderName, commitAndPush, fixFor, infracostKey, linkRepo, type SetupOptions } from '../src/setup/setup.ts';
@@ -290,96 +289,6 @@ describe("the cost job's key", () => {
     assert.equal(existsSync(secret), false);
     assert.equal(await repositorySecret('acme/shop', 'INFRACOST_API_KEY'), false);
     assert.match(said.at(-1)!, /^Skipped: the cost job estimates nothing, and Swarm leaves INFRA and MIXED plans to you/);
-  });
-});
-
-describe('the usage token Swarm reads', () => {
-  let projectDir: string;
-  const reports: Check[] = [];
-  const asked: string[] = [];
-  const report = (check: Check) => void reports.push(check);
-  const options = (answer: string, interactive = true, skipped = new Set<string>()) => ({
-    projectDir, interactive, skipped, askSecret: async (question: string) => (asked.push(question), answer),
-  });
-  // The usage endpoint, as it answers a good token: nothing leaves the machine.
-  const read = async () => ({ percent: 10, resetsAt: '2026-11-09T00:00:00Z', limits: [{ kind: 'session', percent: 10, resetsAt: '2026-11-09T00:00:00Z' }] });
-  beforeEach(() => {
-    rmSync(claudeTokenFile(), { force: true });
-    projectDir = tempDir('mode');
-    reports.length = 0;
-    asked.length = 0;
-  });
-  after(() => rmSync(claudeTokenFile(), { force: true }));
-
-  it('is asked for in Manual too, at a terminal, so the project is ready for Swarm', async () => {
-    await claudeToken(options('sk-ant-oat-token'), report, read);
-    assert.match(asked[0]!, /Paste the token from `claude setup-token` \(hidden\), or press Enter to skip/);
-    assert.equal(loadClaudeToken(), 'sk-ant-oat-token');
-    assert.equal(reports.at(-1)!.status, 'ok');
-    await claudeToken(options('sk-ant-other'), report, read);
-    assert.equal(asked.length, 1, 'never asked for again once stored');
-  });
-
-  it("once skipped, isn't asked for again in the same run: a skip in Manual, a warning in Swarm", async () => {
-    const skipped = new Set<string>();
-    await claudeToken(options('', true, skipped), report, read);
-    await claudeToken(options('', true, skipped), report, read);
-    assert.equal(asked.length, 1);
-    assert.deepEqual(reports.map((c) => c.status), ['skip', 'skip']);
-    assert.match(reports[0]!.detail, /^not stored: the daemon learns of a limit only when an attempt hits it; run `harness doctor` again to store it$/);
-    mkdirSync(join(projectDir, '.harness'));
-    writeFileSync(join(projectDir, '.harness', 'state.json'), JSON.stringify({ mode: 'swarm' }));
-    await claudeToken(options('sk-ant-oat-token', false), report, read);
-    assert.equal(reports.at(-1)!.status, 'warn');
-    assert.equal(asked.length, 1, 'never asked for away from a terminal');
-    assert.equal(loadClaudeToken(), undefined);
-  });
-
-  // The endpoint refuses a token cut short, as a paste from a terminal where it wraps can be.
-  const strict = async (token: string) => {
-    if (token !== 'sk-ant-oat01-whole') throw new Error('the usage endpoint answered 401');
-    return read();
-  };
-  const answering = (answers: string[], interactive = true) => ({
-    projectDir, interactive, skipped: new Set<string>(), askSecret: async (question: string) => (asked.push(question), answers.shift() ?? ''),
-  });
-
-  it("doesn't store a token the endpoint refuses: it asks again, says why, and gives up after three", async () => {
-    await claudeToken(answering(['sk-ant-oat01-who', 'sk-ant-oat01-whole']), report, strict);
-    assert.match(asked[1]!, /^The usage endpoint refused that token \(401\): it may have been cut short\. Copy all of it, from sk-ant-oat01- to its end/);
-    assert.equal(loadClaudeToken(), 'sk-ant-oat01-whole');
-    assert.equal(reports.at(-1)!.status, 'ok');
-
-    rmSync(claudeTokenFile());
-    asked.length = 0;
-    await claudeToken(answering(['a', 'b', 'c', 'never asked']), report, strict);
-    assert.equal(asked.length, 3);
-    assert.equal(loadClaudeToken(), undefined, 'none of the refused ones is kept');
-    assert.equal(reports.at(-1)!.status, 'skip');
-  });
-
-  it('checks the stored token on each run: refused, it is a warning in either mode, and replaced at a terminal', async () => {
-    saveClaudeToken('sk-ant-oat01-cut');
-    await claudeToken(answering([], false), report, strict);
-    assert.equal(reports.at(-1)!.status, 'warn');
-    assert.match(reports.at(-1)!.detail, /^the usage endpoint refuses the stored token \(401\)/);
-    assert.equal(asked.length, 0);
-
-    await claudeToken(answering(['sk-ant-oat01-whole']), report, strict);
-    assert.match(asked[0]!, /^The usage endpoint refuses the stored token \(401\)\. Paste a new one .*or press Enter to keep it/);
-    assert.equal(loadClaudeToken(), 'sk-ant-oat01-whole');
-    assert.match(reports.at(-1)!.detail, /^replaced; stored in /);
-  });
-
-  it("keeps a token the endpoint couldn't be asked about, and says so", async () => {
-    saveClaudeToken('sk-ant-oat01-kept');
-    await claudeToken(answering([]), report, async () => {
-      throw new Error('the usage endpoint answered 503');
-    });
-    assert.equal(reports.at(-1)!.status, 'ok');
-    assert.match(reports.at(-1)!.detail, /couldn't be reached to check it: the usage endpoint answered 503$/);
-    assert.equal(loadClaudeToken(), 'sk-ant-oat01-kept');
-    assert.equal(asked.length, 0);
   });
 });
 

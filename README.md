@@ -149,12 +149,11 @@ the `staging` environment and the variables on GitHub for AWS, the Terraform sca
 secret; commits the files it wrote, and only those, with your git once you agree, and
 pushes them when you are on `main`; runs `harness doctor` and fixes what it can (starts
 the OpenShell gateway, builds the agents' image, imports the Claude profile and creates
-the provider with your token, gives the App the permission to write commit statuses and
-stores the token Swarm reads your usage with, whatever the mode, applies the ruleset on
-`main`, creates the AWS provider with your key); runs the probe; and offers to start the
-daemon. Run it again at any time: what is done is skipped, and a setup commit that
-wasn't pushed is offered again. On a private repository of a free plan, where GitHub has
-no rulesets, it says so and goes on.
+the provider with your token, gives the App the permission to write commit statuses
+whatever the mode, applies the ruleset on `main`, creates the AWS provider with your
+key); runs the probe; and offers to start the daemon. Run it again at any time: what is
+done is skipped, and a setup commit that wasn't pushed is offered again. On a private
+repository of a free plan, where GitHub has no rulesets, it says so and goes on.
 
 The same by hand: `harness init` writes the harness's files into the repository, never
 over existing ones, and prints the setup checklist:
@@ -269,9 +268,9 @@ behind a token. Its views:
 - **Project:** modules, proposals, plans and features, with attempts, findings, CI,
   deploys and `progress.txt`; and the budgets: your hours, the agents' hours, the
   tokens Claude used, written and read, by role, and your subscription's usage as
-  bars: the current session, the weekly limit, and a weekly limit on one model, each
-  with when it resets. The daemon reads the usage every five minutes while a page is
-  open, in either mode, with the token `harness doctor` stores.
+  bars: the current session and the weekly limit, each with when it resets. The
+  Developers, the Manager and the reviewers report it with each model call, in either
+  mode; the daemon keeps the last report across a restart.
 - **Agents:** the Architect's terminal, the Manager's and the Developers' live
   transcripts, a message box for the Manager, and a shell in any agent's sandbox. The
   Architect is Claude Code itself, in a terminal; the others run without a screen, so
@@ -319,10 +318,10 @@ the rules didn't change; `harness github-setup --repo <org>/<repo>` applies them
 it is. With the daemon down, `harness mode` applies them, and the daemon switches when
 it starts. Until the rules match nothing merges. The daemon reads the rules in effect
 on `main` through the App and the dashboard's note lists what is still to do, the
-commands ready to copy: the rules, the App's "Commit statuses: write", and the token
-for the usage probe. While a step is left, the daemon checks again every 30 seconds, so
-the note goes soon after the last one; `harness doctor` checks the same. `harness
-setup` prepares the last two in either mode, so a switch to Swarm needs only its rules.
+commands ready to copy: the rules, and the App's "Commit statuses: write". While a step
+is left, the daemon checks again every 30 seconds, so the note goes soon after the last
+one; `harness doctor` checks the same. `harness setup` prepares the App's permission in
+either mode, so a switch to Swarm needs only its rules.
 
 **What merges itself.** In Swarm the daemon merges a plan's pull request, as the App,
 once CI passed and every status in `swarm.requiredStatuses` is green on its head:
@@ -345,17 +344,13 @@ before they pass. The reviewers read plan pull requests only: the daemon gives a
 `Arch:` or `Fix:` pull request the two statuses as "not reviewed", so you merge it
 without bypassing the rules, and CI still gates it.
 
-**Before a launch.** In Swarm the daemon reads your subscription's usage before it
+**Before a launch.** In Swarm the daemon checks your subscription's usage before it
 starts an attempt, and at or above `swarm.usageCeilingPercent` the pipeline waits for
-the window to reset. It reads it with the token `harness doctor` stores in
-`~/.config/harness/claude.token` when it creates the Claude provider; on an older
-setup, `harness setup` asks for the token again, in either mode, and so does
-`harness doctor` in a terminal. The doctor checks a token against the usage endpoint
-before it keeps it, and the stored one on every run: a refused token, most often one cut
-short by a copy across the line break where `claude setup-token` wrapped it, is asked
-for again. A paste that spans two lines comes in whole. Without a token, the daemon
-learns of a limit only when an attempt hits it, as in Manual, and the dashboard's
-Subscription box says why it has no bars.
+the window to reset. The agents report the usage: each model call comes back with the
+session and weekly windows, which Claude Code writes into the stream the daemon reads,
+so no token of the daemon's own is needed. A `claude setup-token` token couldn't read it
+anyway: it may only run models. Before the first report, the daemon learns of a limit
+only when an attempt hits it, as in Manual.
 
 **The reviewers.** Once CI passed on a plan's pull request, two reviewers read it, one
 after the other, each in a fresh read-only sandbox with the Manager's permissions: a
@@ -673,9 +668,9 @@ To report a vulnerability, see `SECURITY.md` in the source repository.
 - The agents run on your Claude subscription, so their usage counts against your plan's
   limits. When Claude Code reports that a limit is reached, the attempt under way
   doesn't count, and the pipeline pauses for an hour, then goes on. In Swarm mode the
-  daemon also reads the usage before each launch, and waits above
-  `swarm.usageCeilingPercent` until the window resets; the Project view shows the
-  windows.
+  daemon also checks the usage the agents last reported before each launch, and waits
+  at or above `swarm.usageCeilingPercent` until the window resets; the Project view
+  shows the windows.
 - By default, the Architect runs Fable 5.1, the most capable model, and the Manager,
   the reviewers and the Developers run Opus 5.5, all at the highest effort, `max`. At API
   prices Fable costs 2.5 times as much as Opus per token, so the Architect's sessions use
