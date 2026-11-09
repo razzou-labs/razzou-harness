@@ -256,8 +256,9 @@ plans it finds there (see [Configuration](#configuration)).
   the work. It only grows. When plans in parallel both add lines, the daemon keeps both.
 - **Brakes:** counters and deadlines, not judgment. Three failed attempts in a row, a
   Manager that leaves an item waiting for 180 minutes, or CI still failing after two fix
-  rounds pause the pipeline until you resume it. A usage limit pauses it for an hour,
-  and never shortens a pause already there.
+  rounds pause the pipeline until you resume it. A usage limit pauses it until the
+  limit resets, or for an hour when no agent said when, and never shortens a pause
+  already there.
 
 ## The dashboard
 
@@ -674,10 +675,15 @@ To report a vulnerability, see `SECURITY.md` in the source repository.
 
 - The agents run on your Claude subscription, so their usage counts against your plan's
   limits. When Claude Code reports that a limit is reached, the attempt under way
-  doesn't count, and the pipeline pauses for an hour, then goes on. In Swarm mode the
-  daemon also checks the usage the agents last reported before each launch, and waits
-  at or above `swarm.usageCeilingPercent` until the window resets; the Project view
-  shows the windows.
+  doesn't count, and the pipeline pauses until a minute past the reset, then goes on by
+  itself. The reset comes from the agents' last usage report, or from an older Claude
+  Code's message; without either, the pause lasts an hour. In Swarm mode the daemon also
+  checks the usage the agents last reported before each launch, and waits at or above
+  `swarm.usageCeilingPercent` until a minute past the window's reset; the Project view
+  shows the windows. Nothing has to run to learn of the reset: each report says when
+  every window resets. The times are Unix times, so your timezone doesn't matter; the
+  minute covers a clock a little ahead. While paused, agents already running finish,
+  and their results count at once.
 - By default, the Architect runs Fable 5.1, the most capable model, and the Manager,
   the reviewers and the Developers run Opus 5.5, all at the highest effort, `max`. At API
   prices Fable costs 2.5 times as much as Opus per token, so the Architect's sessions use

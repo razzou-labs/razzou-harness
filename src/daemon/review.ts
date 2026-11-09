@@ -38,6 +38,20 @@ export async function stepReview(o: Orchestrator, plan: PlanState, review: Revie
 }
 
 /**
+ * While the pipeline is paused: every reviewer already running is followed to its end, as
+ * an attempt is, so its report, or a usage limit it hit, counts at once rather than when
+ * the pause lifts. One still starting isn't, since that would make its sandbox.
+ */
+export async function pollRunningReviews(o: Orchestrator): Promise<boolean> {
+  let progressed = false;
+  for (const plan of Object.values(o.state.plans)) {
+    const review = activeReview(plan);
+    if (review?.status === 'running' && (await poll(o, plan, review)) === 'progress') progressed = true;
+  }
+  return progressed;
+}
+
+/**
  * Where the reviews of a PR head stand: a reviewer to start or step, findings to post,
  * a fix round to open, or the owner's call; `ready` once every required reviewer passed.
  */
@@ -194,7 +208,7 @@ async function poll(o: Orchestrator, plan: PlanState, review: ReviewState): Prom
   await o.driver.remove(review.sandbox);
   if (result.outcome === 'usage_limit') {
     o.record({ type: 'REVIEW_ENDED', ref, payload: { role: review.role, head: review.head, outcome: 'usage_limit', reason: result.detail ?? 'usage limit', ...(result.usage ? { usage: result.usage } : {}) } });
-    o.pausePipeline('usage limit reached', new Date(o.now() + 3_600_000).toISOString());
+    o.pausePipeline('usage limit reached', o.usageLimitUntil(result.detail));
     return 'progress';
   }
   if (result.outcome !== 'done' || !result.report) {
