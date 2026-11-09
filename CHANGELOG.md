@@ -11,8 +11,9 @@ version), then restart the daemon with `harness down` and `harness up`.
 
 - **razzou-harness says it is alpha.** The README opens with what that means: expect
   bugs, and expect a new minor version to change how a project is set up. The package's
-  description on npm starts with "Alpha." too. Releases still go to npm's `latest`
-  tag, so `npm install -g razzou-harness` installs the newest one, as before.
+  description on npm ends with "In alpha: expect bugs and breaking changes." Releases
+  still go to npm's `latest` tag, so `npm install -g razzou-harness` installs the newest
+  one, as before.
 
 ## 0.4.8 (2026-11-08)
 
