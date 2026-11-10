@@ -337,6 +337,13 @@ function toUsage(usage: unknown, cost: unknown): Usage | undefined {
   return {
     inputTokens: (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0),
     outputTokens: u.output_tokens ?? 0,
+    cacheReadTokens: u.cache_read_input_tokens ?? 0,
     ...(typeof cost === 'number' ? { costUsd: cost } : {}),
   };
+}
+
+/** A finished session's usage, read again from its saved stream: what was recorded before 0.5.1 had no cache reads. */
+export function streamUsage(stream: string): Usage | undefined {
+  const result = lastResult(stream);
+  return result ? toUsage(result.usage, result.total_cost_usd) : undefined;
 }
