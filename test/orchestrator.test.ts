@@ -1858,6 +1858,29 @@ describe('pull requests, continued', () => {
     assert.match(plan(o)!.leftToOwner!.reason, /none was produced/);
   });
 
+  it('waits for GitHub to show its push on the pull request, rather than taking the lag for a moved branch', async () => {
+    let skew = 0;
+    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true, now: () => Date.now() + skew });
+    // GitHub a moment after a push: the branch holds the new commit, and the pull request still shows the one before it.
+    let lagging = true;
+    const read = fake.pullRequest.bind(fake);
+    fake.pullRequest = async (number: number) => {
+      const pr = await read(number);
+      return lagging ? { ...pr, head: (await runOk('git', ['--git-dir', fake.remote, 'rev-parse', `${pr.head}^`])).trim() } : pr;
+    };
+    await until(o, () => plan(o)?.pr !== undefined);
+    for (let i = 0; i < 5; i++) {
+      skew += 60_000;
+      await o.tick();
+    }
+    assert.equal(o.state.pipeline.paused, undefined, 'no pause while GitHub catches up');
+    assert.notEqual(plan(o)!.status, 'ready_to_merge', 'nor a CI read on a head GitHub has yet to show');
+    lagging = false;
+    skew += 60_000;
+    await until(o, () => plan(o)?.status === 'ready_to_merge');
+    assert.equal(o.state.pipeline.paused, undefined);
+  });
+
   it("takes the owner's push to a plan's branch, and runs CI on it", async () => {
     let skew = 0;
     const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true, now: () => Date.now() + skew });

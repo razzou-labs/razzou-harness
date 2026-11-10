@@ -3,6 +3,19 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## 0.4.23 (2026-11-10)
+
+**Upgrading from 0.4.22:** install the new version, rebuild the agents' image with
+`harness doctor --build-images` (its tag follows the harness's version), then restart the
+daemon with `harness down` and `harness up`, and reload the dashboard.
+
+- **No pause for GitHub's lag.** A moment after the harness pushes to a plan's branch,
+  GitHub can still show the pull request at the commit before. The daemon took that for
+  a branch someone had moved, and paused with "the branch of PR #… moved to …, which
+  doesn't build on what the harness pushed". It did so on a merge of `main` into a plan's
+  branch. When the branch holds what the harness pushed and GitHub shows a commit under
+  it, the daemon now looks again ten seconds later.
+
 ## 0.4.22 (2026-11-10)
 
 **Upgrading from 0.4.21:** install the new version, rebuild the agents' image with

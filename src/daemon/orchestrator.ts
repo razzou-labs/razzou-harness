@@ -1177,8 +1177,14 @@ export class Orchestrator {
       return pause(`PR #${pr.number} of ${key} was closed without being merged. Reopen it to go on.`);
     }
     if (pr.head !== plan.pushed) {
-      // The owner pushed to the branch, as GitHub's conflict editor does: the daemon builds on it, unless history was rewritten.
       const head = await this.forge.fetchBranch(this.repo, plan.branch);
+      // GitHub moves a pull request's head a moment after a push: the branch already holds what the harness
+      // pushed, and the pull request still shows a commit under it. It catches up in seconds; nothing moved.
+      if (head === plan.pushed && (await this.repo.isAncestor(pr.head, head))) {
+        this.nextPoll.set(key, this.now() + 10_000);
+        return 'wait';
+      }
+      // The owner pushed to the branch, as GitHub's conflict editor does: the daemon builds on it, unless history was rewritten.
       if (head !== pr.head || !(await this.repo.isAncestor(plan.pushed!, head))) {
         // The fetch moved the daemon's branch: it stays where the harness had it.
         await this.repo.setRef(`refs/heads/${plan.branch}`, plan.head);
