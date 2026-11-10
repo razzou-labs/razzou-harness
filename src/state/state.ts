@@ -3,7 +3,7 @@ import { dirname } from 'node:path';
 import type { CheckResult } from '../checks/runner.ts';
 import type { ReviewFinding, ReviewerRole } from '../design/schemas.ts';
 import type { Denial } from '../sandbox/refusals.ts';
-import type { AttemptOutcome, CiJob, Finding, HarnessEvent, Ref, Usage } from './events.ts';
+import type { AgentReading, AttemptOutcome, CiJob, Finding, HarnessEvent, Ref, Usage } from './events.ts';
 
 export type AttemptStatus = 'starting' | 'running' | 'collecting' | 'checking' | 'reviewing' | 'accepted' | 'failed' | 'interrupted';
 
@@ -178,7 +178,17 @@ export interface ManagerState {
   mail: Array<{ key: string; kind: 'welcome' | 'owner_message' | 'owner_answer' | 'decision'; text: string; requestId?: string }>;
 }
 
-/** A module the owner started with the Architect (§7.1). Modules written by hand on main have none. */
+/**
+ * A long-lived agent's totals over its sandboxes. Its cache reads and its active time are
+ * read since 0.5.1, each reading for its whole sandbox, so the first counts what came
+ * before it; only a sandbox gone before then counts none. `splitInputTokens` is the part
+ * of `inputTokens` whose cache reads are known.
+ */
+export interface AgentTotal extends Usage {
+  splitInputTokens?: number;
+  activeMs?: number;
+}
+
 /**
  * What a CHANGED_LOCKED_FILES change does to one built feature (v5): the fields of its
  * spec, the checks, and the scripts they run that change. `expected` is what its checks
@@ -194,6 +204,7 @@ export interface LockedChange {
   scripts: string[];
 }
 
+/** A module the owner started with the Architect (§7.1). Modules written by hand on main have none. */
 export interface ModuleState {
   module: string;
   title: string;
@@ -252,11 +263,11 @@ export interface State {
    */
   budgets: { ownerHours?: number; ownerHoursSetAt?: string };
   /**
-   * The tokens of the Managers and Architects, by agent (`manager:<key>`, `architect:<module>`):
-   * the total so far, and the last reading of their sandbox. A Developer's and a reviewer's
-   * are on their attempt and review.
+   * The tokens and active time of the Managers and Architects, by agent (`manager:<key>`,
+   * `architect:<module>`): the total so far, and the last reading of their sandbox. A
+   * Developer's and a reviewer's are on their attempt and review.
    */
-  agentTokens?: Record<string, { total: Usage; reading: Usage }>;
+  agentTokens?: Record<string, { total: AgentTotal; reading: AgentReading }>;
   /** What each new sandbox may use of the machine, as the owner set it in the dashboard; no cap without one. */
   sandboxLimits?: { cpu?: number; memoryGiB?: number };
   plans: Record<string, PlanState>;
@@ -391,11 +402,31 @@ export function apply(state: State, event: HarnessEvent): State {
       const known = tokens[agent];
       // A reading below the last is a new sandbox, whose count starts from zero.
       const grew = known !== undefined && reading.inputTokens >= known.reading.inputTokens && reading.outputTokens >= known.reading.outputTokens;
-      const base = grew ? known.reading : { inputTokens: 0, outputTokens: 0 };
+      const base = grew ? known.reading : undefined;
       const total = known?.total ?? { inputTokens: 0, outputTokens: 0 };
+      const next: AgentTotal = {
+        inputTokens: total.inputTokens + reading.inputTokens - (base?.inputTokens ?? 0),
+        outputTokens: total.outputTokens + reading.outputTokens - (base?.outputTokens ?? 0),
+      };
+      // Cache reads and time, read since 0.5.1: the first reading of a sandbox that has them counts its whole sandbox.
+      if (reading.cacheReadTokens !== undefined) {
+        const from = base?.cacheReadTokens !== undefined ? base : undefined;
+        next.cacheReadTokens = (total.cacheReadTokens ?? 0) + reading.cacheReadTokens - (from?.cacheReadTokens ?? 0);
+        next.splitInputTokens = (total.splitInputTokens ?? 0) + reading.inputTokens - (from?.inputTokens ?? 0);
+      } else if (total.cacheReadTokens !== undefined) {
+        next.cacheReadTokens = total.cacheReadTokens;
+        next.splitInputTokens = total.splitInputTokens ?? 0;
+      }
+      if (reading.activeMs !== undefined) next.activeMs = (total.activeMs ?? 0) + reading.activeMs - (base?.activeMs ?? 0);
+      else if (total.activeMs !== undefined) next.activeMs = total.activeMs;
       tokens[agent] = {
-        total: { inputTokens: total.inputTokens + reading.inputTokens - base.inputTokens, outputTokens: total.outputTokens + reading.outputTokens - base.outputTokens },
-        reading: { inputTokens: reading.inputTokens, outputTokens: reading.outputTokens },
+        total: next,
+        reading: {
+          inputTokens: reading.inputTokens,
+          outputTokens: reading.outputTokens,
+          ...(reading.cacheReadTokens !== undefined ? { cacheReadTokens: reading.cacheReadTokens } : {}),
+          ...(reading.activeMs !== undefined ? { activeMs: reading.activeMs } : {}),
+        },
       };
       break;
     }

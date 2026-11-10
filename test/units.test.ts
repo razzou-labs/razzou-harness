@@ -12,6 +12,7 @@ import { githubRepo, init } from '../src/setup/init.ts';
 import { apiProfile, apiProviderName, buildPolicy } from '../src/sandbox/policy.ts';
 import type { Orchestrator } from '../src/daemon/orchestrator.ts';
 import { readTokens } from '../src/daemon/tokens.ts';
+import { tokensByRole } from '../src/dashboard/tokens.ts';
 import { EventStore, type HarnessEvent } from '../src/state/events.ts';
 import { activeAttempts, attemptInSandbox, countedAttempts, project } from '../src/state/state.ts';
 import { modelName } from '../dashboard/src/format.ts';
@@ -147,6 +148,24 @@ describe('agent tokens', () => {
     assert.deepEqual(state.agentTokens!['architect:demo']!.total, { inputTokens: 50, outputTokens: 5 });
   });
 
+  it('counts the cache reads and the time of a whole sandbox from its first reading that has them, and only grows after', () => {
+    let id = 0;
+    const event = (reading: object, agent = 'architect:demo') =>
+      ({ v: 1, id: `e${++id}`, ts: '2026-11-10T00:00:00Z', type: 'AGENT_TOKENS', payload: { agent, reading } }) as unknown as HarnessEvent;
+    const state = project([
+      // A sandbox read before 0.5.1, then gone: its cache reads and time stay unknown.
+      event({ inputTokens: 1000, outputTokens: 100 }),
+      // A new sandbox, read before 0.5.1, then since: its first reading with them counts all of it.
+      event({ inputTokens: 200, outputTokens: 20 }),
+      event({ inputTokens: 300, outputTokens: 30, cacheReadTokens: 270, activeMs: 60_000 }),
+      event({ inputTokens: 500, outputTokens: 40, cacheReadTokens: 460, activeMs: 90_000 }),
+    ]);
+    assert.deepEqual(state.agentTokens!['architect:demo'], {
+      total: { inputTokens: 1500, outputTokens: 140, cacheReadTokens: 460, splitInputTokens: 500, activeMs: 90_000 },
+      reading: { inputTokens: 500, outputTokens: 40, cacheReadTokens: 460, activeMs: 90_000 },
+    });
+  });
+
   it('ignores the agent-hours threshold an older log may hold', () => {
     const event = (type: string, payload: object, ts: string) => ({ v: 1, id: `e-${type}`, ts, type, payload }) as unknown as HarnessEvent;
     const state = project([event('AGENT_HOURS_SET', { hours: 40 }, '2026-11-01T00:00:00Z'), event('OWNER_HOURS_SET', { hours: 12 }, '2026-11-02T00:00:00Z')]);
@@ -173,9 +192,65 @@ describe('agent tokens', () => {
     ].join('\n'));
     writeFileSync(join(dir, 'subagents', 'agent-a.jsonl'), `${reply('msg_4', 3, 1)}\n`);
     const o = { exec: (sandbox: string, script: string) => driver.exec(sandbox, script) } as unknown as Orchestrator;
-    assert.deepEqual(await readTokens(o, 'mgr-tokens'), { inputTokens: 2 * 1110 + 1101, outputTokens: 40 + 7 + 3 });
+    assert.deepEqual(await readTokens(o, 'mgr-tokens'), { inputTokens: 2 * 1110 + 1101, outputTokens: 40 + 7 + 3, cacheReadTokens: 3 * 1000, activeMs: 0 });
     assert.equal(await readTokens(o, 'no-such-sandbox'), undefined);
     await driver.removeAll();
+  });
+
+  it("times an agent's turns, from each prompt to its last step, once even where a resumed conversation repeats them", async () => {
+    const driver = new LocalDriver(tempDir('turns'));
+    await driver.create({ name: 'arc-turns', image: 'x', providers: [], env: {} });
+    const dir = join(driver.rootOf('arc-turns'), '.claude', 'projects', '-sandbox-work');
+    mkdirSync(join(dir, 'subagents'), { recursive: true });
+    const at = (seconds: number) => new Date(Date.UTC(2026, 10, 10, 12, 0, seconds)).toISOString();
+    const prompt = (seconds: number, extra: object = {}) => JSON.stringify({ type: 'user', timestamp: at(seconds), message: { role: 'user', content: 'work' }, ...extra });
+    const result = (seconds: number) => JSON.stringify({ type: 'user', timestamp: at(seconds), message: { role: 'user', content: [{ type: 'tool_result', content: 'ok' }] } });
+    const reply = (seconds: number, extra: object = {}) => JSON.stringify({ type: 'assistant', timestamp: at(seconds), message: { id: `msg_${seconds}`, usage: { input_tokens: 1, output_tokens: 1 } }, ...extra });
+    const first = [prompt(0), reply(5), result(10), reply(20)];
+    writeFileSync(join(dir, 'one.jsonl'), [
+      ...first,
+      // What Claude Code adds itself starts no turn, nor does a subagent's work, which ends with its caller's tool result.
+      prompt(25, { isMeta: true }), prompt(26, { isSidechain: true }), reply(27, { isSidechain: true }), result(28),
+      prompt(60), reply(65),
+      // Claude Code's line for the next message, queued long after the turn ended.
+      JSON.stringify({ type: 'queue-operation', operation: 'enqueue', timestamp: at(95) }),
+    ].join('\n'));
+    // A conversation resumed in a new file repeats the first turn: it counts once.
+    writeFileSync(join(dir, 'two.jsonl'), [...first, prompt(100), reply(130)].join('\n'));
+    writeFileSync(join(dir, 'subagents', 'agent-a.jsonl'), [prompt(30), reply(50)].join('\n'));
+    const o = { exec: (sandbox: string, script: string) => driver.exec(sandbox, script) } as unknown as Orchestrator;
+    // 0 to 28, the subagent's result; 60 to 65; 100 to 130.
+    assert.equal((await readTokens(o, 'arc-turns'))!.activeMs, (28 + 5 + 30) * 1000);
+    await driver.removeAll();
+  });
+
+  it('finds the cache reads of sessions recorded before 0.5.1 in their saved streams, when they are the streams that gave them', () => {
+    const harnessDir = tempDir('tokens-dashboard');
+    const stream = (dir: string, usage: object) => {
+      mkdirSync(join(harnessDir, 'modules', 'demo', dir), { recursive: true });
+      writeFileSync(join(harnessDir, 'modules', 'demo', dir, 'stream.jsonl'), `{"type":"system"}\n${JSON.stringify({ type: 'result', usage })}\n`);
+    };
+    stream('attempts/P1-F01-a1', { input_tokens: 10, cache_creation_input_tokens: 90, cache_read_input_tokens: 900, output_tokens: 50 });
+    // A review run again on the same head wrote over its stream: another session's totals.
+    stream('reviews/P1-security-abcdef12', { input_tokens: 1, cache_read_input_tokens: 99, output_tokens: 5 });
+    const state = project([]);
+    state.features['demo/P1/F01'] = {
+      module: 'demo', plan: 'P1', feature: 'F01', status: 'accepted',
+      attempts: [
+        { n: 1, usage: { inputTokens: 1000, outputTokens: 50 } },
+        { n: 2, usage: { inputTokens: 400, outputTokens: 20, cacheReadTokens: 300 } },
+        { n: 3, usage: { inputTokens: 100, outputTokens: 10 } },
+      ],
+    } as never;
+    state.plans['demo/P1'] = { module: 'demo', plan: 'P1', reviews: [{ role: 'security', head: 'abcdef1234', usage: { inputTokens: 500, outputTokens: 7 } }] } as never;
+    state.agentTokens = { 'architect:demo': { total: { inputTokens: 2000, outputTokens: 30, cacheReadTokens: 900, splitInputTokens: 1000 }, reading: { inputTokens: 1000, outputTokens: 10 } } };
+    assert.deepEqual(tokensByRole(state, harnessDir), [
+      // Attempt 1 from its stream, attempt 2 as recorded; attempt 3 has no stream.
+      { role: 'Developers', read: 1500, cacheRead: 1200, known: 1400, written: 80 },
+      { role: 'Managers', read: 0, cacheRead: 0, known: 0, written: 0 },
+      { role: 'Architects', read: 2000, cacheRead: 900, known: 1000, written: 30 },
+      { role: 'Reviewers', read: 500, cacheRead: 0, known: 0, written: 7 },
+    ]);
   });
 });
 
@@ -437,7 +512,7 @@ describe('claude code adapter', () => {
     const report = { type: 'result', is_error: false, result: 'x', structured_output: { outcome: 'done', summary: 'built it' }, usage: { input_tokens: 3, cache_read_input_tokens: 7, output_tokens: 2 } };
     const done = readResult(`{"type":"system"}\n${JSON.stringify(report)}\n`, 0);
     assert.equal(done.outcome, 'done');
-    assert.deepEqual(done.usage, { inputTokens: 10, outputTokens: 2 });
+    assert.deepEqual(done.usage, { inputTokens: 10, outputTokens: 2, cacheReadTokens: 7 });
 
     const limited = readResult(JSON.stringify({ type: 'result', is_error: true, result: 'Claude usage limit reached' }), 1);
     assert.equal(limited.outcome, 'usage_limit');

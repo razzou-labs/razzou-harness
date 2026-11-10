@@ -1692,17 +1692,18 @@ export class Orchestrator {
 
   /**
    * Records what a long-lived agent, a Manager (`manager:<key>`) or an Architect
-   * (`architect:<module>`), has used of Claude, read from its sandbox at most every five
-   * minutes unless `now`: before a sandbox goes. Only a reading that changed is recorded.
+   * (`architect:<module>`), has used of Claude and the time it worked, read from its
+   * sandbox at most every five minutes unless `now`: before a sandbox goes. Only a reading
+   * that changed is recorded, the first with cache reads and time (0.5.1) included.
    */
   async noteTokens(agent: string, sandbox: string, now = false): Promise<void> {
     if (!now && this.now() - (this.tokensReadAt.get(agent) ?? -Infinity) < 5 * 60_000) return;
     this.tokensReadAt.set(agent, this.now());
     const reading = await readTokens(this, sandbox);
     if (!reading) return;
-    const last = this.state.agentTokens?.[agent]?.reading ?? { inputTokens: 0, outputTokens: 0 };
-    if (last.inputTokens === reading.inputTokens && last.outputTokens === reading.outputTokens) return;
-    this.record({ type: 'AGENT_TOKENS', payload: { agent, reading } });
+    const last = this.state.agentTokens?.[agent]?.reading ?? { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, activeMs: 0 };
+    const same = (['inputTokens', 'outputTokens', 'cacheReadTokens', 'activeMs'] as const).every((key) => last[key] === reading[key]);
+    if (!same) this.record({ type: 'AGENT_TOKENS', payload: { agent, reading } });
   }
 
   /** An error outside any attempt: logged, and the loop goes on. */

@@ -16,7 +16,7 @@ export const Project = defineComponent({
       const moduleIds = [...new Set([...Object.keys(state.modules), ...design.modules.map((m) => m.id)])];
       return (
         <div class="column q-gutter-md">
-          <Budgets state={state} roles={design.roles} ceiling={design.swarm?.usageCeilingPercent ?? null} {...(props.data.ownerTime ? { ownerTime: props.data.ownerTime } : {})} {...(props.data.usage ? { usage: props.data.usage } : {})} />
+          <Budgets state={state} roles={design.roles} tokens={props.data.tokens} ceiling={design.swarm?.usageCeilingPercent ?? null} {...(props.data.ownerTime ? { ownerTime: props.data.ownerTime } : {})} {...(props.data.usage ? { usage: props.data.usage } : {})} />
           <NewModule />
           {moduleIds.length === 0 && <p class="text-muted">No module yet.</p>}
           {moduleIds.map((id) => {
@@ -80,10 +80,10 @@ function useNow(ticking: () => boolean, everyMs = 60_000): Ref<number> {
 /**
  * The agents' active time: each Developer's attempt and each reviewer's session, from its
  * start to its end, those running counted to `now`; a review still waiting to start counts
- * nothing. A Manager and an Architect aren't counted: they live for their module, and wait
- * far more than they work.
+ * nothing. A Manager's and an Architect's is the time it spent on its prompts, as the
+ * daemon reads its sandbox: null until a first reading has it (0.5.1).
  */
-function activeMs(state: State, now: number): { developers: number; reviewers: number } {
+function activeMs(state: State, now: number): { developers: number; reviewers: number; managers: number | null; architects: number | null } {
   const span = (start: string, end: string | undefined) => {
     const started = Date.parse(start);
     const ended = end ? Date.parse(end) : now;
@@ -93,28 +93,15 @@ function activeMs(state: State, now: number): { developers: number; reviewers: n
   let reviewers = 0;
   for (const feature of Object.values(state.features)) for (const attempt of feature.attempts) developers += span(attempt.startedAt, attempt.endedAt);
   for (const plan of Object.values(state.plans)) for (const review of plan.reviews ?? []) if (review.status !== 'starting') reviewers += span(review.startedAt, review.endedAt);
-  return { developers, reviewers };
+  const agents = Object.entries(state.agentTokens ?? {});
+  const read = (prefix: string): number | null => {
+    const mine = agents.filter(([agent]) => agent.startsWith(prefix));
+    return mine.length > 0 && mine.every(([, tokens]) => tokens.total.activeMs === undefined) ? null : mine.reduce((sum, [, tokens]) => sum + (tokens.total.activeMs ?? 0), 0);
+  };
+  return { developers, reviewers, managers: read('manager:'), architects: read('architect:') };
 }
 
 const inHours = (ms: number) => `${(ms / 3_600_000).toFixed(1)} h`;
-
-type Tokens = { input: number; output: number };
-
-/** Claude's tokens by role: a Developer's and a reviewer's from their sessions' end, a Manager's and an Architect's from the daemon's readings of their sandboxes. */
-function tokensByRole(state: State): Array<[string, Tokens]> {
-  const roles: Record<string, Tokens> = { Developers: { input: 0, output: 0 }, Managers: { input: 0, output: 0 }, Architects: { input: 0, output: 0 }, Reviewers: { input: 0, output: 0 } };
-  const add = (role: string, usage?: { inputTokens: number; outputTokens: number }) => {
-    if (!usage) return;
-    roles[role]!.input += usage.inputTokens;
-    roles[role]!.output += usage.outputTokens;
-  };
-  for (const feature of Object.values(state.features)) for (const attempt of feature.attempts) add('Developers', attempt.usage);
-  for (const plan of Object.values(state.plans)) for (const review of plan.reviews ?? []) add('Reviewers', review.usage);
-  for (const [agent, tokens] of Object.entries(state.agentTokens ?? {})) {
-    add(agent.startsWith('manager:') ? 'Managers' : agent.startsWith('architect:') ? 'Architects' : 'Developers', tokens.total);
-  }
-  return Object.entries(roles);
-}
 
 /** 1234567 is 1.2 M; 45678 is 46 k. */
 function count(n: number): string {
@@ -140,12 +127,14 @@ const Meter = defineComponent({
 });
 
 type Roles = DashboardState['design']['roles'];
+type RoleTokens = DashboardState['tokens'][number];
 
 /** The owner's hours for the whole project (v3 §4), set here and recorded by the daemon, and what the agents used. */
 const Budgets = defineComponent({
   props: {
     state: { type: Object as PropType<State>, required: true },
     roles: { type: Object as PropType<Roles>, required: true },
+    tokens: { type: Array as PropType<RoleTokens[]>, required: true },
     ceiling: { type: Number as PropType<number | null>, default: null },
     ownerTime: Object as PropType<OwnerTime>,
     usage: Object as PropType<{ at: string; usage: SubscriptionUsage }>,
@@ -188,7 +177,7 @@ const Budgets = defineComponent({
                 </p>
               </Meter>
               <ActiveMeter state={state} roles={props.roles} now={now.value} />
-              <TokensMeter state={state} />
+              <TokensMeter tokens={props.tokens} />
               <SubscriptionMeter ceiling={props.ceiling} {...(props.usage ? { usage: props.usage } : {})} />
             </div>
           </QCardSection>
@@ -200,15 +189,15 @@ const Budgets = defineComponent({
 
 type Columns = NonNullable<QTableProps['columns']>;
 
-/** One row per agent: its model and effort as harness/config.json sets them, and its active hours, or null where they aren't counted. */
+/** One row per agent: its model and effort as harness/config.json sets them, and its active hours, or null before the daemon read them. */
 const ACTIVE_COLUMNS: Columns = [
   { name: 'agent', label: 'Agent', field: 'agent', align: 'left' },
   { name: 'model', label: 'Model', field: 'model', align: 'left', format: modelName },
   { name: 'effort', label: 'Effort', field: 'effort', align: 'left', format: (effort: string | null) => effort ?? "Claude Code's" },
-  { name: 'hours', label: 'Active', field: 'ms', align: 'right', format: (ms: number | null) => (ms === null ? 'not counted' : inHours(ms)), classes: (row: { ms: number | null }) => (row.ms === null ? 'text-muted' : '') },
+  { name: 'hours', label: 'Active', field: 'ms', align: 'right', format: (ms: number | null) => (ms === null ? 'not read yet' : inHours(ms)), classes: (row: { ms: number | null }) => (row.ms === null ? 'text-muted' : '') },
 ];
 
-/** The hours the agents worked: the Developers' and the reviewers', by agent, with the model and effort of each. */
+/** The hours the agents worked, by agent, with the model and effort of each. */
 const ActiveMeter = defineComponent({
   props: {
     state: { type: Object as PropType<State>, required: true },
@@ -223,18 +212,18 @@ const ActiveMeter = defineComponent({
       const rows = [
         { agent: 'Developers', ...roles.developer, ms: active.developers },
         { agent: 'Reviewers', ...roles.manager, ms: active.reviewers },
-        { agent: 'Managers', ...roles.manager, ms: null },
-        { agent: 'Architects', ...roles.architect, ms: null },
+        { agent: 'Managers', ...roles.manager, ms: active.managers },
+        { agent: 'Architects', ...roles.architect, ms: active.architects },
       ];
       return (
         <Meter title="Active hours">
           <p>
-            <b>{inHours(active.developers + active.reviewers)}</b>
-            <span class="text-muted"> · the Developers and the reviewers</span>
+            <b>{inHours(active.developers + active.reviewers + (active.managers ?? 0) + (active.architects ?? 0))}</b>
+            <span class="text-muted"> · every agent</span>
           </p>
           <QTable class="active q-mb-sm" flat bordered dense hideBottom rowKey="agent" rows={rows} columns={ACTIVE_COLUMNS} pagination={{ rowsPerPage: 0 }} />
           <p class="text-caption text-muted">
-            Each attempt and review from its start to its end; those running count to now. Managers and Architects aren't counted: they wait far more than they work.
+            Each attempt and review from its start to its end; those running count to now. A Manager and an Architect, from each prompt to its last step, as the daemon reads its sandbox every five minutes.
             The model and effort are those of harness/config.json; a running Architect keeps the model it started with until its sandbox is made again.
           </p>
         </Meter>
@@ -243,30 +232,36 @@ const ActiveMeter = defineComponent({
   },
 });
 
+/** The prompt cache's share of what was read where it is known; none where nothing is. */
+const share = (tokens: Pick<RoleTokens, 'cacheRead' | 'known'>): string => (tokens.known > 0 ? `${Math.round((100 * tokens.cacheRead) / tokens.known)}%` : '—');
+
 const TOKEN_COLUMNS: Columns = [
   { name: 'role', label: 'Role', field: 'role', align: 'left' },
-  { name: 'written', label: 'Written', field: 'output', align: 'right', format: count },
-  { name: 'read', label: 'Read', field: 'input', align: 'right', format: count },
-  { name: 'total', label: 'Total', field: 'total', align: 'right', format: count },
+  { name: 'read', label: 'Read', field: 'read', align: 'right', format: count },
+  { name: 'cacheRead', label: 'Of which cache reads', field: 'cacheRead', align: 'right', format: count },
+  { name: 'cache', label: 'Cache', field: (row: RoleTokens) => row, align: 'right', format: share },
+  { name: 'written', label: 'Written', field: 'written', align: 'right', format: count },
+  { name: 'total', label: 'Total', field: (row: RoleTokens) => row.read + row.written, align: 'right', format: count },
 ];
 
-/** Every token Claude used for the project, written and read, and by role. */
+/** Every token Claude used for the project, read and written, by role, with what the prompt cache served. */
 const TokensMeter = defineComponent({
-  props: { state: { type: Object as PropType<State>, required: true } },
+  props: { tokens: { type: Array as PropType<RoleTokens[]>, required: true } },
   setup(props) {
     return () => {
-      const roles = tokensByRole(props.state);
-      const total = roles.reduce((sum, [, t]) => ({ input: sum.input + t.input, output: sum.output + t.output }), { input: 0, output: 0 });
-      const rows = roles.map(([role, t]) => ({ role, input: t.input, output: t.output, total: t.input + t.output }));
+      const roles = props.tokens;
+      const all = roles.reduce((sum, t) => ({ read: sum.read + t.read, cacheRead: sum.cacheRead + t.cacheRead, known: sum.known + t.known, written: sum.written + t.written }), { read: 0, cacheRead: 0, known: 0, written: 0 });
+      const unknown = roles.filter((t) => t.read > t.known);
       return (
         <Meter title="Claude tokens">
           <p>
-            <b>{count(total.input + total.output)}</b>
-            <span class="text-muted"> · {count(total.output)} written, {count(total.input)} read, cache included</span>
+            <b>{count(all.read + all.written)}</b>
+            <span class="text-muted"> · {count(all.read)} read, {share(all)} of it from the cache, {count(all.written)} written</span>
           </p>
-          <QTable class="tokens q-mb-sm" flat bordered dense hideBottom rowKey="role" rows={rows} columns={TOKEN_COLUMNS} pagination={{ rowsPerPage: 0 }} />
+          <QTable class="tokens q-mb-sm" flat bordered dense hideBottom rowKey="role" rows={roles} columns={TOKEN_COLUMNS} pagination={{ rowsPerPage: 0 }} />
           <p class="text-caption text-muted">
-            Claude Code's own counts: an attempt's and a review's when it ends, a Manager's and an Architect's every five minutes. Most of what is read comes from the prompt cache.
+            Claude Code's own counts: an attempt's and a review's when it ends, a Manager's and an Architect's every five minutes. Each call reads the whole conversation again, mostly from the prompt cache, which costs a tenth of what a fresh read does on the API.
+            {unknown.length > 0 && ` Before 0.5.1, cache reads weren't counted apart; for ${unknown.map((t) => `${count(t.read - t.known)} of the ${t.role}' reads`).join(' and ')}, the sandbox or stream that would tell is gone, so the shares are of the rest.`}
           </p>
         </Meter>
       );

@@ -72,7 +72,7 @@ describe('a reviewer\'s report', () => {
     const read = readReview(stream, 0);
     assert.equal(read.outcome, 'done');
     assert.deepEqual(read.report, report);
-    assert.deepEqual(read.usage, { inputTokens: 5, outputTokens: 2 });
+    assert.deepEqual(read.usage, { inputTokens: 5, outputTokens: 2, cacheReadTokens: 0 });
   });
 
   it('reports a session without a result, a malformed report, and a usage limit', () => {

@@ -15,9 +15,17 @@ export interface Ref {
 }
 
 export interface Usage {
+  /** Every token read, the prompt cache's included. */
   inputTokens: number;
   outputTokens: number;
+  /** Of `inputTokens`, what the prompt cache served; unknown in what was recorded before 0.5.1. */
+  cacheReadTokens?: number;
   costUsd?: number;
+}
+
+/** What the daemon reads of a long-lived agent's sandbox: its tokens, and the time it spent on its prompts (0.5.1). */
+export interface AgentReading extends Usage {
+  activeMs?: number;
 }
 
 export interface Finding {
@@ -128,7 +136,7 @@ interface Payloads {
    * What a long-lived agent, a Manager or an Architect, has used of Claude, read from the
    * conversations saved in its sandbox: a running count, which a new sandbox starts again.
    */
-  AGENT_TOKENS: { agent: string; reading: Usage };
+  AGENT_TOKENS: { agent: string; reading: AgentReading };
   /** The owner capped what each new sandbox may use of the machine, CPUs and memory; null lifts a cap. */
   SANDBOX_LIMITS_SET: { cpu: number | null; memoryGiB: number | null };
   /** In Swarm, the merge policy left a plan's PR to the owner, and why (v3 §3.2). */

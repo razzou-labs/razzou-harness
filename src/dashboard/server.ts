@@ -14,6 +14,7 @@ import { readDockerUsage, type UsageReading } from '../sandbox/docker.ts';
 import { removeLeftOver, sandboxDenials, sandboxOverview, sharedReading } from '../daemon/sandboxes.ts';
 import { configView } from './config-view.ts';
 import { Terminals, type Size } from './terminals.ts';
+import { tokensByRole, type RoleTokens } from './tokens.ts';
 
 export interface DashboardOptions {
   orchestrator: Orchestrator;
@@ -45,6 +46,8 @@ export interface DashboardState {
   progress: string[];
   /** Whether node-pty loaded: without it, there are no terminals in the dashboard. */
   terminals: boolean;
+  /** Claude's tokens by role, with what the prompt cache served (0.5.1). */
+  tokens: RoleTokens[];
 }
 
 /** What the daemon types into an Architect's terminal so that its hook delivers the inbox. */
@@ -131,6 +134,7 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
             ...(orchestrator.state.mode === 'swarm' ? { setup: await orchestrator.setupStatus() } : {}),
             progress: await progressTail(orchestrator),
             terminals: terminals.available,
+            tokens: tokensByRole(orchestrator.state, orchestrator.options.harnessDir),
           } satisfies DashboardState);
         case 'GET /api/events':
           res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });

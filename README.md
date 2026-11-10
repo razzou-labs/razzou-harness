@@ -455,8 +455,8 @@ repository with such a token: a KMS key came out at 1 USD a month, which the dae
 gitleaks, semgrep and checkov, are still to come (proposal v3 §5.5): the reviewer reads
 the diff itself.
 
-**Budgets.** In both modes, the Project view shows your time, which you set there, and
-the agents' active hours:
+**Budgets.** In both modes, the Project view shows your time, which you set there, the
+agents' active hours, and Claude's tokens:
 - **Your time.** The hours the whole project may take of you. Once set, every owner
   action in a design, gate or task, carries the Architect's estimate of how long it
   takes you, a reserve of `ownerTime.reservePercent` stays out of what designs may
@@ -464,10 +464,15 @@ the agents' active hours:
   after the other modules. Only owner actions count: the proposals and pull requests
   you read don't. The Architect reads the numbers with `get_owner_time`. The meter
   shows used, planned and the hours, red when over.
-- **Active hours.** The hours the agents worked: each Developer's attempt and each
-  reviewer's session, from its start to its end, in a table by agent with the model and
-  effort `harness/config.json` sets. Managers and Architects aren't counted: they live
-  for their module, and wait far more than they work.
+- **Active hours.** The hours the agents worked, in a table by agent with the model and
+  effort `harness/config.json` sets: each Developer's attempt and each reviewer's
+  session, from its start to its end, and the time a Manager or an Architect spends on
+  its prompts, from each prompt to its last step, which the daemon reads in its sandbox
+  every five minutes. They live for their module, and wait far more than they work.
+- **Claude tokens.** What Claude read and wrote, by role: what was read, how much of it
+  the prompt cache served, and the cache's share. Every call reads the whole
+  conversation again, mostly from the cache, which costs a tenth of a fresh read on the
+  API.
 
 ## Commands
 
@@ -505,7 +510,7 @@ through an `Arch:` pull request, or a commit of your own on `main`.
 
 ```json
 {
-  "harnessVersion": "0.5.0",
+  "harnessVersion": "0.5.1",
   "project": { "name": "shop", "repo": "<org>/shop", "bot": "<org>-harness[bot]" },
   "roles": {
     "architect": { "model": "claude-fable-5-2", "effort": "max" },
