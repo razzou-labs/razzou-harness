@@ -1,4 +1,4 @@
-import { QBtn, QBtnToggle, QCard, QCardSection, QInput, QLinearProgress, QTable, QTd, QTr, type QTableProps } from 'quasar';
+import { QBtn, QBtnToggle, QCard, QCardSection, QInput, QLinearProgress, QSeparator, QTable, QTd, QTr, type QTableProps } from 'quasar';
 import { defineComponent, onUnmounted, ref, watchEffect, type PropType, type Ref } from 'vue';
 import { post, type Attempt, type DashboardState, type FeatureState, type OwnerTime, type PlanState, type State, type SubscriptionUsage, type UsageLimit } from '../api.ts';
 import { Dependencies } from '../components/Dependencies.tsx';
@@ -111,10 +111,10 @@ function count(n: number): string {
 }
 
 const Meter = defineComponent({
-  props: { title: { type: String, required: true } },
+  props: { title: { type: String, required: true }, wide: Boolean },
   setup(props, { slots }) {
     return () => (
-      <div class="col-12 col-sm-6 col-lg-3">
+      <div class={props.wide ? 'col-12 col-lg-6' : 'col-12 col-sm-6 col-lg-3'}>
         <QCard flat bordered class="meter full-height">
           <QCardSection>
             <div class="text-subtitle1 text-weight-medium q-mb-xs">{props.title}</div>
@@ -177,8 +177,7 @@ const Budgets = defineComponent({
                 </p>
               </Meter>
               <ActiveMeter state={state} roles={props.roles} now={now.value} />
-              <TokensMeter tokens={props.tokens} />
-              <SubscriptionMeter ceiling={props.ceiling} {...(props.usage ? { usage: props.usage } : {})} />
+              <ClaudeMeter tokens={props.tokens} ceiling={props.ceiling} {...(props.usage ? { usage: props.usage } : {})} />
             </div>
           </QCardSection>
         </QCard>
@@ -244,8 +243,30 @@ const TOKEN_COLUMNS: Columns = [
   { name: 'total', label: 'Total', field: (row: RoleTokens) => row.read + row.written, align: 'right', format: count },
 ];
 
+/**
+ * What Claude used and what is left of the subscription, in one card twice as wide as
+ * the others: the tokens table needs the width, and the subscription's bars sit under it.
+ */
+const ClaudeMeter = defineComponent({
+  props: {
+    tokens: { type: Array as PropType<RoleTokens[]>, required: true },
+    ceiling: { type: Number as PropType<number | null>, default: null },
+    usage: Object as PropType<{ at: string; usage: SubscriptionUsage }>,
+  },
+  setup(props) {
+    return () => (
+      <Meter title="Claude tokens" wide>
+        <Tokens tokens={props.tokens} />
+        <QSeparator class="q-my-md" />
+        <div class="text-subtitle1 text-weight-medium q-mb-xs">Subscription</div>
+        <Subscription ceiling={props.ceiling} {...(props.usage ? { usage: props.usage } : {})} />
+      </Meter>
+    );
+  },
+});
+
 /** Every token Claude used for the project, read and written, by role, with what the prompt cache served. */
-const TokensMeter = defineComponent({
+const Tokens = defineComponent({
   props: { tokens: { type: Array as PropType<RoleTokens[]>, required: true } },
   setup(props) {
     return () => {
@@ -253,7 +274,7 @@ const TokensMeter = defineComponent({
       const all = roles.reduce((sum, t) => ({ read: sum.read + t.read, cacheRead: sum.cacheRead + t.cacheRead, known: sum.known + t.known, written: sum.written + t.written }), { read: 0, cacheRead: 0, known: 0, written: 0 });
       const unknown = roles.filter((t) => t.read > t.known);
       return (
-        <Meter title="Claude tokens">
+        <>
           <p>
             <b>{count(all.read + all.written)}</b>
             <span class="text-muted"> · {count(all.read)} read, {share(all)} of it from the cache, {count(all.written)} written</span>
@@ -263,7 +284,7 @@ const TokensMeter = defineComponent({
             Claude Code's own counts: an attempt's and a review's when it ends, a Manager's and an Architect's every five minutes. Each call reads the whole conversation again, mostly from the prompt cache, which costs a tenth of what a fresh read does on the API.
             {unknown.length > 0 && ` Before 0.5.1, cache reads weren't counted apart; for ${unknown.map((t) => `${count(t.read - t.known)} of the ${t.role}' reads`).join(' and ')}, the sandbox or stream that would tell is gone, so the shares are of the rest.`}
           </p>
-        </Meter>
+        </>
       );
     };
   },
@@ -273,10 +294,10 @@ const TokensMeter = defineComponent({
  * The subscription's windows as bars, as an agent's model call last reported them: a
  * five-hour session and a weekly window, or the weekly one alone on a plan without a
  * session limit. A window that has reset since the report is gone from it: the next
- * report shows it again if the plan still has it. Before any report, the box says where
- * they come from.
+ * report shows it again if the plan still has it. Before any report, it says where they
+ * come from.
  */
-const SubscriptionMeter = defineComponent({
+const Subscription = defineComponent({
   props: {
     ceiling: { type: Number as PropType<number | null>, default: null },
     usage: Object as PropType<{ at: string; usage: SubscriptionUsage }>,
@@ -286,15 +307,11 @@ const SubscriptionMeter = defineComponent({
     return () => {
       const { usage, ceiling } = props;
       if (!usage) {
-        return (
-          <Meter title="Subscription">
-            <p class="text-muted">No report yet. The Developers, the Manager and the reviewers report your usage with each model call; the bars appear with the first one.</p>
-          </Meter>
-        );
+        return <p class="text-muted">No report yet. The Developers, the Manager and the reviewers report your usage with each model call; the bars appear with the first one.</p>;
       }
       const current = usage.usage.limits.filter((limit) => Date.parse(limit.resetsAt) > now.value);
       return (
-        <Meter title="Subscription">
+        <>
           {current.length === 0 && <p class="text-muted">Every window of the last report has reset since; the next model call reports them again.</p>}
           {current.map((limit) => {
             const hot = ceiling !== null && limit.percent >= ceiling;
@@ -312,7 +329,7 @@ const SubscriptionMeter = defineComponent({
           <p class="text-caption text-muted">
             Reported by an agent's model call at {new Date(usage.at).toLocaleTimeString()}. In Swarm no attempt starts at or above {ceiling === null ? 'the ceiling, which is off' : `${ceiling}%`}; the pipeline waits for the window to reset.
           </p>
-        </Meter>
+        </>
       );
     };
   },
