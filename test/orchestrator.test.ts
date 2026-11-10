@@ -10,6 +10,7 @@ import type { SubscriptionUsage } from '../src/anthropic/usage.ts';
 import { Orchestrator } from '../src/daemon/orchestrator.ts';
 import { handleRequest } from '../src/daemon/requests.ts';
 import type { SandboxOverview, UsageReading } from '../src/daemon/sandboxes.ts';
+import type { ConfigView } from '../src/dashboard/config-view.ts';
 import { startDashboard, type DashboardState } from '../src/dashboard/server.ts';
 import { Terminals, type Pty } from '../src/dashboard/terminals.ts';
 import { recover } from '../src/setup/recover.ts';
@@ -1297,6 +1298,46 @@ describe('dashboard', () => {
     const host = `127.0.0.1:${port}`;
     return { o, driver, port, host, webRoot, bearer: { host, authorization: `Bearer ${token}` } };
   }
+
+  it("shows every setting of harness/config.json, the file's or the default, the daemon's and the machine's, and no key", async () => {
+    const xdg = tempDir('xdg');
+    mkdirSync(join(xdg, 'harness'));
+    writeFileSync(join(xdg, 'harness', 'app.json'), JSON.stringify({ appId: 42, name: 'acme-harness', slug: 'acme-harness', owner: 'acme', htmlUrl: 'https://github.com/apps/acme-harness' }));
+    writeFileSync(join(xdg, 'harness', 'app.pem'), '-----BEGIN RSA PRIVATE KEY-----\nnot a real key\n-----END RSA PRIVATE KEY-----\n');
+    const before = process.env.XDG_CONFIG_HOME;
+    process.env.XDG_CONFIG_HOME = xdg;
+    cleanup.push(async () => {
+      if (before === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = before;
+    });
+    const { port, bearer } = await dashboard();
+    const view = JSON.parse((await call(port, '/api/config', bearer)).body) as ConfigView;
+    const setting = (path: string) => view.settings.find((s) => s.path === path);
+    // The toy's config sets an attempt's deadline: the default it replaces shows beside it.
+    assert.deepEqual(setting('roles.developer.attemptTimeoutMinutes'), { path: 'roles.developer.attemptTimeoutMinutes', value: 5, set: true, default: 180 });
+    // It sets nothing for the Architect: the default model, Fable 5.2.
+    assert.deepEqual(setting('roles.architect.model'), { path: 'roles.architect.model', value: 'claude-fable-5-2', set: false });
+    assert.deepEqual(setting('swarm.usageCeilingPercent'), { path: 'swarm.usageCeilingPercent', value: 80, set: false });
+    assert.equal(setting('project.name')!.required, true);
+    // Every section of the file, the toy having neither AWS nor Terraform.
+    assert.deepEqual([...new Set(view.settings.map((s) => s.path.split('.')[0]))], ['harnessVersion', 'project', 'roles', 'sandbox', 'network', 'checks', 'protect', 'github', 'brakes', 'ownerTime', 'swarm', 'dashboard']);
+    const fact = (facts: Array<{ name: string; value: string }>, name: string) => facts.find((f) => f.name === name)?.value;
+    assert.match(fact(view.daemon, 'Mode')!, /^Manual/);
+    assert.equal(fact(view.daemon, 'Your hours'), 'not set');
+    assert.equal(fact(view.machine, 'Node.js'), process.version);
+    assert.equal(fact(view.machine, 'GitHub App'), 'acme-harness (acme-harness, id 42), owned by acme; its private key is on this machine');
+    assert.doesNotMatch(JSON.stringify(view), /PRIVATE KEY|not a real key/);
+  });
+
+  it('sets and clears only the hours of your time: the agent-hours threshold is gone', async () => {
+    const { o, port, bearer } = await dashboard();
+    const post = async (body: object) => JSON.parse((await callWith(port, '/api/budgets', bearer, body)).body) as { done: boolean };
+    assert.equal((await post({ agentHours: 40 })).done, false);
+    assert.equal((await post({ ownerHours: 12, agentHours: 40 })).done, true);
+    assert.deepEqual(Object.keys(o.state.budgets).sort(), ['ownerHours', 'ownerHoursSetAt']);
+    assert.equal((await post({ ownerHours: null })).done, true);
+    assert.deepEqual(o.state.budgets, {});
+  });
 
   it("lists the gateway's sandboxes, labels its own, shows what a policy refused, and deletes only a left-over one", async () => {
     const { o, driver, port, bearer } = await dashboard();

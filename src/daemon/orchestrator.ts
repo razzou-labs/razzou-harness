@@ -367,18 +367,11 @@ export class Orchestrator {
     return true;
   }
 
-  /** The owner sets their hours for the whole project, or the agent-hours threshold (v3 §4); null clears one. */
-  setBudgets(budgets: { ownerHours?: number | null | undefined; agentHours?: number | null | undefined }): boolean {
-    let changed = false;
-    if (budgets.ownerHours !== undefined && budgets.ownerHours !== (this.state.budgets.ownerHours ?? null)) {
-      this.record({ type: 'OWNER_HOURS_SET', payload: { hours: budgets.ownerHours } });
-      changed = true;
-    }
-    if (budgets.agentHours !== undefined && budgets.agentHours !== (this.state.budgets.agentHours ?? null)) {
-      this.record({ type: 'AGENT_HOURS_SET', payload: { hours: budgets.agentHours } });
-      changed = true;
-    }
-    return changed;
+  /** The owner sets their hours for the whole project (v3 §4); null clears them. */
+  setBudgets(budgets: { ownerHours?: number | null | undefined }): boolean {
+    if (budgets.ownerHours === undefined || budgets.ownerHours === (this.state.budgets.ownerHours ?? null)) return false;
+    this.record({ type: 'OWNER_HOURS_SET', payload: { hours: budgets.ownerHours } });
+    return true;
   }
 
   /**

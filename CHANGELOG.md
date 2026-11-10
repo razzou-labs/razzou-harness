@@ -3,6 +3,41 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## 0.4.22 (2026-11-10)
+
+**Upgrading from 0.4.21:** install the new version, rebuild the agents' image with
+`harness doctor --build-images` (its tag follows the harness's version), then restart the
+daemon with `harness down` and `harness up`, and reload the dashboard. An Architect
+already running keeps its model until its sandbox is made again, which loses its
+conversation but keeps its proposals. `harness budget --agent-hours` is gone.
+
+- **Active hours, not agent hours.** The Agent hours card and its threshold are gone
+  from the whole system: the dashboard, the daemon, its API, its state and
+  `harness budget`. An older log's threshold is ignored. In their place, the Project
+  view shows the hours the agents worked: each Developer's attempt and each reviewer's
+  session, from its start to its end. A table gives them by agent, with each agent's
+  model and effort. Managers and Architects aren't counted: they live for their module,
+  and wait far more than they work.
+- **The Architect on Fable 5.2,** at max effort, by default (`roles.architect.model`
+  is `claude-fable-5-2`).
+- **Three hours per attempt.** An attempt's deadline is now 180 minutes by default,
+  up from 120 (`roles.developer.attemptTimeoutMinutes`). The Architect sizes features
+  against the deadline the config sets.
+- **A Config tab,** after Events, with every setting the harness runs with:
+  - all of `harness/config.json` on `main`, each value from the file or the default,
+    with the default a value of the file replaces, and a filter;
+  - what you set in the dashboard or with `harness`: the mode, the INFRA merges, your
+    hours;
+  - this machine: Node.js, Claude Code, the OpenShell gateway and providers, and the
+    GitHub App.
+  No key or token is shown.
+- **Plans in cards.** Each plan's dependency tree in the Project view sits in a card of
+  its own.
+- **Long texts fold in the features' tables.** A long failure reason shows its first
+  line, and the Developer's questions show as a count, such as "2 questions from the
+  Developer, answered"; a click opens them. Before, a feature with long questions and
+  answers filled its plan's table.
+
 ## 0.4.21 (2026-11-09)
 
 **Upgrading from 0.4.20:** install the new version, rebuild the agents' image with

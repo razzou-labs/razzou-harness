@@ -115,8 +115,6 @@ interface Payloads {
   INFRA_MERGE_SET: { by: InfraMerge };
   /** The owner set, or cleared with null, the hours the whole project may take of their time (v3 §4.1). */
   OWNER_HOURS_SET: { hours: number | null };
-  /** The owner set, or cleared, the threshold the agent-hours meter turns red at (v3 §4.2). */
-  AGENT_HOURS_SET: { hours: number | null };
   /**
    * What a long-lived agent, a Manager or an Architect, has used of Claude, read from the
    * conversations saved in its sandbox: a running count, which a new sandbox starts again.

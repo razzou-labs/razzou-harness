@@ -84,8 +84,9 @@ application code, and never `.github/`: CI refuses both.
   and independent plans are built at the same time, each with its own Manager.
   Declare every dependency in `dependsOn`, including the implicit ones, such as a
   feature that extends a file another creates.
-- **Size each feature for one attempt** by a fresh Developer: well under 120 minutes, one
-  coherent change, and testable on its own.
+- **Size each feature for one attempt** by a fresh Developer: well under the attempt's
+  deadline, `roles.developer.attemptTimeoutMinutes` in `harness/config.json` (180 minutes
+  unless it says otherwise), one coherent change, and testable on its own.
 - **Give every feature at least one check.** A check is a shell command run from the
   repository root that exits 0 when the feature works. It runs in harness sandboxes and
   in GitHub Actions, where the repository is somewhere else: use paths relative to the

@@ -2,7 +2,7 @@ import { QBtn, QBtnToggle, QCard, QCardSection, QInput, QLinearProgress, QTable,
 import { defineComponent, onUnmounted, ref, watchEffect, type PropType, type Ref } from 'vue';
 import { post, type Attempt, type DashboardState, type FeatureState, type OwnerTime, type PlanState, type State, type SubscriptionUsage, type UsageLimit } from '../api.ts';
 import { Dependencies } from '../components/Dependencies.tsx';
-import { duration } from '../format.ts';
+import { duration, modelName } from '../format.ts';
 import { Action, Badge, Fold, GithubLink, text } from '../ui.tsx';
 import { Proposal } from './NeedsYou.tsx';
 
@@ -16,7 +16,7 @@ export const Project = defineComponent({
       const moduleIds = [...new Set([...Object.keys(state.modules), ...design.modules.map((m) => m.id)])];
       return (
         <div class="column q-gutter-md">
-          <Budgets state={state} ceiling={design.swarm?.usageCeilingPercent ?? null} {...(props.data.ownerTime ? { ownerTime: props.data.ownerTime } : {})} {...(props.data.usage ? { usage: props.data.usage } : {})} />
+          <Budgets state={state} roles={design.roles} ceiling={design.swarm?.usageCeilingPercent ?? null} {...(props.data.ownerTime ? { ownerTime: props.data.ownerTime } : {})} {...(props.data.usage ? { usage: props.data.usage } : {})} />
           <NewModule />
           {moduleIds.length === 0 && <p class="text-muted">No module yet.</p>}
           {moduleIds.map((id) => {
@@ -77,18 +77,26 @@ function useNow(ticking: () => boolean, everyMs = 60_000): Ref<number> {
   return now;
 }
 
-/** The Developers' attempt clocks, summed, running ones counted to `now` (v3 §4.2). */
-function agentMs(state: State, now: number): number {
-  let total = 0;
-  for (const feature of Object.values(state.features)) {
-    for (const attempt of feature.attempts) {
-      const started = Date.parse(attempt.startedAt);
-      const ended = attempt.endedAt ? Date.parse(attempt.endedAt) : now;
-      if (Number.isFinite(started) && Number.isFinite(ended)) total += Math.max(0, ended - started);
-    }
-  }
-  return total;
+/**
+ * The agents' active time: each Developer's attempt and each reviewer's session, from its
+ * start to its end, those running counted to `now`; a review still waiting to start counts
+ * nothing. A Manager and an Architect aren't counted: they live for their module, and wait
+ * far more than they work.
+ */
+function activeMs(state: State, now: number): { developers: number; reviewers: number } {
+  const span = (start: string, end: string | undefined) => {
+    const started = Date.parse(start);
+    const ended = end ? Date.parse(end) : now;
+    return Number.isFinite(started) && Number.isFinite(ended) ? Math.max(0, ended - started) : 0;
+  };
+  let developers = 0;
+  let reviewers = 0;
+  for (const feature of Object.values(state.features)) for (const attempt of feature.attempts) developers += span(attempt.startedAt, attempt.endedAt);
+  for (const plan of Object.values(state.plans)) for (const review of plan.reviews ?? []) if (review.status !== 'starting') reviewers += span(review.startedAt, review.endedAt);
+  return { developers, reviewers };
 }
+
+const inHours = (ms: number) => `${(ms / 3_600_000).toFixed(1)} h`;
 
 type Tokens = { input: number; output: number };
 
@@ -131,23 +139,27 @@ const Meter = defineComponent({
   },
 });
 
-/** The owner's hours for the whole project, and the agent-hours threshold (v3 §4): set here, recorded by the daemon. */
+type Roles = DashboardState['design']['roles'];
+
+/** The owner's hours for the whole project (v3 §4), set here and recorded by the daemon, and what the agents used. */
 const Budgets = defineComponent({
   props: {
     state: { type: Object as PropType<State>, required: true },
+    roles: { type: Object as PropType<Roles>, required: true },
     ceiling: { type: Number as PropType<number | null>, default: null },
     ownerTime: Object as PropType<OwnerTime>,
     usage: Object as PropType<{ at: string; usage: SubscriptionUsage }>,
   },
   setup(props) {
-    const now = useNow(() => Object.values(props.state.features).some((f) => f.attempts.some((a) => !a.endedAt)));
+    // The active hours move while an attempt or a review runs.
+    const now = useNow(() =>
+      Object.values(props.state.features).some((f) => f.attempts.some((a) => !a.endedAt)) ||
+      Object.values(props.state.plans).some((p) => (p.reviews ?? []).some((r) => r.status === 'running')));
     return () => {
       const { state, ownerTime } = props;
       const budgets = state.budgets ?? {};
       const overPlanned = ownerTime !== undefined && ownerTime.committedHours > ownerTime.plannableHours;
       const overUsed = ownerTime !== undefined && ownerTime.usedHours > ownerTime.hours;
-      const agentHours = agentMs(state, now.value) / 3_600_000;
-      const over = budgets.agentHours !== undefined && agentHours > budgets.agentHours;
       return (
         <QCard flat bordered>
           <QCardSection>
@@ -168,22 +180,14 @@ const Budgets = defineComponent({
                     <span class="text-muted">{ownerTime.plannableHours} h plannable after the {ownerTime.reservePercent}% reserve</span>
                   </p>
                 )}
-                <HoursForm field="ownerHours" value={budgets.ownerHours} placeholder="hours" />
+                <HoursForm value={budgets.ownerHours} />
                 <p class="text-caption text-muted q-mt-sm">
                   {ownerTime
                     ? "Planned: the estimates of the owner actions in submitted designs, gates and tasks. Used: the actions you marked done. What you read, proposals and pull requests, doesn't count."
                     : 'Once set, the Architect must estimate every owner action and design within your hours; a design over them is refused.'}
                 </p>
               </Meter>
-              <Meter title="Agent hours">
-                <p>
-                  <b class={over ? 'text-negative' : undefined}>{agentHours.toFixed(1)} h</b>
-                  {budgets.agentHours !== undefined ? <> of {budgets.agentHours} h</> : <span class="text-muted"> · no threshold</span>}
-                  {over && <span class="text-negative text-caption"> · over the threshold</span>}
-                </p>
-                <HoursForm field="agentHours" value={budgets.agentHours} placeholder="threshold" />
-                <p class="text-caption text-muted q-mt-sm">The Developers' attempt clocks, summed. Over the threshold the number turns red; nothing stops.</p>
-              </Meter>
+              <ActiveMeter state={state} roles={props.roles} now={now.value} />
               <TokensMeter state={state} />
               <SubscriptionMeter ceiling={props.ceiling} {...(props.usage ? { usage: props.usage } : {})} />
             </div>
@@ -195,6 +199,49 @@ const Budgets = defineComponent({
 });
 
 type Columns = NonNullable<QTableProps['columns']>;
+
+/** One row per agent: its model and effort as harness/config.json sets them, and its active hours, or null where they aren't counted. */
+const ACTIVE_COLUMNS: Columns = [
+  { name: 'agent', label: 'Agent', field: 'agent', align: 'left' },
+  { name: 'model', label: 'Model', field: 'model', align: 'left', format: modelName },
+  { name: 'effort', label: 'Effort', field: 'effort', align: 'left', format: (effort: string | null) => effort ?? "Claude Code's" },
+  { name: 'hours', label: 'Active', field: 'ms', align: 'right', format: (ms: number | null) => (ms === null ? 'not counted' : inHours(ms)), classes: (row: { ms: number | null }) => (row.ms === null ? 'text-muted' : '') },
+];
+
+/** The hours the agents worked: the Developers' and the reviewers', by agent, with the model and effort of each. */
+const ActiveMeter = defineComponent({
+  props: {
+    state: { type: Object as PropType<State>, required: true },
+    roles: { type: Object as PropType<Roles>, required: true },
+    now: { type: Number, required: true },
+  },
+  setup(props) {
+    return () => {
+      const { roles } = props;
+      const active = activeMs(props.state, props.now);
+      // The reviewers run on the Manager's model and effort.
+      const rows = [
+        { agent: 'Developers', ...roles.developer, ms: active.developers },
+        { agent: 'Reviewers', ...roles.manager, ms: active.reviewers },
+        { agent: 'Managers', ...roles.manager, ms: null },
+        { agent: 'Architects', ...roles.architect, ms: null },
+      ];
+      return (
+        <Meter title="Active hours">
+          <p>
+            <b>{inHours(active.developers + active.reviewers)}</b>
+            <span class="text-muted"> · the Developers and the reviewers</span>
+          </p>
+          <QTable class="active q-mb-sm" flat bordered dense hideBottom rowKey="agent" rows={rows} columns={ACTIVE_COLUMNS} pagination={{ rowsPerPage: 0 }} />
+          <p class="text-caption text-muted">
+            Each attempt and review from its start to its end; those running count to now. Managers and Architects aren't counted: they wait far more than they work.
+            The model and effort are those of harness/config.json; a running Architect keeps the model it started with until its sandbox is made again.
+          </p>
+        </Meter>
+      );
+    };
+  },
+});
 
 const TOKEN_COLUMNS: Columns = [
   { name: 'role', label: 'Role', field: 'role', align: 'left' },
@@ -298,12 +345,10 @@ function resetsIn(at: string, now: number): string {
   return new Date(at).toLocaleString(undefined, { weekday: 'short', hour: '2-digit', minute: '2-digit' });
 }
 
-/** A number of hours to save, or clear: null clears it on the daemon. */
+/** The owner's hours for the whole project, to save, or clear: null clears them on the daemon. */
 const HoursForm = defineComponent({
   props: {
-    field: { type: String as PropType<'ownerHours' | 'agentHours'>, required: true },
     value: Number,
-    placeholder: { type: String, required: true },
   },
   setup(props) {
     const hours = ref('');
@@ -312,17 +357,17 @@ const HoursForm = defineComponent({
       const valid = hours.value.trim() !== '' && Number.isFinite(n) && n > 0;
       return (
         <div class="row items-center q-gutter-sm">
-          <QInput {...text(hours)} type="number" dense outlined label={props.placeholder} style="width: 120px" />
+          <QInput {...text(hours)} type="number" dense outlined label="hours" style="width: 120px" />
           <Action
             label="Save"
             run={async () => {
               if (!valid) return { done: false, error: 'a positive number of hours' };
-              const result = await post('/api/budgets', { [props.field]: n });
+              const result = await post('/api/budgets', { ownerHours: n });
               if (result.done) hours.value = '';
               return result;
             }}
           />
-          {props.value !== undefined && <Action label="Clear" flat run={() => post('/api/budgets', { [props.field]: null })} />}
+          {props.value !== undefined && <Action label="Clear" flat run={() => post('/api/budgets', { ownerHours: null })} />}
         </div>
       );
     };
@@ -456,6 +501,45 @@ const PlanDetails = defineComponent({
   },
 });
 
+/** A text kept to its first line until clicked, when it's long: the table stays easy to read. */
+const Folded = defineComponent({
+  props: { text: { type: String, required: true } },
+  setup(props) {
+    return () => {
+      const lines = props.text.trim().split('\n');
+      const first = lines[0]!;
+      if (lines.length === 1 && first.length <= 140) return <div class="text-caption">{first}</div>;
+      return (
+        <Fold class="text-caption" label={() => (first.length > 100 ? `${first.slice(0, 100)}…` : `${first} …`)}>
+          <div class="long-text">{props.text.trim()}</div>
+        </Fold>
+      );
+    };
+  },
+});
+
+/** What the Developer asked during the attempt, and the answers, folded to a count until clicked. */
+const Questions = defineComponent({
+  props: { questions: { type: Array as PropType<NonNullable<Attempt['questions']>>, required: true } },
+  setup(props) {
+    return () => {
+      const n = props.questions.length;
+      const waiting = props.questions.filter((q) => q.answer === undefined).length;
+      const label = `${n} question${n === 1 ? '' : 's'} from the Developer, ${waiting === 0 ? 'answered' : `${waiting} waiting for an answer`}`;
+      return (
+        <Fold class="text-caption" headerClass="text-muted" label={() => label}>
+          {props.questions.map((q) => (
+            <div key={q.requestId} class="q-mb-sm">
+              <div class="long-text"><b>Q:</b> {q.text}</div>
+              {q.answer !== undefined && <div class="long-text q-mt-xs"><b>A:</b> {q.answer}</div>}
+            </div>
+          ))}
+        </Fold>
+      );
+    };
+  },
+});
+
 const FeatureRow = defineComponent({
   props: {
     id: { type: String, required: true },
@@ -486,16 +570,14 @@ const FeatureRow = defineComponent({
               <>
                 {last.status}
                 {last.outcome ? ` · ${last.outcome}` : ''} · {duration(ended - Date.parse(last.startedAt))}
-                {last.reason && <div class="text-caption">{last.reason}</div>}
+                {last.reason && <Folded text={last.reason} />}
                 {last.finding && (
                   <Fold class="text-caption" label={() => `Finding: ${last.finding!.category}`}>
                     <p>{last.finding.summary}</p>
                     {last.finding.needs && <p>Needs: {last.finding.needs}</p>}
                   </Fold>
                 )}
-                {last.questions?.map((q) => (
-                  <div key={q.requestId} class="text-caption text-muted">Q: {q.text}{q.answer ? ` — A: ${q.answer}` : ''}</div>
-                ))}
+                {last.questions && last.questions.length > 0 && <Questions questions={last.questions} />}
               </>
             )}
           </QTd>

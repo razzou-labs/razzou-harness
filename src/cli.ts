@@ -31,8 +31,8 @@ Usage: harness <command> [--dir <project>]
   mode [manual|swarm]
                      Show the mode, or switch it and apply the mode's rules on main with your gh:
                      in Swarm the daemon merges plans (docs/architecture/proposal-v3.md)
-  budget --owner-hours <n> | --agent-hours <n>
-                     Set the hours of your time for the whole project, or the agent-hours threshold
+  budget --owner-hours <n>
+                     Set the hours of your time for the whole project
   retry <m/p/f>      Grant one more attempt to an escalated feature (--note: guidance)
   module new <id> <title>
                      Start a module: its Architect's sandbox and conversation
@@ -73,7 +73,6 @@ async function main(): Promise<void> {
       owner: { type: 'string' },
       mode: { type: 'string' },
       'owner-hours': { type: 'string' },
-      'agent-hours': { type: 'string' },
       probe: { type: 'boolean' },
       'build-images': { type: 'boolean' },
       help: { type: 'boolean', short: 'h' },
@@ -126,16 +125,12 @@ async function main(): Promise<void> {
       return;
     }
     case 'budget': {
-      const hours = (key: 'owner-hours' | 'agent-hours') => (values[key] === undefined ? undefined : Number(values[key]));
-      const budgets = { ownerHours: hours('owner-hours'), agentHours: hours('agent-hours') };
-      if ((budgets.ownerHours === undefined && budgets.agentHours === undefined) || [budgets.ownerHours, budgets.agentHours].some((h) => h !== undefined && (!Number.isFinite(h) || h <= 0))) {
-        throw new Error('usage: harness budget --owner-hours <n> | --agent-hours <n>, with positive numbers');
-      }
-      if (runningDaemon(harnessDir)) return void (await ownerAction(harnessDir, '/api/budgets', budgets, 'already set'));
+      const ownerHours = values['owner-hours'] === undefined ? undefined : Number(values['owner-hours']);
+      if (ownerHours === undefined || !Number.isFinite(ownerHours) || ownerHours <= 0) throw new Error('usage: harness budget --owner-hours <n>, with a positive number');
+      if (runningDaemon(harnessDir)) return void (await ownerAction(harnessDir, '/api/budgets', { ownerHours }, 'already set'));
       // The daemon is down: the hours wait for it in .harness/setup.json (v4 §5), and replace any it has, as they would if it ran.
-      if (budgets.agentHours !== undefined) throw new Error('the agent-hours threshold needs the daemon running: `harness up`');
-      recordForDaemon(harnessDir, { ownerHours: budgets.ownerHours, ownerHoursFrom: 'budget' });
-      console.log(`${budgets.ownerHours} hours of your time: the daemon records it when it starts (harness up).`);
+      recordForDaemon(harnessDir, { ownerHours, ownerHoursFrom: 'budget' });
+      console.log(`${ownerHours} hours of your time: the daemon records it when it starts (harness up).`);
       return;
     }
     case 'retry':

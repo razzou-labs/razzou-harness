@@ -4,16 +4,17 @@ import { defineComponent, onUnmounted, ref } from 'vue';
 import { connect, harness, post, type DashboardState, type Outcome } from './api.ts';
 import { Action, Badge, Command, confirm, Loading, toggleDark } from './ui.tsx';
 import { Agents } from './views/Agents.tsx';
+import { Config } from './views/Config.tsx';
 import { Events } from './views/Events.tsx';
 import { collectNeeds, NeedsYou } from './views/NeedsYou.tsx';
 import { Project } from './views/Project.tsx';
 import { Sandboxes } from './views/Sandboxes.tsx';
 
-export type View = 'needs' | 'project' | 'agents' | 'sandboxes' | 'events';
+export type View = 'needs' | 'project' | 'agents' | 'sandboxes' | 'events' | 'config';
 /** Opens a view, and what to select in it, through the URL: a reload keeps it. */
 export type Go = (view: View, detail?: string) => void;
 
-const TABS: Array<[View, string]> = [['needs', 'Needs you'], ['project', 'Project'], ['agents', 'Agents'], ['sandboxes', 'Sandboxes'], ['events', 'Events']];
+const TABS: Array<[View, string]> = [['needs', 'Needs you'], ['project', 'Project'], ['agents', 'Agents'], ['sandboxes', 'Sandboxes'], ['events', 'Events'], ['config', 'Config']];
 
 function route(hash: string): { view: View; detail?: string } {
   const [view, ...rest] = hash.replace(/^#/, '').split('/');
@@ -58,6 +59,7 @@ export const App = defineComponent({
               {view === 'agents' && <Agents data={data} go={go} {...(detail ? { selected: detail } : {})} />}
               {view === 'sandboxes' && <Sandboxes go={go} {...(detail ? { selected: detail } : {})} />}
               {view === 'events' && <Events />}
+              {view === 'config' && <Config />}
             </QPage>
           </QPageContainer>
         </QLayout>

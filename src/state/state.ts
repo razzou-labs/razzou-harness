@@ -218,8 +218,12 @@ export interface State {
   mode: Mode;
   /** The owner's button for INFRA and MIXED plans in Swarm (v3 D36). */
   infraMerge: InfraMerge;
-  /** What the owner set in the dashboard (v3 §4): their hours for the whole project, and the agent-hours threshold. */
-  budgets: { ownerHours?: number; ownerHoursSetAt?: string; agentHours?: number };
+  /**
+   * What the owner set in the dashboard (v3 §4): their hours for the whole project. An
+   * older log may hold AGENT_HOURS_SET, the agent-hours threshold before 0.4.22: nothing
+   * reads it any more.
+   */
+  budgets: { ownerHours?: number; ownerHoursSetAt?: string };
   /**
    * The tokens of the Managers and Architects, by agent (`manager:<key>`, `architect:<module>`):
    * the total so far, and the last reading of their sandbox. A Developer's and a reviewer's
@@ -353,10 +357,6 @@ export function apply(state: State, event: HarnessEvent): State {
             : `The owner set their time budget: ${event.payload.hours} hours for the whole project. Call get_owner_time for what this module may plan; every owner action needs estimatedMinutes, and submit_design refuses a design over the budget.`,
         });
       }
-      break;
-    case 'AGENT_HOURS_SET':
-      if (event.payload.hours === null) delete state.budgets.agentHours;
-      else state.budgets.agentHours = event.payload.hours;
       break;
     case 'AGENT_TOKENS': {
       const { agent, reading } = event.payload;

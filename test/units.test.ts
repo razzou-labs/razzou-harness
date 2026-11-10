@@ -14,6 +14,7 @@ import type { Orchestrator } from '../src/daemon/orchestrator.ts';
 import { readTokens } from '../src/daemon/tokens.ts';
 import { EventStore, type HarnessEvent } from '../src/state/events.ts';
 import { activeAttempts, attemptInSandbox, countedAttempts, project } from '../src/state/state.ts';
+import { modelName } from '../dashboard/src/format.ts';
 import { clip, runOk } from '../src/util.ts';
 import { createToyRepo, tempDir } from './helpers/toy-repo.ts';
 
@@ -91,7 +92,7 @@ describe('design', () => {
     await repo.fetchMain(dir);
     const design = await loadDesign(repo, 'refs/heads/main');
     const { architect, manager, developer } = design.config.roles;
-    assert.deepEqual([architect.model, architect.effort], ['claude-fable-5-1', 'max']);
+    assert.deepEqual([architect.model, architect.effort], ['claude-fable-5-2', 'max']);
     assert.deepEqual([manager.model, manager.effort], ['claude-opus-5-5', 'max']);
     assert.deepEqual([developer.model, developer.effort], ['claude-opus-5-5', 'max']);
     assert.equal(design.config.sandbox.claudeProvider, 'claude-sub');
@@ -144,6 +145,18 @@ describe('agent tokens', () => {
     ]);
     assert.deepEqual(state.agentTokens!['manager:demo'], { total: { inputTokens: 1800, outputTokens: 210 }, reading: { inputTokens: 300, outputTokens: 30 } });
     assert.deepEqual(state.agentTokens!['architect:demo']!.total, { inputTokens: 50, outputTokens: 5 });
+  });
+
+  it('ignores the agent-hours threshold an older log may hold', () => {
+    const event = (type: string, payload: object, ts: string) => ({ v: 1, id: `e-${type}`, ts, type, payload }) as unknown as HarnessEvent;
+    const state = project([event('AGENT_HOURS_SET', { hours: 40 }, '2026-11-01T00:00:00Z'), event('OWNER_HOURS_SET', { hours: 12 }, '2026-11-02T00:00:00Z')]);
+    assert.deepEqual(state.budgets, { ownerHours: 12, ownerHoursSetAt: '2026-11-02T00:00:00Z' });
+  });
+
+  it('names a model as people do: Fable 5.2, Sonnet 4.5, Opus 5.5 (1M), and anything else as it is', () => {
+    assert.deepEqual(['claude-fable-5-2', 'claude-sonnet-4-5-20250929', 'claude-opus-5-5[1m]', 'claude-fable-5', 'opus', 'claude-3-7-sonnet-latest'].map(modelName), [
+      'Fable 5.2', 'Sonnet 4.5', 'Opus 5.5 (1M)', 'Fable 5', 'opus', 'claude-3-7-sonnet-latest',
+    ]);
   });
 
   it("counts every reply of a sandbox's saved conversations once, at its final count", async () => {
