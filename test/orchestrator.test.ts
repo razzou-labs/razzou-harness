@@ -1,5 +1,5 @@
 import { strict as assert } from 'node:assert';
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { request } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
@@ -845,7 +845,7 @@ describe('pull requests', () => {
     o.events.emit('transcript', { agent: 'manager:demo', line: rateLimitEvent({ five_hour: 0.2, seven_day: 0.85 }, resetsAt) });
     o.setMode('swarm');
     await until(o, () => o.state.pipeline.paused !== undefined);
-    assert.equal(o.state.pipeline.paused!.reason, "the subscription's usage is at 85% (weekly_all), at or above the 80% ceiling (swarm.usageCeilingPercent)");
+    assert.equal(o.state.pipeline.paused!.reason, "the subscription's usage is at 85% in the weekly window, at or above the 80% ceiling (swarm.usageCeilingPercent)");
     assert.equal(o.state.pipeline.paused!.until, new Date(resetsAt * 1000 + 60_000).toISOString(), 'a minute past the reset, for a clock a little ahead');
     assert.equal(Object.keys(o.state.features).length, 0);
 
@@ -872,6 +872,31 @@ describe('pull requests', () => {
     await o.stop(0);
     const restarted = make();
     assert.deepEqual(restarted.usage, o.usage, 'a restart shows the last report at once');
+  });
+
+  it("takes no report from the lines a stream held before the daemon followed it, as after a restart, but the next", async () => {
+    const { orchestrator: o, driver } = await setup((f) => solved(f));
+    const resetsAt = Math.floor((Date.now() + 3 * 3_600_000) / 1000);
+    await driver.create({ name: 'mgr-replay', image: 'x', providers: [], env: {} });
+    const file = join(driver.rootOf('mgr-replay'), 'out.jsonl');
+    // Written before the restart: a session window the plan no longer has.
+    writeFileSync(file, `${rateLimitEvent({ five_hour: 0.95, seven_day: 0.3 }, resetsAt)}\n`);
+    const lines: Array<{ line: string; replay?: boolean }> = [];
+    o.events.on('transcript', (event: { line: string; replay?: boolean }) => lines.push(event));
+    const settle = async (done: () => boolean) => {
+      for (let i = 0; i < 200 && !done(); i++) await sleep(25);
+      assert.ok(done());
+    };
+    const follower = o.followStream('mgr-replay', file, 'manager:replay');
+    await settle(() => lines.length === 1);
+    assert.equal(lines[0]!.replay, true, 'the transcript still gets it');
+    assert.equal(o.usage, undefined);
+    // Written after: a plan without a session limit, the weekly window alone.
+    appendFileSync(file, `${JSON.stringify({ type: 'rate_limit_event', rate_limit_info: { status: 'allowed', unifiedWindows: { seven_day: { utilization: 0.31, resetsAt, status: 'allowed' } } } })}\n`);
+    await settle(() => o.usage !== undefined);
+    assert.deepEqual(o.usage!.usage.limits.map((l) => [l.kind, l.percent]), [['weekly_all', 31]]);
+    follower.stop();
+    await follower.done;
   });
 
   it('in Swarm, both reviewers read the head, their verdicts are posted and set as statuses, and the plan merges itself', async () => {

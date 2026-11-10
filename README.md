@@ -292,9 +292,11 @@ behind a token. Its views:
   deploys and `progress.txt`; and the budgets: your hours, the agents' active hours in
   a table by agent with each one's model and effort, the tokens Claude used, written
   and read, in a table by role, and your subscription's usage as
-  bars: the current session and the weekly limit, each with when it resets. The
+  bars, one per window your plan has, each with when it resets: a five-hour session and
+  a weekly window, or the weekly one alone on a plan without a session limit. The
   Developers, the Manager and the reviewers report it with each model call, in either
-  mode; the daemon keeps the last report across a restart.
+  mode; the daemon keeps the last report across a restart, and a window that has reset
+  since leaves the card until the next report.
 - **Agents:** the Architect's terminal, the Manager's and the Developers' live
   transcripts, a message box for the Manager, and a shell in any agent's sandbox. The
   Architect is Claude Code itself, in a terminal; the others run without a screen, so
@@ -381,9 +383,11 @@ without bypassing the rules, and CI still gates it.
 
 **Before a launch.** In Swarm the daemon checks your subscription's usage before it
 starts an attempt, and at or above `swarm.usageCeilingPercent` the pipeline waits for
-the window to reset. The agents report the usage: each model call comes back with the
-session and weekly windows, which Claude Code writes into the stream the daemon reads,
-so no token of the daemon's own is needed. A `claude setup-token` token couldn't read it
+the window to reset. The agents report the usage: each model call comes back with your
+plan's windows, the five-hour session and the weekly one, or the weekly one alone,
+which Claude Code writes into the stream the daemon reads, so no token of the daemon's
+own is needed. After a restart, the daemon reads the agents' streams again from their
+start, and takes no report from what they held before. A `claude setup-token` token couldn't read it
 anyway: it may only run models. Before the first report, the daemon learns of a limit
 only when an attempt hits it, as in Manual.
 
