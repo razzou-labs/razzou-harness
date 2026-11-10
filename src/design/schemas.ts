@@ -113,7 +113,7 @@ export const ConfigSchema = z.object({
           model: z.string().default('claude-opus-5-5'),
           /** Claude Code's `--effort`; `null` leaves it to Claude Code, for models without effort levels. */
           effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).nullable().default('max'),
-          attemptTimeoutMinutes: z.number().int().positive().max(600).default(120),
+          attemptTimeoutMinutes: z.number().int().positive().max(600).default(180),
           maxAttempts: z.number().int().min(1).max(5).default(2),
         })
         .prefault({}),
@@ -129,7 +129,7 @@ export const ConfigSchema = z.object({
       architect: z
         .object({
           agent: z.enum(['claude-code']).default('claude-code'),
-          model: z.string().default('claude-fable-5-1'),
+          model: z.string().default('claude-fable-5-2'),
           effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).nullable().default('max'),
         })
         .prefault({}),

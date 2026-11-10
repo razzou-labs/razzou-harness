@@ -1,4 +1,4 @@
-import { QTooltip, QTree } from 'quasar';
+import { QCard, QCardSection, QTooltip, QTree } from 'quasar';
 import { defineComponent, ref, type PropType } from 'vue';
 import type { DashboardState, State } from '../api.ts';
 
@@ -16,7 +16,7 @@ type TreeNode = { key: string; children: TreeNode[] } & (
 );
 
 /**
- * A module's features and their dependencies (v3 §6.7), one tree per plan, in order. A
+ * A module's features and their dependencies (v3 §6.7), one tree per plan, in order, each in a card. A
  * feature hangs from the feature of its plan it waits for: of several, the one at the end
  * of the longest chain, with the others, and another plan's, named beside it. Green is
  * accepted, blue under way, amber waiting for a decision, red escalated, grey not started;
@@ -32,7 +32,11 @@ export const Dependencies = defineComponent({
       <div class="deps row q-col-gutter-md q-my-sm" role="group" aria-label={`The features of ${props.module.id} and their dependencies`}>
         {props.module.plans.map((plan) => (
           <div key={plan.id} class="col-12 col-md-6 col-xl-4">
-            <PlanTree module={props.module.id} plan={plan} state={props.state} />
+            <QCard flat bordered class="full-height">
+              <QCardSection class="q-pa-sm">
+                <PlanTree module={props.module.id} plan={plan} state={props.state} />
+              </QCardSection>
+            </QCard>
           </div>
         ))}
       </div>

@@ -216,7 +216,7 @@ plans it finds there (see [Configuration](#configuration)).
   the one under way is finished before the next starts, and only it has Developers,
   Managers and reviewers. Every module's Architect stays available, so you can design the
   next module while one is built; its plans wait their turn. Size a module
-  so that its design fits in one conversation. With its default model, Fable 5.1, the
+  so that its design fits in one conversation. With its default model, Fable 5.2, the
   Architect's context holds up to a million tokens, and a well-sized module never fills
   it. If a module's design keeps growing, split it into smaller modules: each gets its
   own Architect, with a fresh context.
@@ -235,7 +235,7 @@ plans it finds there (see [Configuration](#configuration)).
   works. `pre-merge` checks run on every attempt and in CI; `post-deploy` checks run
   after an infrastructure deploy.
 - **Attempt:** one Developer session on one feature, in a fresh sandbox, with a deadline
-  (120 minutes) and a budget (2 attempts per feature). A failed attempt's successor
+  (180 minutes) and a budget (2 attempts per feature). A failed attempt's successor
   starts with the Manager's guidance. Once the budget is spent, the feature is escalated
   to you.
 - **Owner actions:** what only you can do, such as creating an account, approving a
@@ -267,8 +267,9 @@ behind a token. Its views:
 - **Needs you:** questions from the Manager, proposals to accept, pull requests to merge,
   escalations, owner actions, a paused pipeline. Each has its button or form.
 - **Project:** modules, proposals, plans and features, with attempts, findings, CI,
-  deploys and `progress.txt`; and the budgets: your hours, the agents' hours, the
-  tokens Claude used, written and read, in a table by role, and your subscription's usage as
+  deploys and `progress.txt`; and the budgets: your hours, the agents' active hours in
+  a table by agent with each one's model and effort, the tokens Claude used, written
+  and read, in a table by role, and your subscription's usage as
   bars: the current session and the weekly limit, each with when it resets. The
   Developers, the Manager and the reviewers report it with each model call, in either
   mode; the daemon keeps the last report across a restart.
@@ -298,6 +299,12 @@ behind a token. Its views:
   use, so that agents and checks in parallel leave the machine usable. There is no cap
   until you set one.
 - **Events:** the event log, live, with a filter.
+- **Config:** every setting the harness runs with. All of `harness/config.json` on
+  `main`, each value from the file or the default, with the default a value of the
+  file replaces, and a filter. What you set in the dashboard or with `harness`, kept in
+  the daemon's state: the mode, the INFRA merges, your hours. And this machine: Node.js,
+  Claude Code, the OpenShell gateway and providers, and the GitHub App. No key or token
+  is shown.
 
 The header pauses and resumes the pipeline: a pause lets what runs finish, and starts
 nothing new. It also shows the mode, Manual or Swarm, and switches it. Its last button
@@ -426,7 +433,8 @@ repository with such a token: a KMS key came out at 1 USD a month, which the dae
 gitleaks, semgrep and checkov, are still to come (proposal v3 §5.5): the reviewer reads
 the diff itself.
 
-**Budgets.** In both modes, the Project view shows two meters you set there:
+**Budgets.** In both modes, the Project view shows your time, which you set there, and
+the agents' active hours:
 - **Your time.** The hours the whole project may take of you. Once set, every owner
   action in a design, gate or task, carries the Architect's estimate of how long it
   takes you, a reserve of `ownerTime.reservePercent` stays out of what designs may
@@ -434,8 +442,10 @@ the diff itself.
   after the other modules. Only owner actions count: the proposals and pull requests
   you read don't. The Architect reads the numbers with `get_owner_time`. The meter
   shows used, planned and the hours, red when over.
-- **Agent hours.** The Developers' attempt clocks summed, against a threshold: red when
-  over, and nothing stops.
+- **Active hours.** The hours the agents worked: each Developer's attempt and each
+  reviewer's session, from its start to its end, in a table by agent with the model and
+  effort `harness/config.json` sets. Managers and Architects aren't counted: they live
+  for their module, and wait far more than they work.
 
 ## Commands
 
@@ -449,7 +459,7 @@ too.
 | `harness github-app create --org <org>` | Creates the harness's GitHub App, once per machine |
 | `harness github-app check --repo <org>/<repo>` | Checks that the App can reach the repository |
 | `harness github-setup --repo <org>/<repo> [--mode manual\|swarm]` | Sets merge commits only, and the ruleset on `main` for the daemon's mode, with your own `gh` |
-| `harness budget --owner-hours <n>` | Sets the hours of your time for the whole project; with the daemon down, it records them when it starts, over hours set before (`--agent-hours` sets the threshold) |
+| `harness budget --owner-hours <n>` | Sets the hours of your time for the whole project; with the daemon down, it records them when it starts, over hours set before |
 | `harness setup [--repo <owner/name>] [--owner <login>]` | Sets up this machine and the project, asking only for what is yours; run it again any time |
 | `harness install-ci [--owner <login>]` | Writes the workflow, its CI script and `CODEOWNERS` again, after an upgrade |
 | `harness lock` | Writes `harness/lock.json`, the hashes of the protected files |
@@ -476,7 +486,7 @@ through an `Arch:` pull request, or a commit of your own on `main`.
   "harnessVersion": "0.4.21",
   "project": { "name": "shop", "repo": "<org>/shop", "bot": "<org>-harness[bot]" },
   "roles": {
-    "architect": { "model": "claude-fable-5-1", "effort": "max" },
+    "architect": { "model": "claude-fable-5-2", "effort": "max" },
     "manager": { "model": "claude-opus-5-5", "effort": "max" },
     "developer": { "model": "claude-opus-5-5", "effort": "max", "attemptTimeoutMinutes": 90, "maxAttempts": 2 }
   },
@@ -489,9 +499,9 @@ through an `Arch:` pull request, or a commit of your own on `main`.
 |---|---|---|
 | `project.name` | the folder's name, from `init` | Names the sandboxes and the dashboard |
 | `project.repo`, `project.bot` | none | The GitHub repository, and the App's bot login. Without them, the project stays local. |
-| `roles.<role>.model` | `claude-fable-5-1` for the Architect, `claude-opus-5-5` for the Manager and the Developers | The role's model. The reviewers run on the Manager's model and effort. |
+| `roles.<role>.model` | `claude-fable-5-2` for the Architect, `claude-opus-5-5` for the Manager and the Developers | The role's model. The reviewers run on the Manager's model and effort. |
 | `roles.<role>.effort` | `max` | Claude Code's `--effort`; `null` for a model without effort levels, such as Haiku |
-| `roles.developer.attemptTimeoutMinutes` | 120 | An attempt's deadline |
+| `roles.developer.attemptTimeoutMinutes` | 180 | An attempt's deadline |
 | `roles.developer.maxAttempts` | 2 | Attempts per feature before it is escalated to you |
 | `network.bundles` | `["all"]` | The hosts sandboxes reach directly, read-only, by bundle: `core`, `node`, `python`, `aws`, `terraform`, `go`, `rust`, `jvm`, `opentofu`, `browsers`, or `all` for every one, those later versions add included. The Architect gets them all. |
 | `network.extraHosts` | `[]` | More hosts, read-only |
@@ -684,7 +694,7 @@ To report a vulnerability, see `SECURITY.md` in the source repository.
   every window resets. The times are Unix times, so your timezone doesn't matter; the
   minute covers a clock a little ahead. While paused, agents already running finish,
   and their results count at once.
-- By default, the Architect runs Fable 5.1, the most capable model, and the Manager,
+- By default, the Architect runs Fable 5.2, the most capable model, and the Manager,
   the reviewers and the Developers run Opus 5.5, all at the highest effort, `max`. At API
   prices Fable costs 2.5 times as much as Opus per token, so the Architect's sessions use
   your plan fastest. To try the harness, or to use less of your plan, set each role's

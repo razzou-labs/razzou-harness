@@ -43,3 +43,14 @@ export function tone(status: string): string {
   if (/^(pending|stopped|exited|skipped|waiting)$/.test(status)) return 'muted';
   return 'run';
 }
+
+/**
+ * A model as people name it: `claude-fable-5-2` is Fable 5.2, `claude-sonnet-4-5-20250929`
+ * Sonnet 4.5, with "(1M)" for a `[1m]` context; any other name, such as an alias, as it is.
+ */
+export function modelName(id: string): string {
+  const parts = /^claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?(?:-\d{8})?(\[1m\])?$/i.exec(id);
+  if (!parts) return id;
+  const [, family, major, minor, wide] = parts as unknown as [string, string, string, string | undefined, string | undefined];
+  return `${family[0]!.toUpperCase()}${family.slice(1)} ${major}${minor ? `.${minor}` : ''}${wide ? ' (1M)' : ''}`;
+}

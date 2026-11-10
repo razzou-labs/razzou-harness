@@ -12,6 +12,7 @@ import { planDependencies } from '../design/schemas.ts';
 import type { State } from '../state/state.ts';
 import { readDockerUsage, type UsageReading } from '../sandbox/docker.ts';
 import { removeLeftOver, sandboxDenials, sandboxOverview, sharedReading } from '../daemon/sandboxes.ts';
+import { configView } from './config-view.ts';
 import { Terminals, type Size } from './terminals.ts';
 
 export interface DashboardOptions {
@@ -181,10 +182,12 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
         case 'POST /api/mode':
           // The dashboard's switch and `harness mode` alike: the mode, and main's rules with the owner's gh.
           return sendJson(res, body.mode === 'manual' || body.mode === 'swarm' ? await orchestrator.switchMode(body.mode) : { done: false, error: 'the mode is manual or swarm' });
+        case 'GET /api/config':
+          return sendJson(res, await configView(orchestrator));
         case 'POST /api/budgets': {
-          // A positive number sets a budget, null clears it, anything else leaves it alone.
-          const hours = (key: string) => (body[key] === null ? null : typeof body[key] === 'number' && Number.isFinite(body[key]) && (body[key] as number) > 0 ? (body[key] as number) : undefined);
-          return sendJson(res, { done: orchestrator.setBudgets({ ownerHours: hours('ownerHours'), agentHours: hours('agentHours') }) });
+          // A positive number sets the owner's hours, null clears them, anything else leaves them alone.
+          const hours = body.ownerHours === null ? null : typeof body.ownerHours === 'number' && Number.isFinite(body.ownerHours) && body.ownerHours > 0 ? body.ownerHours : undefined;
+          return sendJson(res, { done: orchestrator.setBudgets({ ownerHours: hours }) });
         }
         case 'POST /api/retry':
           return sendJson(res, { done: typeof body.feature === 'string' && orchestrator.retry(body.feature, text('note')) });
@@ -441,6 +444,8 @@ function designSummary(orchestrator: Orchestrator) {
     repo: config.project.repo,
     maxAttempts: config.roles.developer.maxAttempts,
     attemptMinutes: config.roles.developer.attemptTimeoutMinutes,
+    // Each role's model and effort, for the active hours by agent; the reviewers run on the Manager's.
+    roles: Object.fromEntries((['architect', 'manager', 'developer'] as const).map((role) => [role, { model: config.roles[role].model, effort: config.roles[role].effort }])) as Record<'architect' | 'manager' | 'developer', { model: string; effort: string | null }>,
     terraform: config.terraform !== undefined,
     ownerTime: config.ownerTime,
     swarm: config.swarm,
