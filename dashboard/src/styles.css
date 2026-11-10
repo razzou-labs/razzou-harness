@@ -54,6 +54,8 @@ code { background: var(--h-soft); padding: 1px 5px; border-radius: 4px; }
 
 /* The features' tables: their cells start at the top, as their content grows down. */
 .features td { vertical-align: top; }
+/* A long text opened from its fold: as written, and scrolled past a screenful. */
+.long-text { white-space: pre-wrap; word-break: break-word; max-height: 320px; overflow: auto; }
 
 /* Terminals draw for a dark screen; transcripts follow the page. */
 .terminal { height: 70vh; background: #141413; border-radius: 6px; padding: 4px; }

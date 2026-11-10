@@ -33,6 +33,10 @@ conversation but keeps its proposals. `harness budget --agent-hours` is gone.
   No key or token is shown.
 - **Plans in cards.** Each plan's dependency tree in the Project view sits in a card of
   its own.
+- **Long texts fold in the features' tables.** A long failure reason shows its first
+  line, and the Developer's questions show as a count, such as "2 questions from the
+  Developer, answered"; a click opens them. Before, a feature with long questions and
+  answers filled its plan's table.
 
 ## 0.4.21 (2026-11-09)
 

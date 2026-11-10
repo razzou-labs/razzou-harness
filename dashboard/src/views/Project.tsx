@@ -501,6 +501,45 @@ const PlanDetails = defineComponent({
   },
 });
 
+/** A text kept to its first line until clicked, when it's long: the table stays easy to read. */
+const Folded = defineComponent({
+  props: { text: { type: String, required: true } },
+  setup(props) {
+    return () => {
+      const lines = props.text.trim().split('\n');
+      const first = lines[0]!;
+      if (lines.length === 1 && first.length <= 140) return <div class="text-caption">{first}</div>;
+      return (
+        <Fold class="text-caption" label={() => (first.length > 100 ? `${first.slice(0, 100)}…` : `${first} …`)}>
+          <div class="long-text">{props.text.trim()}</div>
+        </Fold>
+      );
+    };
+  },
+});
+
+/** What the Developer asked during the attempt, and the answers, folded to a count until clicked. */
+const Questions = defineComponent({
+  props: { questions: { type: Array as PropType<NonNullable<Attempt['questions']>>, required: true } },
+  setup(props) {
+    return () => {
+      const n = props.questions.length;
+      const waiting = props.questions.filter((q) => q.answer === undefined).length;
+      const label = `${n} question${n === 1 ? '' : 's'} from the Developer, ${waiting === 0 ? 'answered' : `${waiting} waiting for an answer`}`;
+      return (
+        <Fold class="text-caption" headerClass="text-muted" label={() => label}>
+          {props.questions.map((q) => (
+            <div key={q.requestId} class="q-mb-sm">
+              <div class="long-text"><b>Q:</b> {q.text}</div>
+              {q.answer !== undefined && <div class="long-text q-mt-xs"><b>A:</b> {q.answer}</div>}
+            </div>
+          ))}
+        </Fold>
+      );
+    };
+  },
+});
+
 const FeatureRow = defineComponent({
   props: {
     id: { type: String, required: true },
@@ -531,16 +570,14 @@ const FeatureRow = defineComponent({
               <>
                 {last.status}
                 {last.outcome ? ` · ${last.outcome}` : ''} · {duration(ended - Date.parse(last.startedAt))}
-                {last.reason && <div class="text-caption">{last.reason}</div>}
+                {last.reason && <Folded text={last.reason} />}
                 {last.finding && (
                   <Fold class="text-caption" label={() => `Finding: ${last.finding!.category}`}>
                     <p>{last.finding.summary}</p>
                     {last.finding.needs && <p>Needs: {last.finding.needs}</p>}
                   </Fold>
                 )}
-                {last.questions?.map((q) => (
-                  <div key={q.requestId} class="text-caption text-muted">Q: {q.text}{q.answer ? ` — A: ${q.answer}` : ''}</div>
-                ))}
+                {last.questions && last.questions.length > 0 && <Questions questions={last.questions} />}
               </>
             )}
           </QTd>
