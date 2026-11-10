@@ -3,6 +3,16 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## 0.5.4 (2026-11-10)
+
+**Upgrading from 0.5.3:** install the new version, rebuild the agents' image with
+`harness doctor --build-images` (its tag follows the harness's version), then restart the
+daemon with `harness down` and `harness up`, and reload the dashboard.
+
+- **Each plan in a card.** In a module of the Project view, a plan's heading, its
+  pull request, CI and reviews, and its features' table sit in a card of their own, so
+  one plan ends where the next begins.
+
 ## 0.5.3 (2026-11-10)
 
 **Upgrading from 0.5.2:** install the new version, rebuild the agents' image with

@@ -459,27 +459,30 @@ const Plan = defineComponent({
         ...plan.features.map((f) => ({ id: f.id, title: f.title, kind: f.kind as string, state: state.features[`${key}/${f.id}`], supersededBy: supersededBy.get(f.id) })),
         ...fixes.map((f) => ({ id: f.feature, title: `Fix after ${f.fix!.kind === 'ci' ? 'CI' : 'the deploy'}, round ${f.fix!.round}`, kind: 'fix', state: f })),
       ];
+      // Each plan in a card of its own: its heading, its details and its features' table together.
       return (
-        <div class="plan q-mt-md">
-          <div class="text-subtitle1 text-weight-medium row items-center q-gutter-sm">
-            <span>{plan.id} · {plan.title}</span>
-            <Badge status={planState?.status ?? 'waiting'} />
-            {planState?.pr && <GithubLink url={planState.pr.url}>PR #{planState.pr.number}</GithubLink>}
-            {planState?.mergedBy === 'daemon' && <span class="text-muted text-caption">merged by the daemon</span>}
-            {planState?.ci && <Badge status={planState.ci.status} label={`CI ${planState.ci.status}`} />}
-          </div>
-          {planState && <PlanDetails plan={planState} />}
-          <QTable class="features q-mt-sm" flat bordered dense wrapCells hideBottom rowKey="id" rows={rows} columns={FEATURE_COLUMNS} pagination={{ rowsPerPage: 0 }} tableStyle="table-layout: fixed">
-            {{
-              body: ({ row }: { row: (typeof rows)[number] }) => (
-                <FeatureRow
-                  key={row.id} id={row.id} title={row.title} kind={row.kind} max={design.maxAttempts} {...(row.state ? { feature: row.state } : {})}
-                  {...('supersededBy' in row && row.supersededBy ? { supersededBy: row.supersededBy, supersededDone: state.features[`${props.module}/${row.supersededBy}`]?.status === 'accepted' } : {})}
-                />
-              ),
-            }}
-          </QTable>
-        </div>
+        <QCard flat bordered class="plan q-mt-md">
+          <QCardSection>
+            <div class="text-subtitle1 text-weight-medium row items-center q-gutter-sm">
+              <span>{plan.id} · {plan.title}</span>
+              <Badge status={planState?.status ?? 'waiting'} />
+              {planState?.pr && <GithubLink url={planState.pr.url}>PR #{planState.pr.number}</GithubLink>}
+              {planState?.mergedBy === 'daemon' && <span class="text-muted text-caption">merged by the daemon</span>}
+              {planState?.ci && <Badge status={planState.ci.status} label={`CI ${planState.ci.status}`} />}
+            </div>
+            {planState && <PlanDetails plan={planState} />}
+            <QTable class="features q-mt-sm" flat bordered dense wrapCells hideBottom rowKey="id" rows={rows} columns={FEATURE_COLUMNS} pagination={{ rowsPerPage: 0 }} tableStyle="table-layout: fixed">
+              {{
+                body: ({ row }: { row: (typeof rows)[number] }) => (
+                  <FeatureRow
+                    key={row.id} id={row.id} title={row.title} kind={row.kind} max={design.maxAttempts} {...(row.state ? { feature: row.state } : {})}
+                    {...('supersededBy' in row && row.supersededBy ? { supersededBy: row.supersededBy, supersededDone: state.features[`${props.module}/${row.supersededBy}`]?.status === 'accepted' } : {})}
+                  />
+                ),
+              }}
+            </QTable>
+          </QCardSection>
+        </QCard>
       );
     };
   },
