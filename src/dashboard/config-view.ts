@@ -55,7 +55,7 @@ function daemonFacts(o: Orchestrator): ConfigFact[] {
   return [
     { name: 'Mode', value: state.mode === 'swarm' ? 'Swarm: the daemon merges plans that pass CI and the reviewers' : 'Manual: you review and merge every pull request' },
     {
-      name: 'INFRA and MIXED merges, in Swarm',
+      name: 'INFRA and MIXED_INFRA_AND_CODE merges, in Swarm',
       value: (state.infraMerge ?? 'ceiling') === 'daemon'
         ? "the daemon's once CI and the reviewers pass; an estimate over the cost ceiling still waits for you"
         : "yours, unless the cost job's estimate is under the ceiling",

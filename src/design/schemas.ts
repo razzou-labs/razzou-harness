@@ -28,6 +28,12 @@ export const FeatureSchema = z.object({
   description: z.string().min(1),
   expected: z.string().min(1),
   dependsOn: z.array(FeatureRef).default([]),
+  /**
+   * Built features of earlier plans whose behavior this one changes, as `P2/F04`: from the
+   * moment this feature is accepted, their checks no longer run. Their definitions stay as
+   * the record of what was built; this feature's checks prove what is true now.
+   */
+  supersedes: z.array(FeatureRef).default([]),
   gates: z.array(z.string()).default([]),
   resources: z.array(z.string()).default([]),
   checks: z.array(CheckSchema).min(1),
@@ -71,6 +77,9 @@ export function planKind(plan: Pick<Plan, 'features'>): PlanKind {
   const infra = plan.features.filter((f) => f.kind === 'infra').length;
   return infra === 0 ? 'CODE' : infra === plan.features.length ? 'INFRA' : 'MIXED';
 }
+
+/** A plan kind as the owner reads it, in titles and messages: MIXED says what it mixes. */
+export const KIND_TAGS: Record<PlanKind, string> = { CODE: 'CODE', INFRA: 'INFRA', MIXED: 'MIXED_INFRA_AND_CODE' };
 
 /** The plans a plan waits for (v3 §6.1): what it declares, or else the previous plan of its module, which keeps v2's order. */
 export function planDependencies(module: Pick<ModuleDesign, 'plans'>, plan: Pick<Plan, 'id' | 'dependsOn'>): string[] {
@@ -328,13 +337,34 @@ export function checkScripts(check: Check): string[] {
 /** The blob ids of the design files each loaded feature's checks run. */
 const scripts = new WeakMap<Feature, Record<string, string>>();
 
+/** The design files a loaded feature's checks run, each with its blob id: which of them a change touched. */
+export function scriptsOf(feature: Feature): Record<string, string> {
+  return scripts.get(feature) ?? {};
+}
+
 /**
  * The hash of a feature's definition: its JSON, and the design files its checks run. A
  * changed definition, a fixed check script among them, starts a fresh attempt budget.
  */
 export function definitionHash(feature: Feature): string {
   const files = scripts.get(feature);
-  return sha256(canonicalJson(files ? { feature, files } : feature));
+  // Without a `supersedes`, the hash is the one from before the field existed: no feature is redefined by an upgrade.
+  const { supersedes, ...rest } = feature;
+  const defined = supersedes.length > 0 ? feature : rest;
+  return sha256(canonicalJson(files ? { feature: defined, files } : defined));
+}
+
+/**
+ * The hash of a plan's checks of one phase as a design defines them: the entries, and the
+ * design files they run. A change, by whoever, is one this hash shows.
+ */
+export function checksHash(plan: Plan, phase: Check['phase']): string {
+  return sha256(canonicalJson(plan.features.map((feature) => {
+    const checks = feature.checks.filter((c) => c.phase === phase);
+    const files = scripts.get(feature) ?? {};
+    const runs = new Set(checks.flatMap(checkScripts));
+    return { id: feature.id, checks, files: Object.fromEntries(Object.entries(files).filter(([path]) => runs.has(path))) };
+  })));
 }
 
 /** Reads config and plans from a commit, never from a working tree: the daemon acts on what is committed. */
@@ -407,6 +437,14 @@ function checkReferences(module: ModuleDesign): void {
         const other = module.plans.find((p) => p.id === target.plan);
         if (!earlier.includes(target.plan) || !other?.features.some((f) => f.id === target.feature)) {
           throw new Error(`${where}/plans/${plan.id}.json: ${feature.id} depends on ${dep}, which is not a feature of an earlier plan of ${module.id}`);
+        }
+      }
+      // Only a feature of an earlier plan can be superseded: one of the same plan is simply changed.
+      for (const ref of feature.supersedes) {
+        const target = featureDependency(plan.id, ref);
+        const other = module.plans.find((p) => p.id === target.plan);
+        if (target.plan === plan.id || !earlier.includes(target.plan) || !other?.features.some((f) => f.id === target.feature)) {
+          throw new Error(`${where}/plans/${plan.id}.json: ${feature.id} supersedes ${ref}, which is not a feature of an earlier plan of ${module.id}: name it as P1/F01`);
         }
       }
       for (const gate of feature.gates) {

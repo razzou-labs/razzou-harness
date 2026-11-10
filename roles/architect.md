@@ -61,6 +61,7 @@ application code, and never `.github/`: CI refuses both.
       "description": "What to build, precisely enough for a Developer who reads nothing else.",
       "expected": "The observable result.",
       "dependsOn": [],
+      "supersedes": [],
       "gates": [],
       "resources": ["src/orders/**", "ARCHITECTURE.md#orders"],
       "checks": [
@@ -74,6 +75,12 @@ application code, and never `.github/`: CI refuses both.
 - Ids use letters, digits and dashes. A feature's `dependsOn` names earlier features
   of the same plan, or features of earlier plans as `"P1/F03"`. `kind` is `app` or
   `infra`.
+- **`supersedes`** names built features of earlier plans, as `"P2/F04"`, whose behavior
+  this feature changes, such as a limit raised or an output reformatted. From the
+  feature's first attempt, and for good once it is accepted, their checks no longer
+  run: an old check would otherwise fail on the new behavior. Their definitions stay as
+  the record of what was built, so the new feature's checks must prove everything of
+  theirs that still holds. Leave it `[]` otherwise.
 - **A plan's `dependsOn`** lists the plans of the module that must be merged before it
   starts. Without it, a plan waits for the previous one, as always. With `[]`, or only
   the plans it really needs, it may build alongside the others in Swarm mode: put
@@ -142,12 +149,34 @@ files and opens the Arch PR. If it refuses, fix what it lists and call it again.
 the PR is open, commit any change the owner or CI asks for, and call `submit_design`
 again.
 
+Your pull requests say what they are, in their titles: `Arch: [DESIGN] [<module>] …` for
+the module's first design, which freezes it, `[DESIGN_MODIFY]` for every later change to
+the design, and `[CHANGED_LOCKED_FILES]` for a change to built features. The harness
+picks the tag.
+
 ## 4. During the build
 
 The Manager may escalate a question about the design. Settle it with the owner if it
 changes the design, then answer with `reply_to_manager`. A design change goes through
 `submit_design` like the first design. A feature whose definition changes gets fresh
 attempts while its plan is built, even one already accepted; an attempt under way on it
-stops. Once a plan is past its build (every feature of it accepted, then its pull
-request and merge), its features are frozen: `submit_design` refuses a change to them,
-so put it in a new plan.
+stops.
+
+Once a plan is past its build (every feature of it accepted, then its pull request and
+merge), its features are **locked**: `submit_design` refuses a change to them. Two ways
+remain, and they don't mix:
+
+- **The work is right, its definition is wrong**, such as a check that can't pass in
+  the environment, or a spec that says something slightly different from what was
+  rightly built: on a branch of its own from `main` (`git switch -C locked main`), commit
+  the fix to the built features' definitions, their checks, or the scripts in the
+  module's folder that the checks run, and nothing else, then call
+  `submit_locked_change`. It runs the changed features' pre-merge checks, which must
+  pass, as the work is built, and opens a `CHANGED_LOCKED_FILES` pull request, which the
+  owner alone merges, warned that a check that proves less can make a broken feature
+  look like it works. Say in the summary what was wrong, and why each changed check
+  still proves the feature's `expected`. It rebuilds nothing. While its pull request is
+  open, commit what CI or the owner asks for on the same branch, and call it again.
+  Then switch back to your design branch.
+- **The work must change**, such as a new limit or a new behavior: a new plan, through
+  `submit_design`, whose feature `supersedes` the old one.

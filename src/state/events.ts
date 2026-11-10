@@ -4,7 +4,7 @@ import type { CheckResult } from '../checks/runner.ts';
 import type { ReviewFinding, ReviewerRole } from '../design/schemas.ts';
 import type { Party, Role } from '../roles.ts';
 import type { Denial } from '../sandbox/refusals.ts';
-import type { ActionState, FeatureState, InfraMerge, Mode, PlanState } from './state.ts';
+import type { ActionState, FeatureState, InfraMerge, LockedChange, Mode, PlanState } from './state.ts';
 
 /** What an event is about. Ids repeat across modules, so a feature is always addressed with its module and plan. */
 export interface Ref {
@@ -93,17 +93,26 @@ interface Payloads {
   DEPLOYED: { commit: string; verify: boolean };
   DEPLOY_FAILED: { commit: string; jobs: CiJob[] };
   PLAN_VERIFIED: { results: CheckResult[] };
-  POST_DEPLOY_CHECKS_FAILED: { results: CheckResult[] };
+  /** `checks`: the hash of the post-deploy checks that ran, which a change on main is told apart from (v5). */
+  POST_DEPLOY_CHECKS_FAILED: { results: CheckResult[]; checks?: string };
+  /** A plan whose post-deploy checks failed is checked again: its checks changed on main since (v5). */
+  POST_DEPLOY_RECHECK: { reason: string };
   PR_CLOSED: Record<string, never>;
   MODULE_CREATED: { module: string; title: string; sandbox: string; sessionId: string };
   ARCHITECT_LAUNCHED: { module: string };
   ARCHITECTURE_ACCEPTED: { module: string; version: number };
   DESIGN_REFUSED: { module: string; requestId: string; problems: string[] };
   DESIGN_SUBMITTED: { module: string; head: string; suspect: string[] };
-  ARCH_PR_OPENED: { module: string; number: number; url: string };
-  ARCH_PR_CLOSED: { module: string };
-  ARCH_CI_DONE: { module: string; sha: string; jobs: CiJob[] };
+  /** `locked`: the PR of a CHANGED_LOCKED_FILES change, not of a design (v5). */
+  ARCH_PR_OPENED: { module: string; number: number; url: string; locked?: boolean };
+  ARCH_PR_CLOSED: { module: string; locked?: boolean };
+  ARCH_CI_DONE: { module: string; sha: string; jobs: CiJob[]; locked?: boolean };
   DESIGN_FROZEN: { module: string; commit: string };
+  LOCKED_CHANGE_REFUSED: { module: string; requestId: string; problems: string[] };
+  /** A change to built features' definitions, ready for the owner: `changes` says what changes in each. */
+  LOCKED_CHANGE_SUBMITTED: { module: string; head: string; changes: LockedChange[] };
+  /** The owner merged it: each changed feature stays accepted under its new definition's hash. */
+  LOCKED_CHANGE_MERGED: { module: string; commit: string; rehash: Array<{ feature: string; definitionHash: string }> };
   ARCHITECT_NOTE_SENT: { module: string; key: string };
   OWNER_ACTION_CLAIMED: { module: string; action: string; note?: string };
   /** `minutes`: the action's estimate when it was done, so the owner's time used survives a redesign that drops it. */
@@ -156,6 +165,8 @@ interface Payloads {
   PROPOSAL: { module: string; requestId: string; version: number; sha256: string };
   /** The Architect submits its design; `head` is its commit, now in the daemon's repository. */
   DESIGN: { module: string; requestId: string; summary: string; head: string };
+  /** The Architect submits a change to built features' definitions (v5); `head` is its commit. */
+  LOCKED_CHANGE: { module: string; requestId: string; summary: string; head: string };
   ESCALATION: { module: string; requestId: string; question: string; feature?: string; manager?: string };
   DECISION: { module: string; requestId: string; escalationId: string; decision: string };
 }

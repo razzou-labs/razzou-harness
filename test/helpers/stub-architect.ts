@@ -19,6 +19,8 @@ export interface ArchitectBehavior {
   decision?: string;
   /** Written and submitted as a design change on the first escalation, before the answer. */
   change?: Record<string, string>;
+  /** Written on a branch of its own from main and submitted as a change to locked files, on the first escalation. */
+  locked?: Record<string, string>;
 }
 
 const { values } = parseArgs({ options: { harness: { type: 'string' }, work: { type: 'string' }, behavior: { type: 'string' } } });
@@ -81,6 +83,13 @@ for (;;) {
         write(behavior.change);
         commit('Change the design');
         await call('submit_design', { summary: 'Fix a check' });
+      }
+      if (behavior.locked && answered.size === 0) {
+        spawnSync('git', ['switch', '--quiet', '-C', 'locked', 'main'], { cwd: work });
+        write(behavior.locked);
+        commit("Fix F01's definition");
+        await call('submit_locked_change', { summary: "Fix F01's definition" });
+        spawnSync('git', ['switch', '--quiet', `arch/${behavior.module}`], { cwd: work });
       }
       answered.add(id);
       await call('reply_to_manager', { escalation_id: id, decision: behavior.decision ?? 'Keep the design as it is.' });

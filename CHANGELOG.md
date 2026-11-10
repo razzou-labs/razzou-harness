@@ -3,6 +3,50 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## 0.5.0 (2026-11-10)
+
+**Upgrading from 0.4.23:** install the new version, then, in each project, run
+`harness install-ci` and commit the CI files it writes: CI now checks the new titles,
+and the pull requests opened by 0.4 titles would fail them. Rebuild the agents' image
+with `harness doctor --build-images` (its tag follows the harness's version), restart
+the daemon with `harness down` and `harness up`, and reload the dashboard.
+
+- **Titles that say what a pull request is:** `<Type>: [<TAG>] [<scope>] <title>`, which
+  CI's `verify` checks.
+  - `Plan: [CODE|INFRA|MIXED_INFRA_AND_CODE] [module/plan]`: MIXED now says what it
+    mixes, in the dashboard and the README too.
+  - `Fix: [DEPLOY_FAILED|VERIFY_FAILED] [module/plan]`: what failed after the merge.
+  - `Arch: [DESIGN] [module]`: a module's first design, once, which freezes it.
+    `Arch: [DESIGN_MODIFY] [module]`: every later change to the design.
+  - `Arch: [CHANGED_LOCKED_FILES] [module]`, below.
+  - `Harness:` and `Owner:`, yours, keep their free titles.
+- **Locked features, and how they change.** Once a plan is past its build, its features
+  are locked: a design change can't touch them.
+  - A wrong definition, such as a post-deploy check that can't pass in the environment
+    while the deploy is right, changes in a `[CHANGED_LOCKED_FILES]` pull request. The
+    Architect submits it with `submit_locked_change`, from a branch of its own.
+  - It changes built features' definitions, their checks and the scripts in the
+    module's folder that those run, and nothing else. A design can't include it, and it
+    can't include design.
+  - Its changed pre-merge checks must pass first, as the work is built. Main is merged
+    into it when it didn't start from there. CI runs its checks as it defines them;
+    every other pull request runs those of `main`, so none can weaken its own.
+  - It rebuilds nothing. Once merged, its features stay accepted under their new
+    definitions, and their checks keep running.
+  - Only you merge it. Needs you gives it a card of its own, with a red warning: a check
+    that proves less can make a broken feature look like it works.
+- **`supersedes`.** New behavior for a built feature comes in a new plan, whose feature
+  names the old one in `supersedes`. From its first attempt, and for good once it is
+  accepted, the old feature's checks no longer run: they would fail on the new behavior.
+  The old definition stays as the record of what was built, and the Project view says
+  which feature superseded it.
+- **Re-checked by itself.** A plan whose post-deploy checks failed is checked again as
+  soon as those checks change on `main`, whoever changed them, with no Pause and Resume:
+  a locked change, your own commit, or a merged feature that supersedes one of the
+  plan's. Before, only a Resume ran them again, and only while the pipeline was paused.
+- **The Architect's clone follows main** as plans merge, so a branch it starts from
+  `main` holds the built work.
+
 ## 0.4.23 (2026-11-10)
 
 **Upgrading from 0.4.22:** install the new version, rebuild the agents' image with

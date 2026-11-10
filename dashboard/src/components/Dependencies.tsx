@@ -12,7 +12,7 @@ const LIVE = ['starting', 'running', 'collecting', 'checking', 'reviewing'];
 type TreeNode = { key: string; children: TreeNode[] } & (
   | { kind: 'plan'; plan: PlanDesign }
   /** `also`: what it waits for besides the feature it hangs from, as the design names it. */
-  | { kind: 'feature'; feature: FeatureDesign; also: string[]; hangs: boolean }
+  | { kind: 'feature'; feature: FeatureDesign; also: string[]; hangs: boolean; supersededBy?: string }
 );
 
 /**
@@ -34,7 +34,7 @@ export const Dependencies = defineComponent({
           <div key={plan.id} class="col-12 col-md-6 col-xl-4">
             <QCard flat bordered class="full-height">
               <QCardSection class="q-pa-sm">
-                <PlanTree module={props.module.id} plan={plan} state={props.state} />
+                <PlanTree module={props.module.id} modulePlans={props.module.plans} plan={plan} state={props.state} />
               </QCardSection>
             </QCard>
           </div>
@@ -47,6 +47,8 @@ export const Dependencies = defineComponent({
 const PlanTree = defineComponent({
   props: {
     module: { type: String, required: true },
+    /** Every plan of the module: a later one may supersede a feature of this one. */
+    modulePlans: { type: Array as PropType<PlanDesign[]>, required: true },
     plan: { type: Object as PropType<PlanDesign>, required: true },
     state: { type: Object as PropType<State>, required: true },
   },
@@ -55,7 +57,7 @@ const PlanTree = defineComponent({
     const folded = ref(new Set<string>());
     return () => {
       const { module, plan, state } = props;
-      const root: TreeNode = { key: plan.id, kind: 'plan', plan, children: featureTree(plan) };
+      const root: TreeNode = { key: plan.id, kind: 'plan', plan, children: featureTree(plan, supersededIn(props.modulePlans, plan.id)) };
       const parents = branches(root);
       return (
         <QTree
@@ -83,6 +85,7 @@ const PlanTree = defineComponent({
                     <QTooltip>{`${node.feature.id} ${node.feature.title}: ${featureLabel(feature)}`}</QTooltip>
                   </span>
                   {node.also.length > 0 && <span class="deps-also">{node.hangs ? 'also after' : 'after'} {node.also.join(', ')}</span>}
+                  {node.supersededBy && <span class="deps-also">superseded by {node.supersededBy}</span>}
                 </div>
               );
             },
@@ -98,7 +101,21 @@ const PlanTree = defineComponent({
  * waits for, the last named on a tie; one that waits for none of them is a root. The
  * design names only earlier features of the plan, so the chains end.
  */
-function featureTree(plan: PlanDesign): TreeNode[] {
+/** Which of a plan's features later plans supersede, and by what, as P6/F11 (v5). */
+function supersededIn(plans: PlanDesign[], planId: string): Map<string, string> {
+  const by = new Map<string, string>();
+  for (const later of plans) {
+    for (const f of later.features) {
+      for (const ref of f.supersedes ?? []) {
+        const [target, feature] = ref.includes('/') ? ref.split('/') : [later.id, ref];
+        if (target === planId && feature) by.set(feature, `${later.id}/${f.id}`);
+      }
+    }
+  }
+  return by;
+}
+
+function featureTree(plan: PlanDesign, supersededBy: Map<string, string> = new Map()): TreeNode[] {
   const own = (dep: string) => (dep.includes('/') ? (dep.startsWith(`${plan.id}/`) ? dep.slice(plan.id.length + 1) : undefined) : dep);
   const ids = new Set(plan.features.map((f) => f.id));
   const depth = new Map<string, number>();
@@ -115,7 +132,11 @@ function featureTree(plan: PlanDesign): TreeNode[] {
   const nodes = new Map<string, TreeNode>();
   for (const f of plan.features) {
     const hangs = parent.get(f.id);
-    nodes.set(f.id, { key: `${plan.id}/${f.id}`, kind: 'feature', feature: f, also: hangs === undefined ? f.dependsOn : f.dependsOn.filter((dep) => own(dep) !== hangs), hangs: hangs !== undefined, children: [] });
+    const by = supersededBy.get(f.id);
+    nodes.set(f.id, {
+      key: `${plan.id}/${f.id}`, kind: 'feature', feature: f, also: hangs === undefined ? f.dependsOn : f.dependsOn.filter((dep) => own(dep) !== hangs), hangs: hangs !== undefined, children: [],
+      ...(by ? { supersededBy: by } : {}),
+    });
   }
   const roots: TreeNode[] = [];
   for (const f of plan.features) {

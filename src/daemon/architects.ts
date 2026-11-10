@@ -1,14 +1,14 @@
 import { copyFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { architectSettings, claudeJson } from '../agents/claude-code.ts';
-import { requiredChecks } from '../design/schemas.ts';
+import { definitionHash, loadDesign, requiredChecks } from '../design/schemas.ts';
 import { ARCHITECT } from '../git/repo.ts';
 import type { CheckRun } from '../github/forge.ts';
 import type { CiJob } from '../state/events.ts';
 import type { ModuleState } from '../state/state.ts';
 import { clip, sh } from '../util.ts';
 import type { AgentChannel } from './channel.ts';
-import { submitDesign } from './design.ts';
+import { architectRef, lockedRef, submitDesign, submitLockedChange } from './design.ts';
 import type { Orchestrator } from './orchestrator.ts';
 
 /**
@@ -50,7 +50,7 @@ export class Architects {
   }
 
   /** Takes the Architect's committed design out of its sandbox into `refs/architect/<module>`. */
-  async takeDesign(module: ModuleState): Promise<{ head?: string; problem?: string }> {
+  async takeDesign(module: ModuleState, what: 'design' | 'locked' = 'design'): Promise<{ head?: string; problem?: string }> {
     const o = this.o;
     const p = o.paths(module.architect.sandbox);
     const result = await o.exec(module.architect.sandbox, [
@@ -63,7 +63,7 @@ export class Architects {
     if (result.code !== 0) throw new Error(`could not take the design: ${(result.stderr || result.stdout).trim()}`);
     const local = join(this.localDir(module.module), 'design.bundle');
     await o.driver.download(module.architect.sandbox, `${p.out}/design.bundle`, local);
-    return { head: await o.fetchBundle(local, `refs/architect/${module.module}`) };
+    return { head: await o.fetchBundle(local, what === 'locked' ? lockedRef(module.module) : architectRef(module.module)) };
   }
 
   private async syncModule(module: ModuleState): Promise<void> {
@@ -75,8 +75,12 @@ export class Architects {
     this.attach(module);
     await this.sendNotes(module);
     await o.noteTokens(`architect:${module.module}`, module.architect.sandbox);
+    await this.refreshMainIfMoved(module);
     if (module.submission && !this.busy.has(module.module)) await this.process(module);
     if (module.status === 'in_review' && module.design?.pr) await this.followPullRequest(module);
+    // A change to locked files has its own PR, which doesn't hold the build (v5).
+    if (module.lockedSubmission && !this.busy.has(`${module.module}:locked`)) await this.processLocked(module);
+    if (module.locked?.pr) await this.followLocked(module);
   }
 
   /** A sandbox whose main command waits for the launcher; the launcher, uploaded last, starts Claude. */
@@ -202,16 +206,119 @@ export class Architects {
     }
   }
 
-  /** The daemon's hash-list commit goes back into the Architect's branch, so its next commits build on it. */
-  private async syncBranch(module: ModuleState): Promise<void> {
+  private async processLocked(module: ModuleState): Promise<void> {
+    const o = this.o;
+    const submission = module.lockedSubmission!;
+    const key = `${module.module}:locked`;
+    this.busy.add(key);
+    try {
+      const outcome = await submitLockedChange(o, module, submission.summary, submission.head).catch((error: Error) => ({
+        ok: false as const,
+        problems: [`the harness failed while handling it (${error.message.split('\n')[0]}); submit again`],
+      }));
+      if (!outcome.ok) {
+        o.record({ type: 'LOCKED_CHANGE_REFUSED', payload: { module: module.module, requestId: submission.requestId, problems: outcome.problems } });
+        await this.reply(module.module, submission.requestId, false, `Refused:\n${outcome.problems.map((p) => `- ${p}`).join('\n')}`);
+        return;
+      }
+      o.record({ type: 'LOCKED_CHANGE_SUBMITTED', payload: { module: module.module, head: outcome.head, changes: outcome.changes } });
+      if (outcome.opened) o.record({ type: 'ARCH_PR_OPENED', payload: { module: module.module, number: outcome.pr.number, url: outcome.pr.url, locked: true } });
+      await this.syncBranch(module, `locked/${module.module}`);
+      await this.reply(
+        module.module,
+        submission.requestId,
+        true,
+        `CHANGED_LOCKED_FILES PR #${outcome.pr.number}: ${outcome.pr.url}. It changes ${outcome.changes.map((c) => `${c.plan}/${c.feature}`).join(', ')}, and their pre-merge checks pass. The owner reviews and merges it.`,
+      );
+    } finally {
+      this.busy.delete(key);
+    }
+  }
+
+  /** Until the owner merges a change to locked files: CI goes to the Architect, and the merge keeps its features accepted (v5). */
+  private async followLocked(module: ModuleState): Promise<void> {
+    const o = this.o;
+    const key = `${module.module}:locked`;
+    if (o.now() < (this.nextPoll.get(key) ?? 0)) return;
+    this.nextPoll.set(key, o.now() + 60_000);
+    const pr = await o.forge.pullRequest(module.locked!.pr!.number);
+    if (pr.merged) {
+      const commit = pr.mergeCommit ?? '';
+      await o.forge.fetchMain(o.repo);
+      // Its features stay accepted under the definitions it gave them: nothing was rebuilt.
+      const design = await loadDesign(o.repo, commit || 'refs/heads/main');
+      const rehash = module.locked!.changes.flatMap((c) => {
+        const feature = design.modules.find((m) => m.id === module.module)?.plans.find((p) => p.id === c.plan)?.features.find((f) => f.id === c.feature);
+        return feature ? [{ feature: `${module.module}/${c.plan}/${c.feature}`, definitionHash: definitionHash(feature) }] : [];
+      });
+      o.record({ type: 'LOCKED_CHANGE_MERGED', payload: { module: module.module, commit, rehash } });
+      await this.refreshMain(module);
+      o.kick();
+      return;
+    }
+    if (pr.state === 'closed') {
+      o.record({ type: 'ARCH_PR_CLOSED', payload: { module: module.module, locked: true } });
+      return;
+    }
+    await o.markUnreviewed(pr.head, 'a CHANGED_LOCKED_FILES PR, which the owner reviews and merges');
+    if (module.locked!.ciNoted === pr.head) return;
+    const required = requiredChecks(o.design.config);
+    const latest = new Map<string, CheckRun>();
+    for (const run of await o.forge.checkRuns(pr.head)) {
+      if (required.includes(run.name) && run.id >= (latest.get(run.name)?.id ?? 0)) latest.set(run.name, run);
+    }
+    if (latest.size < required.length || [...latest.values()].some((r) => r.status !== 'completed')) return;
+    const jobs: CiJob[] = [];
+    for (const run of latest.values()) {
+      const conclusion = run.conclusion ?? 'unknown';
+      jobs.push({ name: run.name, conclusion, ...(conclusion === 'success' ? {} : { log: await o.forge.jobLog(run) }) });
+    }
+    o.record({ type: 'ARCH_CI_DONE', payload: { module: module.module, sha: pr.head, jobs, locked: true } });
+  }
+
+  /** The main last given to each Architect's clone. */
+  private readonly mainSent = new Map<string, string>();
+
+  /**
+   * Main as it moves, plans merged and locked changes too, reaches the Architect's clone,
+   * whose branches stay as they are: a branch it starts from main holds the built work (v5).
+   */
+  private async refreshMainIfMoved(module: ModuleState): Promise<void> {
+    if (module.architect.status !== 'running') return;
+    const main = await this.o.repo.revParse('refs/heads/main');
+    if (!main || this.mainSent.get(module.module) === main) return;
+    await this.refreshMain(module);
+    this.mainSent.set(module.module, main);
+  }
+
+  /**
+   * After a locked change merges: the Architect's clone gets the new main, and its branches
+   * stay as they are. A `main` it has checked out is left alone, which git refuses to move
+   * under a working tree; the next move of main tries again.
+   */
+  private async refreshMain(module: ModuleState): Promise<void> {
+    const o = this.o;
+    const p = o.paths(module.architect.sandbox);
+    const local = join(this.localDir(module.module), 'main.bundle');
+    await o.repo.bundle('refs/heads/main', local);
+    await o.uploadBundle(module.architect.sandbox, local, p.harness);
+    await o.exec(module.architect.sandbox, `cd ${sh(p.work)} && git fetch --quiet --force ${sh(`${p.harness}/main.bundle`)} refs/heads/main:refs/heads/main`);
+  }
+
+  /**
+   * The daemon's hash-list commit goes back into the Architect's branch, so its next
+   * commits build on it: `arch/<module>` for a design, `locked/<module>` for a change to
+   * locked files, whose branch the Architect submitted from.
+   */
+  private async syncBranch(module: ModuleState, branch = `arch/${module.module}`): Promise<void> {
     const o = this.o;
     const p = o.paths(module.architect.sandbox);
     const local = join(this.localDir(module.module), 'arch.bundle');
-    await o.repo.bundle(`refs/heads/arch/${module.module}`, local);
+    await o.repo.bundle(`refs/heads/${branch}`, local);
     await o.uploadBundle(module.architect.sandbox, local, p.harness);
     const result = await o.exec(module.architect.sandbox, [
       `cd ${sh(p.work)}`,
-      `git fetch --quiet --force ${sh(`${p.harness}/arch.bundle`)} ${sh(`refs/heads/arch/${module.module}:refs/remotes/harness/arch`)}`,
+      `git fetch --quiet --force ${sh(`${p.harness}/arch.bundle`)} ${sh(`refs/heads/${branch}:refs/remotes/harness/arch`)}`,
       'git merge --quiet --ff-only refs/remotes/harness/arch',
     ].join(' && '));
     if (result.code !== 0) {
