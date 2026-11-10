@@ -3,6 +3,17 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## 0.5.3 (2026-11-10)
+
+**Upgrading from 0.5.2:** install the new version, rebuild the agents' image with
+`harness doctor --build-images` (its tag follows the harness's version), then restart the
+daemon with `harness down` and `harness up`, and reload the dashboard.
+
+- **One card for Claude's tokens and the subscription.** On a screen 1440 pixels wide or
+  more, the Claude tokens table had a quarter of the Budgets row, and scrolled sideways to
+  show its columns. It now shares a card twice as wide with the subscription's bars,
+  which sit under it; on a narrower screen, the card takes the whole row.
+
 ## 0.5.2 (2026-11-10)
 
 **Upgrading from 0.5.1:** install the new version, rebuild the agents' image with
