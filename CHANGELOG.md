@@ -3,6 +3,28 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## 0.5.2 (2026-11-10)
+
+**Upgrading from 0.5.1:** install the new version, rebuild the agents' image with
+`harness doctor --build-images` (its tag follows the harness's version), then restart the
+daemon with `harness down` and `harness up`, and reload the dashboard.
+
+- **Plans with or without a session limit.** A plan without a five-hour session limit
+  reports the weekly window alone. The Swarm ceiling and the pause after a hit limit
+  already went by whichever windows the agents report, and still do. The Subscription
+  card now shows only the windows that haven't reset since the last report: a five-hour
+  session from before an upgrade leaves it once its reset has passed, and the next
+  report shows the windows the plan has. A pause at the ceiling names its window, such
+  as "in the weekly window".
+- **No old report after a restart.** After a restart the daemon reads the agents' streams
+  again from their start, and it took the last usage report among them for a new one,
+  stamped with the restart's time. A plan's old windows came back that way, a five-hour
+  session included, which could hold the pipeline at the ceiling until that window
+  reset. The lines a stream held before the daemon followed it no longer count as
+  reports; the one the daemon kept stays, with its own time.
+- **A report without `unifiedWindows`** gives the window it names at its top, when it
+  gives its numbers.
+
 ## 0.5.1 (2026-11-10)
 
 **Upgrading from 0.5.0:** install the new version, rebuild the agents' image with
