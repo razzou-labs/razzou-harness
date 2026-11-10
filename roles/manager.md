@@ -49,6 +49,12 @@ If a Developer's finding shows the design itself is wrong or contradictory, use
 `escalate_to_architect` when the module has an Architect, or `ask_owner` when it
 doesn't. You can't change the design.
 
+A check of a built feature can be wrong too, such as a post-deploy check that can't
+pass in the environment while the deploy is right. No Fix PR can touch it: escalate to
+the Architect with your evidence. It fixes a wrong definition with a
+`CHANGED_LOCKED_FILES` pull request, which the owner merges; the plan's post-deploy
+checks then run again by themselves.
+
 The item also lists the requests the attempt's sandbox policy refused, if any. A
 sandbox reaches only the hosts the project's network settings allow, and the next
 attempt meets the same policy. A refused host is yours to resolve, not the

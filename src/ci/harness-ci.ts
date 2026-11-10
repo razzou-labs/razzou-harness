@@ -252,6 +252,25 @@ export async function lockMismatches(tree: TreeReader): Promise<string[]> {
   ];
 }
 
+/**
+ * The accepted features whose checks no longer run: each superseded, as `P2/F04`, by an
+ * accepted feature of the same module (v5). Their definitions stay; the superseding
+ * feature's checks prove what is true now.
+ */
+export async function supersededFeatures(tree: TreeReader, accepted: ReadonlySet<string>): Promise<Set<string>> {
+  const superseded = new Set<string>();
+  for (const path of await tree.list('harness/modules')) {
+    const match = /^harness\/modules\/([^/]+)\/plans\/([^/]+)\.json$/.exec(path);
+    if (!match) continue;
+    const plan = parseJson(await tree.read(path)) as { features?: Array<{ id: string; supersedes?: string[] }> } | undefined;
+    for (const feature of plan?.features ?? []) {
+      if (!accepted.has(`${match[1]}/${match[2]}/${feature.id}`)) continue;
+      for (const ref of feature.supersedes ?? []) superseded.add(`${match[1]}/${ref.includes('/') ? ref : `${match[2]}/${ref}`}`);
+    }
+  }
+  return superseded;
+}
+
 /** Every check of every feature in the design, with the feature it belongs to. */
 export async function designChecks(tree: TreeReader): Promise<Array<{ feature: string; check: Check }>> {
   const out: Array<{ feature: string; check: Check }> = [];
@@ -266,12 +285,16 @@ export async function designChecks(tree: TreeReader): Promise<Array<{ feature: s
   return out;
 }
 
-/** The kind of a PR, from who opened it and its branch; the title must agree, and grants nothing (§11.3). */
+/**
+ * The kind of a PR, from who opened it and its branch; the title must agree, and grants
+ * nothing (§11.3). The Architect's changes to built features, `locked/<module>`, are Arch
+ * PRs of their own tag (v5).
+ */
 export function prKind(author: string, branch: string, bot: string | undefined): 'Plan' | 'Fix' | 'Arch' | 'Harness' | 'Owner' {
   const byBot = bot !== undefined && author === bot;
   if (byBot && /^plan\/[^/]+\/[^/]+$/.test(branch)) return 'Plan';
   if (byBot && /^fix\/[^/]+\/[^/]+-\d+$/.test(branch)) return 'Fix';
-  if (byBot && /^arch\/[^/]+$/.test(branch)) return 'Arch';
+  if (byBot && /^(?:arch|locked)\/[^/]+$/.test(branch)) return 'Arch';
   if (!byBot && branch.startsWith('harness/upgrade-')) return 'Harness';
   return 'Owner';
 }
@@ -301,6 +324,84 @@ export function planKindOf(features: Array<{ kind?: string }>): 'CODE' | 'INFRA'
   return infra === 0 ? 'CODE' : infra === features.length ? 'INFRA' : 'MIXED';
 }
 
+/** A plan kind as titles write it: MIXED says what it mixes. The daemon's KIND_TAGS, kept here so this file stands alone. */
+const KIND_TAGS = { CODE: 'CODE', INFRA: 'INFRA', MIXED: 'MIXED_INFRA_AND_CODE' } as const;
+
+/**
+ * The title of a PR the daemon opens (v5): `<Type>: [<TAG>] [<scope>] <title>`. A Plan PR's
+ * tag is its kind, a Fix PR's what failed after the deploy, an Arch PR's what it changes:
+ * a module's first design, a change to it, or built features' definitions.
+ */
+async function titleProblems(input: VerifyInput, kind: 'Plan' | 'Fix' | 'Arch'): Promise<string[]> {
+  const [, type, tag, scope] = /^(Plan|Fix|Arch): \[([A-Z_]+)\] \[([^\]]+)\] \S/.exec(input.title) ?? [];
+  const expected = (tags: string, where: string) => [`a ${kind} PR's title is "${kind}: [${tags}] [${where}] <title>", not "${input.title}"`];
+  if (kind === 'Plan') {
+    const [, module, plan] = /^plan\/([^/]+)\/([^/]+)$/.exec(input.branch) ?? [];
+    if (type !== 'Plan' || scope !== `${module}/${plan}` || !Object.values(KIND_TAGS).includes(tag as never)) return expected('CODE|INFRA|MIXED_INFRA_AND_CODE', `${module}/${plan}`);
+    return [];
+  }
+  if (kind === 'Fix') {
+    const [, module, plan] = /^fix\/([^/]+)\/([^/]+)-\d+$/.exec(input.branch) ?? [];
+    if (type !== 'Fix' || scope !== `${module}/${plan}` || !['DEPLOY_FAILED', 'VERIFY_FAILED'].includes(tag ?? '')) return expected('DEPLOY_FAILED|VERIFY_FAILED', `${module}/${plan}`);
+    return [];
+  }
+  const [, branchType, module] = /^(arch|locked)\/([^/]+)$/.exec(input.branch) ?? [];
+  if (branchType === 'locked') {
+    if (type !== 'Arch' || scope !== module || tag !== 'CHANGED_LOCKED_FILES') return expected('CHANGED_LOCKED_FILES', module ?? '<module>');
+    return [];
+  }
+  // A module's first design is the one that finds no plan of it on the base branch: later ones change it.
+  const designed = (await input.base.list(`harness/modules/${module}/plans`)).some((path) => path.endsWith('.json'));
+  const want = designed ? 'DESIGN_MODIFY' : 'DESIGN';
+  if (type !== 'Arch' || scope !== module || tag !== want) {
+    return [`this Arch PR ${designed ? `changes the design of ${module}, which main already has` : `is the first design of ${module}`}, so its title is "Arch: [${want}] [${module}] <title>", not "${input.title}"`];
+  }
+  return [];
+}
+
+/**
+ * What a CHANGED_LOCKED_FILES PR may change (v5): the definitions of existing features in
+ * their module's plan files, and the scripts its checks run; never a plan's own fields,
+ * a feature added, removed, renamed or moved, nor any other file. The daemon also makes
+ * sure every feature it changes is built, which it alone knows.
+ */
+async function lockedProblems(input: VerifyInput, module: string): Promise<string[]> {
+  const problems: string[] = [];
+  const plans = new RegExp(`^harness/modules/${module.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/plans/[^/]+\\.json$`);
+  // The scripts in the module's folder: another module's would redefine that module's features too.
+  const scripts = new Set([...(await checkScriptsOf(input.base, module)), ...(await checkScriptsOf(input.head, module))]);
+  for (const path of input.changedPaths) {
+    if (path === 'harness/lock.json' || (scripts.has(path) && path.startsWith(`harness/modules/${module}/`))) continue;
+    if (!plans.test(path)) {
+      problems.push(`a CHANGED_LOCKED_FILES PR changes only the definitions of ${module}'s built features and the scripts in harness/modules/${module}/ that their checks run, not ${path}`);
+      continue;
+    }
+    const before = parseJson(await input.base.read(path)) as { features?: Array<{ id?: string }> } | undefined;
+    const after = parseJson(await input.head.read(path)) as { features?: Array<{ id?: string }> } | undefined;
+    if (!before || !after) {
+      problems.push(`${path}: a CHANGED_LOCKED_FILES PR neither adds nor removes a plan`);
+      continue;
+    }
+    const { features: was = [], ...planBefore } = before;
+    const { features: now = [], ...planAfter } = after;
+    if (canonicalJson(planBefore) !== canonicalJson(planAfter)) problems.push(`${path}: a CHANGED_LOCKED_FILES PR changes features, not the plan's own fields`);
+    if (was.map((f) => f.id).join('\n') !== now.map((f) => f.id).join('\n')) problems.push(`${path}: a CHANGED_LOCKED_FILES PR neither adds, removes, renames nor moves a feature`);
+  }
+  return problems;
+}
+
+/** The design files a module's checks run, as the daemon's `checkScripts` finds them in their commands. */
+async function checkScriptsOf(tree: TreeReader, module: string): Promise<string[]> {
+  const out: string[] = [];
+  for (const path of await tree.list(`harness/modules/${module}/plans`)) {
+    const plan = parseJson(await tree.read(path)) as { features?: Array<{ checks?: Array<{ run?: string }> }> } | undefined;
+    for (const feature of plan?.features ?? []) {
+      for (const check of feature.checks ?? []) out.push(...(check.run?.match(/harness\/modules\/[^\s'"`;|&)]+/g) ?? []));
+    }
+  }
+  return out;
+}
+
 /**
  * The plan-kind rules of a Plan PR (v3 §3.1), from the plan file on the base branch: a
  * tag in the title must be the plan's kind, and a CODE plan stays off the Terraform
@@ -315,8 +416,11 @@ async function planKindProblems(input: VerifyInput, config: BaseConfig | undefin
   if (!definition || !Array.isArray(definition.features)) return [`${file} is missing or unreadable on the base branch, so the plan's kind is unknown`];
   const kind = planKindOf(definition.features as Array<{ kind?: string }>);
   const problems: string[] = [];
-  const tag = /(?:^|\s)-(CODE|INFRA|MIXED)-(?:\s|$)/.exec(input.title)?.[1];
-  if (tag && tag !== kind) problems.push(`the title says -${tag}-, but ${module}/${plan} is a ${kind} plan on the base branch: its features' kinds decide`);
+  const tag = /^Plan: \[([A-Z_]+)\]/.exec(input.title)?.[1];
+  // An unknown tag is the title's format problem; a known one must be the plan's kind.
+  if (tag && Object.values(KIND_TAGS).includes(tag as never) && tag !== KIND_TAGS[kind]) {
+    problems.push(`the title says [${tag}], but ${module}/${plan} is a ${KIND_TAGS[kind]} plan on the base branch: its features' kinds decide`);
+  }
   if (kind === 'CODE' && config?.terraform && typeof config.terraform === 'object') {
     // Terraform at the root, `.` or empty, is every .tf or .tf.json file.
     const dir = (config.terraform.dir ?? 'iac').replace(/^(?:\.?\/)+/, '').replace(/\/+$/, '');
@@ -333,6 +437,7 @@ export async function verify(input: VerifyInput): Promise<string[]> {
   const kind = prKind(input.author, input.branch, config?.project?.bot);
   const problems: string[] = [];
   if (!input.title.startsWith(`${kind}: `)) problems.push(`this is a ${kind} PR (from ${input.author}, branch ${input.branch}), so its title must start with "${kind}: "`);
+  else if (kind === 'Plan' || kind === 'Fix' || kind === 'Arch') problems.push(...(await titleProblems(input, kind)));
   if (kind === 'Plan' || kind === 'Fix') {
     for (const change of await protectedChanges(input.base, input.head, input.changedPaths, { progress: 'append' })) {
       problems.push(`changes a protected file: ${change}`);
@@ -342,9 +447,15 @@ export async function verify(input: VerifyInput): Promise<string[]> {
   if (kind === 'Plan') problems.push(...(await planKindProblems(input, config)));
   if (kind === 'Arch') {
     // The base's rules, as for every PR: what its head protects opens nothing to the PR itself.
-    const rules = await protectionRules(input.base);
-    for (const path of input.changedPaths.filter((p) => !archMayChange(p, rules))) {
-      problems.push(`an Arch PR may not change ${path}: only the design, shared knowledge and tool configs`);
+    const locked = /^locked\/([^/]+)$/.exec(input.branch)?.[1];
+    if (locked) {
+      // Stricter than a design's: built features' definitions and their scripts only.
+      problems.push(...(await lockedProblems(input, locked)));
+    } else {
+      const rules = await protectionRules(input.base);
+      for (const path of input.changedPaths.filter((p) => !archMayChange(p, rules))) {
+        problems.push(`an Arch PR may not change ${path}: only the design, shared knowledge and tool configs`);
+      }
     }
     for (const mismatch of await lockMismatches(input.head)) problems.push(`harness/lock.json: ${mismatch}`);
   }
@@ -361,10 +472,12 @@ export interface CheckOutcome {
 export async function runCiChecks(definitions: TreeReader, dir: string, log: (line: string) => void): Promise<CheckOutcome[]> {
   const config = parseJson(await definitions.read('harness/config.json')) as { checks?: Check[] } | undefined;
   const progress = existsSync(join(dir, 'progress.txt')) ? readFileSync(join(dir, 'progress.txt'), 'utf8') : '';
-  const accepted = new Set([...progress.matchAll(/ feature\.accepted (\S+) /g)].map((m) => m[1]));
+  const accepted = new Set([...progress.matchAll(/ feature\.accepted (\S+) /g)].map((m) => m[1]!));
+  // A feature superseded by an accepted one keeps its definition, but its checks no longer run (v5).
+  const superseded = await supersededFeatures(definitions, accepted);
   const checks = [
     ...(config?.checks ?? []),
-    ...(await designChecks(definitions)).filter((c) => accepted.has(c.feature)).map((c) => c.check),
+    ...(await designChecks(definitions)).filter((c) => accepted.has(c.feature) && !superseded.has(c.feature)).map((c) => c.check),
   ].filter((c) => c.phase === 'pre-merge');
   const outcomes: CheckOutcome[] = [];
   const run = (id: string, command: string, timeoutSec: number) => {
@@ -491,7 +604,12 @@ async function main(): Promise<number> {
       return problems.length ? 1 : 0;
     }
     case 'checks': {
-      const outcomes = await runCiChecks(directoryReader(values.definitions!), values.dir!, (line) => console.log(line));
+      // The checks run as main defines them, so a PR can't weaken its own; a CHANGED_LOCKED_FILES PR, the App's on
+      // locked/<module>, exists to change built features' checks, and they run as it defines them, which the owner merges (v5).
+      const base = directoryReader(values.definitions!);
+      const config = parseJson(await base.read('harness/config.json')) as BaseConfig | undefined;
+      const locked = (values.branch ?? '').startsWith('locked/') && prKind(values.author ?? '', values.branch ?? '', config?.project?.bot) === 'Arch';
+      const outcomes = await runCiChecks(locked ? directoryReader(values.dir!) : base, values.dir!, (line) => console.log(line));
       const failed = outcomes.filter((o) => o.exit !== 0);
       summary(`### checks\n\n${outcomes.map((o) => `- ${o.exit === 0 ? 'passed' : `**failed** (exit ${o.exit})`}: ${o.id}`).join('\n')}`);
       return failed.length ? 1 : 0;

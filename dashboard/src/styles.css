@@ -29,6 +29,9 @@ code { background: var(--h-soft); padding: 1px 5px; border-radius: 4px; }
 .body--dark .note-info { background: rgba(100, 160, 255, 0.14); }
 .body--dark .note-warn { background: rgba(224, 164, 58, 0.16); }
 
+/* A built feature a locked change touches: set off from the Architect's summary. */
+.locked-change { border-left: 3px solid var(--q-negative); padding-left: 10px; }
+
 /* A proposal's versions, one toggle: the border holds the unselected ones together. */
 .versions { border: 1px solid var(--q-primary); }
 

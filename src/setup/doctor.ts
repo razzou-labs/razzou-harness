@@ -205,7 +205,7 @@ async function project(options: DoctorOptions, config: Config, report: (c: Check
       report(set
         ? ok('Infracost key', 'INFRACOST_API_KEY is set: the cost job estimates each pull request')
         : { status: 'skip', name: 'Infracost key', detail: set === false
-          ? "INFRACOST_API_KEY isn't set: the cost job estimates nothing, and Swarm leaves INFRA and MIXED plans to you. `harness setup` asks for it"
+          ? "INFRACOST_API_KEY isn't set: the cost job estimates nothing, and Swarm leaves INFRA and MIXED_INFRA_AND_CODE plans to you. `harness setup` asks for it"
           : "your gh login can't tell whether INFRACOST_API_KEY is set" });
     }
     for (const file of ['.github/workflows/harness.yml', '.github/harness/harness-ci.ts']) {

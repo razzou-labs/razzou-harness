@@ -223,14 +223,18 @@ plans it finds there (see [Configuration](#configuration)).
 - **Proposal:** the Architect's design document, in versions v1, v2 and so on. You
   accept one.
 - **Plan:** features that ship together as one pull request. A module's plans are built
-  in order. A plan is `CODE`, `INFRA` or `MIXED`, from its features' kinds: the kind is
-  tagged in the pull request's title, and a `CODE` plan's pull request may not touch
-  the Terraform folder. Give infrastructure plans of its own.
+  in order. A plan is `CODE`, `INFRA` or `MIXED_INFRA_AND_CODE`, from its features'
+  kinds: the kind is tagged in the pull request's title, and a `CODE` plan's pull
+  request may not touch the Terraform folder. Give infrastructure plans of its own.
 - **Feature:** one change that a Developer can make in one attempt, with at least one
   check. A design change can redefine it while its plan is built: an attempt under way
   stops, and the feature is built again with a fresh budget, even if it was accepted.
   Once its plan is past its build (every feature of it accepted, then its pull request
-  and merge), it is frozen: a change goes in a new plan.
+  and merge), it is **locked**. A wrong definition of it, such as a check that can't
+  pass in the environment, changes only in a `[CHANGED_LOCKED_FILES]` pull request, which
+  you alone merge; new behavior comes in a new plan, whose feature `supersedes` it: from
+  then on its checks no longer run, and its definition stays as the record of what was
+  built.
 - **Check:** a shell command, run from the repository root, that exits 0 when the feature
   works. `pre-merge` checks run on every attempt and in CI; `post-deploy` checks run
   after an infrastructure deploy.
@@ -252,6 +256,24 @@ plans it finds there (see [Configuration](#configuration)).
   first. They change through an `Arch:` pull request, also judged by the base branch's
   rules, so what it newly protects counts from the next one, or your own commits.
   `harness/lock.json` holds their hashes.
+- **Pull requests:** each says what it is in its title, `<Type>: [<TAG>] [<scope>] <title>`,
+  and CI's `verify` holds it to that:
+
+  | Type | Opened for | Tags | Who merges |
+  |---|---|---|---|
+  | `Plan:` | a plan's features, built by the Developers | `[CODE]`, `[INFRA]`, `[MIXED_INFRA_AND_CODE]`: its kind | you in Manual, the daemon in Swarm under its policy |
+  | `Fix:` | a fix after a merged plan's deploy failed | `[DEPLOY_FAILED]`: the apply; `[VERIFY_FAILED]`: its post-deploy checks | you |
+  | `Arch:` | the Architect's design | `[DESIGN]`: a module's first design, once, which freezes it; `[DESIGN_MODIFY]`: every later change | you |
+  | `Arch:` | built features' definitions, on `locked/<module>` | `[CHANGED_LOCKED_FILES]`: only those definitions and the module's scripts their checks run | you |
+  | `Harness:`, `Owner:` | yours | none | you |
+
+  For example `Plan: [MIXED_INFRA_AND_CODE] [shop/P3] The report Lambda`. A
+  `[CHANGED_LOCKED_FILES]` pull request has a card of its own under **Needs you**, with a
+  warning: a check that proves less can make a broken feature look like it works. Its
+  changed pre-merge checks pass before it opens, and CI runs them as it defines them,
+  where every other pull request runs those of `main`. It rebuilds nothing. Once it is
+  merged, a plan whose post-deploy checks failed is checked again by itself, as it is
+  whenever those checks change on `main`, your own commits included.
 - **`progress.txt`:** one line per accepted feature and satisfied gate, committed with
   the work. It only grows. When plans in parallel both add lines, the daemon keeps both.
 - **Brakes:** counters and deadlines, not judgment. Three failed attempts in a row, a
@@ -339,7 +361,7 @@ either mode, so a switch to Swarm needs only its rules.
 **What merges itself.** In Swarm the daemon merges a plan's pull request, as the App,
 once CI passed and every status in `swarm.requiredStatuses` is green on its head:
 - a `CODE` plan, when `swarm.merge.code` is `daemon`;
-- an `INFRA` or `MIXED` plan, when the monthly cost it adds, estimated by CI, is at or
+- an `INFRA` or `MIXED_INFRA_AND_CODE` plan, when the monthly cost it adds, estimated by CI, is at or
   under `swarm.merge.infraMonthlyUsdCeiling`; or, once the header's button **Let the
   daemon merge infra** is on, like a `CODE` plan, once CI and both reviewers pass, an
   estimate over the ceiling still waiting for you. The button is off by default, and
@@ -423,7 +445,7 @@ on [dashboard.infracost.io](https://dashboard.infracost.io). `harness setup` ask
 once the project has Terraform, and gives it to `gh secret set`; the doctor says whether
 it is set. Infracost's current CLI, 2.x, logs in through the browser and stores no key,
 and the job runs its own pinned 0.10.47, so you don't need the CLI. Without the secret the
-job does nothing, no estimate exists, and `INFRA` and `MIXED` plans wait for you with that
+job does nothing, no estimate exists, and `INFRA` and `MIXED_INFRA_AND_CODE` plans wait for you with that
 reason. Infracost sees your Terraform's resource types and sizes, not your code or state,
 and prices fixed resources only: pay-per-use charges count as zero. The cost reviewer
 gets the estimate in its brief. The job is not a required check. It was checked on a real
@@ -517,7 +539,7 @@ through an `Arch:` pull request, or a commit of your own on `main`.
 | `brakes.ciFixRounds`, `brakes.deployFixRounds` | 2, 2 | Fix rounds after CI fails, and `Fix:` pull requests after a deploy fails |
 | `ownerTime.reservePercent` | 20 | The share of your hours designs may not plan for owner actions |
 | `swarm.merge.code` | `daemon` | Who merges a `CODE` plan in Swarm: `daemon`, or `owner` |
-| `swarm.merge.infraMonthlyUsdCeiling` | 50 | The monthly cost an `INFRA` or `MIXED` plan may add and still merge itself in Swarm; `null` leaves them all to you |
+| `swarm.merge.infraMonthlyUsdCeiling` | 50 | The monthly cost an `INFRA` or `MIXED_INFRA_AND_CODE` plan may add and still merge itself in Swarm; `null` leaves them all to you |
 | `swarm.requiredStatuses` | `["harness/security", "harness/cost"]` | The App's statuses a pull request needs before the daemon merges it; `[]` merges on CI alone |
 | `swarm.maxDevelopers`, `swarm.maxPlans` | 3, 2 | Attempts and plans at once in Swarm |
 | `swarm.usageCeilingPercent` | 80 | No launch in Swarm at or above this share of your subscription's limits; `null` turns the probe off |

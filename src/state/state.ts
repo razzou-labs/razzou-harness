@@ -78,6 +78,11 @@ export interface FeatureState {
   awaitingGuidanceSince?: string;
   /** Set for a fix, which is built like a feature but isn't in the design: after CI failed, or after the deploy. */
   fix?: { round: number; kind: 'ci' | 'deploy' | 'review'; failure: string; requestId: string; role?: ReviewerRole };
+  /**
+   * The definitions that CHANGED_LOCKED_FILES PRs gave the feature since it was accepted
+   * (v5): it stays accepted under each, as nothing was rebuilt.
+   */
+  lockedHashes?: string[];
 }
 
 export interface PlanState {
@@ -123,7 +128,10 @@ export interface PlanState {
   /** Fix rounds each reviewer asked for on this PR. */
   reviewFixRounds?: Partial<Record<ReviewerRole, number>>;
   deploy?: { commit: string; status: 'passed' | 'failed'; jobs?: CiJob[] };
-  postDeploy?: { status: 'passed' | 'failed'; results: CheckResult[] };
+  /** `checks`: the hash of the post-deploy checks a failure ran, so a change to them on main checks the plan again (v5). */
+  postDeploy?: { status: 'passed' | 'failed'; results: CheckResult[]; checks?: string };
+  /** For a Fix PR: what failed after the merge, the apply or the post-deploy checks (v5). */
+  fixAfter?: 'deploy' | 'verify';
 }
 
 /** One reviewer's session on one PR head (v3 §5). */
@@ -171,6 +179,21 @@ export interface ManagerState {
 }
 
 /** A module the owner started with the Architect (§7.1). Modules written by hand on main have none. */
+/**
+ * What a CHANGED_LOCKED_FILES change does to one built feature (v5): the fields of its
+ * spec, the checks, and the scripts they run that change. `expected` is what its checks
+ * must still prove, for the owner who reviews it.
+ */
+export interface LockedChange {
+  plan: string;
+  feature: string;
+  title: string;
+  expected: string;
+  fields: string[];
+  checks: string[];
+  scripts: string[];
+}
+
 export interface ModuleState {
   module: string;
   title: string;
@@ -182,6 +205,10 @@ export interface ModuleState {
   submission?: { requestId: string; summary: string; head: string; at: string };
   /** The design under review: its branch head with the hash list, and its PR. */
   design?: { head: string; suspect: string[]; summary: string; pr?: { number: number; url: string }; ciNoted?: string };
+  /** A CHANGED_LOCKED_FILES change the daemon is checking before it opens its PR (v5). */
+  lockedSubmission?: { requestId: string; summary: string; head: string; at: string };
+  /** A CHANGED_LOCKED_FILES change under review: what it changes in each built feature, and its PR (v5). */
+  locked?: { head: string; summary: string; changes: LockedChange[]; pr?: { number: number; url: string }; ciNoted?: string };
   frozenCommit?: string;
   /** Messages for the Architect, written into its sandbox once and shown with the owner's next prompt. */
   notes: Array<{ key: string; text: string; sent?: boolean }>;
@@ -411,9 +438,17 @@ export function apply(state: State, event: HarnessEvent): State {
       for (const manager of managersOf(state, ref!.module, ref!.plan)) manager.sent = {};
       break;
     }
-    case 'POST_DEPLOY_CHECKS_FAILED':
-      Object.assign(state.plans[planKey(ref!)]!, { status: 'verify_failed', postDeploy: { status: 'failed', results: event.payload.results } });
+    case 'POST_DEPLOY_CHECKS_FAILED': {
+      const { results, checks } = event.payload;
+      Object.assign(state.plans[planKey(ref!)]!, { status: 'verify_failed', postDeploy: { status: 'failed', results, ...(checks ? { checks } : {}) } });
       break;
+    }
+    case 'POST_DEPLOY_RECHECK': {
+      const plan = state.plans[planKey(ref!)]!;
+      plan.status = 'verifying';
+      delete plan.postDeploy;
+      break;
+    }
     case 'PR_CLOSED': {
       const plan = state.plans[planKey(ref!)]!;
       if (plan.pr) plan.pr.closed = true;
@@ -431,9 +466,12 @@ export function apply(state: State, event: HarnessEvent): State {
         const review = plan.reviews?.findLast((r) => r.role === role && r.head === plan.head && r.status === 'reported');
         if (review) review.fixRequested = true;
       } else if (kind === 'deploy') {
-        // A Fix PR: a new branch from the merge, and a new pull request (§11.3).
+        // A Fix PR: a new branch from the merge, and a new pull request (§11.3); its title says what failed (v5).
         round = (plan.deployFixRounds ?? 0) + 1;
-        Object.assign(plan, { deployFixRounds: round, branch: `fix/${plan.module}/${plan.plan}-${round}`, base: plan.mergeCommit, head: plan.mergeCommit, fixRounds: 0 });
+        Object.assign(plan, {
+          deployFixRounds: round, branch: `fix/${plan.module}/${plan.plan}-${round}`, base: plan.mergeCommit, head: plan.mergeCommit, fixRounds: 0,
+          fixAfter: plan.status === 'verify_failed' ? 'verify' : 'deploy',
+        });
         delete plan.pr;
         delete plan.pushed;
         delete plan.ci;
@@ -735,13 +773,58 @@ export function apply(state: State, event: HarnessEvent): State {
       module.status = 'in_review';
       break;
     }
+    case 'LOCKED_CHANGE':
+      state.modules[event.payload.module]!.lockedSubmission = {
+        requestId: event.payload.requestId, summary: event.payload.summary, head: event.payload.head, at: event.ts,
+      };
+      break;
+    case 'LOCKED_CHANGE_REFUSED': {
+      const module = state.modules[event.payload.module]!;
+      delete module.lockedSubmission;
+      module.notes.push({ key: `note:${event.id}`, text: `Your change to locked files was refused:\n${event.payload.problems.map((p) => `- ${p}`).join('\n')}\nFix it, commit, and call submit_locked_change again.` });
+      break;
+    }
+    case 'LOCKED_CHANGE_SUBMITTED': {
+      const module = state.modules[event.payload.module]!;
+      module.locked = {
+        head: event.payload.head, summary: module.lockedSubmission?.summary ?? '', changes: event.payload.changes,
+        ...(module.locked?.pr ? { pr: module.locked.pr } : {}),
+      };
+      delete module.lockedSubmission;
+      break;
+    }
+    case 'LOCKED_CHANGE_MERGED': {
+      const module = state.modules[event.payload.module]!;
+      delete module.locked;
+      for (const { feature, definitionHash } of event.payload.rehash) {
+        const changed = state.features[feature];
+        if (changed && !changed.lockedHashes?.includes(definitionHash)) changed.lockedHashes = [...(changed.lockedHashes ?? []), definitionHash];
+      }
+      module.notes.push({
+        key: `note:${event.id}`,
+        text: 'The owner merged your change to locked files. The features it changed stay accepted, and a plan whose post-deploy checks changed is checked again.',
+      });
+      break;
+    }
     case 'ARCH_PR_OPENED': {
+      if (event.payload.locked) {
+        const module = state.modules[event.payload.module]!;
+        if (module.locked) module.locked.pr = { number: event.payload.number, url: event.payload.url };
+        module.notes.push({ key: `note:${event.id}`, text: `Your change to locked files is in PR #${event.payload.number} (${event.payload.url}). The owner reviews and merges it. If CI or the owner asks for changes, commit them on the same branch and call submit_locked_change again.` });
+        break;
+      }
       const module = state.modules[event.payload.module]!;
       if (module.design) module.design.pr = { number: event.payload.number, url: event.payload.url };
       module.notes.push({ key: `note:${event.id}`, text: `Your design is in Arch PR #${event.payload.number} (${event.payload.url}). The owner reviews and merges it. If CI or the owner asks for changes, commit them and call submit_design again.` });
       break;
     }
     case 'ARCH_PR_CLOSED': {
+      if (event.payload.locked) {
+        const module = state.modules[event.payload.module]!;
+        delete module.locked;
+        module.notes.push({ key: `note:${event.id}`, text: 'The owner closed your CHANGED_LOCKED_FILES PR without merging it. Ask them why before you submit again.' });
+        break;
+      }
       const module = state.modules[event.payload.module]!;
       // A design change that was closed leaves the merged design as it was.
       module.status = module.frozenCommit ? 'frozen' : 'decomposing';
@@ -751,13 +834,16 @@ export function apply(state: State, event: HarnessEvent): State {
     }
     case 'ARCH_CI_DONE': {
       const module = state.modules[event.payload.module]!;
-      if (module.design) module.design.ciNoted = event.payload.sha;
+      if (event.payload.locked) {
+        if (module.locked) module.locked.ciNoted = event.payload.sha;
+      } else if (module.design) module.design.ciNoted = event.payload.sha;
+      const tool = event.payload.locked ? 'submit_locked_change' : 'submit_design';
       const failed = event.payload.jobs.filter((j) => j.conclusion !== 'success');
       module.notes.push({
         key: `note:${event.id}`,
         text: failed.length === 0
           ? 'CI passed on your Arch PR. The owner reviews it.'
-          : `CI failed on your Arch PR:\n${failed.map((j) => `- ${j.name}: ${j.conclusion}\n${(j.log ?? '').slice(-2000)}`).join('\n')}\nFix it, commit, and call submit_design again.`,
+          : `CI failed on your Arch PR:\n${failed.map((j) => `- ${j.name}: ${j.conclusion}\n${(j.log ?? '').slice(-2000)}`).join('\n')}\nFix it, commit, and call ${tool} again.`,
       });
       break;
     }

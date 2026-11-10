@@ -3,7 +3,7 @@ import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { managerSettings, readReview, reviewJsonSchema, type AgentRun } from '../agents/claude-code.ts';
 import { runChecks } from '../checks/runner.ts';
-import { planKind, REVIEWER_ROLES, statusContext, type Plan, type ReviewerRole, type ReviewFinding } from '../design/schemas.ts';
+import { KIND_TAGS, planKind, REVIEWER_ROLES, statusContext, type Plan, type ReviewerRole, type ReviewFinding } from '../design/schemas.ts';
 import type { PullRequest, ReviewPost } from '../github/forge.ts';
 import { describePaidCalls, paidCallDiff } from '../review/paid-calls.ts';
 import { planKey, type PlanState, type ReviewState } from '../state/state.ts';
@@ -327,7 +327,7 @@ function brief(o: Orchestrator, plan: PlanState, review: ReviewState, inputs: Br
   const previous = plan.reviews?.filter((r) => r.role === review.role && r.head !== review.head && r.verdict === 'block').at(-1);
   const features = (definition?.features ?? []).map((f) => `- ${f.id} ${f.title} (${f.kind}): ${f.description}\n  Expected: ${f.expected}`);
   return [
-    `# Review PR #${plan.pr?.number ?? '?'} of plan ${planKey(plan)} (${kind}) as the ${review.role} reviewer`,
+    `# Review PR #${plan.pr?.number ?? '?'} of plan ${planKey(plan)} (${KIND_TAGS[kind]}) as the ${review.role} reviewer`,
     '',
     `Head: ${review.head}. Base on main: ${inputs.base}. Your clone at ${p.work} is checked out at the head.`,
     `\`git diff ${short(inputs.base)}..${short(review.head)}\` shows the whole change, \`git log ${short(inputs.base)}..${short(review.head)}\` its commits.`,

@@ -236,6 +236,18 @@ const HANDLERS: Handlers = {
     return undefined;
   },
 
+  async submit_locked_change({ o, agent, requestId }, { summary }) {
+    const module = o.state.modules[agent.module!]!;
+    if (module.lockedSubmission) return module.lockedSubmission.requestId === requestId ? undefined : refuse('A change to locked files is already being checked. Wait for its answer.');
+    if (!module.frozenCommit) return refuse('Nothing is locked yet: the owner merges your first design before any feature is built.');
+    if (o.forge.kind !== 'github') return refuse('This project has no GitHub repository (project.repo), and locked changes land through PRs.');
+    const taken = await o.architects.takeDesign(module, 'locked');
+    if (!taken.head) return refuse(`Not submitted: ${taken.problem}.`);
+    o.record({ type: 'LOCKED_CHANGE', from: 'architect', to: 'daemon', payload: { module: module.module, requestId, summary, head: taken.head } });
+    o.kick();
+    return undefined;
+  },
+
   get_inbox({ o, agent }) {
     const module = o.state.modules[agent.module!]!;
     if (module.notes.length === 0) return ok('No messages.');
@@ -322,6 +334,8 @@ function architectState(o: Orchestrator, id: string): string {
   const plans = Object.values(o.state.plans).filter((p) => p.module === id).map((p) => ({
     plan: planKey(p),
     status: p.status,
+    // Past its build, a plan's features are locked: submit_locked_change, or a new plan that supersedes them (v5).
+    locked: p.status !== 'active',
     features: Object.values(o.state.features).filter((f) => f.module === id && f.plan === p.plan).map((f) => ({
       feature: f.feature, status: f.status, attempts: f.attempts.length, ...(f.escalation ? { escalation: f.escalation } : {}),
     })),
@@ -331,6 +345,7 @@ function architectState(o: Orchestrator, id: string): string {
     status: module.status,
     proposals: module.proposals.map((p) => `v${p.version}${p.acceptedAt ? ' (accepted)' : ''}`),
     ...(module.design ? { designUnderReview: { pr: module.design.pr?.url, suspectChecks: module.design.suspect } } : {}),
+    ...(module.locked ? { lockedChangeUnderReview: { pr: module.locked.pr?.url, features: module.locked.changes.map((c) => `${c.plan}/${c.feature}`) } } : {}),
     plans,
     openEscalations: module.escalations.filter((e) => e.decision === undefined).map((e) => ({ id: e.id, question: clip(e.question, 400), feature: e.feature })),
   }, null, 2);

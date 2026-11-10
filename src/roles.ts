@@ -29,6 +29,7 @@ export const INPUTS = {
   escalate_to_architect: z.object({ question: z.string().trim().min(1).max(8000), feature: FeatureKey.optional() }),
   submit_proposal: z.object({ version: z.number().int().positive() }),
   submit_design: z.object({ summary: z.string().trim().min(1).max(8000) }),
+  submit_locked_change: z.object({ summary: z.string().trim().min(1).max(8000) }),
   get_inbox: z.object({}),
   get_owner_time: z.object({}),
   reply_to_manager: z.object({ escalation_id: z.string().min(1), decision: z.string().trim().min(1).max(8000) }),
@@ -132,6 +133,13 @@ export const TOOLS: Record<Role, ToolSpec[]> = {
         "Submits the design committed on your branch. The daemon validates it, runs its new checks once (they should fail, as nothing is built yet), hashes the protected files, and opens the Arch PR. You get the problems to fix, or the PR's link.",
       waitSec: 1800,
       onTimeout: 'The harness is still working on your design. Its answer will come as a message with your next prompt; get_inbox shows it too.',
+    },
+    {
+      name: 'submit_locked_change',
+      description:
+        "Submits a change to the definitions of built features, committed on a branch of its own from main: their spec, their checks, the scripts the checks run, and nothing else. A feature is built, so locked, once its plan is past its build. The daemon checks that the change is only that, runs the changed features' pre-merge checks (they must pass, as the work is built), and opens a CHANGED_LOCKED_FILES PR, which the owner alone merges. It rebuilds nothing: for new behavior, submit_design a new plan whose feature supersedes the old one.",
+      waitSec: 1800,
+      onTimeout: 'The harness is still working on your change. Its answer will come as a message with your next prompt; get_inbox shows it too.',
     },
     { name: 'get_state', description: "Your module: its status, proposals, design PR, plans and features, and open questions from the Manager.", waitSec: 60 },
     { name: 'get_inbox', description: 'Your messages: questions from the Manager and notes from the harness, newest last.', waitSec: 60 },

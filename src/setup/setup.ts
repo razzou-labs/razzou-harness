@@ -317,7 +317,7 @@ export const INFRACOST_DASHBOARD = 'https://dashboard.infracost.io';
 /**
  * The cost job's key (v3 §5.3): Infracost's token as the repository secret
  * INFRACOST_API_KEY, asked for while it is missing. It is optional: without it the cost job
- * estimates nothing, and Swarm leaves INFRA and MIXED plans to the owner. The token goes
+ * estimates nothing, and Swarm leaves INFRA and MIXED_INFRA_AND_CODE plans to the owner. The token goes
  * from the hidden prompt to gh's input, and nowhere else.
  */
 export async function infracostKey(options: Pick<SetupOptions, 'say' | 'askSecret'>, repo: string): Promise<void> {
@@ -325,7 +325,7 @@ export async function infracostKey(options: Pick<SetupOptions, 'say' | 'askSecre
   if ((await repositorySecret(repo, 'INFRACOST_API_KEY')) !== false) return;
   say(`\nThe cost job estimates, with Infracost, what each pull request adds to the AWS bill a month. It needs a free token: on ${INFRACOST_DASHBOARD}, your organization's Settings, CLI tokens.`);
   const token = (await options.askSecret('Infracost token (hidden, or Enter to skip): ')).trim();
-  if (!token) return say('Skipped: the cost job estimates nothing, and Swarm leaves INFRA and MIXED plans to you. `harness setup` asks again.');
+  if (!token) return say('Skipped: the cost job estimates nothing, and Swarm leaves INFRA and MIXED_INFRA_AND_CODE plans to you. `harness setup` asks again.');
   const set = await run('gh', ['secret', 'set', 'INFRACOST_API_KEY', '--repo', repo], { input: token });
   if (set.code !== 0) return say(`GitHub: INFRACOST_API_KEY was not set: ${(set.stderr || set.stdout).trim().split('\n')[0]}`);
   say('GitHub: the secret INFRACOST_API_KEY is set: the cost job estimates each pull request.');

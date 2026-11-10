@@ -84,8 +84,8 @@ const Toolbar = defineComponent({
     // The owner's button for INFRA and MIXED plans (v3 D36): the reviewers and CI as the gate, the cost ceiling still holding.
     const switchInfra = async (byDaemon: boolean): Promise<Outcome> => {
       const question = byDaemon
-        ? "INFRA and MIXED plans will wait for you again, unless the cost job's estimate is under the ceiling. Keep their merges for you?"
-        : 'INFRA and MIXED plans will merge themselves once CI, the security reviewer and the cost reviewer pass, like CODE plans. An estimate over the ceiling still waits for you. Let the daemon merge infra?';
+        ? "INFRA and MIXED_INFRA_AND_CODE plans will wait for you again, unless the cost job's estimate is under the ceiling. Keep their merges for you?"
+        : 'INFRA and MIXED_INFRA_AND_CODE plans will merge themselves once CI, the security reviewer and the cost reviewer pass, like CODE plans. An estimate over the ceiling still waits for you. Let the daemon merge infra?';
       return (await confirm(question)) ? post('/api/infra-merge', { by: byDaemon ? 'ceiling' : 'daemon' }) : { done: true };
     };
     return () => {

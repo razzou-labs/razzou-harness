@@ -428,8 +428,18 @@ const Plan = defineComponent({
       const key = `${props.module}/${plan.id}`;
       const planState = state.plans[key];
       const fixes = Object.values(state.features).filter((f) => f.fix && `${f.module}/${f.plan}` === key);
+      // Who supersedes each of the plan's features, from the module's later plans (v5).
+      const supersededBy = new Map<string, string>();
+      for (const later of design.modules.find((m) => m.id === props.module)?.plans ?? []) {
+        for (const f of later.features) {
+          for (const ref of f.supersedes ?? []) {
+            const [planId, featureId] = ref.includes('/') ? ref.split('/') : [later.id, ref];
+            if (planId === plan.id && featureId) supersededBy.set(featureId, `${later.id}/${f.id}`);
+          }
+        }
+      }
       const rows = [
-        ...plan.features.map((f) => ({ id: f.id, title: f.title, kind: f.kind as string, state: state.features[`${key}/${f.id}`] })),
+        ...plan.features.map((f) => ({ id: f.id, title: f.title, kind: f.kind as string, state: state.features[`${key}/${f.id}`], supersededBy: supersededBy.get(f.id) })),
         ...fixes.map((f) => ({ id: f.feature, title: `Fix after ${f.fix!.kind === 'ci' ? 'CI' : 'the deploy'}, round ${f.fix!.round}`, kind: 'fix', state: f })),
       ];
       return (
@@ -445,7 +455,10 @@ const Plan = defineComponent({
           <QTable class="features q-mt-sm" flat bordered dense wrapCells hideBottom rowKey="id" rows={rows} columns={FEATURE_COLUMNS} pagination={{ rowsPerPage: 0 }} tableStyle="table-layout: fixed">
             {{
               body: ({ row }: { row: (typeof rows)[number] }) => (
-                <FeatureRow key={row.id} id={row.id} title={row.title} kind={row.kind} max={design.maxAttempts} {...(row.state ? { feature: row.state } : {})} />
+                <FeatureRow
+                  key={row.id} id={row.id} title={row.title} kind={row.kind} max={design.maxAttempts} {...(row.state ? { feature: row.state } : {})}
+                  {...('supersededBy' in row && row.supersededBy ? { supersededBy: row.supersededBy, supersededDone: state.features[`${props.module}/${row.supersededBy}`]?.status === 'accepted' } : {})}
+                />
               ),
             }}
           </QTable>
@@ -547,6 +560,9 @@ const FeatureRow = defineComponent({
     kind: { type: String, required: true },
     max: { type: Number, required: true },
     feature: Object as PropType<FeatureState>,
+    /** The later feature, as P6/F11, that supersedes this one, and whether it is accepted (v5). */
+    supersededBy: String,
+    supersededDone: Boolean,
   },
   setup(props) {
     return () => {
@@ -559,6 +575,9 @@ const FeatureRow = defineComponent({
         <QTr>
           <QTd>
             <b>{props.id}</b> {props.title} {props.kind === 'infra' && <span class="text-muted text-caption">infra</span>}
+            {props.supersededBy && (
+              <div class="text-caption text-muted">superseded by {props.supersededBy}{props.supersededDone ? ': its checks no longer run' : ', once it is accepted'}</div>
+            )}
           </QTd>
           <QTd>
             <Badge status={feature?.status ?? 'pending'} />

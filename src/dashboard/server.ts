@@ -457,7 +457,7 @@ function designSummary(orchestrator: Orchestrator) {
         id: p.id,
         title: p.title,
         goal: p.goal,
-        features: p.features.map((f) => ({ id: f.id, title: f.title, kind: f.kind, dependsOn: f.dependsOn, checks: f.checks.map((c) => ({ id: c.id, phase: c.phase, needs: c.needs })) })),
+        features: p.features.map((f) => ({ id: f.id, title: f.title, kind: f.kind, dependsOn: f.dependsOn, supersedes: f.supersedes, checks: f.checks.map((c) => ({ id: c.id, phase: c.phase, needs: c.needs })) })),
       })),
       actions: m.actions.map((a) => ({
         id: a.id, kind: a.kind, title: a.title, when: a.when, blocks: a.blocks, instructions: a.instructions, verify: a.verify !== null, estimatedMinutes: a.estimatedMinutes,

@@ -7,6 +7,7 @@ import { after, describe, it } from 'node:test';
 import { WebSocket } from 'ws';
 import { detach, type AgentAdapter, type AgentRun } from '../src/agents/claude-code.ts';
 import type { SubscriptionUsage } from '../src/anthropic/usage.ts';
+import { submitLockedChange } from '../src/daemon/design.ts';
 import { Orchestrator } from '../src/daemon/orchestrator.ts';
 import { handleRequest } from '../src/daemon/requests.ts';
 import type { SandboxOverview, UsageReading } from '../src/daemon/sandboxes.ts';
@@ -16,6 +17,7 @@ import { Terminals, type Pty } from '../src/dashboard/terminals.ts';
 import { recover } from '../src/setup/recover.ts';
 import type { Config } from '../src/design/schemas.ts';
 import { activeAttempts, type Mode } from '../src/state/state.ts';
+import { HARNESS } from '../src/git/repo.ts';
 import { runOk, sh, sleep } from '../src/util.ts';
 import { FAKE_BOT, FakeForge } from './helpers/fake-forge.ts';
 import { LocalDriver } from './helpers/local-driver.ts';
@@ -692,7 +694,7 @@ describe('pull requests', () => {
 
     assert.equal(fake.prs.length, 1);
     const pr = fake.prs[0]!;
-    assert.equal(pr.title, 'Plan: demo/P1 -CODE- Greeting and adding');
+    assert.equal(pr.title, 'Plan: [CODE] [demo/P1] Greeting and adding');
     assert.equal(pr.branch, 'plan/demo/P1');
     assert.match(pr.body, /^Stub summary of the plan\.\n\n## Features\n\n- \*\*F01\*\* Greet: attempt 1, commit [0-9a-f]{8}\n- \*\*F02\*\* Add/);
     const pushed = (await runOk('git', ['--git-dir', fake.remote, 'rev-parse', 'refs/heads/plan/demo/P1'])).trim();
@@ -714,7 +716,7 @@ describe('pull requests', () => {
     fake.statuses = () => ({ 'harness/security': 'success', 'harness/cost': 'success' });
     await until(o, completed(o));
 
-    assert.equal(fake.prs[0]!.title, 'Plan: demo/P1 -CODE- Greeting and adding');
+    assert.equal(fake.prs[0]!.title, 'Plan: [CODE] [demo/P1] Greeting and adding');
     assert.equal(plan(o)!.mergedBy, 'daemon');
     assert.equal(plan(o)!.leftToOwner, undefined);
     const main = (await runOk('git', ['--git-dir', fake.remote, 'rev-parse', 'refs/heads/main'])).trim();
@@ -775,7 +777,7 @@ describe('pull requests', () => {
     o.setMode('swarm');
     fake.statuses = () => ({ 'harness/security': 'success', 'harness/cost': 'success' });
     await until(o, () => plan(o)?.leftToOwner !== undefined);
-    assert.equal(fake.prs[0]!.title, 'Plan: demo/P1 -INFRA- Greeting and adding');
+    assert.equal(fake.prs[0]!.title, 'Plan: [INFRA] [demo/P1] Greeting and adding');
     assert.match(plan(o)!.leftToOwner!.reason, /^an INFRA plan merges itself only with the cost job's estimate .* none was produced: the cost job needs iac\/ and the INFRACOST_API_KEY secret; the dashboard's button lets the daemon merge infra once CI and the reviewers pass$/);
 
     o.setMode('manual');
@@ -1050,7 +1052,7 @@ describe('deploys', () => {
 
     const plan = o.state.plans['demo/P1']!;
     assert.equal(plan.branch, 'fix/demo/P1-1');
-    assert.equal(fake.prs[1]!.title, 'Fix: demo/P1 — after the deploy, round 1');
+    assert.equal(fake.prs[1]!.title, 'Fix: [VERIFY_FAILED] [demo/P1] round 1 after the deploy');
     assert.equal(fake.prs[1]!.branch, 'fix/demo/P1-1');
     assert.match(fake.prs[1]!.body, /The post-deploy checks, run with the view-only role:\n- F02-live: exited 1/);
     const fix = feature(o, 'fix1')!;
@@ -1062,6 +1064,36 @@ describe('deploys', () => {
     await until(o, completed(o));
     assert.equal(o.state.plans['demo/P1']!.postDeploy!.status, 'passed');
     assert.equal(o.state.plans['demo/P1']!.deployFixRounds, 1);
+  });
+
+  it('checks a plan again by itself once its post-deploy checks change on main, without a resume', async () => {
+    let skew = 0;
+    const { orchestrator: o, fake } = await setup(infra, {
+      github: true, config: { terraform: {} }, prepare: withPostDeploy('test -f iac/never.tf'), manager: { ignore: ['POST'] }, now: () => Date.now() + skew,
+    });
+    fake.ci = allGreen;
+    await until(o, () => o.state.plans['demo/P1']?.status === 'ready_to_merge');
+    await fake.merge(1);
+    skew += 120_000;
+    await until(o, () => o.state.plans['demo/P1']?.status === 'verify_failed');
+    assert.ok(o.state.plans['demo/P1']!.postDeploy!.checks, 'the failure says which checks it ran');
+    // Nothing changed on main: no new run.
+    for (let i = 0; i < 3; i++) {
+      skew += 30_000;
+      await o.tick();
+    }
+    assert.equal(o.state.plans['demo/P1']!.status, 'verify_failed');
+    assert.equal(o.state.pipeline.paused, undefined);
+
+    // The owner fixes the check on main: the daemon sees the change, and runs the checks again by itself.
+    const path = 'harness/modules/demo/plans/P1.json';
+    const design = JSON.parse((await o.repo.show('refs/heads/main', path))!) as { features: Array<{ checks: Array<{ id: string; run: string }> }> };
+    design.features[1]!.checks.find((c) => c.id === 'F02-live')!.run = 'test -f iac/main.tf';
+    await ownerCommit(fake.remote, 'main', path, JSON.stringify(design));
+    skew += 120_000;
+    await until(o, completed(o));
+    assert.equal(o.state.plans['demo/P1']!.postDeploy!.status, 'passed');
+    assert.ok(o.store.readAll().some((e) => e.type === 'POST_DEPLOY_RECHECK'));
   });
 });
 
@@ -1083,7 +1115,7 @@ describe('architect', () => {
     await until(o, () => module(o)?.status === 'in_review');
     const pr = fake.prs[0]!;
     assert.equal(pr.branch, 'arch/shop');
-    assert.equal(pr.title, 'Arch: shop — Greeting and adding');
+    assert.equal(pr.title, 'Arch: [DESIGN] [shop] Greeting and adding');
     assert.match(pr.body, /## Plans\n\n- \*\*P1\*\* Greeting and adding: F01 Greet; F02 Add/);
     assert.match(pr.body, /Every new check failed on the unbuilt repository/);
     const head = await runOk('git', ['--git-dir', fake.remote, 'log', '-1', '--format=%an|%s', 'refs/heads/arch/shop']);
@@ -1095,7 +1127,7 @@ describe('architect', () => {
     skew += 120_000;
     await until(o, () => module(o)?.status === 'frozen');
     await until(o, () => o.state.plans['shop/P1']?.status === 'ready_to_merge');
-    assert.equal(fake.prs[1]!.title, 'Plan: shop/P1 -CODE- Greeting and adding');
+    assert.equal(fake.prs[1]!.title, 'Plan: [CODE] [shop/P1] Greeting and adding');
     // The Architect hears of its plan's pull request in one line (v3 §6.5).
     assert.ok(module(o)!.notes.some((n) => n.text === "[digest] Plan P1's pull request #2 is open: https://github.test/pull/2."));
 
@@ -1642,6 +1674,22 @@ function fakePty(command: string[] = []) {
   return { pty, command, writes, emit: (data: string) => listeners.forEach((listener) => listener(data)) };
 }
 
+describe('supersedes', () => {
+  it("drops a feature's checks once a feature that supersedes it is being built, or accepted in what is checked", async () => {
+    const { orchestrator: o } = await setup((f) => solved(f));
+    await until(o, completed(o));
+    // A later plan whose F03 supersedes F01, read from the design as the daemon has it.
+    const demo = o.design.modules.find((m) => m.id === 'demo')!;
+    const p1 = demo.plans[0]!;
+    demo.plans.push({ ...p1, id: 'P2', features: [{ ...p1.features[0]!, id: 'F03', supersedes: ['P1/F01'] }] });
+    const head = `refs/heads/${o.state.plans['demo/P1']!.branch}`;
+    const ids = async (building?: { module: string; plan: string; feature: string }) => (await o.regressionChecks(head, building)).map((c) => c.id);
+    assert.ok((await ids()).includes('F01-greet'), 'F03 is neither accepted nor being built');
+    assert.ok(!(await ids({ module: 'demo', plan: 'P2', feature: 'F03' })).includes('F01-greet'), "F03's attempt doesn't keep the check it replaces");
+    assert.ok((await ids({ module: 'demo', plan: 'P2', feature: 'F03' })).includes('F02-add'));
+  });
+});
+
 describe('pauses', () => {
   it("keeps the owner's pause when an attempt then hits a usage limit, past the limit's hour", async () => {
     let skew = 0;
@@ -2023,7 +2071,57 @@ describe('architect, continued', () => {
     await until(o, () => o.store.readAll().some((e) => e.type === 'DESIGN_REFUSED'));
     const refused = o.store.readAll().find((e) => e.type === 'DESIGN_REFUSED');
     assert.ok(refused && refused.type === 'DESIGN_REFUSED');
-    assert.ok(refused.payload.problems.some((p) => /^P1\/F01: plan P1 is past its build \(completed\), so its features are frozen: put the change in a new plan$/.test(p)), refused.payload.problems.join('\n'));
+    assert.ok(refused.payload.problems.some((p) => /^P1\/F01: plan P1 is past its build \(completed\), so this feature is locked\. Fix a wrong definition with submit_locked_change, a CHANGED_LOCKED_FILES PR of its own; for new behavior, add a plan whose feature supersedes P1\/F01$/.test(p)), refused.payload.problems.join('\n'));
+  });
+
+  it("turns a change to a built feature's definition into a CHANGED_LOCKED_FILES PR, and keeps the feature accepted once it merges", async () => {
+    let skew = 0;
+    const plan = JSON.parse(toyDesign('shop')['harness/modules/shop/plans/P1.json']!) as { title: string; features: Array<{ expected: string }> };
+    plan.features[0]!.expected = '`bash src/greet.sh` prints hello, and nothing else.';
+    const { orchestrator: o, fake } = await setup((f) => solved(f), {
+      github: true, design: false, now: () => Date.now() + skew,
+      architect: shop({ locked: { 'harness/modules/shop/plans/P1.json': JSON.stringify(plan, null, 2) }, decision: "F01's expected result says more." }),
+    });
+    o.createModule('shop', 'A tiny shop');
+    await until(o, () => module(o)?.status === 'proposed');
+    o.acceptProposal('shop', 1);
+    await until(o, () => module(o)?.status === 'in_review');
+    await fake.merge(1);
+    skew += 120_000;
+    await until(o, () => o.state.plans['shop/P1']?.status === 'ready_to_merge', 60_000);
+    await fake.merge(2);
+    skew += 120_000;
+    await until(o, () => o.state.plans['shop/P1']?.status === 'completed');
+
+    // What a change to locked files can't do.
+    const main = (await o.repo.revParse('refs/heads/main'))!;
+    const refused = async (files: Record<string, string>) => {
+      const head = await o.repo.commitTree({ parent: main, tree: main, files, message: 'a try\n', author: HARNESS, committer: HARNESS });
+      const outcome = await submitLockedChange(o, module(o)!, 'A try', head);
+      assert.equal(outcome.ok, false, JSON.stringify(files));
+      return outcome.ok ? '' : outcome.problems.join('\n');
+    };
+    assert.match(await refused({ 'src/greet.sh': 'echo goodbye\n' }), /^src\/greet\.sh: a change to locked files changes only built features' definitions/);
+    assert.match(await refused({ 'harness/modules/shop/plans/P1.json': JSON.stringify({ ...plan, title: 'Renamed' }) }), /^P1: the plan's own fields changed/);
+    assert.match(await refused({ 'harness/modules/shop/checks/F01.sh': 'false\n' }), /^F01-greet fails on the change, though its feature is built: it must pass/);
+    assert.match(await refused({ 'README.md': '# toy\n' }), /no built feature's definition changes/);
+
+    // The Architect's own: on its first escalation, a branch from main with F01's new expected result.
+    await handleRequest(o, { role: 'manager', sandbox: 'mgr-x', module: 'shop' }, { v: 1, id: 'esc-1', tool: 'escalate_to_architect', args: { question: "Is F01's expected result complete?" } });
+    await until(o, () => module(o)?.locked?.pr !== undefined, 60_000);
+    const pr = fake.prs.at(-1)!;
+    assert.equal(pr.title, "Arch: [CHANGED_LOCKED_FILES] [shop] Fix F01's definition");
+    assert.equal(pr.branch, 'locked/shop');
+    assert.match(pr.body, /> \[!CAUTION\]\n> Changing locked files can make a broken feature look like it works/);
+    assert.deepEqual(module(o)!.locked!.changes, [{ plan: 'P1', feature: 'F01', title: 'Greet', expected: plan.features[0]!.expected, fields: ['expected'], checks: [], scripts: [] }]);
+    assert.equal(module(o)!.status, 'frozen', "it doesn't hold the build as a design change does");
+
+    await fake.merge(pr.number);
+    skew += 120_000;
+    await until(o, () => module(o)?.locked === undefined);
+    assert.equal(o.state.features['shop/P1/F01']!.lockedHashes?.length, 1);
+    // Still accepted under its new definition: later work keeps passing its check.
+    assert.ok((await o.regressionChecks('refs/heads/main')).some((c) => c.id === 'F01-greet'));
   });
 });
 

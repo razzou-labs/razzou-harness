@@ -288,7 +288,7 @@ describe("the cost job's key", () => {
     await infracostKey(owner(''), 'acme/shop');
     assert.equal(existsSync(secret), false);
     assert.equal(await repositorySecret('acme/shop', 'INFRACOST_API_KEY'), false);
-    assert.match(said.at(-1)!, /^Skipped: the cost job estimates nothing, and Swarm leaves INFRA and MIXED plans to you/);
+    assert.match(said.at(-1)!, /^Skipped: the cost job estimates nothing, and Swarm leaves INFRA and MIXED_INFRA_AND_CODE plans to you/);
   });
 });
 

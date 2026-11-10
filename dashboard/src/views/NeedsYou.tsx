@@ -1,4 +1,4 @@
-import { QBtn, QCard, QCardSection, QInput } from 'quasar';
+import { QBanner, QBtn, QCard, QCardSection, QInput } from 'quasar';
 import { defineComponent, onMounted, ref, watch, type PropType, type VNodeChild } from 'vue';
 import { getText, post, type DashboardState, type FeatureState } from '../api.ts';
 import { clock } from '../format.ts';
@@ -63,7 +63,7 @@ export function collectNeeds({ state, design }: DashboardState, go: Go): Need[] 
       const pr = module.design.pr;
       needs.push({
         key: `design:${module.module}`,
-        title: module.frozenCommit ? `A change to the design of ${module.module} is ready for review` : `The design of ${module.module} is ready for review`,
+        title: module.frozenCommit ? `[DESIGN_MODIFY] A change to the design of ${module.module} is ready for review` : `[DESIGN] The design of ${module.module} is ready for review`,
         body: () => (
           <>
             {module.frozenCommit && <p>{module.design?.summary}</p>}
@@ -75,6 +75,38 @@ export function collectNeeds({ state, design }: DashboardState, go: Go): Need[] 
             {(module.design?.suspect.length ?? 0) > 0 && (
               <p class="text-caption text-warning">These checks already pass before anything is built, so they may test nothing: {module.design?.suspect.join(', ')}</p>
             )}
+          </>
+        ),
+      });
+    }
+    // A change to built features' definitions: a card of its own, with what it puts at risk (v5).
+    if (module.locked?.pr) {
+      const locked = module.locked;
+      const pr = module.locked.pr;
+      needs.push({
+        key: `locked:${module.module}`,
+        title: `[CHANGED_LOCKED_FILES] The Architect of ${module.module} asks to change locked files`,
+        body: () => (
+          <>
+            <QBanner class="bg-negative text-white q-mb-md" rounded>
+              <b>Changing locked files can make a broken feature look like it works:</b> a check that proves less turns red into green without fixing anything.
+              Merge only if each changed check still proves its feature's expected result.
+              <div class="q-mt-xs">A locked change rebuilds nothing: if a feature must work differently, ask the Architect for a new plan.</div>
+            </QBanner>
+            <Markdown text={locked.summary} />
+            {locked.changes.map((c) => (
+              <div key={`${c.plan}/${c.feature}`} class="locked-change q-mb-sm">
+                <div><b>{c.plan}/{c.feature}</b> {c.title}</div>
+                <div class="text-caption"><span class="text-muted">Expected:</span> {c.expected}</div>
+                {c.fields.length > 0 && <div class="text-caption"><span class="text-muted">Spec fields:</span> {c.fields.join(', ')}</div>}
+                {c.checks.length > 0 && <div class="text-caption"><span class="text-muted">Checks:</span> {c.checks.join(', ')}</div>}
+                {c.scripts.length > 0 && <div class="text-caption"><span class="text-muted">Scripts:</span> {c.scripts.map((s) => <code key={s} class="q-mr-xs">{s}</code>)}</div>}
+              </div>
+            ))}
+            <p>
+              Review the diff of <GithubLink url={pr.url}>PR #{pr.number}</GithubLink> on GitHub, then merge it with a merge commit, or close it.
+              Comments go to the Architect, in its terminal.
+            </p>
           </>
         ),
       });
