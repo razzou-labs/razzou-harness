@@ -3,6 +3,31 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## 0.5.1 (2026-11-10)
+
+**Upgrading from 0.5.0:** install the new version, rebuild the agents' image with
+`harness doctor --build-images` (its tag follows the harness's version), then restart the
+daemon with `harness down` and `harness up`, and reload the dashboard. An Architect whose
+sandbox was made before 0.5.0 has neither `submit_locked_change` nor the instructions
+about locked features: an agent gets its tools and its role when its sandbox is made.
+Delete its sandbox with `openshell sandbox delete`, which loses its conversation but
+keeps its proposals, and the daemon makes it again.
+
+- **What the prompt cache served.** The Claude tokens table shows, by role, what was
+  read, how much of it the prompt cache served, the cache's share, and what was written.
+  Every call reads the whole conversation again, mostly from the cache, which costs a
+  tenth of a fresh read on the API: an agent that lives long with a large context reads
+  millions of tokens that way. The sessions recorded before 0.5.1 get theirs from the
+  streams the daemon kept, and a Manager or an Architect from its sandbox's whole
+  conversation; only a sandbox already gone has none, which the card says.
+- **Managers and Architects in the active hours:** the time each spends on its prompts,
+  from each prompt to its last step, which the daemon reads in its sandbox every five
+  minutes. A sandbox's whole history counts from its first reading; one gone before
+  0.5.1 counts nothing.
+- **A reading that fails counts nothing.** A reading of a Manager's or an Architect's
+  sandbox that couldn't read every conversation gave a short count, which the daemon
+  took for a new sandbox and counted again. It now gives none, and the next one counts.
+
 ## 0.5.0 (2026-11-10)
 
 **Upgrading from 0.4.23:** install the new version, then, in each project, run
