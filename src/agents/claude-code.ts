@@ -267,9 +267,10 @@ export function reviewJsonSchema(): string {
 
 /**
  * How a session's error result says the subscription ran out. Claude Code 2.1.x writes
- * "You've hit your 5-hour limit · resets 3pm", "You've reached your …", "You're out of
- * usage credits", "You're out of extra usage" or "Your org is out of usage …"; older
- * versions wrote "Claude AI usage limit reached|<epoch>".
+ * "You've hit your 5-hour limit · resets 3pm", the same of a weekly limit, which a plan
+ * without a session limit hits alone, "You've reached your …", "You're out of usage
+ * credits", "You're out of extra usage" or "Your org is out of usage …"; older versions
+ * wrote "Claude AI usage limit reached|<epoch>".
  */
 const USAGE_LIMIT = /usage limit|limit reached|rate.?limit|you['’]ve (?:hit|reached) your|you['’]re out of (?:usage credits|extra usage)|your org is out of usage/i;
 

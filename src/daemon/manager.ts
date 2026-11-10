@@ -209,7 +209,7 @@ export class Managers {
     this.detachOne(key);
     const o = this.o;
     const agent = `manager:${key}`;
-    const transcript = o.driver.follow(manager.sandbox, this.paths(manager).output, 1, (line) => o.events.emit('transcript', { agent, line }));
+    const transcript = o.followStream(manager.sandbox, this.paths(manager).output, agent);
     const channel = o.channel(
       { role: 'manager', sandbox: manager.sandbox, ...identity(manager) },
       join(this.localDir(manager), `replied-${manager.sessionId}.txt`),

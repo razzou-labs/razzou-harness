@@ -270,8 +270,11 @@ const TokensMeter = defineComponent({
 });
 
 /**
- * The subscription's windows as bars: the current session and the weekly limit, as an
- * agent's model call last reported them. Before any report, the box says where they come from.
+ * The subscription's windows as bars, as an agent's model call last reported them: a
+ * five-hour session and a weekly window, or the weekly one alone on a plan without a
+ * session limit. A window that has reset since the report is gone from it: the next
+ * report shows it again if the plan still has it. Before any report, the box says where
+ * they come from.
  */
 const SubscriptionMeter = defineComponent({
   props: {
@@ -289,9 +292,11 @@ const SubscriptionMeter = defineComponent({
           </Meter>
         );
       }
+      const current = usage.usage.limits.filter((limit) => Date.parse(limit.resetsAt) > now.value);
       return (
         <Meter title="Subscription">
-          {usage.usage.limits.map((limit) => {
+          {current.length === 0 && <p class="text-muted">Every window of the last report has reset since; the next model call reports them again.</p>}
+          {current.map((limit) => {
             const hot = ceiling !== null && limit.percent >= ceiling;
             return (
               <div key={`${limit.kind}:${limit.model ?? ''}`} class="q-mb-sm">

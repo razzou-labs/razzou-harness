@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events';
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { claudeCode, mcpConfig, readResult, reportJsonSchema, type AgentAdapter, type AgentRun } from '../agents/claude-code.ts';
-import { usageFromEvent, type SubscriptionUsage, type UsageLimit } from '../anthropic/usage.ts';
+import { usageFromEvent, windowName, type SubscriptionUsage, type UsageLimit } from '../anthropic/usage.ts';
 import { allPassed, initEnvironment, runChecks, type CheckResult, type RunOptions } from '../checks/runner.ts';
 import { protectedChanges } from '../ci/harness-ci.ts';
 import { ownerTime, type OwnerTime } from '../design/owner-time.ts';
@@ -150,8 +150,10 @@ export class Orchestrator {
     this.webRead = options.webRead ?? ((url) => webRead(url));
     this.store = new EventStore(join(options.harnessDir, 'events.jsonl'), this.now);
     this.usage = savedUsage(options.harnessDir);
-    // The agents' streams carry the usage: each model call reports it (usage.ts).
-    this.events.on('transcript', ({ line }: { line: string }) => this.noteUsage(line));
+    // The agents' streams carry the usage: each model call reports it (usage.ts). A replayed line's report is old.
+    this.events.on('transcript', ({ line, replay }: { line: string; replay?: boolean }) => {
+      if (!replay) this.noteUsage(line);
+    });
     this.state = project(this.store.readAll());
     this.managers = new Managers(this);
     this.architects = new Architects(this);
@@ -779,7 +781,7 @@ export class Orchestrator {
       .reduce<UsageLimit | undefined>((top, limit) => (!top || limit.percent > top.percent ? limit : top), undefined);
     if (!binding || binding.percent < ceiling) return false;
     this.pausePipeline(
-      `the subscription's usage is at ${binding.percent}% (${binding.kind}), at or above the ${ceiling}% ceiling (swarm.usageCeilingPercent)`,
+      `the subscription's usage is at ${binding.percent}% in ${windowName(binding.kind)}, at or above the ${ceiling}% ceiling (swarm.usageCeilingPercent)`,
       new Date(Date.parse(binding.resetsAt) + RESET_MARGIN_MS).toISOString(),
     );
     return true;
@@ -2032,10 +2034,33 @@ export class Orchestrator {
     return mine ? head : undefined;
   }
 
+  /**
+   * Follows an agent's stream from its first line, for its transcript. The lines the file
+   * held when the daemon began to follow it come again after a restart: they are marked
+   * `replay`, and a usage report among them is old, so the one usage.json kept stays
+   * (0.5.2). The first lines wait until the daemon has counted them.
+   */
+  followStream(sandbox: string, file: string, agent: string): Follower {
+    let n = 0;
+    let held: number | undefined;
+    const waiting: string[] = [];
+    const emit = (line: string) => {
+      n++;
+      this.events.emit('transcript', { agent, line, ...(n <= held! ? { replay: true } : {}) });
+    };
+    void this.driver.exec(sandbox, `if [ -f ${sh(file)} ]; then wc -l < ${sh(file)}; else echo 0; fi`)
+      .then((result) => (result.code === 0 ? Number.parseInt(result.stdout.trim(), 10) : 0), () => 0)
+      .then((count) => {
+        held = Number.isFinite(count) ? count : 0;
+        for (const line of waiting.splice(0)) emit(line);
+      });
+    return this.driver.follow(sandbox, file, 1, (line) => (held === undefined ? void waiting.push(line) : emit(line)));
+  }
+
   private followAttempt(ref: Ref, sandbox: string): void {
     if (this.developers.has(sandbox)) return;
     const agent = `developer:${featureKey(ref)}/a${ref.attempt}`;
-    const follower = this.driver.follow(sandbox, this.paths(sandbox).stream, 1, (line) => this.events.emit('transcript', { agent, line }));
+    const follower = this.followStream(sandbox, this.paths(sandbox).stream, agent);
     const channel = this.channel({ role: 'developer', sandbox }, join(this.attemptDir(ref), 'replied.txt'));
     this.developers.set(sandbox, { follower, channel });
   }
@@ -2051,7 +2076,7 @@ export class Orchestrator {
   followReview(review: ReviewState): void {
     if (this.reviewers.has(review.sandbox)) return;
     const agent = `${review.role}:${review.head.slice(0, 8)}`;
-    const follower = this.driver.follow(review.sandbox, this.paths(review.sandbox).stream, 1, (line) => this.events.emit('transcript', { agent, line }));
+    const follower = this.followStream(review.sandbox, this.paths(review.sandbox).stream, agent);
     const channel = this.channel({ role: 'reviewer', sandbox: review.sandbox }, join(this.options.harnessDir, 'reviews', `${review.sandbox}.replied.txt`));
     this.reviewers.set(review.sandbox, { follower, channel });
   }
