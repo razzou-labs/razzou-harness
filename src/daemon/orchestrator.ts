@@ -9,7 +9,7 @@ import { protectedChanges } from '../ci/harness-ci.ts';
 import { ownerTime, type OwnerTime } from '../design/owner-time.ts';
 import {
   checksHash, definitionHash, featureDependency, KIND_TAGS, loadDesign, planDependencies, planKind, requiredChecks, REVIEWER_ROLES, statusContext,
-  type Check, type Config, type Design, type Feature, type ModuleDesign, type Plan,
+  type Check, type Config, type Design, type Feature, type ModuleDesign, type Plan, type ReviewerRole,
 } from '../design/schemas.ts';
 import { DEVELOPER, HARNESS, Repo } from '../git/repo.ts';
 import { GitHubClient, loadAppCredentials } from '../github/app.ts';
@@ -24,7 +24,7 @@ import { orderCards } from '../dashboard/needs.ts';
 import { EventStore, type CiJob, type HarnessEvent, type NewEvent, type Ref } from '../state/events.ts';
 import {
   activeAttempts, apply, countedAttempts, featureKey, interruptions, isActive, managerKey, managersOf, planKey, planMerged, project, writeSnapshot,
-  type Attempt, type FeatureState, type InfraMerge, type ManagerState, type Mode, type PlanState, type ReviewState, type State,
+  type Attempt, type FeatureState, type InfraMerge, type ManagerState, type Mode, type PlanState, type ReviewScope, type ReviewState, type State,
 } from '../state/state.ts';
 import { clip, machineSize, sh, sleep } from '../util.ts';
 import { Architects } from './architects.ts';
@@ -372,6 +372,21 @@ export class Orchestrator {
     this.nextPoll.clear();
     this.kick();
     return true;
+  }
+
+  /**
+   * The owner switches a reviewer: every plan's pull request, those of infrastructure
+   * plans only, which is the cost reviewer's alone, or none. It narrows what the
+   * configuration runs. Open PRs are looked at again at once: a session of a reviewer
+   * switched off stops, and what waited for it goes on. Returns why not, if not.
+   */
+  setReviews(role: ReviewerRole, scope: ReviewScope): string | undefined {
+    if (scope === 'infra' && role !== 'cost') return 'only cost reviews can be for infrastructure plans only';
+    if ((this.state.reviews?.[role] ?? 'on') === scope) return undefined;
+    this.record({ type: 'REVIEWS_SET', payload: { role, scope } });
+    this.nextPoll.clear();
+    this.kick();
+    return undefined;
   }
 
   /** The owner sets their hours for the whole project (v3 §4); null clears them. */
@@ -1287,7 +1302,7 @@ export class Orchestrator {
       }
       // Without the owner's button (v3 D36), an estimate under the ceiling is the only way in.
       if (this.state.infraMerge !== 'daemon') {
-        const button = "the dashboard's button lets the daemon merge infra once CI and the reviewers pass";
+        const button = "under Config, the Infra merges switch lets the daemon merge infra once CI and the reviewers pass";
         if (ceiling === null) return leave(`${KIND_TAGS[kind]} plans are the owner's to merge (swarm.merge.infraMonthlyUsdCeiling is null); ${button}`);
         if (estimate === undefined) {
           return leave(`${kind === 'INFRA' ? 'an' : 'a'} ${KIND_TAGS[kind]} plan merges itself only with the cost job's estimate of the monthly cost it adds, and none was produced: the cost job needs iac/ and the INFRACOST_API_KEY secret; ${button}`);

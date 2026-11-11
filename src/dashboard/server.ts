@@ -183,6 +183,15 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
           return sendJson(res, { done: orchestrator.resume() });
         case 'POST /api/infra-merge':
           return sendJson(res, body.by === 'daemon' || body.by === 'ceiling' ? { done: orchestrator.setInfraMerge(body.by) } : { done: false, error: 'by is daemon or ceiling' });
+        case 'POST /api/reviews': {
+          // A reviewer's switch: every plan's pull request, infrastructure plans' only (the cost reviewer's), or none.
+          const { role, scope } = body;
+          if ((role !== 'security' && role !== 'cost') || (scope !== 'on' && scope !== 'infra' && scope !== 'off')) {
+            return sendJson(res, { done: false, error: 'role is security or cost; scope is on, infra or off' });
+          }
+          const error = orchestrator.setReviews(role, scope);
+          return sendJson(res, error ? { done: false, error } : { done: true });
+        }
         case 'POST /api/mode':
           // The dashboard's switch and `harness mode` alike: the mode, and main's rules with the owner's gh.
           return sendJson(res, body.mode === 'manual' || body.mode === 'swarm' ? await orchestrator.switchMode(body.mode) : { done: false, error: 'the mode is manual or swarm' });

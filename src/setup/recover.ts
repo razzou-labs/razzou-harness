@@ -82,7 +82,7 @@ export async function recover(options: RecoverOptions): Promise<string[]> {
   for (const gate of onMain.gates) actions[gate] = { status: 'done', at, note: 'recovered from progress.txt' };
   if (onMain.gates.size > 0) notes.push(`gates satisfied: ${[...onMain.gates].join(', ')}`);
   notes.push('Not recovered: attempts under way, the Architects\' and Managers\' sessions, unanswered questions, plan branches that were never pushed, and deploys a merge started.');
-  notes.push('Nor what you set: the mode is Manual again (`harness mode swarm` switches back), the hours of your time are unset (`harness budget`), the INFRA merge button is off, and the owner tasks you marked done are pending again (gates come back from progress.txt; `harness done <module>/<task>` once the daemon runs).');
+  notes.push('Nor what you set: the mode is Manual again (`harness mode swarm` switches back), the hours of your time are unset (`harness budget`), the switches under Config are back as they start (infra merges yours, both reviews on), and the owner tasks you marked done are pending again (gates come back from progress.txt; `harness done <module>/<task>` once the daemon runs).');
   new EventStore(log).append({ type: 'RECOVERED', payload: { plans, features, actions, notes } });
   return notes;
 }

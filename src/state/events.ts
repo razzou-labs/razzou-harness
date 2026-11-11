@@ -4,7 +4,7 @@ import type { CheckResult } from '../checks/runner.ts';
 import type { ReviewFinding, ReviewerRole } from '../design/schemas.ts';
 import type { Party, Role } from '../roles.ts';
 import type { Denial } from '../sandbox/refusals.ts';
-import type { ActionState, FeatureState, InfraMerge, LockedChange, Mode, OrderCard, PlanState } from './state.ts';
+import type { ActionState, FeatureState, InfraMerge, LockedChange, Mode, OrderCard, PlanState, ReviewScope } from './state.ts';
 
 /** What an event is about. Ids repeat across modules, so a feature is always addressed with its module and plan. */
 export interface Ref {
@@ -131,6 +131,8 @@ interface Payloads {
   MODE_CHANGED: { mode: Mode };
   /** The owner's button (v3 D36): the daemon merges INFRA and MIXED plans like CODE ones, or only under the cost ceiling. */
   INFRA_MERGE_SET: { by: InfraMerge };
+  /** The owner switched a reviewer: every plan's pull request, those of infrastructure plans only, or none. */
+  REVIEWS_SET: { role: ReviewerRole; scope: ReviewScope };
   /** The owner set, or cleared with null, the hours the whole project may take of their time (v3 §4.1). */
   OWNER_HOURS_SET: { hours: number | null };
   /**
@@ -153,6 +155,8 @@ interface Payloads {
     role: ReviewerRole; head: string; outcome: AttemptOutcome;
     verdict?: 'pass' | 'block'; summary?: string; findings?: ReviewFinding[]; usage?: Usage; reason?: string;
   };
+  /** A reviewer the owner switched off, or away from CODE plans, didn't read this head: in Swarm its status is set as passed, saying so. */
+  REVIEW_SKIPPED: { role: ReviewerRole; head: string; why: 'off' | 'code' };
   /** The review posted on the PR as comments, and the commit status set, or what went wrong. */
   REVIEW_POSTED: { role: ReviewerRole; head: string; status: 'success' | 'failure' | 'error'; comments: number; problem?: string };
 

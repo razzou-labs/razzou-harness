@@ -53,13 +53,6 @@ function daemonFacts(o: Orchestrator): ConfigFact[] {
   const { state } = o;
   const paused = state.pipeline.paused;
   return [
-    { name: 'Mode', value: state.mode === 'swarm' ? 'Swarm: the daemon merges plans that pass CI and the reviewers' : 'Manual: you review and merge every pull request' },
-    {
-      name: 'INFRA and MIXED_INFRA_AND_CODE merges, in Swarm',
-      value: (state.infraMerge ?? 'ceiling') === 'daemon'
-        ? "the daemon's once CI and the reviewers pass; an estimate over the cost ceiling still waits for you"
-        : "yours, unless the cost job's estimate is under the ceiling",
-    },
     { name: 'Your hours', value: state.budgets.ownerHours !== undefined ? `${state.budgets.ownerHours} h for the whole project` : 'not set' },
     { name: 'Pipeline', value: paused ? `paused: ${paused.reason}${paused.until ? `, until ${paused.until}` : ''}` : 'running' },
     { name: 'Daemon', value: state.daemon ? `razzou-harness ${state.daemon.version}, pid ${state.daemon.pid}` : 'stopped' },

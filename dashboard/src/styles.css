@@ -32,8 +32,8 @@ code { background: var(--h-soft); padding: 1px 5px; border-radius: 4px; }
 /* A built feature a locked change touches: set off from the Architect's summary. */
 .locked-change { border-left: 3px solid var(--q-negative); padding-left: 10px; }
 
-/* A proposal's versions, one toggle: the border holds the unselected ones together. */
-.versions { border: 1px solid var(--q-primary); }
+/* A toggle, of a proposal's versions or of a switch's choices: the border holds the unselected ones together. */
+.versions, .choice { border: 1px solid var(--q-primary); }
 
 /* Folds: Quasar's expansion items, as compact as the lines of text around them. */
 .fold .fold-header { min-height: 0; padding: 1px 4px 1px 0; border-radius: 4px; }

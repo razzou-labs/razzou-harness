@@ -1,9 +1,9 @@
 import { matDarkMode, matLightMode, matPause, matPlayArrow } from '@quasar/extras/material-icons';
 import { Dark, QBadge, QBanner, QBtn, QHeader, QLayout, QPage, QPageContainer, QTab, QTabs, QToolbar, QToolbarTitle, QTooltip } from 'quasar';
 import { defineComponent, onUnmounted, ref } from 'vue';
-import { connect, harness, post, type DashboardState, type Outcome } from './api.ts';
+import { connect, harness, post, type DashboardState } from './api.ts';
 import { listNeeds } from '../../src/dashboard/needs.ts';
-import { Action, Badge, Command, confirm, Loading, toggleDark } from './ui.tsx';
+import { Action, Badge, Command, Loading, toggleDark } from './ui.tsx';
 import { Agents } from './views/Agents.tsx';
 import { Config } from './views/Config.tsx';
 import { Events } from './views/Events.tsx';
@@ -60,7 +60,7 @@ export const App = defineComponent({
               {view === 'agents' && <Agents data={data} go={go} {...(detail ? { selected: detail } : {})} />}
               {view === 'sandboxes' && <Sandboxes go={go} {...(detail ? { selected: detail } : {})} />}
               {view === 'events' && <Events />}
-              {view === 'config' && <Config />}
+              {view === 'config' && <Config data={data} />}
             </QPage>
           </QPageContainer>
         </QLayout>
@@ -69,26 +69,10 @@ export const App = defineComponent({
   },
 });
 
-/** The project, the pipeline's pause, the mode and the infra merges, and light or dark. */
+/** The project, the pipeline's pause, the mode and who merges infrastructure as they are, and light or dark. */
 const Toolbar = defineComponent({
   props: { data: { type: Object as () => DashboardState, required: true } },
   setup(props) {
-    // The switch takes effect at item boundaries; the daemon records it, and applies main's rules with the owner's gh, as `harness mode` does (v3 §2.1).
-    const switchMode = async (swarm: boolean): Promise<Outcome> => {
-      const question = swarm
-        ? 'In Manual you review and merge every pull request yourself. Switch to Manual?'
-        : 'In Swarm the daemon merges plans that pass CI and the reviewers, without your review. Switch to Swarm?';
-      if (!(await confirm(question))) return { done: true };
-      const result = await post('/api/mode', { mode: swarm ? 'manual' : 'swarm' });
-      return typeof result.problem === 'string' ? { ...result, warning: `GitHub's rules on main were not changed: ${result.problem}` } : result;
-    };
-    // The owner's button for INFRA and MIXED plans (v3 D36): the reviewers and CI as the gate, the cost ceiling still holding.
-    const switchInfra = async (byDaemon: boolean): Promise<Outcome> => {
-      const question = byDaemon
-        ? "INFRA and MIXED_INFRA_AND_CODE plans will wait for you again, unless the cost job's estimate is under the ceiling. Keep their merges for you?"
-        : 'INFRA and MIXED_INFRA_AND_CODE plans will merge themselves once CI, the security reviewer and the cost reviewer pass, like CODE plans. An estimate over the ceiling still waits for you. Let the daemon merge infra?';
-      return (await confirm(question)) ? post('/api/infra-merge', { by: byDaemon ? 'ceiling' : 'daemon' }) : { done: true };
-    };
     return () => {
       const { state, design } = props.data;
       const paused = state.pipeline.paused;
@@ -101,10 +85,9 @@ const Toolbar = defineComponent({
           {paused
             ? <Action label="Resume" icon={matPlayArrow} toast run={() => post('/api/resume')} />
             : <Action label="Pause" icon={matPause} toast run={() => post('/api/pause')} />}
+          {/* The mode and who merges infrastructure, as they are: Config's switches change them. */}
           <Badge status={swarm ? 'swarm' : 'manual'} label={swarm ? 'Swarm' : 'Manual'} />
-          <Action label={swarm ? 'Switch to Manual' : 'Switch to Swarm'} toast run={() => switchMode(swarm)} />
           {swarm && <Badge status={infraByDaemon ? 'swarm' : 'waiting'} label={infraByDaemon ? 'Infra: the daemon merges' : 'Infra: yours'} />}
-          {swarm && <Action label={infraByDaemon ? 'Keep infra merges for me' : 'Let the daemon merge infra'} toast run={() => switchInfra(infraByDaemon)} />}
           <span class="text-caption text-muted">
             {!harness.connected ? 'reconnecting…' : state.daemon ? `daemon ${state.daemon.version}, pid ${state.daemon.pid}` : 'daemon stopped'}
           </span>

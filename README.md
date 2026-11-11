@@ -339,17 +339,21 @@ behind a token. Its views:
   use, so that agents and checks in parallel leave the machine usable. There is no cap
   until you set one.
 - **Events:** the event log, live, with a filter.
-- **Config:** every setting the harness runs with. All of `harness/config.json` on
-  `main`, each value from the file or the default, with the default a value of the
-  file replaces, and a filter. What you set in the dashboard or with `harness`, kept in
-  the daemon's state: the mode, the INFRA merges, your hours. And this machine: Node.js,
-  Claude Code, the OpenShell gateway and providers, and the GitHub App. No key or token
-  is shown.
+- **Config:** every setting the harness runs with. First, **Mode and reviews**: your
+  switches, each a line with its toggle. The mode, Manual or Swarm; who merges INFRA
+  and MIXED plans in Swarm, you or the daemon; the security reviews, on or off; the
+  cost reviews, on, for infrastructure plans only, or off. The daemon keeps them in its
+  state and records each switch: `harness/config.json` isn't written. Then all of
+  `harness/config.json` on `main`, each value from the file or the default, with the
+  default a value of the file replaces, and a filter. What else the daemon's state
+  holds: your hours, the pipeline. And this machine: Node.js, Claude Code, the
+  OpenShell gateway and providers, and the GitHub App. No key or token is shown.
 
 The header pauses and resumes the pipeline: a pause lets what runs finish, and starts
-nothing new. It also shows the mode, Manual or Swarm, and switches it. Its last button
-switches between light and dark: the browser remembers your choice, and until you make
-one, the dashboard follows your system's.
+nothing new. It also shows the mode, Manual or Swarm, and in Swarm who merges
+infrastructure: **Config** switches both. Its last button switches between light and
+dark: the browser remembers your choice, and until you make one, the dashboard follows
+your system's.
 
 ## Swarm mode
 
@@ -359,8 +363,8 @@ gives the agents more autonomy and you less to read. Its design is
 `docs/architecture/proposal-v3.md` in the source repository; this section says what
 exists today.
 
-**The switch.** The dashboard's header switches the mode; so do `harness mode swarm`
-and `harness mode manual`, and both do the same. A switch takes effect at item
+**The switch.** The dashboard's **Config** tab switches the mode; so do `harness mode
+swarm` and `harness mode manual`, and both do the same. A switch takes effect at item
 boundaries: what runs finishes under the rules it started with. GitHub's rules on
 `main` differ per mode, and only a repository admin can change them: the App has no
 administration permission, on purpose. So the switch applies the mode's ruleset with
@@ -380,10 +384,10 @@ either mode, so a switch to Swarm needs only its rules.
 once CI passed and every status in `swarm.requiredStatuses` is green on its head:
 - a `CODE` plan, when `swarm.merge.code` is `daemon`;
 - an `INFRA` or `MIXED_INFRA_AND_CODE` plan, when the monthly cost it adds, estimated by CI, is at or
-  under `swarm.merge.infraMonthlyUsdCeiling`; or, once the header's button **Let the
-  daemon merge infra** is on, like a `CODE` plan, once CI and both reviewers pass, an
-  estimate over the ceiling still waiting for you. The button is off by default, and
-  the choice is recorded in the event log.
+  under `swarm.merge.infraMonthlyUsdCeiling`; or, once **Infra merges** is switched to
+  the daemon's under **Config**, like a `CODE` plan, once CI and the reviewers pass, an
+  estimate over the ceiling still waiting for you. The switch starts on yours, and the
+  choice is recorded in the event log.
 
 Only an estimate of the pull request's current head counts: after a fix round, the new
 head needs its own. Before it merges, the daemon merges `main` into the pull request's
@@ -421,6 +425,18 @@ Manager reviews, CI and the reviewers run again on the new head. A blocking find
 blocks, whatever the verdict says. After `swarm.securityFixRounds` or
 `swarm.costFixRounds`, the pull request is yours. In Manual,
 `swarm.reviewersInManual` runs them as comments and statuses that gate nothing.
+
+Each reviewer has a switch under **Config**. Off, it reads nothing; the cost reviewer
+can also be kept for `INFRA` and `MIXED_INFRA_AND_CODE` plans, since a `CODE` plan
+seldom changes what a project costs. In Swarm, GitHub's rules and the merge policy
+still require the status of a reviewer that didn't read a pull request, so the daemon
+sets it as passed and says why: "not reviewed: the owner switched security reviews
+off". The plan then merges on CI and whatever review is left, and on CI alone with
+both off. A session of a reviewer switched off stops, and a pull request it blocked is
+released. Switched on again, it reads the open pull requests it hasn't read, and a
+verdict it gave a head stands. The cost job's estimate in CI and its ceiling don't
+depend on the cost reviewer. A switch narrows what `swarm.requiredStatuses` and
+`swarm.reviewersInManual` run, and never widens it.
 
 The App needs **Commit statuses: write** for the verdicts. An App created before this
 version has read only: `harness setup` opens the App's permissions page, in either mode,
@@ -530,7 +546,7 @@ through an `Arch:` pull request, or a commit of your own on `main`.
 
 ```json
 {
-  "harnessVersion": "0.5.6",
+  "harnessVersion": "0.5.7",
   "project": { "name": "shop", "repo": "<org>/shop", "bot": "<org>-harness[bot]" },
   "roles": {
     "architect": { "model": "claude-fable-5-2", "effort": "max" },

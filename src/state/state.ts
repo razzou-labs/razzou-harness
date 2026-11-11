@@ -17,6 +17,13 @@ export type Mode = 'manual' | 'swarm';
  */
 export type InfraMerge = 'ceiling' | 'daemon';
 
+/**
+ * The owner's switch for a reviewer: `on`, it reads every plan's pull request; `infra`,
+ * those of INFRA and MIXED plans only; `off`, none. It narrows what the configuration
+ * runs, and never widens it: a reviewer whose status the policy doesn't require stays out.
+ */
+export type ReviewScope = 'on' | 'infra' | 'off';
+
 export interface Question {
   requestId: string;
   text: string;
@@ -125,6 +132,12 @@ export interface PlanState {
   costEstimate?: { head: string; monthlyUsd: number };
   /** The reviewers' sessions on the PR's heads (v3 §5), oldest first. */
   reviews?: ReviewState[];
+  /**
+   * The heads a reviewer didn't read because the owner switched it off (`off`), or to
+   * infrastructure plans only while this one is CODE (`code`): in Swarm its status was
+   * set as passed, saying so, since main's rules and the merge policy still require it.
+   */
+  unreviewed?: Array<{ role: ReviewerRole; head: string; why: 'off' | 'code'; at: string }>;
   /** Fix rounds each reviewer asked for on this PR. */
   reviewFixRounds?: Partial<Record<ReviewerRole, number>>;
   deploy?: { commit: string; status: 'passed' | 'failed'; jobs?: CiJob[] };
@@ -282,6 +295,8 @@ export interface State {
   mode: Mode;
   /** The owner's button for INFRA and MIXED plans in Swarm (v3 D36). */
   infraMerge: InfraMerge;
+  /** The owner's switch for each reviewer; one never switched is `on`. */
+  reviews?: Partial<Record<ReviewerRole, ReviewScope>>;
   /**
    * What the owner set in the dashboard (v3 §4): their hours for the whole project. An
    * older log may hold AGENT_HOURS_SET, the agent-hours threshold before 0.4.22: nothing
@@ -406,6 +421,14 @@ export function apply(state: State, event: HarnessEvent): State {
     case 'INFRA_MERGE_SET':
       state.infraMerge = event.payload.by;
       break;
+    case 'REVIEWS_SET':
+      state.reviews = { ...state.reviews, [event.payload.role]: event.payload.scope };
+      break;
+    case 'REVIEW_SKIPPED': {
+      const { role, head, why } = event.payload;
+      (state.plans[planKey(ref!)]!.unreviewed ??= []).push({ role, head, why, at: event.ts });
+      break;
+    }
     case 'OWNER_HOURS_SET':
       if (event.payload.hours === null) {
         delete state.budgets.ownerHours;
