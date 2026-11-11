@@ -95,6 +95,15 @@ export function listNeeds({ state, design }: { state: State; design: Design }): 
   return needs;
 }
 
+/**
+ * A module is complete once every plan the design has for it is: nothing of it is left
+ * to build, which is how the daemon picks the module to build. A design change that
+ * adds a plan gives it one to build again.
+ */
+export function moduleCompleted(module: Pick<ModuleDesign, 'id' | 'plans'> | undefined, state: Pick<State, 'plans'>): boolean {
+  return module !== undefined && module.plans.length > 0 && module.plans.every((plan) => state.plans[`${module.id}/${plan.id}`]?.status === 'completed');
+}
+
 /** What a gate holds back: the plans and features it blocks, and the features that name it. A task holds nothing back. */
 export function heldBack(module: ModuleDesign, action: OwnerAction): string[] {
   if (action.kind !== 'gate') return [];

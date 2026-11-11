@@ -4,6 +4,7 @@ import { post, type Attempt, type DashboardState, type FeatureState, type OwnerT
 import { Dependencies } from '../components/Dependencies.tsx';
 import { duration, modelName } from '../format.ts';
 import { Action, Badge, Fold, GithubLink, text } from '../ui.tsx';
+import { moduleCompleted } from '../../../src/dashboard/needs.ts';
 import { Proposal } from './NeedsYou.tsx';
 
 /** Modules, proposals, plans and features, with CI, deploys and progress (§14.1). */
@@ -31,6 +32,8 @@ export const Project = defineComponent({
                     <span>{id}</span>
                     {module && <span class="text-muted text-subtitle1">· {module.title}</span>}
                     {module && <Badge status={module.status} />}
+                    {/* The status is the design's, frozen once merged: the build's end is said beside it. */}
+                    {moduleCompleted(designed, state) && <Badge status="completed" label="module completed" />}
                     {module?.design?.pr && <span class="text-subtitle2">· <GithubLink url={module.design.pr.url}>Arch PR #{module.design.pr.number}</GithubLink></span>}
                   </div>
                   {module && module.proposals.length > 0 && (
