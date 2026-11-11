@@ -3,6 +3,42 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## 0.5.7 (2026-11-11)
+
+**Upgrading from 0.5.6:** install the new version, rebuild the agents' image with
+`harness doctor --build-images` (its tag follows the harness's version), then restart the
+daemon with `harness down` and `harness up`, and reload the dashboard. The mode and the
+infra merges keep the values they had; both reviews start on, as before.
+
+- **Mode and reviews, a box of switches in the Config tab.** The header's two buttons,
+  **Switch to Manual** and **Let the daemon merge infra**, moved there, each a line with
+  a toggle: the mode, Manual or Swarm, and the infra merges, yours or the daemon's. The
+  header keeps their badges. A line says under its name what its value does now, and a
+  switch that hands merges to the daemon still asks first.
+- **The reviews can be switched.** Two new lines: the security reviews, on or off, and
+  the cost reviews, on, for infrastructure plans only, or off. Until now both reviewers
+  read every plan's pull request, a `CODE` plan's too, and only `swarm.requiredStatuses`
+  in `harness/config.json` said otherwise.
+  - Off, a reviewer reads nothing. For infrastructure plans only, the cost reviewer
+    leaves `CODE` plans unread.
+  - In Swarm, GitHub's rules and the merge policy still require its status: the daemon
+    sets it as passed and says why, such as "not reviewed: the owner switched security
+    reviews off", as it does on `Arch:` and `Fix:` pull requests. The plan merges on CI
+    and the review that is left, or on CI alone.
+  - Switching one off stops its session under way and releases a pull request it
+    blocked. Switched on again, it reads the open pull requests it hasn't read, and a
+    verdict it gave a head stands, its status with it.
+  - A switch that takes a review away asks first. One that brings it back doesn't.
+  - The cost job's estimate in CI and its ceiling don't depend on the cost reviewer.
+  - In Manual the reviewers run only with `swarm.reviewersInManual`, as comments: the
+    switches count there too, and the lines say when nothing runs. A switch narrows what
+    the configuration runs, and never widens it.
+- **In the Project view,** a plan shows a review that wasn't made as "not reviewed",
+  with why, and a session the switch stopped as stopped, not failed.
+- The daemon keeps the switches in its state and records each in the event log:
+  `harness/config.json` isn't written. The Config tab's card "The daemon" no longer
+  repeats the mode and the infra merges.
+
 ## 0.5.6 (2026-11-11)
 
 **Upgrading from 0.5.5:** install the new version, rebuild the agents' image with
