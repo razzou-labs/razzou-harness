@@ -3,6 +3,35 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## 0.5.6 (2026-11-11)
+
+**Upgrading from 0.5.5:** install the new version, rebuild the agents' image with
+`harness doctor --build-images` (its tag follows the harness's version), then restart the
+daemon with `harness down` and `harness up`, and reload the dashboard. A Manager whose
+sandbox was made before 0.5.6 has no tool to answer an order request with: Needs you
+says so in place of the button, with the command that deletes its sandbox, and the
+daemon starts a new one. The new Manager has none of the old one's conversation, and
+gets again whatever still waits for its decision, such as a failed deploy: do it when
+nothing waits for it.
+
+- **Ask the Manager for an order.** Needs you lists its cards by kind, and can't read
+  what they say: a question that a pull request has answered since, or a gate whose
+  `when` names something the design's dependencies don't. A button above the cards now
+  asks a Manager of the module being built. The daemon sends it every card with its
+  text, what the dashboard works out for each, where the plans stand, and what handling
+  each kind of card sets off in the daemon, which a Manager can't read otherwise. The
+  Manager answers with its new tool, `suggest_order`: the cards in its order, each with
+  a reason. Nothing else changes.
+- **Advice about the cards as they were.** The daemon keeps only the request's cards
+  from the answer, and puts last, without a reason, any the Manager left out. The page
+  shows the Manager's order, with its reasons, while the cards are as it saw them, less
+  the ones handled since. The standard order is one click away, and every warning on a
+  card stays. Once a card came, or one changed under the order, such as a gate whose
+  plan was checked again, the standard order is back, the Manager's stays readable under
+  it, and you can ask again.
+- **When nobody can answer.** Without a Manager running, before a module's build or
+  after it, the page says so in place of the button.
+
 ## 0.5.5 (2026-11-11)
 
 **Upgrading from 0.5.4:** install the new version, rebuild the agents' image with
