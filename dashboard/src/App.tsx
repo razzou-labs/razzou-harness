@@ -2,7 +2,7 @@ import { matDarkMode, matLightMode, matPause, matPlayArrow } from '@quasar/extra
 import { Dark, QBadge, QBanner, QBtn, QHeader, QLayout, QPage, QPageContainer, QTab, QTabs, QToolbar, QToolbarTitle, QTooltip } from 'quasar';
 import { defineComponent, onUnmounted, ref } from 'vue';
 import { connect, harness, post, type DashboardState, type Outcome } from './api.ts';
-import { listNeeds } from './needs.ts';
+import { listNeeds } from '../../src/dashboard/needs.ts';
 import { Action, Badge, Command, confirm, Loading, toggleDark } from './ui.tsx';
 import { Agents } from './views/Agents.tsx';
 import { Config } from './views/Config.tsx';

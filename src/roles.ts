@@ -21,6 +21,11 @@ export const INPUTS = {
   retry_feature: z.object({ feature: FeatureKey, guidance: Guidance }),
   abort_attempt: z.object({ feature: FeatureKey, attempt: AttemptNumber, reason: z.string().trim().min(1).max(2000) }),
   ask_owner: z.object({ question: z.string().trim().min(1).max(8000), blocking: z.boolean() }),
+  suggest_order: z.object({
+    request_id: z.string().min(1),
+    order: z.array(z.object({ card: z.string().trim().min(1).max(200), why: z.string().trim().min(1).max(600) })).min(1).max(200),
+    summary: z.string().trim().max(2000).optional(),
+  }),
   submit_plan: z.object({ plan: PlanKey, summary: z.string().trim().min(1).max(8000) }),
   get_state: z.object({}),
   get_attempt: z.object({ feature: FeatureKey, attempt: AttemptNumber }),
@@ -91,6 +96,12 @@ export const TOOLS: Record<Role, ToolSpec[]> = {
     {
       name: 'ask_owner',
       description: 'Asks the owner in the dashboard. The answer arrives later, as a message. With blocking: true, no new attempt starts until the owner answers.',
+      waitSec: 120,
+    },
+    {
+      name: 'suggest_order',
+      description:
+        "Answers an order request of the owner: the cards it lists, by key, in the order the owner should handle them, each with why. The dashboard shows it as your advice while the cards stay as they were. It changes nothing else.",
       waitSec: 120,
     },
     {

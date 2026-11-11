@@ -294,6 +294,16 @@ behind a token. Its views:
   too early. A gate can: its card shows its `when`, what it holds back, and any plan
   that work builds on that isn't complete, with a warning once that plan's deploy or
   post-deploy checks failed.
+
+  That order goes by the kind of each card, and can't read what the cards say. When
+  some depend on others in their text only, **Ask the Manager for an order** sends a
+  Manager every card, what handling each sets off, and where the plans stand. Its answer
+  is advice and changes nothing else: the cards in its order, each with its reason. It
+  shows while the cards are as the Manager saw them, less the ones you handled; once a
+  card came or changed, the standard order is back, and you can ask again. A Manager
+  whose sandbox was made before 0.5.6 has no tool to answer with: the page gives the
+  command that deletes its sandbox, and the daemon starts a new one, without the old
+  one's conversation.
 - **Project:** modules, proposals, plans and features, with attempts, findings, CI,
   deploys and `progress.txt`; and the budgets: your hours, the agents' active hours in
   a table by agent with each one's model and effort, the tokens Claude used, written
@@ -520,7 +530,7 @@ through an `Arch:` pull request, or a commit of your own on `main`.
 
 ```json
 {
-  "harnessVersion": "0.5.5",
+  "harnessVersion": "0.5.6",
   "project": { "name": "shop", "repo": "<org>/shop", "bot": "<org>-harness[bot]" },
   "roles": {
     "architect": { "model": "claude-fable-5-2", "effort": "max" },

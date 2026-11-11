@@ -20,9 +20,10 @@ import { PROJECT_LABEL, type ExecResult, type Follower, type SandboxDriver, type
 import { BUNDLES } from '../sandbox/allowlist.ts';
 import { apiProviderName, buildPolicy } from '../sandbox/policy.ts';
 import { Denials, LOG_LINES } from '../sandbox/refusals.ts';
+import { orderCards } from '../dashboard/needs.ts';
 import { EventStore, type CiJob, type HarnessEvent, type NewEvent, type Ref } from '../state/events.ts';
 import {
-  activeAttempts, apply, countedAttempts, featureKey, interruptions, isActive, managersOf, planKey, planMerged, project, writeSnapshot,
+  activeAttempts, apply, countedAttempts, featureKey, interruptions, isActive, managerKey, managersOf, planKey, planMerged, project, writeSnapshot,
   type Attempt, type FeatureState, type InfraMerge, type ManagerState, type Mode, type PlanState, type ReviewState, type State,
 } from '../state/state.ts';
 import { clip, machineSize, sh, sleep } from '../util.ts';
@@ -32,6 +33,7 @@ import { architectRef } from './design.ts';
 import { parseCostEstimate } from '../review/cost-estimate.ts';
 import { activeReview, pollRunningReviews, reviewStep, stepReview } from './review.ts';
 import { Managers } from './manager.ts';
+import { needsNow, orderManager, orderRequest } from './order.ts';
 import { sweepLeftOvers } from './sandboxes.ts';
 import { readTokens } from './tokens.ts';
 import { attemptRefName, preMerge, probeScript, refOf, sandboxName, waitForFile } from './refs.ts';
@@ -73,6 +75,9 @@ const SWEEP_EVERY_MS = 3_600_000;
  * ahead of Anthropic's, and an attempt started before the real reset would hit the limit.
  */
 const RESET_MARGIN_MS = 60_000;
+
+/** How long an order request waits for its answer before the owner can ask the same again: a Manager's turn takes about a minute. */
+const ORDER_WAIT_MS = 5 * 60_000;
 
 /** Where the Swarm setup stands, for the dashboard's note (v4 §6): read through the App, at most every five minutes. */
 export interface SetupStatus {
@@ -479,6 +484,35 @@ export class Orchestrator {
     this.record({ type: 'OWNER_ANSWER', from: 'owner', to: 'manager', payload: { module: request.module, requestId, answer: answer.trim() } });
     this.kick();
     return true;
+  }
+
+  /**
+   * The owner asks a Manager in which order to handle the cards under Needs you: their
+   * text may say more than the standard order, which goes by kind, can know. The request
+   * holds the cards as they are now, and the Manager's answer is advice about those: it
+   * changes nothing else. Returns why not, if not.
+   */
+  requestOrder(): string | undefined {
+    const needs = needsNow(this);
+    if (needs.length < 2) return 'fewer than two cards wait: there is nothing to order';
+    const manager = orderManager(this);
+    if (typeof manager === 'string') return manager;
+    const cards = orderCards(needs);
+    const last = this.state.order;
+    const same = last !== undefined && JSON.stringify(last.cards) === JSON.stringify(cards);
+    // One that got lost, with a Manager that stopped, can be asked again after a while.
+    if (last && !last.suggestion && same && this.now() - Date.parse(last.askedAt) < ORDER_WAIT_MS) {
+      return "the Manager was asked a moment ago and hasn't answered yet";
+    }
+    const requestId = randomUUID();
+    this.record({
+      type: 'ORDER_REQUESTED',
+      from: 'owner',
+      to: 'manager',
+      payload: { module: manager.module, requestId, manager: managerKey(manager), cards, text: orderRequest(this, requestId, needs, manager) },
+    });
+    this.kick();
+    return undefined;
   }
 
   private async step(): Promise<Step> {

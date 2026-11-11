@@ -89,6 +89,10 @@ function act(item: string): void {
     call('request_fix', { plan: m[1], guidance: 'Stub diagnosis: the checks job fails; make it pass.' });
   } else if ((m = /^\[harness\] PLAN READY (\S+)/.exec(header))) {
     call('submit_plan', { plan: m[1], summary: 'Stub summary of the plan.' });
+  } else if ((m = /^\[harness\] ORDER REQUEST from the owner \(request ([^)]+)\)/.exec(header))) {
+    // The cards from the last to the first, so that its order shows as its own.
+    const cards = [...item.matchAll(/^### \d+\. key: (.+)$/gm)].map((card) => card[1]!).reverse();
+    call('suggest_order', { request_id: m[1], order: cards.map((card, i) => ({ card, why: `Stub reason ${i + 1} for ${card}.` })), summary: 'Stub summary of the order.' });
   } else {
     say('noted');
   }

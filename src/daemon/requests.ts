@@ -138,6 +138,36 @@ const HANDLERS: Handlers = {
     return ok(`Asked the owner (request ${requestId}). The answer will arrive as a message.${blocking ? ' No new attempt starts until then.' : ''}`);
   },
 
+  suggest_order({ o, agent, requestId }, { request_id, order, summary }) {
+    const asked = o.state.order;
+    if (!asked) return refuse('The owner asked for no order.');
+    if (asked.requestId !== request_id) return refuse(`The owner asked again since: request ${asked.requestId} replaced ${request_id}. Answer that one once it reaches you.`);
+    if (asked.manager !== managerKey({ module: agent.module!, plan: agent.plan })) return refuse('That request went to another Manager.');
+    if (asked.suggestion) return asked.suggestion.call === requestId ? ok('Recorded.') : refuse('You already answered that request. The owner asks again if they want another order.');
+    // Only the request's cards, each once; one left out goes last, without a reason.
+    const known = new Set(asked.cards.map((card) => card.key));
+    const placed = new Map<string, string>();
+    for (const { card, why } of order) if (known.has(card) && !placed.has(card)) placed.set(card, why);
+    const unknown = [...new Set(order.map(({ card }) => card).filter((card) => !known.has(card)))];
+    if (placed.size === 0) return refuse(`None of these is a card of the request. Its cards: ${[...known].join(', ')}`);
+    const missing = asked.cards.map((card) => card.key).filter((key) => !placed.has(key));
+    o.record({
+      type: 'ORDER_SUGGESTED',
+      from: 'manager',
+      to: 'owner',
+      payload: {
+        module: asked.module, requestId: request_id, call: requestId,
+        order: [...[...placed].map(([key, why]) => ({ key, why })), ...missing.map((key) => ({ key, why: '' }))],
+        ...(summary ? { summary } : {}),
+      },
+    });
+    return ok([
+      'The owner sees your order under Needs you. Nothing else changed.',
+      ...(missing.length > 0 ? [`You left out ${missing.join(', ')}: shown last, without a reason.`] : []),
+      ...(unknown.length > 0 ? [`Not cards of the request, and dropped: ${unknown.join(', ')}.`] : []),
+    ].join(' '));
+  },
+
   submit_plan({ o, agent, requestId }, { plan, summary }) {
     const state = o.state.plans[plan];
     if (!state || !inScope(agent, state)) return refuse(`${plan} is not ${agent.plan ? 'your plan' : 'a plan of your module'}.`);

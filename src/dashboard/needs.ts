@@ -1,7 +1,7 @@
-import type { DashboardState } from '../../src/dashboard/server.ts';
-import type { ActionState, FeatureState, ModuleState, OwnerRequest, PlanState, State } from '../../src/state/state.ts';
+import type { ActionState, FeatureState, ModuleState, OrderCard, OrderState, OwnerRequest, PlanState, State } from '../state/state.ts';
+import type { DesignView } from './design-view.ts';
 
-type Design = DashboardState['design'];
+type Design = Pick<DesignView, 'modules'>;
 type ModuleDesign = Design['modules'][number];
 export type OwnerAction = ModuleDesign['actions'][number];
 
@@ -43,7 +43,7 @@ export type Need =
  * The daemon holds back whatever isn't ready, so most cards can't be handled too early.
  * A gate can: its `when` is a sentence for the owner, which the daemon can't check.
  */
-export function listNeeds({ state, design }: Pick<DashboardState, 'state' | 'design'>): Need[] {
+export function listNeeds({ state, design }: { state: State; design: Design }): Need[] {
   const needs: Need[] = [];
   const paused = state.pipeline.paused;
   if (paused) needs.push({ kind: 'paused', key: 'paused', paused });
@@ -171,6 +171,90 @@ export function waitText(wait: Upstream): string {
   const held = list(wait.holds);
   const standing = `${held} ${wait.holds.length === 1 ? 'builds' : 'build'} on ${wait.plan}, ${STANDING[wait.status]}.`;
   return wait.failed ? `${standing} Marking this done lets ${held} start all the same.` : standing;
+}
+
+/** A card's title, as the dashboard heads it and an order request names it. */
+export function needTitle(need: Need): string {
+  switch (need.kind) {
+    case 'paused': return 'The pipeline is paused';
+    case 'locked': return `[CHANGED_LOCKED_FILES] The Architect of ${need.module.module} asks to change locked files`;
+    case 'design':
+      return need.module.frozenCommit
+        ? `[DESIGN_MODIFY] A change to the design of ${need.module.module} is ready for review`
+        : `[DESIGN] The design of ${need.module.module} is ready for review`;
+    case 'proposal': return `The Architect of ${need.module.module} proposes v${need.version}`;
+    case 'escalation': return `The Manager asks the Architect of ${need.module.module}${need.escalation.feature ? ` about ${need.escalation.feature}` : ''}`;
+    case 'request': return `The Manager of ${need.request.module} asks you`;
+    case 'left': return `PR #${need.plan.pr?.number ?? '?'} of ${need.plan.module}/${need.plan.plan} waits for you`;
+    case 'merge': return `${need.plan.module}/${need.plan.plan} passed CI`;
+    case 'escalated': return `${need.feature.module}/${need.feature.plan}/${need.feature.feature} is escalated`;
+    case 'action': return `${need.action.kind === 'gate' ? 'Gate' : 'Task'} ${need.module}/${need.action.id}: ${need.action.title}`;
+  }
+}
+
+/**
+ * What the daemon knows of a card that advice about it rests on: a later print that
+ * differs means the card isn't what it was. A card's own text is one with its key, so it
+ * isn't repeated here; what moves under a card is: a pull request's head, a gate's
+ * status, the plans its work builds on and how they stand.
+ */
+export function needPrint(need: Need): string {
+  const facts = (): unknown => {
+    switch (need.kind) {
+      case 'paused': return [need.paused.reason, need.paused.until ?? null];
+      case 'locked': return [need.module.locked?.head ?? null, need.rechecks];
+      case 'design': return [need.module.design?.head ?? null];
+      case 'proposal': return [need.version];
+      case 'escalation': return [];
+      case 'request': return [need.request.blocking];
+      case 'left': return [need.plan.leftToOwner?.head ?? null, need.plan.leftToOwner?.reason ?? null];
+      case 'merge': return [need.plan.pushed ?? need.plan.head];
+      case 'escalated': return [need.feature.attempts.length, need.feature.escalation ?? null];
+      case 'action': return [need.status?.status ?? 'pending', need.status?.reason ?? null, need.holds, need.waits.map((w) => `${w.plan} ${w.status}`)];
+    }
+  };
+  return JSON.stringify(facts());
+}
+
+/** The cards as an order request records them. */
+export const orderCards = (needs: Need[]): OrderCard[] => needs.map((need) => ({ key: need.key, title: needTitle(need), print: needPrint(need) }));
+
+/** Needs you, in the order to show it: the standard one, or the Manager's while it holds. */
+export interface Ordered {
+  needs: Need[];
+  by: 'standard' | 'manager';
+  /** Why each card is where the Manager put it; empty for one it left out, which the daemon put last. */
+  why: Record<string, string>;
+  /** The owner asked, and the Manager hasn't answered. */
+  waiting: boolean;
+  /** The Manager's order no longer holds: the titles of the cards that came since, and of those that changed. */
+  outdated?: { added: string[]; changed: string[] };
+}
+
+/**
+ * The cards in the Manager's order, while its advice is about the cards as they are: a
+ * card handled since leaves the rest in their order, but a card it never saw, or one that
+ * changed under it, makes the whole order one of another moment. Then, and before any
+ * answer, the standard order shows.
+ */
+export function orderNeeds(needs: Need[], order: OrderState | undefined): Ordered {
+  const standard: Ordered = { needs, by: 'standard', why: {}, waiting: false };
+  if (!order) return standard;
+  const asked = new Map(order.cards.map((card) => [card.key, card.print]));
+  // Every card of the request handled since: nothing is left of it to show.
+  if (!needs.some((need) => asked.has(need.key))) return standard;
+  if (!order.suggestion) return { ...standard, waiting: true };
+  const added = needs.filter((need) => !asked.has(need.key));
+  const changed = needs.filter((need) => asked.has(need.key) && asked.get(need.key) !== needPrint(need));
+  if (added.length > 0 || changed.length > 0) return { ...standard, outdated: { added: added.map(needTitle), changed: changed.map(needTitle) } };
+  const place = new Map(order.suggestion.order.map(({ key }, index) => [key, index]));
+  const position = (need: Need) => place.get(need.key) ?? place.size;
+  return {
+    needs: [...needs].sort((a, b) => position(a) - position(b)),
+    by: 'manager',
+    why: Object.fromEntries(order.suggestion.order.map(({ key, why }) => [key, why])),
+    waiting: false,
+  };
 }
 
 /** "P2", "P2 and P3", "P2, P3 and P4". */

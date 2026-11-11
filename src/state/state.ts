@@ -166,6 +166,8 @@ export interface ManagerState {
   status: 'starting' | 'running' | 'exited' | 'stopped';
   /** Claude Code processes started in this sandbox so far; the first uses `--session-id`, later ones `--resume`. */
   launch: number;
+  /** The harness tools its sandbox was made with: one made before a tool existed doesn't have it. Unknown for one made before 0.5.6. */
+  tools?: string[];
   launchedAt?: string;
   /** The size of its output when the current launch started: no growth means Claude never started. */
   launchedOutputBytes?: number;
@@ -175,7 +177,7 @@ export interface ManagerState {
   /** Items that need a decision, by key: when they were sent in the current launch, and reminded. */
   sent: Record<string, { launch: number; at: string; reminded?: string }>;
   /** Things to deliver once: the owner's messages and answers, the Architect's decisions, and the welcome. */
-  mail: Array<{ key: string; kind: 'welcome' | 'owner_message' | 'owner_answer' | 'decision'; text: string; requestId?: string }>;
+  mail: Array<{ key: string; kind: 'welcome' | 'owner_message' | 'owner_answer' | 'decision' | 'order_request'; text: string; requestId?: string }>;
 }
 
 /**
@@ -247,6 +249,30 @@ export interface OwnerRequest {
   answeredAt?: string;
 }
 
+/** A card under Needs you as an order request names it: its key, its title, and what the daemon knew of it then, which tells whether it changed since. */
+export interface OrderCard {
+  key: string;
+  title: string;
+  print: string;
+}
+
+/**
+ * The owner's latest request for an order of the cards under Needs you, and the Manager's
+ * answer once it came. It is advice about the cards as they were: the dashboard shows it
+ * while they are the same, less the ones handled since.
+ */
+export interface OrderState {
+  requestId: string;
+  module: string;
+  /** The key of the Manager that was asked. */
+  manager: string;
+  askedAt: string;
+  /** The cards as they were, in the standard order. */
+  cards: OrderCard[];
+  /** The cards' keys in the Manager's order, each with why it is there; `call` is the tool call that gave it. */
+  suggestion?: { at: string; call: string; order: Array<{ key: string; why: string }>; summary?: string };
+}
+
 /** The projection of the event log that the daemon and the dashboard read. Never edited by hand. */
 export interface State {
   v: 1;
@@ -277,6 +303,8 @@ export interface State {
   modules: Record<string, ModuleState>;
   /** Owner actions by "module/action". */
   actions: Record<string, ActionState>;
+  /** The order the owner last asked a Manager for, of the cards under Needs you. */
+  order?: OrderState;
   /** progress.txt lines waiting for the next feature commit, such as satisfied gates. */
   pendingProgress: string[];
 }
@@ -705,6 +733,21 @@ export function apply(state: State, event: HarnessEvent): State {
         manager.mail.push({ key: `mail:${event.id}`, kind: 'owner_message', text: event.payload.text });
       }
       break;
+    case 'ORDER_REQUESTED': {
+      // The latest request is the only one: an answer to an earlier one is refused.
+      const { requestId, module, manager, cards, text } = event.payload;
+      state.order = { requestId, module, manager, askedAt: event.ts, cards };
+      // An earlier request still waiting to be delivered is about cards as they no longer are.
+      for (const other of Object.values(state.managers)) other.mail = other.mail.filter((mail) => mail.kind !== 'order_request');
+      const asked = state.managers[manager];
+      if (asked && asked.status !== 'stopped') asked.mail.push({ key: `mail:${event.id}`, kind: 'order_request', text, requestId });
+      break;
+    }
+    case 'ORDER_SUGGESTED': {
+      const { requestId, call, order, summary } = event.payload;
+      if (state.order?.requestId === requestId) state.order.suggestion = { at: event.ts, call, order, ...(summary ? { summary } : {}) };
+      break;
+    }
     case 'MANAGER_STARTING': {
       const { module, plan, sandbox, sessionId } = event.payload;
       const key = managerKey(event.payload);
@@ -718,6 +761,7 @@ export function apply(state: State, event: HarnessEvent): State {
     case 'MANAGER_LAUNCHED':
       Object.assign(state.managers[managerKey(event.payload)]!, {
         status: 'running', launch: event.payload.launch, launchedAt: event.ts, launchedOutputBytes: event.payload.outputBytes,
+        ...(event.payload.tools ? { tools: event.payload.tools } : {}),
       });
       break;
     case 'MANAGER_EXITED': {

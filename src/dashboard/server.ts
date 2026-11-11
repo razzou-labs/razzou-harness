@@ -8,11 +8,11 @@ import type { Orchestrator, SetupStatus } from '../daemon/orchestrator.ts';
 import type { HarnessEvent } from '../state/events.ts';
 import type { SubscriptionUsage } from '../anthropic/usage.ts';
 import type { OwnerTime } from '../design/owner-time.ts';
-import { planDependencies } from '../design/schemas.ts';
 import type { State } from '../state/state.ts';
 import { readDockerUsage, type UsageReading } from '../sandbox/docker.ts';
 import { removeLeftOver, sandboxDenials, sandboxOverview, sharedReading } from '../daemon/sandboxes.ts';
 import { configView } from './config-view.ts';
+import { designView, type DesignView } from './design-view.ts';
 import { Terminals, type Size } from './terminals.ts';
 import { tokensByRole, type RoleTokens } from './tokens.ts';
 
@@ -36,7 +36,7 @@ export interface DashboardOptions {
 /** What `GET /api/state` returns. */
 export interface DashboardState {
   state: State;
-  design: ReturnType<typeof designSummary>;
+  design: DesignView;
   /** The owner's time, planned and used, once they set their hours (v3 §4.1). */
   ownerTime?: OwnerTime;
   /** The subscription's usage, as an agent's model call last reported it: for the meters, and the Swarm ceiling (v3 §4.3). */
@@ -128,7 +128,7 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
         case 'GET /api/state':
           return sendJson(res, {
             state: orchestrator.state,
-            design: designSummary(orchestrator),
+            design: designView(orchestrator.design),
             ...(orchestrator.state.budgets.ownerHours !== undefined ? { ownerTime: await orchestrator.ownerTime() } : {}),
             ...(orchestrator.usage ? { usage: orchestrator.usage } : {}),
             ...(orchestrator.state.mode === 'swarm' ? { setup: await orchestrator.setupStatus() } : {}),
@@ -192,6 +192,11 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
           // A positive number sets the owner's hours, null clears them, anything else leaves them alone.
           const hours = body.ownerHours === null ? null : typeof body.ownerHours === 'number' && Number.isFinite(body.ownerHours) && body.ownerHours > 0 ? body.ownerHours : undefined;
           return sendJson(res, { done: orchestrator.setBudgets({ ownerHours: hours }) });
+        }
+        case 'POST /api/order': {
+          // The owner asks a Manager in which order to handle the cards of Needs you.
+          const error = orchestrator.requestOrder();
+          return sendJson(res, error ? { done: false, error } : { done: true });
         }
         case 'POST /api/retry':
           return sendJson(res, { done: typeof body.feature === 'string' && orchestrator.retry(body.feature, text('note')) });
@@ -439,35 +444,6 @@ function serveFile(res: ServerResponse, webRoot: string, path: string, hosts: st
     'cache-control': file.endsWith('index.html') ? 'no-store' : 'max-age=31536000, immutable',
   });
   res.end(readFileSync(file));
-}
-
-function designSummary(orchestrator: Orchestrator) {
-  const { config, modules } = orchestrator.design;
-  return {
-    project: config.project.name,
-    repo: config.project.repo,
-    maxAttempts: config.roles.developer.maxAttempts,
-    attemptMinutes: config.roles.developer.attemptTimeoutMinutes,
-    // Each role's model and effort, for the active hours by agent; the reviewers run on the Manager's.
-    roles: Object.fromEntries((['architect', 'manager', 'developer'] as const).map((role) => [role, { model: config.roles[role].model, effort: config.roles[role].effort }])) as Record<'architect' | 'manager' | 'developer', { model: string; effort: string | null }>,
-    terraform: config.terraform !== undefined,
-    ownerTime: config.ownerTime,
-    swarm: config.swarm,
-    modules: modules.map((m) => ({
-      id: m.id,
-      plans: m.plans.map((p) => ({
-        // What the plan waits for, and each feature's dependencies, for the graph (v3 §6.7).
-        dependsOn: planDependencies(m, p),
-        id: p.id,
-        title: p.title,
-        goal: p.goal,
-        features: p.features.map((f) => ({ id: f.id, title: f.title, kind: f.kind, dependsOn: f.dependsOn, supersedes: f.supersedes, gates: f.gates, checks: f.checks.map((c) => ({ id: c.id, phase: c.phase, needs: c.needs })) })),
-      })),
-      actions: m.actions.map((a) => ({
-        id: a.id, kind: a.kind, title: a.title, when: a.when, blocks: a.blocks, instructions: a.instructions, verify: a.verify !== null, estimatedMinutes: a.estimatedMinutes,
-      })),
-    })),
-  };
 }
 
 /** The last lines of progress.txt on the most recently started plan branch. */
