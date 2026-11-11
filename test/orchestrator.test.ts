@@ -1546,6 +1546,8 @@ describe('dashboard', () => {
     const state = await call(port, '/api/state', bearer);
     assert.equal(state.status, 200);
     assert.equal(JSON.parse(state.body).design.project, 'toy');
+    // The gates a feature names go to the page, which says what each gate holds back.
+    assert.deepEqual((JSON.parse(state.body) as DashboardState).design.modules[0]!.plans[0]!.features.map((f) => f.gates), [[], []]);
     const login = await call(port, `/?token=${token}`, { host });
     assert.equal(login.status, 303);
     assert.match(String(login.headers['set-cookie']), new RegExp(`^harness_token_${port}=[0-9a-f]+; HttpOnly; SameSite=Strict`));
