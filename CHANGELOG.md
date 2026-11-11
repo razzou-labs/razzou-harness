@@ -3,6 +3,47 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## 0.5.9 (2026-11-11)
+
+**Upgrading from 0.5.8:** install the new version, rebuild the agents' image with
+`harness doctor --build-images` (its tag follows the harness's version), then restart the
+daemon with `harness down` and `harness up`, and reload the dashboard. A Manager started
+before the upgrade resolves a conflict too: the item says what to do, and it answers with
+`request_fix`, a tool it already has.
+
+- **A conflict with `main` is resolved through the plan's Manager.** `main` moves while
+  a plan is built or its pull request is open, when another plan merges or a design
+  change does. Git still merges it into the plan's branch when the two sides changed
+  different lines. When they changed the same lines, the conflict used to wait in the
+  plan's pull request for you to resolve in GitHub's editor. Now, in both modes:
+  - The daemon records it as soon as `main` has moved, and nothing new starts in the
+    plan. The Project view says which files conflict.
+  - The plan's Manager gets the files, what `main` gained, and both sides in its clone.
+    It says how each file must come out, with `request_fix`. When the two plans ask for
+    contradictory things, it asks the Architect instead.
+  - A Developer merges `main` in a fresh sandbox, following that. The daemon refuses a
+    result that leaves `main` out, keeps a conflict marker, or holds a protected file
+    otherwise than `main` does, then runs the checks of everything accepted on both
+    sides.
+  - The Manager reviews the merge like a feature. Accepted, it lands as one merge
+    commit; on an open pull request it is pushed, and CI and the reviewers run again.
+  - A merge that uses up its attempts is escalated like a feature: under **Needs you**
+    you give it one more, with a note.
+  - Between two features of one plan nothing changes: a conflict still interrupts the
+    later attempt, and the next one starts from the new head.
+- **Two dead ends are gone.**
+  - A pull request that conflicts with `main` no longer pauses the pipeline with "no CI
+    ran on PR #n within 10 minutes". GitHub runs no CI on such a pull request, and the
+    daemon now looks for the conflict before it waits for CI. It shows no card to merge
+    it either, as GitHub can't.
+  - A conflict that came with a change to the module's design no longer pauses the
+    pipeline with nothing to resume: the plan waits for its merge like any other.
+- **The Architect hears of each conflict**, in one line of its digest: plans meant to
+  build together should stay off the same files.
+- **The tests remove their temporary folders.** Every run of the test suite left its
+  folders of git repositories in the system's temporary directory, which in time used up
+  a disk's file count.
+
 ## 0.5.8 (2026-11-11)
 
 **Upgrading from 0.5.7:** install the new version, rebuild the agents' image with
