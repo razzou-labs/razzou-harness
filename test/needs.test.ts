@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
-import { heldBack, listNeeds, needPrint, needTitle, orderCards, orderNeeds, upstream, waitText, type Need } from '../src/dashboard/needs.ts';
+import { heldBack, listNeeds, moduleCompleted, needPrint, needTitle, orderCards, orderNeeds, upstream, waitText, type Need } from '../src/dashboard/needs.ts';
 import type { DashboardState } from '../src/dashboard/server.ts';
 import type { ModuleState, OrderState, PlanState, State } from '../src/state/state.ts';
 
@@ -50,6 +50,21 @@ const plansOf = (p3: PlanState['status']): State['plans'] => ({
   'web/P3': built('web', 'P3', p3),
   'web/P4': built('web', 'P4', 'completed'),
   'web/P5': built('web', 'P5', 'active'),
+});
+
+describe('a module', () => {
+  it('is complete once every plan the design has for it is, and not before it has one', () => {
+    assert.equal(moduleCompleted(teardown, { plans: plansOf('completed') }), false, 'P5 is still being built');
+    const all = { ...plansOf('completed'), 'web/P5': built('web', 'P5', 'completed') };
+    assert.equal(moduleCompleted(teardown, { plans: all }), true);
+    assert.equal(moduleCompleted(teardown, { plans: { ...all, 'web/P3': built('web', 'P3', 'verify_failed') } }), false);
+    // A design change that adds a plan gives it one to build again.
+    assert.equal(moduleCompleted({ ...teardown, plans: [...teardown.plans, plan('P6', ['P5'], [feature('F11')])] }, { plans: all }), false);
+    // Designed and not started, without a plan yet, or not designed at all.
+    assert.equal(moduleCompleted(teardown, { plans: {} }), false);
+    assert.equal(moduleCompleted({ id: 'web', plans: [] }, { plans: all }), false);
+    assert.equal(moduleCompleted(undefined, { plans: all }), false);
+  });
 });
 
 describe('needs you', () => {

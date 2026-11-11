@@ -305,7 +305,9 @@ behind a token. Its views:
   command that deletes its sandbox, and the daemon starts a new one, without the old
   one's conversation.
 - **Project:** modules, proposals, plans and features, with attempts, findings, CI,
-  deploys and `progress.txt`; and the budgets: your hours, the agents' active hours in
+  deploys and `progress.txt`. A module's badge is its design's state, `frozen` once
+  merged; **module completed** joins it once every plan of the module is complete. And
+  the budgets: your hours, the agents' active hours in
   a table by agent with each one's model and effort, the tokens Claude used, written
   and read, in a table by role, and your subscription's usage as
   bars, one per window your plan has, each with when it resets: a five-hour session and
