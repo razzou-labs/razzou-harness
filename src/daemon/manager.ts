@@ -259,11 +259,13 @@ export class Managers {
   /** Checks out an attempt in the Manager's clone, so it reviews the real files with git. */
   private async show(manager: ManagerState, item: Item): Promise<void> {
     const o = this.o;
-    const { attempt, branch } = item.show!;
+    const { attempt, branch, main } = item.show!;
     const attemptRef = attempt ? attemptRefName(attempt) : undefined;
     const head = attemptRef ? await o.repo.revParse(attemptRef) : undefined;
     const local = join(this.localDir(manager), 'review.bundle');
-    await o.repo.bundle([`refs/heads/${branch}`, ...(head && attemptRef ? [attemptRef] : [])], local);
+    // With main, for a conflict or a merge round's result: it is fetched as harness/main, beside the branch.
+    const refs = new Set([`refs/heads/${branch}`, ...(main ? ['refs/heads/main'] : []), ...(head && attemptRef ? [attemptRef] : [])]);
+    await o.repo.bundle([...refs], local);
     const p = this.paths(manager);
     await o.uploadBundle(manager.sandbox, local, p.harness);
     const result = await o.exec(manager.sandbox, [

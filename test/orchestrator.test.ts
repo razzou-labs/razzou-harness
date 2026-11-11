@@ -2491,3 +2491,163 @@ describe('one module at a time', () => {
     assert.equal(f01.attempts.at(-1)!.status, 'accepted');
   });
 });
+
+describe('conflicts with main', () => {
+  const plan = (o: Orchestrator, id = 'P1') => o.state.plans[`demo/${id}`];
+  const mainOf = async (o: Orchestrator) => (await o.repo.revParse('refs/heads/main'))!;
+  const resolved: StubBehavior = { files: { 'src/shared.txt': 'one\nmain\n' } };
+  /**
+   * F01 also writes a shared file, which main gets too, with other lines, while F02 is
+   * built; the merge round's Developer keeps both, from its first attempt unless `first` says otherwise.
+   */
+  const sharing = (first: StubBehavior = resolved) => (f: string, attempt: number): StubBehavior => {
+    if (f === 'F01') return { files: { ...SOLUTIONS.F01, 'src/shared.txt': 'one\n' } };
+    if (f.startsWith('fix')) return attempt === 1 ? first : resolved;
+    return { ...solved(f), sleepSec: 3 };
+  };
+
+  it('has a conflict with main resolved through the Manager: nothing starts meanwhile, a Developer merges, and the merge lands with both parents', async () => {
+    const { orchestrator: o, harnessDir } = await setup(sharing());
+    await until(o, () => feature(o, 'F01')?.status === 'accepted');
+    await commitOnMain(join(harnessDir, '..'), { 'src/shared.txt': 'main\n' }, 'the owner writes the shared file');
+    await until(o, completed(o), 90_000);
+
+    const events = o.store.readAll();
+    const conflict = events.find((e) => e.type === 'PLAN_MAIN_CONFLICT')!;
+    const main = await mainOf(o);
+    assert.deepEqual(conflict.payload, { main, files: ['src/shared.txt'] });
+    assert.equal(o.state.pipeline.paused, undefined);
+    // The Manager got the conflict, and asked for the merge round.
+    assert.ok(events.some((e) => e.type === 'MANAGER_ITEM_SENT' && (e.payload as { key: string }).key === `conflict:demo/P1@${main}`));
+    const request = events.find((e) => e.type === 'REQUEST_FIX')!;
+    assert.deepEqual((request.payload as { merge?: unknown }).merge, { main, files: ['src/shared.txt'] });
+    // Nothing started in the plan between the conflict and the merge round.
+    const between = events.slice(events.indexOf(conflict), events.indexOf(request)).filter((e) => e.type === 'ATTEMPT_STARTING' || e.type === 'PLAN_VALIDATING');
+    assert.deepEqual(between, []);
+
+    const fix = feature(o, 'fix1')!;
+    assert.equal(fix.status, 'accepted');
+    assert.deepEqual([fix.fix!.kind, fix.fix!.round, fix.fix!.resume], ['merge', 1, 'active']);
+    const task = readFileSync(join(harnessDir, 'modules/demo/attempts/P1-fix1-a1/task.md'), 'utf8');
+    assert.match(task, /^# Feature demo\/P1\/fix1: Merge main, round 1$/m);
+    assert.match(task, /## The merge[\s\S]*- `src\/shared\.txt`[\s\S]*Run `git merge main`/);
+    assert.match(task, /each must exit 0:\n\n- `bash harness\/modules\/demo\/checks\/F01\.sh` \(F01-greet\)\n- `bash harness\/modules\/demo\/checks\/F02\.sh` \(F02-add\)/);
+    assert.match(task, /## Guidance for this attempt\n\nStub resolution: keep the lines of both sides/);
+
+    // It landed as the merge of main into the plan branch, with the Developer's resolution.
+    const landed = await o.repo.commitInfo(fix.commit!);
+    assert.deepEqual(landed.parents, [fix.attempts[0]!.base, main]);
+    assert.match(landed.message, /^merge\(demo\/P1\): main, round 1\n\nConflicts resolved in src\/shared\.txt\./);
+    const head = plan(o)!.head;
+    assert.ok(await o.repo.isAncestor(main, head));
+    assert.equal(await o.repo.show(head, 'src/shared.txt'), 'one\nmain\n');
+    assert.match((await o.repo.show(head, 'progress.txt'))!, /feature\.accepted demo\/P1\/F01 [\s\S]*merge\.accepted demo\/P1 round=1 attempt=1/);
+    assert.equal(plan(o)!.mainConflict, undefined);
+    assert.equal(plan(o)!.base, main);
+    assert.equal(feature(o, 'F02')!.status, 'accepted');
+  });
+
+  it("fails a merge round whose result leaves main out, and the next attempt merges with the Manager's guidance", async () => {
+    const { orchestrator: o, harnessDir } = await setup(sharing({ ...resolved, skipMerge: true }));
+    await until(o, () => feature(o, 'F01')?.status === 'accepted');
+    await commitOnMain(join(harnessDir, '..'), { 'src/shared.txt': 'main\n' }, 'the owner writes the shared file');
+    await until(o, completed(o), 90_000);
+
+    const fix = feature(o, 'fix1')!;
+    assert.deepEqual(fix.attempts.map((a) => a.status), ['failed', 'accepted']);
+    assert.match(fix.attempts[0]!.reason!, /^the result doesn't contain main at [0-9a-f]{8}: run `git merge main`/);
+    assert.match(readFileSync(join(harnessDir, 'modules/demo/attempts/P1-fix1-a2/task.md'), 'utf8'), /## The previous attempt\n\nIt failed: the result doesn't contain main/);
+    assert.ok(await o.repo.isAncestor(await mainOf(o), plan(o)!.head));
+  });
+
+  it('with the pull request ready, a conflict has main merged in by a Developer, pushed, and through CI again before the merge', async () => {
+    let skew = 0;
+    const { orchestrator: o, fake } = await setup((f, attempt) => ({ ...sharing()(f, attempt), sleepSec: 0 }), { github: true, now: () => Date.now() + skew });
+    await until(o, () => plan(o)?.status === 'ready_to_merge', 60_000);
+    const first = plan(o)!.head;
+    await ownerCommit(fake.remote, 'main', 'src/shared.txt', 'main\n');
+    // The pull request is looked at again a minute after its CI passed.
+    skew = 61_000;
+    await until(o, () => feature(o, 'fix1')?.status === 'accepted', 60_000);
+    assert.deepEqual([feature(o, 'fix1')!.fix!.kind, feature(o, 'fix1')!.fix!.resume], ['merge', 'pr_open']);
+    await until(o, () => plan(o)!.status === 'ready_to_merge', 60_000);
+
+    assert.equal(o.state.pipeline.paused, undefined);
+    const head = plan(o)!.head;
+    assert.notEqual(head, first);
+    assert.equal(plan(o)!.pushed, head);
+    assert.equal((await runOk('git', ['--git-dir', fake.remote, 'rev-parse', 'refs/heads/plan/demo/P1'])).trim(), head);
+    assert.ok(await o.repo.isAncestor(await mainOf(o), head));
+    assert.equal(plan(o)!.ci!.sha, head);
+    assert.equal(plan(o)!.mainConflict, undefined);
+    // GitHub merges it now.
+    await fake.merge(1);
+    skew += 61_000;
+    await until(o, completed(o));
+    assert.equal(await o.repo.show('refs/heads/main', 'src/shared.txt'), 'one\nmain\n');
+  });
+
+  it("doesn't pause for the CI GitHub never runs on a pull request that conflicts, and shows the owner no card to merge it", async () => {
+    let skew = 0;
+    const { orchestrator: o, fake } = await setup((f, attempt) => ({ ...sharing()(f, attempt), sleepSec: 0 }), {
+      github: true, now: () => Date.now() + skew, manager: { ignore: ['CONFLICT'] },
+    });
+    // No CI on this pull request, as on one GitHub can't merge.
+    fake.ci = () => undefined;
+    await until(o, () => plan(o)?.pr !== undefined && plan(o)!.ci?.status === 'pending', 60_000);
+    await ownerCommit(fake.remote, 'main', 'src/shared.txt', 'main\n');
+    // Past the ten minutes after which a pull request without CI pauses the pipeline.
+    skew = 11 * 60_000;
+    await until(o, () => plan(o)!.mainConflict !== undefined);
+    for (let i = 0; i < 5; i++) await o.tick();
+
+    assert.equal(o.state.pipeline.paused, undefined);
+    assert.equal(plan(o)!.status, 'pr_open');
+    assert.deepEqual(plan(o)!.mainConflict!.files, ['src/shared.txt']);
+    assert.deepEqual(needsNow(o).map((need) => need.kind), []);
+  });
+
+  it('in Swarm, two plans that wrote the same file both merge: the later one takes main in through its own Manager', async () => {
+    // P1 greets, and P2 adds and then writes a third file slowly, so that P1 merges while P2 is built; both write the shared file.
+    const split = async (dir: string) => {
+      const plans = join(dir, 'harness/modules/demo/plans');
+      const design = JSON.parse(readFileSync(join(plans, 'P1.json'), 'utf8')) as { features: Array<Record<string, unknown>>; [key: string]: unknown };
+      const [f01, f02] = design.features as [Record<string, unknown>, Record<string, unknown>];
+      delete f02.dependsOn;
+      const f03 = { id: 'F03', title: 'Three', description: 'src/three.txt exists.', expected: 'The file exists.', checks: [{ id: 'F03-file', run: 'test -f src/three.txt', phase: 'pre-merge', timeoutSec: 30 }] };
+      writeFileSync(join(plans, 'P1.json'), JSON.stringify({ ...design, features: [f01] }, null, 2));
+      writeFileSync(join(plans, 'P2.json'), JSON.stringify({ ...design, id: 'P2', title: 'Adding', dependsOn: [], features: [f02, f03] }, null, 2));
+      await runOk('git', ['-C', dir, 'add', '-A']);
+      await runOk('git', ['-C', dir, '-c', 'user.name=o', '-c', 'user.email=o@test.invalid', 'commit', '--quiet', '-m', 'plans']);
+    };
+    const decide = (f: string): StubBehavior => (f === 'F01' ? { files: { ...SOLUTIONS.F01, 'src/shared.txt': 'one\n' } }
+      : f === 'F02' ? { files: { ...SOLUTIONS.F02, 'src/shared.txt': 'two\n' } }
+        : f === 'F03' ? { files: { 'src/three.txt': '3\n' }, sleepSec: 8 }
+          : { files: { 'src/shared.txt': 'one\ntwo\n' } });
+    // The daemon's clock runs fast, so that a pull request it looks at once a minute doesn't hold the test.
+    let skew = 0;
+    const { orchestrator: o, fake } = await setup(decide, { github: true, prepare: split, config: { swarm: { requiredStatuses: [] } }, now: () => Date.now() + skew });
+    o.setMode('swarm');
+    const deadline = Date.now() + 150_000;
+    while (!['P1', 'P2'].every((p) => plan(o, p)?.status === 'completed')) {
+      if (Date.now() > deadline) throw new Error(`timed out; last events: ${o.store.readAll().slice(-10).map((e) => e.type).join(', ')}`);
+      await o.tick();
+      await sleep(100);
+      skew += 2_000;
+    }
+
+    assert.equal(o.state.pipeline.paused, undefined);
+    const merges = Object.values(o.state.features).filter((f) => f.fix?.kind === 'merge');
+    assert.deepEqual(merges.map((f) => [f.plan, f.status]), [['P2', 'accepted']]);
+    // P2's own Manager asked for the merge round, and nobody was left a pull request to resolve.
+    const request = o.store.readAll().find((e) => e.type === 'REQUEST_FIX')!;
+    assert.deepEqual([request.from, request.ref!.plan], ['manager', 'P2']);
+    const sent = o.store.readAll().filter((e) => e.type === 'MANAGER_ITEM_SENT' && (e.payload as { key: string }).key.startsWith('conflict:')).map((e) => e.payload as { key: string; plan?: string });
+    assert.deepEqual(sent.map((item) => [item.key, item.plan]), [[`conflict:demo/P2@${plan(o)!.mergeCommit}`, 'P2']]);
+    assert.equal(o.store.readAll().some((e) => e.type === 'PR_LEFT_TO_OWNER' && /conflict/i.test((e.payload as { reason: string }).reason)), false);
+    assert.deepEqual(fake.prs.map((pr) => pr.state), ['closed', 'closed']);
+    assert.equal(await o.repo.show('refs/heads/main', 'src/shared.txt'), 'one\ntwo\n');
+    assert.equal(await o.repo.show('refs/heads/main', 'src/add.sh'), SOLUTIONS.F02['src/add.sh']);
+    assert.equal(await o.repo.show('refs/heads/main', 'src/three.txt'), '3\n');
+  });
+});

@@ -70,6 +70,8 @@ export function listNeeds({ state, design }: { state: State; design: Design }): 
     .filter((p) => p.pr && (p.status === 'ready_to_merge' || p.status === 'pr_open'))
     .sort((a, b) => position(a) - position(b));
   for (const plan of open) {
+    // Main conflicts with the branch: GitHub can't merge the PR, and the plan's Manager has the conflict resolved first.
+    if (plan.mainConflict) continue;
     // In Swarm, the merge policy may leave a PR to the owner, with its reason (v3 §3.2).
     if (plan.leftToOwner) needs.push({ kind: 'left', key: `left:${plan.module}/${plan.plan}`, plan });
     else if (plan.status === 'ready_to_merge') needs.push({ kind: 'merge', key: `merge:${plan.module}/${plan.plan}`, plan });

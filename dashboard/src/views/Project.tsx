@@ -460,8 +460,10 @@ const Plan = defineComponent({
       }
       const rows = [
         ...plan.features.map((f) => ({ id: f.id, title: f.title, kind: f.kind as string, state: state.features[`${key}/${f.id}`], supersededBy: supersededBy.get(f.id) })),
-        ...fixes.map((f) => ({ id: f.feature, title: `Fix after ${f.fix!.kind === 'ci' ? 'CI' : 'the deploy'}, round ${f.fix!.round}`, kind: 'fix', state: f })),
+        ...fixes.map((f) => ({ id: f.feature, title: fixTitle(f.fix!), kind: f.fix!.kind === 'merge' ? 'merge' : 'fix', state: f })),
       ];
+      // A merge round under way: a Developer merges main, after a conflict the plan's Manager took.
+      const merging = planState?.status === 'fixing' && state.features[`${key}/fix${planState.fixes}`]?.fix?.kind === 'merge';
       // Each plan in a card of its own: its heading, its details and its features' table together.
       return (
         <QCard flat bordered class="plan q-mt-md">
@@ -473,7 +475,7 @@ const Plan = defineComponent({
               {planState?.mergedBy === 'daemon' && <span class="text-muted text-caption">merged by the daemon</span>}
               {planState?.ci && <Badge status={planState.ci.status} label={`CI ${planState.ci.status}`} />}
             </div>
-            {planState && <PlanDetails plan={planState} />}
+            {planState && <PlanDetails plan={planState} merging={merging} />}
             <QTable class="features q-mt-sm" flat bordered dense wrapCells hideBottom rowKey="id" rows={rows} columns={FEATURE_COLUMNS} pagination={{ rowsPerPage: 0 }} tableStyle="table-layout: fixed">
               {{
                 body: ({ row }: { row: (typeof rows)[number] }) => (
@@ -491,8 +493,14 @@ const Plan = defineComponent({
   },
 });
 
+/** A fix work item's title: what it follows, or the merge of main after a conflict. */
+function fixTitle(fix: NonNullable<FeatureState['fix']>): string {
+  if (fix.kind === 'merge') return `Merge of main, round ${fix.round}`;
+  return `Fix after ${fix.kind === 'ci' ? 'CI' : fix.kind === 'review' ? `the ${fix.role} review` : 'the deploy'}, round ${fix.round}`;
+}
+
 const PlanDetails = defineComponent({
-  props: { plan: { type: Object as PropType<PlanState>, required: true } },
+  props: { plan: { type: Object as PropType<PlanState>, required: true }, merging: { type: Boolean, default: false } },
   setup(props) {
     return () => {
       const plan = props.plan;
@@ -500,6 +508,12 @@ const PlanDetails = defineComponent({
       const postDeploy = plan.postDeploy;
       return (
         <div class="text-caption q-mt-xs">
+          {/* Main no longer merges into the branch: nothing new starts in the plan until a merge round lands. */}
+          {plan.mainConflict && (
+            <p class="q-my-xs text-warning">
+              Conflicts with main in {plan.mainConflict.files.join(', ')}: {props.merging ? 'a Developer is merging main in, for its Manager to review' : 'its Manager says how to resolve it, then a Developer merges main in'}.
+            </p>
+          )}
           {failedJobs.map((job) => (
             <Fold key={job.name} headerClass="text-negative" label={() => `CI job ${job.name}: ${job.conclusion}`}>
               <pre>{job.log ?? ''}</pre>

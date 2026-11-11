@@ -141,6 +141,8 @@ export class Orchestrator {
   private readonly unreviewed = new Set<string>();
   /** The Developers under way, by sandbox: their transcripts for the dashboard, and their channels for the harness tools. */
   private readonly developers = new Map<string, { follower: Follower; channel: AgentChannel }>();
+  /** By plan, the main and head last seen to merge without a conflict, so an open pull request is tried once per pair. */
+  private readonly mergesWithMain = new Map<string, string>();
   /** The reviewers under way, by sandbox: plans in parallel can be reviewed at once. */
   private readonly reviewers = new Map<string, { follower: Follower; channel: AgentChannel }>();
   /** What the policy refused the attempts under way, by sandbox, added up from their logs every minute. */
@@ -642,6 +644,8 @@ export class Orchestrator {
   private async buildStep(module: ModuleDesign, plan: Plan, planState: PlanState, running: number, limit: number): Promise<Step> {
     const planRef = { module: module.id, plan: plan.id };
     if (await this.mergeMain(planState)) return 'progress';
+    // Main conflicts with the branch: what would start now would build without main, so the plan waits for its merge round.
+    if (planState.mainConflict) return 'wait';
     if (this.state.mode === 'swarm') {
       const own = activeAttempts(this.state).filter(({ feature }) => feature.module === module.id && feature.plan === plan.id).length;
       return this.scheduleParallel(planRef, plan, planState, own, running, limit);
@@ -707,6 +711,8 @@ export class Orchestrator {
         return this.recheckIfChanged(plan);
       case 'fixing': {
         const fix = this.state.features[`${planKey(planRef)}/fix${plan.fixes}`]!;
+        // A merge round has the plan branch to itself: the plan's attempts under way land first.
+        if (fix.fix?.kind === 'merge' && !isActive(fix) && activeAttempts(this.state).some(({ feature }) => feature.module === plan.module && feature.plan === plan.plan)) return 'wait';
         // A Fix PR's branch starts from the merge.
         if (!(await this.repo.revParse(`refs/heads/${plan.branch}`))) await this.repo.setRef(`refs/heads/${plan.branch}`, plan.base, '');
         return (await this.scheduleWork({ ...planRef, feature: fix.feature }, this.lookup(fix).feature, fix)) ?? 'wait';
@@ -874,20 +880,16 @@ export class Orchestrator {
   /**
    * Main moved while a plan is built, as a design change or another plan's merge moves it:
    * the daemon merges it into the plan branch before the next attempt, progress.txt taking
-   * both sides' lines (§11.3). When other files conflict, the plan goes on from its base and
-   * the conflict is resolved in its pull request, unless main changed this module's design
-   * or the config, which the next attempt must see: then the pipeline pauses.
+   * both sides' lines (§11.3). When other files conflict, the conflict is recorded, and
+   * nothing new starts in the plan until a merge round has landed (v3 §6.6): the plan's
+   * Manager says how the files must come out, a Developer merges, and the next attempt
+   * sees main, a design change included.
    */
   private async mergeMain(plan: PlanState): Promise<boolean> {
     const main = (await this.repo.revParse('refs/heads/main'))!;
     if (plan.mainConflict?.main === main || (await this.repo.isAncestor(main, plan.head))) return false;
     const merged = await this.mergeMainInto(plan.head, plan.branch);
     if ('conflicts' in merged) {
-      const changed = await this.repo.changedFiles(await this.repo.mergeBase(main, plan.head), main);
-      if (changed.some((file) => file === 'harness/config.json' || file.startsWith(`harness/modules/${plan.module}/`))) {
-        this.pausePipeline(`main changed the design of ${plan.module}, and files that ${plan.branch} changed too, so the daemon can't merge it in: ${merged.conflicts.join(', ')}`);
-        return true;
-      }
       this.record({ type: 'PLAN_MAIN_CONFLICT', ref: { module: plan.module, plan: plan.plan }, payload: { main, files: merged.conflicts } });
       return true;
     }
@@ -948,15 +950,19 @@ export class Orchestrator {
       command: ['sleep', 'infinity'],
     });
 
-    await this.repo.bundle(`refs/heads/${branch}`, join(dir, 'plan.bundle'));
+    // A merge round (v3 §6.6) merges main at the commit that conflicted: its sandbox gets main with the plan branch.
+    const merge = mergeOf(state);
+    await this.repo.bundle(merge ? [`refs/heads/${branch}`, 'refs/heads/main'] : `refs/heads/${branch}`, join(dir, 'plan.bundle'));
     const previous = state.attempts.filter((a) => a.n < attempt.n && a.status === 'failed').at(-1);
     const progress = (await this.repo.show(`refs/heads/${branch}`, 'progress.txt')) ?? '';
     const mustKeep = await this.regressionChecks(attempt.base, ref);
     writeFileSync(join(dir, 'task.md'), buildTask({
       ref, plan, feature, previous,
       ...(attempt.guidance ? { guidance: attempt.guidance } : {}),
-      regressionChecks: mustKeep,
+      // The merge must pass the checks of both sides; before it, only the plan's can pass.
+      regressionChecks: merge ? distinct([...mustKeep, ...(await this.regressionChecks(merge.main, ref))]) : mustKeep,
       progressTail: progress.split('\n').slice(-21).join('\n'),
+      ...(merge ? { merge } : {}),
     }));
     copyFileSync(join(this.options.packageDir, 'roles', 'developer.md'), join(dir, 'developer.md'));
     writeFileSync(join(dir, 'report.schema.json'), reportJsonSchema());
@@ -972,6 +978,8 @@ export class Orchestrator {
       `git config user.name ${sh(DEVELOPER.name)}`,
       `git config user.email ${sh(DEVELOPER.email)}`,
       'git checkout --quiet -b attempt',
+      // `main` is the commit to merge, and progress.txt merges by itself: the daemon writes it when the merge lands.
+      ...(merge ? [`git branch --quiet -f main ${sh(merge.main)}`, "mkdir -p .git/info && echo 'progress.txt merge=union' >> .git/info/attributes"] : []),
     ].join(' && '));
     if (clone.code !== 0) return this.interrupt(state, attempt, `could not clone the plan branch: ${clone.stderr.trim()}`);
 
@@ -1063,11 +1071,35 @@ export class Orchestrator {
     if (!head) return this.fail(state, attempt, 'the Developer reported done but committed nothing');
 
     const files = await this.repo.changedFiles(attempt.base, head);
-    const touched = await protectedChanges(this.repo.treeReader(attempt.base), this.repo.treeReader(head), files, { progress: 'frozen' });
-    if (touched.length > 0) return this.fail(state, attempt, `changed protected files: ${touched.join(', ')}`);
+    const merge = mergeOf(state);
+    if (merge) {
+      const problem = await this.mergeProblem(head, merge);
+      if (problem) return this.fail(state, attempt, problem);
+    } else {
+      const touched = await protectedChanges(this.repo.treeReader(attempt.base), this.repo.treeReader(head), files, { progress: 'frozen' });
+      if (touched.length > 0) return this.fail(state, attempt, `changed protected files: ${touched.join(', ')}`);
+    }
     this.record({ type: 'CHECKS_STARTED', ref, payload: { head, files } });
     await this.driver.remove(attempt.sandbox);
     return 'progress';
+  }
+
+  /**
+   * Why a merge round's result can't land, if it can't. It must contain main, leave no
+   * conflict marker in the files that conflicted, and hold every protected file as main
+   * has it: the design and the checks are main's, and a plan branch never changes them.
+   * progress.txt is left out, as the daemon writes it when the merge lands.
+   */
+  private async mergeProblem(head: string, merge: { main: string; files: string[] }): Promise<string | undefined> {
+    if (!(await this.repo.isAncestor(merge.main, head))) {
+      return `the result doesn't contain main at ${merge.main.slice(0, 8)}: run \`git merge main\`, resolve the conflicts, and commit the merge`;
+    }
+    for (const file of merge.files) {
+      if (/^(<{7}|>{7}) /m.test((await this.repo.show(head, file)) ?? '')) return `conflict markers are left in ${file}`;
+    }
+    const changed = (await this.repo.changedFiles(merge.main, head)).filter((file) => file !== 'progress.txt');
+    const touched = await protectedChanges(this.repo.treeReader(merge.main), this.repo.treeReader(head), changed, { progress: 'append' });
+    return touched.length > 0 ? `protected files differ from main's: ${touched.join(', ')}` : undefined;
   }
 
   /** Step 8: every check in a fresh sandbox. If they pass, the attempt waits for the Manager's review. */
@@ -1125,7 +1157,8 @@ export class Orchestrator {
     const ref = refOf(state, attempt);
     const { feature } = this.lookup(state);
     const branch = this.state.plans[planKey(ref)]!.branch;
-    const landed = await this.alreadyLanded(branch, attempt, ref);
+    const merge = mergeOf(state);
+    const landed = await this.alreadyLanded(branch, attempt, ref, merge?.main);
     let base = attempt.base;
     let head = attempt.head!;
     const planHead = (await this.repo.revParse(`refs/heads/${branch}`))!;
@@ -1139,14 +1172,16 @@ export class Orchestrator {
       base = planHead;
       head = attempt.rebased!.commit;
     }
-    const commit = landed ?? (await this.repo.commitFeature({
+    const landing = {
       base,
       head,
       progressLine: this.progressLine(ref, attempt, state.fix),
       message: commitMessage(ref, feature, attempt, attempt.checks ?? [], state.fix),
       author: DEVELOPER,
       committer: HARNESS,
-    }));
+    };
+    // A merge round lands as the merge of main into the branch, with the Developer's resolution as its tree.
+    const commit = landed ?? (merge ? await this.repo.commitMerge({ ...landing, main: merge.main }) : await this.repo.commitFeature(landing));
     if (!landed) await this.repo.setRef(`refs/heads/${branch}`, commit, base);
     this.record({ type: 'FEATURE_ACCEPTED', ref, payload: { commit } });
     return 'progress';
@@ -1247,6 +1282,13 @@ export class Orchestrator {
       this.nextPoll.delete(key);
       return 'progress';
     }
+    // GitHub runs no CI on a pull request that conflicts with main: the conflict is the plan's Manager's, and CI isn't waited for.
+    const conflict = await this.conflictWithMain(plan);
+    if (conflict) {
+      if (conflict === 'wait') this.nextPoll.set(key, this.now() + 60_000);
+      else this.nextPoll.delete(key);
+      return conflict;
+    }
     // CI is read until it passed: a run the owner starts again on GitHub counts too.
     if (plan.ci?.status === 'pending' || plan.ci?.status === 'failed') {
       const step = await this.readCi(plan);
@@ -1274,6 +1316,36 @@ export class Orchestrator {
     const quiet = plan.ci ? this.now() - Date.parse(plan.ci.since) : 0;
     this.nextPoll.set(key, this.now() + (plan.ci?.status === 'pending' ? 30_000 : quiet < 600_000 ? 60_000 : 300_000));
     return 'wait';
+  }
+
+  /**
+   * Whether main still merges into an open pull request's branch, tried once per main
+   * and head. A conflict is recorded, and 'wait' is the answer while the plan's Manager
+   * has it; undefined when there is none. A main that merges again, after one that
+   * didn't, is merged in at once, so the pull request gets a head CI can run on.
+   */
+  private async conflictWithMain(plan: PlanState): Promise<Step | undefined> {
+    const key = planKey(plan);
+    const ref = { module: plan.module, plan: plan.plan };
+    const main = (await this.repo.revParse('refs/heads/main'))!;
+    if (await this.repo.isAncestor(main, plan.head)) return undefined;
+    if (plan.mainConflict?.main === main) return 'wait';
+    const tried = `${main} ${plan.head}`;
+    if (this.mergesWithMain.get(key) === tried) return undefined;
+    const files = await this.repo.conflicts(plan.head, main, ['progress.txt']);
+    if (files.length > 0) {
+      this.record({ type: 'PLAN_MAIN_CONFLICT', ref, payload: { main, files } });
+      return 'progress';
+    }
+    if (plan.mainConflict) {
+      const merged = await this.mergeMainInto(plan.head, plan.branch);
+      if (!('conflicts' in merged)) {
+        this.record({ type: 'PLAN_MAIN_MERGED', ref, payload: { main, head: merged.commit } });
+        return 'progress';
+      }
+    }
+    this.mergesWithMain.set(key, tried);
+    return undefined;
   }
 
   /**
@@ -1314,8 +1386,9 @@ export class Orchestrator {
     const main = (await this.repo.revParse('refs/heads/main'))!;
     if (!(await this.repo.isAncestor(main, pr.head))) {
       const merged = await this.mergeMainInto(pr.head, plan.branch);
-      if ('conflicts' in merged) return leave(`it conflicts with main in ${merged.conflicts.join(', ')}: resolve them on GitHub, and the daemon takes your push`);
-      this.record({ type: 'PLAN_MAIN_MERGED', ref, payload: { main, head: merged.commit } });
+      // A conflict is the plan's Manager's (v3 §6.6): CI and the reviewers then run on the merge round's result.
+      if ('conflicts' in merged) this.record({ type: 'PLAN_MAIN_CONFLICT', ref, payload: { main, files: merged.conflicts } });
+      else this.record({ type: 'PLAN_MAIN_MERGED', ref, payload: { main, head: merged.commit } });
       return true;
     }
     const statuses = await this.forge.commitStatuses(pr.head);
@@ -2074,11 +2147,13 @@ export class Orchestrator {
   }
 
   /** The plan branch may already hold this attempt's commit if the previous process stopped right after writing it. */
-  private async alreadyLanded(branch: string, attempt: Attempt, ref: Ref): Promise<string | undefined> {
+  private async alreadyLanded(branch: string, attempt: Attempt, ref: Ref, merged?: string): Promise<string | undefined> {
     const head = await this.repo.revParse(`refs/heads/${branch}`);
     if (!head || head === attempt.base) return undefined;
     const info = await this.repo.commitInfo(head);
-    const mine = info.parents.length === 1 && info.parents[0] === attempt.base
+    // A merge round's commit has main as its second parent.
+    const parents = merged ? [attempt.base, merged] : [attempt.base];
+    const mine = info.parents.join(' ') === parents.join(' ')
       && info.message.includes(`Feature: ${featureKey(ref)}\n`) && info.message.includes(`Attempt: ${ref.attempt}\n`);
     return mine ? head : undefined;
   }
@@ -2180,7 +2255,7 @@ export class Orchestrator {
   /** This attempt's line, after any waiting for a commit, such as satisfied gates (§8.5). */
   private progressLine(ref: Ref, attempt: Attempt, fix?: FeatureState['fix']): string {
     const summary = clip((attempt.summary ?? '').replace(/\s+/g, ' ').replaceAll('"', "'"), 160);
-    const what = fix ? `fix.accepted ${ref.module}/${ref.plan} round=${fix.round}` : `feature.accepted ${featureKey(ref)}`;
+    const what = fix ? `${fix.kind === 'merge' ? 'merge' : 'fix'}.accepted ${ref.module}/${ref.plan} round=${fix.round}` : `feature.accepted ${featureKey(ref)}`;
     return [...this.state.pendingProgress, `${new Date(this.now()).toISOString()} ${what} attempt=${ref.attempt} "${summary}"`].join('\n');
   }
 }
@@ -2190,8 +2265,25 @@ export function makeForge(config: Config, projectDir: string): Forge {
   return config.project.repo ? new GitHubForge(new GitHubClient(loadAppCredentials(), config.project.repo)) : new LocalForge(projectDir);
 }
 
-/** A fix round, described as a feature so that it runs like one. It has no checks of its own: CI, or the reviewer, is its check. */
+/**
+ * A fix round, described as a feature so that it runs like one. It has no checks of its
+ * own: CI, or the reviewer, is its check; a merge round's are those of both sides.
+ */
 function fixDefinition(id: string, plan: string, fix: NonNullable<FeatureState['fix']>): Feature {
+  if (fix.kind === 'merge') {
+    return {
+      id,
+      title: `Merge main, round ${fix.round}`,
+      kind: 'app',
+      description: `Main no longer merges into the branch of plan ${plan}. Merge it, and resolve the conflicts so that the work of both sides holds, without changing anything else.\n\n${fix.failure}`,
+      expected: 'The plan branch contains main, the work of both sides holds, and every check listed below passes.',
+      dependsOn: [],
+      supersedes: [],
+      gates: [],
+      resources: [],
+      checks: [],
+    };
+  }
   if (fix.kind === 'review') {
     return {
       id,
@@ -2219,6 +2311,16 @@ function fixDefinition(id: string, plan: string, fix: NonNullable<FeatureState['
     resources: [],
     checks: [],
   };
+}
+
+/** A merge round's main and the files that conflicted, when the work item is one. */
+function mergeOf(state: FeatureState): { main: string; files: string[] } | undefined {
+  return state.fix?.kind === 'merge' && state.fix.main ? { main: state.fix.main, files: state.fix.files ?? [] } : undefined;
+}
+
+/** Checks, each once: what both sides of a merge must keep passing. */
+function distinct(checks: Check[]): Check[] {
+  return [...new Map(checks.map((check) => [check.id, check])).values()];
 }
 
 /**
@@ -2269,8 +2371,12 @@ function outcomeReason(attempt: Attempt): string {
 }
 
 function commitMessage(ref: Ref, feature: Feature, attempt: Attempt, results: CheckResult[], fix?: FeatureState['fix']): string {
+  const subject = !fix ? `feat(${featureKey(ref)}): ${feature.title}`
+    : fix.kind === 'merge' ? `merge(${ref.module}/${ref.plan}): main, round ${fix.round}`
+      : `fix(${ref.module}/${ref.plan}): ${fix.kind === 'ci' ? 'CI' : fix.kind === 'review' ? `the ${fix.role} review` : 'the deploy'}, round ${fix.round}`;
   return [
-    fix ? `fix(${ref.module}/${ref.plan}): ${fix.kind === 'ci' ? 'CI' : fix.kind === 'review' ? `the ${fix.role} review` : 'the deploy'}, round ${fix.round}` : `feat(${featureKey(ref)}): ${feature.title}`,
+    subject,
+    ...(fix?.kind === 'merge' ? ['', `Conflicts resolved in ${(fix.files ?? []).join(', ')}.`] : []),
     ...(fix ? [] : ['', feature.description]),
     ...(attempt.summary ? ['', attempt.summary] : []),
     '',

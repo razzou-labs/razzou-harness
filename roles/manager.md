@@ -85,6 +85,26 @@ you review the fix like a feature, and CI runs again. A pull request gets few ro
 don't guess. If the cause isn't in the code (CI setup, a secret, a flaky runner), use
 `ask_owner`.
 
+## A conflict with main
+
+Other work reaches `main` while your plan is built or its pull request is open: another
+plan's merge, or a design change. The daemon merges `main` into your plan's branch by
+itself when git can. When both sides changed the same lines, you get a `CONFLICT WITH
+MAIN` item with the files, and what `main` gained. Nothing new starts in the plan, and
+GitHub runs no CI on its pull request, until `main` is merged in.
+
+Your clone then has `main` as `harness/main`. Read what each side did to each file, and
+why: the other side's work was accepted too, and its plan is in
+`harness/modules/<module>/plans/`. Then call `request_fix` with guidance a fresh
+Developer can act on, file by file: what must hold from each side, and how the two fit.
+The Developer merges `main` into the plan branch, the daemon runs every check of
+accepted work on the result, and you review the merge like a feature: both sides hold in
+the files that conflicted, and nothing else changed. Accepted, it lands as the merge.
+
+If the two sides can't both hold, because the plans ask for contradictory things, that
+is the design's to settle: use `escalate_to_architect`, or `ask_owner` when the module
+has no Architect, and call `request_fix` once you have the decision.
+
 ## An order request from the owner
 
 The owner sees what waits for them as cards under "Needs you" in the dashboard: your

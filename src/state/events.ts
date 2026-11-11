@@ -59,7 +59,10 @@ interface Payloads {
   PLAN_STARTED: { branch: string; base: string };
   /** Main moved while the plan was built, as a design change makes it: merged into the plan branch. */
   PLAN_MAIN_MERGED: { main: string; head: string };
-  /** Main moved, but its changes conflict with the plan branch's in `files`: the plan goes on from its base, and the conflict is resolved in its pull request. */
+  /**
+   * Main moved, but its changes conflict with the plan branch's in `files`: nothing new
+   * starts in the plan until its Manager has the conflict resolved in a merge round.
+   */
   PLAN_MAIN_CONFLICT: { main: string; files: string[] };
   /** The owner pushed to the plan's PR branch on GitHub, on top of what the harness pushed: the daemon builds on the new head. */
   PLAN_HEAD_ADOPTED: { head: string };
@@ -180,8 +183,12 @@ interface Payloads {
   /** The Manager's answer: the request's cards in its order, each with why; `call` is its tool call. It changes nothing else. */
   ORDER_SUGGESTED: { module: string; requestId: string; call: string; order: Array<{ key: string; why: string }>; summary?: string };
   PLAN_SUBMITTED: { requestId: string; summary: string };
-  /** The Manager asks for a fix round after CI failed, or the daemon after a reviewer blocked (`review`); `failure` is what was reported. */
-  REQUEST_FIX: { requestId: string; guidance: string; failure: string; review?: ReviewerRole };
+  /**
+   * The Manager asks for a fix round after CI failed, or the daemon after a reviewer
+   * blocked (`review`); `failure` is what was reported. With `merge`, the round merges
+   * main at that commit into the plan branch, which conflicts with it in `files`.
+   */
+  REQUEST_FIX: { requestId: string; guidance: string; failure: string; review?: ReviewerRole; merge?: { main: string; files: string[] } };
   PROPOSAL: { module: string; requestId: string; version: number; sha256: string };
   /** The Architect submits its design; `head` is its commit, now in the daemon's repository. */
   DESIGN: { module: string; requestId: string; summary: string; head: string };

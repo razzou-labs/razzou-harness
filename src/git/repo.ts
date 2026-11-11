@@ -105,23 +105,38 @@ export class Repo {
    */
   async merge(options: { ours: string; theirs: string; message: string; committer: Identity; union?: string[] }): Promise<{ commit: string } | { conflicts: string[] }> {
     if (await this.isAncestor(options.ours, options.theirs)) return { commit: options.theirs };
-    const result = await run('git', ['--git-dir', this.dir, 'merge-tree', '--write-tree', '-z', '--name-only', '--no-messages', options.ours, options.theirs], { env: ISOLATED });
-    const [tree, ...names] = nulSeparated(result.stdout);
-    if ((result.code !== 0 && result.code !== 1) || !tree) throw new Error(`git merge-tree failed: ${result.stderr.trim()}`);
-    let merged = tree;
-    if (result.code === 1) {
-      const conflicts = [...new Set(names)];
-      const appended = conflicts.every((file) => options.union?.includes(file)) ? await this.appendedOnBothSides(options.ours, options.theirs, conflicts) : undefined;
-      if (!appended) return { conflicts };
-      merged = await this.treeWith(tree, appended);
-    }
+    const merged = await this.mergeTree(options.ours, options.theirs, options.union);
+    if ('conflicts' in merged) return merged;
     const identity = {
       GIT_AUTHOR_NAME: options.committer.name,
       GIT_AUTHOR_EMAIL: options.committer.email,
       GIT_COMMITTER_NAME: options.committer.name,
       GIT_COMMITTER_EMAIL: options.committer.email,
     };
-    return { commit: (await this.git(['commit-tree', merged, '-p', options.ours, '-p', options.theirs, '-F', '-'], identity, options.message)).trim() };
+    return { commit: (await this.git(['commit-tree', merged.tree, '-p', options.ours, '-p', options.theirs, '-F', '-'], identity, options.message)).trim() };
+  }
+
+  /** The files in which merging `theirs` into `ours` would conflict, by the rules of `merge`; none when it merges. No commit is written. */
+  async conflicts(ours: string, theirs: string, union?: string[]): Promise<string[]> {
+    if (await this.isAncestor(ours, theirs)) return [];
+    const merged = await this.mergeTree(ours, theirs, union);
+    return 'conflicts' in merged ? merged.conflicts : [];
+  }
+
+  /** The merged tree of two commits, or the files that conflict. */
+  private async mergeTree(ours: string, theirs: string, union?: string[]): Promise<{ tree: string } | { conflicts: string[] }> {
+    const result = await run('git', ['--git-dir', this.dir, 'merge-tree', '--write-tree', '-z', '--name-only', '--no-messages', ours, theirs], { env: ISOLATED });
+    const [tree, ...names] = nulSeparated(result.stdout);
+    if ((result.code !== 0 && result.code !== 1) || !tree) throw new Error(`git merge-tree failed: ${result.stderr.trim()}`);
+    if (result.code === 0) return { tree };
+    const conflicts = [...new Set(names)];
+    const appended = conflicts.every((file) => union?.includes(file)) ? await this.appendedOnBothSides(ours, theirs, conflicts) : undefined;
+    return appended ? { tree: await this.treeWith(tree, appended) } : { conflicts };
+  }
+
+  /** A file both sides only appended to, as `merge` writes it for `union`: theirs' lines, then ours'. Undefined when a side did more than append. */
+  async unionOf(ours: string, theirs: string, file: string): Promise<string | undefined> {
+    return (await this.appendedOnBothSides(ours, theirs, [file]))?.[file];
   }
 
   /** Each file's lines added by theirs, then by ours, on top of the merge base; undefined when a side did more than append. */
@@ -171,6 +186,11 @@ export class Repo {
     return this.git(['log', '--oneline', `-n${count}`, ref]);
   }
 
+  /** What `head` gained since `base`, newest first, one line each: a merged pull request shows as its merge, not as its commits. */
+  async gained(base: string, head: string, count: number): Promise<string[]> {
+    return lines(await this.git(['log', '--first-parent', '--format=%h %s', `-n${count}`, `${base}..${head}`]));
+  }
+
   /** Parents and message of a commit, to recognise one the daemon wrote just before a restart. */
   async commitInfo(ref: string): Promise<{ parents: string[]; message: string }> {
     const [parents = '', message = ''] = (await this.git(['log', '-1', '--format=%P%x00%B', ref])).split('\0');
@@ -202,9 +222,40 @@ export class Repo {
     });
   }
 
-  /** One commit on `parent` with the tree of `tree`, some files replaced. Nothing is checked out. */
+  /**
+   * Lands a merge round as one commit that merges `main` into `base`, with the tree a
+   * Developer resolved at `head`. progress.txt is written here, as `merge` writes it:
+   * main's lines, then the plan's, then this round's line.
+   */
+  async commitMerge(options: {
+    base: string;
+    main: string;
+    head: string;
+    progressLine: string;
+    message: string;
+    author: Identity;
+    committer: Identity;
+  }): Promise<string> {
+    const progress = (await this.unionOf(options.base, options.main, 'progress.txt')) ?? (await this.show(options.head, 'progress.txt')) ?? '';
+    const separator = progress === '' || progress.endsWith('\n') ? '' : '\n';
+    return this.commitTree({
+      parent: options.base,
+      merged: options.main,
+      tree: options.head,
+      files: { 'progress.txt': `${progress}${separator}${options.progressLine}\n` },
+      message: options.message,
+      author: options.author,
+      committer: options.committer,
+    });
+  }
+
+  /**
+   * One commit on `parent` with the tree of `tree`, some files replaced. Nothing is
+   * checked out. With `merged`, it is the merge of that commit into `parent`.
+   */
   async commitTree(options: {
     parent: string;
+    merged?: string;
     tree: string;
     files: Record<string, string>;
     message: string;
@@ -218,7 +269,8 @@ export class Repo {
       GIT_COMMITTER_NAME: options.committer.name,
       GIT_COMMITTER_EMAIL: options.committer.email,
     };
-    return (await this.git(['commit-tree', tree, '-p', options.parent, '-F', '-'], identity, options.message)).trim();
+    const parents = ['-p', options.parent, ...(options.merged ? ['-p', options.merged] : [])];
+    return (await this.git(['commit-tree', tree, ...parents, '-F', '-'], identity, options.message)).trim();
   }
 
   /** The tree of `treeish` with some files replaced, written with a scratch index. */

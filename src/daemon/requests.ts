@@ -6,7 +6,7 @@ import { INPUTS, TOOLS, type Role, type ToolInput, type ToolName } from '../role
 import { activeAttempts, attemptInSandbox, featureKey, managerKey, planKey, type Attempt, type FeatureState } from '../state/state.ts';
 import { clip, sh, sha256, tail } from '../util.ts';
 import type { AgentRequest } from './channel.ts';
-import { attemptsLeft, ciReport, deployReport } from './items.ts';
+import { attemptsLeft, ciReport, conflictReport, CONFLICT_STATUSES, deployReport } from './items.ts';
 import type { Orchestrator } from './orchestrator.ts';
 import { refOf } from './refs.ts';
 
@@ -187,6 +187,7 @@ const HANDLERS: Handlers = {
       plan: planKey(p),
       status: p.status,
       ...(p.validation ? { fullCheckRun: p.validation.status } : {}),
+      ...(p.mainConflict ? { conflictsWithMainIn: p.mainConflict.files } : {}),
       features: Object.values(o.state.features).filter((f) => f.module === module && f.plan === p.plan).map(featureSummary),
     }));
     const requests = Object.values(o.state.ownerRequests).filter((r) => r.module === module)
@@ -200,10 +201,19 @@ const HANDLERS: Handlers = {
     return ok(ciReport(state));
   },
 
-  request_fix({ o, agent, requestId }, { plan, guidance }) {
+  async request_fix({ o, agent, requestId }, { plan, guidance }) {
     const state = o.state.plans[plan];
     if (!state || !inScope(agent, state)) return refuse(`${plan} is not ${agent.plan ? 'your plan' : 'a plan of your module'}.`);
     if (state.status === 'fixing') return ok(`A fix of ${plan} is already under way.`);
+    // Main conflicts with the branch (v3 §6.6): a merge round, which comes before anything CI could say.
+    if (state.mainConflict && CONFLICT_STATUSES.includes(state.status)) {
+      o.record({
+        type: 'REQUEST_FIX', ref: { module: state.module, plan: state.plan }, from: 'manager', to: 'daemon',
+        payload: { requestId, guidance, failure: await conflictReport(o, state), merge: state.mainConflict },
+      });
+      o.kick();
+      return ok(`Merge round ${state.mergeRounds} of ${plan} starts: a Developer merges main into the plan branch with your guidance, and you review the merge.`);
+    }
     if (state.status === 'deploy_failed' || state.status === 'verify_failed') {
       const limit = o.design.config.brakes.deployFixRounds;
       if ((state.deployFixRounds ?? 0) >= limit) return refuse(`${plan} used its ${limit} Fix PR(s): the owner decides now.`);
