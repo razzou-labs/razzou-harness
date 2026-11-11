@@ -2,11 +2,12 @@ import { matDarkMode, matLightMode, matPause, matPlayArrow } from '@quasar/extra
 import { Dark, QBadge, QBanner, QBtn, QHeader, QLayout, QPage, QPageContainer, QTab, QTabs, QToolbar, QToolbarTitle, QTooltip } from 'quasar';
 import { defineComponent, onUnmounted, ref } from 'vue';
 import { connect, harness, post, type DashboardState, type Outcome } from './api.ts';
+import { listNeeds } from './needs.ts';
 import { Action, Badge, Command, confirm, Loading, toggleDark } from './ui.tsx';
 import { Agents } from './views/Agents.tsx';
 import { Config } from './views/Config.tsx';
 import { Events } from './views/Events.tsx';
-import { collectNeeds, NeedsYou } from './views/NeedsYou.tsx';
+import { NeedsYou } from './views/NeedsYou.tsx';
 import { Project } from './views/Project.tsx';
 import { Sandboxes } from './views/Sandboxes.tsx';
 
@@ -36,7 +37,7 @@ export const App = defineComponent({
     return () => {
       const data = harness.data;
       if (!data) return harness.problem ? <div class="q-pa-lg text-body1">{harness.problem}</div> : <Loading class="q-pa-lg" text="Connecting to the daemon…" />;
-      const needs = collectNeeds(data, go).length;
+      const needs = listNeeds(data).length;
       const { view, detail } = current.value;
       return (
         <QLayout view="hHh lpR fFf">

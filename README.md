@@ -286,8 +286,14 @@ plans it finds there (see [Configuration](#configuration)).
 
 `harness up` runs the daemon in the foreground and opens the dashboard: localhost only,
 behind a token. Its views:
-- **Needs you:** questions from the Manager, proposals to accept, pull requests to merge,
-  escalations, owner actions, a paused pipeline. Each has its button or form.
+- **Needs you:** a paused pipeline, the Architects' pull requests and proposals,
+  questions from the Manager, pull requests to merge, escalations, owner actions. Each
+  has its button or form. They are numbered in the order to handle them: what changes
+  the design first, and gates and tasks last, since marking one done starts the work it
+  held back. The daemon holds back whatever isn't ready, so most cards can't be handled
+  too early. A gate can: its card shows its `when`, what it holds back, and any plan
+  that work builds on that isn't complete, with a warning once that plan's deploy or
+  post-deploy checks failed.
 - **Project:** modules, proposals, plans and features, with attempts, findings, CI,
   deploys and `progress.txt`; and the budgets: your hours, the agents' active hours in
   a table by agent with each one's model and effort, the tokens Claude used, written
@@ -514,7 +520,7 @@ through an `Arch:` pull request, or a commit of your own on `main`.
 
 ```json
 {
-  "harnessVersion": "0.5.4",
+  "harnessVersion": "0.5.5",
   "project": { "name": "shop", "repo": "<org>/shop", "bot": "<org>-harness[bot]" },
   "roles": {
     "architect": { "model": "claude-fable-5-2", "effort": "max" },
@@ -597,9 +603,12 @@ A plan, `harness/modules/greeter/plans/P1.json`:
   sandbox before the action counts as done:
 
   ```json
-  [{ "id": "G1", "kind": "gate", "title": "Approve the retention policy", "blocks": ["P2"],
-     "instructions": "Markdown for you.", "verify": null }]
+  [{ "id": "G1", "kind": "gate", "title": "Approve the retention policy", "when": "before P2",
+     "blocks": ["P2"], "instructions": "Markdown for you.", "verify": null }]
   ```
+
+  `when` is a sentence for you, which the daemon doesn't check: once a gate is done, the
+  work it held back starts as soon as the plans it depends on are merged.
 
 ## AWS and Terraform
 

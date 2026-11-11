@@ -133,6 +133,11 @@ anything to do.
 
 A gate holds back the plans (`"P2"`) or features (`"P2/F03"`) it blocks until the owner
 marks it done. A feature can also name gates in `gates`. A task holds nothing back.
+`when` is a sentence for the owner, the first thing they read on the action: the daemon
+doesn't check it. Once a gate is done, the work it held back starts as soon as the plans
+it depends on are merged, whether or not their deploy and post-deploy checks passed. If
+the owner must wait for something first, such as a plan's post-deploy checks, say
+exactly what in `when`.
 Explain the actions in prose in `harness/modules/<module>/owner-guide.md`, by id.
 
 **The owner's time.** `estimatedMinutes` is how long an action takes the owner. When
