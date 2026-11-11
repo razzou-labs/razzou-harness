@@ -3,6 +3,18 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## 0.5.8 (2026-11-11)
+
+**Upgrading from 0.5.7:** install the new version, rebuild the agents' image with
+`harness doctor --build-images` (its tag follows the harness's version), then restart the
+daemon with `harness down` and `harness up`, and reload the dashboard.
+
+- **A finished module says so.** In the Project view, a module's badge is its design's
+  state, and stays `frozen` from the day the design is merged, whatever happens to the
+  build. Once every plan of the module is complete, a **module completed** badge now
+  joins it. A design change that adds a plan takes it away until that plan is complete
+  too.
+
 ## 0.5.7 (2026-11-11)
 
 **Upgrading from 0.5.6:** install the new version, rebuild the agents' image with
