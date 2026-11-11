@@ -3,6 +3,35 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## 0.5.5 (2026-11-11)
+
+**Upgrading from 0.5.4:** install the new version, rebuild the agents' image with
+`harness doctor --build-images` (its tag follows the harness's version), then restart the
+daemon with `harness down` and `harness up`, and reload the dashboard.
+
+- **Needs you, in the order to handle it.** The cards were listed by kind, the Managers'
+  questions first, and nothing said why. The daemon holds back whatever isn't ready, so
+  most cards can't be handled too early, whatever the order. They are now numbered in
+  the order to handle them:
+  - a paused pipeline;
+  - what changes the design: each module's change to locked files, its design, its
+    proposal;
+  - the build's own: the Managers' questions, the blocking ones first, the plans' pull
+    requests in the design's order, the escalated features;
+  - gates and tasks last, since marking one done starts the work it held back.
+- **A gate says when, and what its work builds on.** A gate can be handled too early: its
+  `when` is a sentence for you, which the daemon doesn't check, and the dashboard didn't
+  show it. An action's card now starts with its `when`. A gate's card names what it
+  holds back, the features that name it included, and any plan that work builds on that
+  isn't complete. Once that plan's deploy or post-deploy checks failed, a note says that
+  marking the gate done lets the work start all the same: behind such a gate, a teardown
+  would delete what the failed plan's checks still have to read. These gates come after
+  the actions that wait on nothing.
+- **A change to locked files says what it sets off.** Its card names the plans whose
+  failed post-deploy checks it changes: they run again once it is merged.
+- **For Architects.** Their instructions say that `when` is for the owner and isn't
+  checked. An Architect reads them when its sandbox is made.
+
 ## 0.5.4 (2026-11-10)
 
 **Upgrading from 0.5.3:** install the new version, rebuild the agents' image with
