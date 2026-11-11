@@ -9,9 +9,11 @@ import { detach, type AgentAdapter, type AgentRun } from '../src/agents/claude-c
 import type { SubscriptionUsage } from '../src/anthropic/usage.ts';
 import { submitLockedChange } from '../src/daemon/design.ts';
 import { Orchestrator } from '../src/daemon/orchestrator.ts';
+import { needsNow } from '../src/daemon/order.ts';
 import { handleRequest } from '../src/daemon/requests.ts';
 import type { SandboxOverview, UsageReading } from '../src/daemon/sandboxes.ts';
 import type { ConfigView } from '../src/dashboard/config-view.ts';
+import { orderNeeds } from '../src/dashboard/needs.ts';
 import { startDashboard, type DashboardState } from '../src/dashboard/server.ts';
 import { Terminals, type Pty } from '../src/dashboard/terminals.ts';
 import { recover } from '../src/setup/recover.ts';
@@ -478,6 +480,120 @@ describe('manager', () => {
     assert.equal(aborted.ok, true);
     await until(o, () => feature(o, 'F01')?.attempts[0]?.status === 'failed');
     assert.equal(feature(o, 'F01')!.attempts[0]!.reason, 'stopped by the Manager: It cannot work.');
+  });
+});
+
+describe('order request', () => {
+  /** A build that waits for the owner, with two tasks beside the Manager's question: three cards under Needs you. */
+  const waiting = (manager: ManagerBehavior = {}) => setup((f, attempt) => (f === 'F01' && attempt === 1 ? { files: { 'src/greet.sh': 'echo hi\n' } } : solved(f)), {
+    manager: { askOwner: true, ...manager },
+    prepare: async (dir) => {
+      const tasks = [
+        { id: 'T1', kind: 'task', title: 'Read the guide', when: 'anytime', instructions: 'Read it.', verify: null },
+        { id: 'T2', kind: 'task', title: 'Keep a copy', when: 'before T1', instructions: 'Copy it.', verify: null },
+      ];
+      writeFileSync(join(dir, 'harness/modules/demo/owner-actions.json'), JSON.stringify(tasks));
+      await runOk('git', ['-C', dir, 'add', '-A']);
+      await runOk('git', ['-C', dir, '-c', 'user.name=o', '-c', 'user.email=o@test.invalid', 'commit', '--quiet', '-m', 'tasks']);
+    },
+  });
+  const shown = (o: Orchestrator) => orderNeeds(needsNow(o), o.state.order);
+
+  it("asks the Manager for an order of the cards, and shows its answer while the cards stay as they were", async () => {
+    const { orchestrator: o } = await waiting();
+    await until(o, () => Object.keys(o.state.ownerRequests).length === 1);
+    const question = `request:${Object.keys(o.state.ownerRequests)[0]}`;
+    assert.deepEqual(needsNow(o).map((n) => n.key), [question, 'action:demo/T1', 'action:demo/T2']);
+
+    assert.equal(o.requestOrder(), undefined);
+    const asked = o.store.readAll().find((e) => e.type === 'ORDER_REQUESTED');
+    assert.ok(asked && asked.type === 'ORDER_REQUESTED');
+    assert.equal(`${asked.kind} ${asked.from}→${asked.to}`, 'message owner→manager');
+    assert.deepEqual(asked.payload.cards.map((c) => c.title), ['The Manager of demo asks you', 'Task demo/T1: Read the guide', 'Task demo/T2: Keep a copy']);
+    // What the Manager reads: that it changes nothing, what handling the kinds of card it holds sets off, and each card with its text.
+    const text = asked.payload.text;
+    assert.match(text, new RegExp(`^\\[harness\\] ORDER REQUEST from the owner \\(request ${asked.payload.requestId}\\)\n`));
+    assert.match(text, /This request changes nothing\. Because of it, start no fix, ask the owner or the Architect nothing/);
+    assert.match(text, /^- A Manager's question to the owner: .* A question stays until the owner answers it/m);
+    assert.match(text, /^- A gate or a task: .* Its "when" is the Architect's sentence for the owner: the daemon doesn't check it\.$/m);
+    assert.doesNotMatch(text, /A paused pipeline|A change to locked files/, 'only the kinds of card it holds');
+    assert.match(text, /^- demo\/P1 ".*": being built$/m);
+    assert.match(text, new RegExp(`^### 1\\. key: ${question}\nThe Manager of demo asks you\nAsked \\S+, by you\\. Blocking: no new attempt starts in its module until the owner answers\\.\nThe question: How should demo/P1/F01 be done\\?$`, 'm'));
+    assert.match(text, /^### 3\. key: action:demo\/T2\nTask demo\/T2: Keep a copy\nWhen, in the Architect's words: before T1\nA task: it holds nothing back\.\nIt has no verify command\.\nIts instructions for the owner: Copy it\.$/m);
+    assert.equal(shown(o).waiting, true);
+    assert.equal(o.requestOrder(), "the Manager was asked a moment ago and hasn't answered yet");
+
+    // The stub answers with the cards from the last to the first.
+    await until(o, () => o.state.order?.suggestion !== undefined);
+    assert.deepEqual(o.state.order!.suggestion!.order.map((c) => c.key), ['action:demo/T2', 'action:demo/T1', question]);
+    assert.equal(o.state.order!.suggestion!.summary, 'Stub summary of the order.');
+    let view = shown(o);
+    assert.equal(view.by, 'manager');
+    assert.deepEqual(view.needs.map((n) => n.key), ['action:demo/T2', 'action:demo/T1', question]);
+    assert.equal(view.why['action:demo/T2'], 'Stub reason 1 for action:demo/T2.');
+    assert.equal(feature(o, 'F01')!.attempts.length, 1, 'an order changes nothing: the build still waits for the owner');
+
+    // A card handled leaves the others in the Manager's order.
+    assert.equal(o.claimAction('demo', 'T2'), true);
+    view = shown(o);
+    assert.equal(view.by, 'manager');
+    assert.deepEqual(view.needs.map((n) => n.key), ['action:demo/T1', question]);
+
+    // A card the Manager never saw: its order was about another list, and the standard one shows.
+    o.pause();
+    view = shown(o);
+    assert.equal(view.by, 'standard');
+    assert.deepEqual(view.outdated, { added: ['The pipeline is paused'], changed: [] });
+    assert.deepEqual(view.needs.map((n) => n.key), ['paused', question, 'action:demo/T1']);
+  });
+
+  it("keeps only the request's cards from the Manager's answer, puts last what it left out, and takes one answer", async () => {
+    const { orchestrator: o } = await waiting({ ignore: ['ORDER'] });
+    await until(o, () => Object.keys(o.state.ownerRequests).length === 1);
+    const question = `request:${Object.keys(o.state.ownerRequests)[0]}`;
+    const manager = { role: 'manager' as const, sandbox: o.state.managers.demo!.sandbox, module: 'demo' };
+    const answer = (id: string, args: Record<string, unknown>, agent: { role: 'manager'; sandbox: string; module: string; plan?: string } = manager) =>
+      handleRequest(o, agent, { v: 1, id, tool: 'suggest_order', args });
+    const order = [{ card: 'action:demo/T2', why: 'It says before T1.' }, { card: 'action:demo/T9', why: 'Not a card.' }, { card: 'action:demo/T2', why: 'Twice.' }, { card: question, why: 'Then my question.' }];
+
+    assert.match((await answer('c0', { request_id: 'r0', order }))!.text, /^The owner asked for no order\.$/);
+    assert.equal(o.requestOrder(), undefined);
+    const requestId = o.state.order!.requestId;
+    assert.match((await answer('c1', { request_id: 'another', order }))!.text, new RegExp(`^The owner asked again since: request ${requestId} replaced another\\.`));
+    assert.match((await answer('c2', { request_id: requestId, order }, { ...manager, plan: 'P1' }))!.text, /^That request went to another Manager\.$/);
+    assert.match((await answer('c3', { request_id: requestId, order: [{ card: 'nothing', why: 'x' }] }))!.text, /^None of these is a card of the request\. Its cards: request:\S+, action:demo\/T1, action:demo\/T2$/);
+    assert.match((await answer('c4', { request_id: requestId, order: [] }))!.text, /Invalid arguments/);
+
+    const reply = (await answer('c5', { request_id: requestId, order }))!;
+    assert.equal(reply.ok, true);
+    assert.equal(reply.text, 'The owner sees your order under Needs you. Nothing else changed. You left out action:demo/T1: shown last, without a reason. Not cards of the request, and dropped: action:demo/T9.');
+    assert.deepEqual(o.state.order!.suggestion!.order, [
+      { key: 'action:demo/T2', why: 'It says before T1.' }, { key: question, why: 'Then my question.' }, { key: 'action:demo/T1', why: '' },
+    ]);
+    const suggested = o.store.readAll().find((e) => e.type === 'ORDER_SUGGESTED')!;
+    assert.equal(`${suggested.kind} ${suggested.from}→${suggested.to}`, 'message manager→owner');
+    // The same call again, as after a restart, and another answer to the same request.
+    assert.equal((await answer('c5', { request_id: requestId, order }))!.text, 'Recorded.');
+    assert.match((await answer('c6', { request_id: requestId, order }))!.text, /^You already answered that request\./);
+    assert.equal(o.store.readAll().filter((e) => e.type === 'ORDER_SUGGESTED').length, 1);
+  });
+
+  it('asks only a Manager whose sandbox has the tool to answer, and nobody about fewer than two cards', async () => {
+    const { orchestrator: o } = await waiting({ ignore: ['ORDER'] });
+    await until(o, () => Object.keys(o.state.ownerRequests).length === 1);
+    assert.ok(o.state.managers.demo!.tools!.includes('suggest_order'), 'a Manager is recorded with the tools its sandbox was made with');
+
+    // As one made before 0.5.6: its sandbox keeps the tools it was made with.
+    const tools = o.state.managers.demo!.tools;
+    delete o.state.managers.demo!.tools;
+    assert.equal(o.requestOrder(), `the Manager's sandbox was made before it had the tool to answer: run \`openshell sandbox delete ${o.state.managers.demo!.sandbox}\`, and the daemon starts a new one`);
+    o.state.managers.demo!.tools = tools!;
+
+    assert.equal(o.claimAction('demo', 'T1'), true);
+    assert.equal(o.claimAction('demo', 'T2'), true);
+    assert.equal(needsNow(o).length, 1);
+    assert.equal(o.requestOrder(), 'fewer than two cards wait: there is nothing to order');
+    assert.equal(o.state.order, undefined);
   });
 });
 
@@ -1546,6 +1662,8 @@ describe('dashboard', () => {
     const state = await call(port, '/api/state', bearer);
     assert.equal(state.status, 200);
     assert.equal(JSON.parse(state.body).design.project, 'toy');
+    // An order of the cards under Needs you is asked of a Manager, or refused with why: here nothing waits.
+    assert.deepEqual(JSON.parse((await call(port, '/api/order', { ...bearer, 'content-type': 'application/json' }, 'POST')).body), { done: false, error: 'fewer than two cards wait: there is nothing to order' });
     // The gates a feature names go to the page, which says what each gate holds back.
     assert.deepEqual((JSON.parse(state.body) as DashboardState).design.modules[0]!.plans[0]!.features.map((f) => f.gates), [[], []]);
     const login = await call(port, `/?token=${token}`, { host });

@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { copyFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { managerSettings, userMessage, type ManagerRun } from '../agents/claude-code.ts';
+import { TOOLS } from '../roles.ts';
 import type { Follower } from '../sandbox/driver.ts';
 import { managerKey, type ManagerState } from '../state/state.ts';
 import { clip, sh } from '../util.ts';
@@ -145,11 +146,12 @@ export class Managers {
     await o.uploadAgentFiles(manager.sandbox, 'manager', dir);
     const clone = await o.exec(manager.sandbox, `git clone --quiet --branch ${sh(branch)} ${sh(`${p.harness}/clone.bundle`)} ${sh(p.work)}`);
     if (clone.code !== 0) throw new Error(`could not clone the plan branch for the Manager: ${clone.stderr.trim()}`);
-    await this.launch(manager, 1);
+    // The tools its sandbox has from now on, whatever the harness gains later.
+    await this.launch(manager, 1, TOOLS.manager.map((tool) => tool.name));
     o.kick();
   }
 
-  private async launch(manager: ManagerState, n: number): Promise<void> {
+  private async launch(manager: ManagerState, n: number, tools?: string[]): Promise<void> {
     const o = this.o;
     const run = this.run(manager, n);
     const p = this.paths(manager);
@@ -158,7 +160,7 @@ export class Managers {
     if (size.code !== 0) throw new Error(`could not prepare the Manager's launch: ${size.stderr.trim()}`);
     const result = await o.exec(manager.sandbox, [o.agent.launchManager(run), waitForFile(run.pidFile)].join('\n'));
     if (result.code !== 0) throw new Error(`could not start the Manager: ${(result.stderr || result.stdout).trim()}`);
-    o.record({ type: 'MANAGER_LAUNCHED', payload: { ...identity(manager), launch: n, outputBytes: Number(size.stdout.trim()) || 0 } });
+    o.record({ type: 'MANAGER_LAUNCHED', payload: { ...identity(manager), launch: n, outputBytes: Number(size.stdout.trim()) || 0, ...(tools ? { tools } : {}) } });
   }
 
   /** Whether the current launch still runs. If not, its exit is recorded. */

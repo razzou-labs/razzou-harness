@@ -218,6 +218,8 @@ export function ciReport(plan: PlanState): string {
 /** The once-only messages: the welcome, and the owner's messages and answers. */
 export function mailText(o: Orchestrator, manager: ManagerState, mail: ManagerState['mail'][number]): string {
   if (mail.kind === 'owner_message') return ['[harness] MESSAGE from the owner', '', mail.text].join('\n');
+  // Written whole when the owner asked: the cards as they were then.
+  if (mail.kind === 'order_request') return mail.text;
   if (mail.kind === 'decision') {
     const question = o.state.modules[manager.module]?.escalations.find((e) => e.id === mail.requestId)?.question ?? '';
     return [`[harness] DECISION from the Architect on your escalation ${mail.requestId}`, '', `You asked: ${clip(question, 800)}`, '', `Decision: ${mail.text}`].join('\n');

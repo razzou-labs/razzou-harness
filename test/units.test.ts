@@ -53,6 +53,33 @@ describe('state projection', () => {
     assert.equal(state.plans['demo/P1']!.head, 'c1');
   });
 
+  it("keeps the owner's latest order request alone, with the answer to it, and a Manager's tools from when its sandbox was made", () => {
+    const store = new EventStore(join(tempDir('state'), 'events.jsonl'));
+    const cards = [{ key: 'action:demo/T1', title: 'Task demo/T1: Read', print: '[]' }, { key: 'action:demo/T2', title: 'Task demo/T2: Copy', print: '[]' }];
+    store.append({ type: 'MANAGER_STARTING', payload: { module: 'demo', sandbox: 'mgr-1', sessionId: 's' } });
+    store.append({ type: 'ORDER_REQUESTED', from: 'owner', to: 'manager', payload: { module: 'demo', requestId: 'o1', manager: 'demo', cards, text: 'first' } });
+    let state = project(store.readAll());
+    assert.equal(state.managers.demo!.tools, undefined, 'unknown until its sandbox is made');
+    assert.deepEqual(state.managers.demo!.mail.map((m) => `${m.kind} ${m.text}`), ['welcome ', 'order_request first']);
+
+    // Asked again before the first request was delivered: the Manager reads the second alone.
+    store.append({ type: 'ORDER_REQUESTED', from: 'owner', to: 'manager', payload: { module: 'demo', requestId: 'o2', manager: 'demo', cards, text: 'second' } });
+    store.append({ type: 'MANAGER_LAUNCHED', payload: { module: 'demo', launch: 1, outputBytes: 0, tools: ['ask_owner', 'suggest_order'] } });
+    store.append({ type: 'MANAGER_LAUNCHED', payload: { module: 'demo', launch: 2, outputBytes: 10 } });
+    store.append({ type: 'ORDER_SUGGESTED', from: 'manager', to: 'owner', payload: { module: 'demo', requestId: 'o1', call: 'c1', order: [{ key: 'action:demo/T1', why: 'late' }] } });
+    state = project(store.readAll());
+    assert.deepEqual(state.managers.demo!.mail.map((m) => `${m.kind} ${m.text}`), ['welcome ', 'order_request second']);
+    assert.deepEqual(state.managers.demo!.tools, ['ask_owner', 'suggest_order'], 'a relaunch in the same sandbox keeps them');
+    assert.equal(state.order!.requestId, 'o2');
+    assert.equal(state.order!.suggestion, undefined, 'an answer to the request it replaced is not its answer');
+
+    store.append({ type: 'ORDER_SUGGESTED', from: 'manager', to: 'owner', payload: { module: 'demo', requestId: 'o2', call: 'c2', order: [{ key: 'action:demo/T2', why: 'first' }, { key: 'action:demo/T1', why: '' }], summary: 'T2 first.' } });
+    state = project(store.readAll());
+    assert.deepEqual(state.order!.suggestion!.order.map((c) => c.key), ['action:demo/T2', 'action:demo/T1']);
+    assert.equal(state.order!.suggestion!.summary, 'T2 first.');
+    assert.deepEqual(store.readAll().filter((e) => e.type.startsWith('ORDER_')).map((e) => e.kind), ['message', 'message', 'message', 'message']);
+  });
+
   it('counts failures against the current definition only', () => {
     const store = new EventStore(join(tempDir('state'), 'events.jsonl'));
     store.append({ type: 'PLAN_STARTED', ref, payload: { branch: 'plan/demo/P1', base: 'b0' } });

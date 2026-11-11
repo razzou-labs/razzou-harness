@@ -2,29 +2,18 @@ import { QAvatar, QBanner, QBtn, QCard, QCardSection, QInput } from 'quasar';
 import { defineComponent, onMounted, ref, watch, type PropType, type VNodeChild } from 'vue';
 import { getText, post, type DashboardState, type FeatureState } from '../api.ts';
 import { clock } from '../format.ts';
-import { list, listNeeds, waitText, type Need } from '../needs.ts';
-import { Action, GithubLink, Loading, Markdown, Reply, text } from '../ui.tsx';
+import { list, listNeeds, needTitle, orderNeeds, waitText, type Need, type Ordered } from '../../../src/dashboard/needs.ts';
+import { Action, Command, Fold, GithubLink, Loading, Markdown, Reply, text } from '../ui.tsx';
 import type { Go } from '../App.tsx';
-
-interface Card {
-  key: string;
-  title: string;
-  body: () => VNodeChild;
-}
 
 const key = (f: FeatureState) => `${f.module}/${f.plan}/${f.feature}`;
 
-/** Everything waiting for the owner as cards, in the order to handle them (`listNeeds`). */
-export function collectNeeds(data: DashboardState, go: Go): Card[] {
-  return listNeeds(data).map((need) => ({ key: need.key, ...card(need, go) }));
-}
-
-function card(need: Need, go: Go): Omit<Card, 'key'> {
+/** What a card holds under its title: its text, and its buttons or form. */
+function content(need: Need, go: Go): { body: () => VNodeChild } {
   switch (need.kind) {
     case 'paused': {
       const paused = need.paused;
       return {
-        title: 'The pipeline is paused',
         body: () => (
           <>
             <p>{paused.reason}{paused.until ? ` (until ${clock(paused.until)})` : ''}</p>
@@ -39,7 +28,6 @@ function card(need: Need, go: Go): Omit<Card, 'key'> {
       const locked = module.locked!;
       const pr = locked.pr!;
       return {
-        title: `[CHANGED_LOCKED_FILES] The Architect of ${module.module} asks to change locked files`,
         body: () => (
           <>
             <QBanner class="bg-negative text-white q-mb-md" rounded>
@@ -70,7 +58,6 @@ function card(need: Need, go: Go): Omit<Card, 'key'> {
       const module = need.module;
       const pr = module.design!.pr!;
       return {
-        title: module.frozenCommit ? `[DESIGN_MODIFY] A change to the design of ${module.module} is ready for review` : `[DESIGN] The design of ${module.module} is ready for review`,
         body: () => (
           <>
             {module.frozenCommit && <p>{module.design?.summary}</p>}
@@ -89,7 +76,6 @@ function card(need: Need, go: Go): Omit<Card, 'key'> {
     case 'proposal': {
       const { module, version } = need;
       return {
-        title: `The Architect of ${module.module} proposes v${version}`,
         body: () => (
           <>
             <Proposal module={module.module} version={version} />
@@ -104,7 +90,6 @@ function card(need: Need, go: Go): Omit<Card, 'key'> {
     case 'escalation': {
       const { module, escalation } = need;
       return {
-        title: `The Manager asks the Architect of ${module.module}${escalation.feature ? ` about ${escalation.feature}` : ''}`,
         body: () => (
           <>
             <Markdown text={escalation.question} />
@@ -117,7 +102,6 @@ function card(need: Need, go: Go): Omit<Card, 'key'> {
     case 'request': {
       const request = need.request;
       return {
-        title: `The Manager of ${request.module} asks you`,
         body: () => (
           <>
             <Markdown text={request.question} />
@@ -132,7 +116,6 @@ function card(need: Need, go: Go): Omit<Card, 'key'> {
       const pr = plan.pr!;
       const reason = plan.leftToOwner!.reason;
       return {
-        title: `PR #${pr.number} of ${plan.module}/${plan.plan} waits for you`,
         body: () => (
           <>
             <p>{reason}</p>
@@ -145,18 +128,16 @@ function card(need: Need, go: Go): Omit<Card, 'key'> {
       const plan = need.plan;
       const pr = plan.pr!;
       return {
-        title: `${plan.module}/${plan.plan} passed CI`,
         body: () => <p>Review and merge <GithubLink url={pr.url}>PR #{pr.number}</GithubLink> on GitHub, with a merge commit.</p>,
       };
     }
     case 'escalated': {
       const feature = need.feature;
-      return { title: `${key(feature)} is escalated`, body: () => <Escalated feature={feature} /> };
+      return { body: () => <Escalated feature={feature} /> };
     }
     case 'action': {
       const { action, status, holds, waits } = need;
       return {
-        title: `${action.kind === 'gate' ? 'Gate' : 'Task'} ${need.module}/${action.id}: ${action.title}`,
         body: () => (
           <>
             {/* The Architect's sentence for the owner: the daemon can't check it, so it is the first thing said. */}
@@ -188,25 +169,138 @@ export const NeedsYou = defineComponent({
     go: { type: Function as PropType<Go>, required: true },
   },
   setup(props) {
+    // The owner's switch back to the standard order while the Manager's holds; a new answer shows first.
+    const standard = ref(false);
+    watch(() => props.data.state.order?.requestId, () => (standard.value = false));
     return () => {
-      const needs = collectNeeds(props.data, props.go);
+      const needs = listNeeds(props.data);
       if (needs.length === 0) return <p class="text-muted">Nothing needs you.</p>;
+      const view = orderNeeds(needs, props.data.state.order);
+      const managers = view.by === 'manager' && !standard.value;
+      const shown = managers ? view.needs : needs;
       // Numbered once there is an order to follow.
-      const ordered = needs.length > 1;
+      const ordered = shown.length > 1;
       return (
         <div class="column q-gutter-md">
-          {ordered && <div class="text-caption text-muted">In the order to handle them: what changes the design first; gates and tasks last, since marking one done starts new work.</div>}
-          {needs.map((need, index) => (
-            <QCard key={need.key} flat bordered class="need">
-              <QCardSection>
-                <div class="text-subtitle1 text-weight-medium q-mb-sm row items-center no-wrap">
-                  {ordered && <div class="col-auto q-mr-sm"><QAvatar size="24px" fontSize="13px" color="primary" textColor="white">{index + 1}</QAvatar></div>}
-                  <span class="col">{need.title}</span>
-                </div>
-                {need.body()}
-              </QCardSection>
-            </QCard>
-          ))}
+          {ordered && <Order data={props.data} view={view} standard={standard.value} onToggle={() => (standard.value = !standard.value)} />}
+          {shown.map((need, index) => {
+            const why = managers ? view.why[need.key] : undefined;
+            return (
+              <QCard key={need.key} flat bordered class="need">
+                <QCardSection>
+                  <div class="text-subtitle1 text-weight-medium q-mb-sm row items-center no-wrap">
+                    {ordered && <div class="col-auto q-mr-sm"><QAvatar size="24px" fontSize="13px" color="primary" textColor="white">{index + 1}</QAvatar></div>}
+                    <span class="col">{needTitle(need)}</span>
+                  </div>
+                  {/* The Manager's own words, as text: why the card is where it put it. */}
+                  {why !== undefined && (
+                    <p class="q-mb-sm"><span class="text-muted">The Manager:</span> {why === '' ? 'left this card out of its order: it is last.' : why}</p>
+                  )}
+                  {content(need, props.go).body()}
+                </QCardSection>
+              </QCard>
+            );
+          })}
+        </div>
+      );
+    };
+  },
+});
+
+/** How long an order request waits before the owner can ask the same again, as the daemon counts it. */
+const ORDER_WAIT_MS = 5 * 60_000;
+
+/**
+ * Above the cards: which order they are in, and the Manager's, which the owner asks for
+ * when the cards' text says more than the standard order knows. Its order is advice about
+ * the cards as they were when asked: it shows while they are the same, and gives way to
+ * the standard order once one came or changed.
+ */
+const Order = defineComponent({
+  props: {
+    data: { type: Object as PropType<DashboardState>, required: true },
+    view: { type: Object as PropType<Ordered>, required: true },
+    standard: { type: Boolean, required: true },
+    onToggle: { type: Function as PropType<() => void>, required: true },
+  },
+  setup(props) {
+    /** The button that asks, or why nobody can be asked: a line of its own, under what it stands beside. */
+    const ask = (label: string): { button?: VNodeChild; why?: VNodeChild } => {
+      // A Manager made before it had the tool can't answer: the daemon starts a new one once its sandbox is gone.
+      const running = Object.values(props.data.state.managers).filter((m) => m.status !== 'stopped');
+      if (running.some((m) => m.tools?.includes('suggest_order'))) return { button: <Action flat label={label} run={() => post('/api/order')} /> };
+      if (running.length === 0) return { why: <div class="text-caption text-muted q-mt-xs">No Manager is running to ask for an order: one starts with the build of a module.</div> };
+      // Its tools are known once its sandbox is made.
+      if (running.some((m) => m.status === 'starting')) return { why: <div class="text-caption text-muted q-mt-xs">A Manager is starting: it can be asked for an order in a moment.</div> };
+      return {
+        why: (
+          <div class="text-caption text-muted q-mt-xs">
+            To ask the Manager for an order, it needs a new sandbox, with the tool to answer: <Command text={`openshell sandbox delete ${running[0]!.sandbox}`} /> The daemon then starts a new one, without the old one's conversation.
+          </div>
+        ),
+      };
+    };
+    return () => {
+      const { view } = props;
+      const order = props.data.state.order;
+      const given = order?.suggestion;
+      if (view.waiting && order) {
+        const again = Date.now() - Date.parse(order.askedAt) > ORDER_WAIT_MS ? ask('Ask again') : {};
+        return (
+          <QBanner class="note note-info" rounded dense>
+            <div class="row items-center q-gutter-sm">
+              <Loading class="col" text={`The Manager was asked at ${clock(order.askedAt)} for an order of these cards. Until it answers, they are in the standard order.`} />
+              {again.button}
+            </div>
+            {again.why}
+          </QBanner>
+        );
+      }
+      if (view.outdated && order && given) {
+        const titles = new Map(order.cards.map((card) => [card.key, card.title]));
+        const since = [
+          ...(view.outdated.added.length > 0 ? [`${list(view.outdated.added.map((t) => `"${t}"`))} came`] : []),
+          ...(view.outdated.changed.length > 0 ? [`${list(view.outdated.changed.map((t) => `"${t}"`))} changed`] : []),
+        ].join(', and ');
+        const again = ask('Ask again');
+        return (
+          <QBanner class="note note-warn" rounded dense>
+            <div class="row items-center q-gutter-sm">
+              <span class="col">The Manager's order of {clock(given.at)} no longer applies: since then, {since}. The cards are in the standard order.</span>
+              {again.button}
+            </div>
+            {again.why}
+            <Fold label={() => "The Manager's order then"}>
+              <ol class="q-my-xs">
+                {given.order.map(({ key, why }) => <li key={key}>{titles.get(key) ?? key}{why && <span class="text-muted">: {why}</span>}</li>)}
+              </ol>
+            </Fold>
+          </QBanner>
+        );
+      }
+      if (view.by === 'manager' && given) {
+        return (
+          <QBanner class="note note-info" rounded dense>
+            <div class="row items-center q-gutter-sm">
+              <span class="col">
+                {props.standard
+                  ? <>In the standard order. The Manager gave another at {clock(given.at)}.</>
+                  : <>In <b>the Manager's order</b>, given at {clock(given.at)} for these cards. It is advice: what each card says still applies.</>}
+              </span>
+              <QBtn flat dense noCaps color="primary" padding="2px 10px" label={props.standard ? "Show the Manager's order" : 'Show the standard order'} onClick={props.onToggle} />
+            </div>
+            {!props.standard && given.summary && <Markdown text={given.summary} />}
+          </QBanner>
+        );
+      }
+      const first = ask('Ask the Manager for an order');
+      return (
+        <div>
+          <div class="row items-center q-gutter-sm">
+            <span class="col text-caption text-muted">In the order to handle them: what changes the design first; gates and tasks last, since marking one done starts new work.</span>
+            {first.button}
+          </div>
+          {first.why}
         </div>
       );
     };

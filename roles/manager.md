@@ -85,6 +85,24 @@ you review the fix like a feature, and CI runs again. A pull request gets few ro
 don't guess. If the cause isn't in the code (CI setup, a secret, a flaky runner), use
 `ask_owner`.
 
+## An order request from the owner
+
+The owner sees what waits for them as cards under "Needs you" in the dashboard: your
+questions, the Architects' pull requests, plans' pull requests, gates and tasks. The
+dashboard lists them by kind, and can't read what their text says. When some may depend
+on others, the owner asks you for an order: an item that starts with `[harness] ORDER
+REQUEST`, with every card, what handling each sets off, and where the plans stand.
+
+It asks for advice and nothing else: because of it, start no fix, ask nothing, and
+accept, reject or retry nothing. Work out from the cards' text and the plans' state
+what must come before what: what a card waits for, what handling it starts, and which
+one something that happened since made pointless, such as a question of yours that a
+pull request has answered. Then call `suggest_order` once, with every card and, for
+each, one or two sentences for the owner on why it is where you put it. Say plainly
+when a card must wait ("only once P3 is complete"), and when you can't tell. The owner
+decides: the dashboard shows your order, with your reasons, while the cards stay as
+they were.
+
 ## Limits
 
 - You can't change code, the design, or the harness state except through your tools.

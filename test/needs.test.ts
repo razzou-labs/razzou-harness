@@ -1,8 +1,8 @@
 import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
-import { heldBack, listNeeds, upstream, waitText, type Need } from '../dashboard/src/needs.ts';
+import { heldBack, listNeeds, needPrint, needTitle, orderCards, orderNeeds, upstream, waitText, type Need } from '../src/dashboard/needs.ts';
 import type { DashboardState } from '../src/dashboard/server.ts';
-import type { ModuleState, PlanState, State } from '../src/state/state.ts';
+import type { ModuleState, OrderState, PlanState, State } from '../src/state/state.ts';
 
 type ModuleDesign = DashboardState['design']['modules'][number];
 type PlanDesign = ModuleDesign['plans'][number];
@@ -164,5 +164,54 @@ describe('needs you', () => {
     // A pre-merge check alone leaves the plan's post-deploy checks as they failed; a check it adds isn't on main yet.
     assert.deepEqual(rechecks({ ...locked(['F07-plan', 'F07-smoke (added)']), plans: plansOf('verify_failed') }), []);
     assert.deepEqual(rechecks({ ...locked(['F07-deploy']), plans: plansOf('completed') }), []);
+  });
+
+  it("shows the Manager's order while the cards are as it saw them, less the ones handled since", () => {
+    const question = { requestId: 'r1', module: 'web', question: 'Commit the fix by hand?', blocking: false, askedAt: '2026-11-10T10:49:00.000Z' };
+    const state = (p3: PlanState['status'], more: Partial<State> = {}): Partial<State> => ({
+      plans: plansOf(p3), actions: { 'web/G1': { status: 'done', at: '2026-11-09T21:00:00.000Z' } }, ownerRequests: { r1: question },
+      modules: { web: architect('web', 'frozen', { frozenCommit: 'c0ffee', locked: { head: 'l1', summary: 'A fixed check.', changes: [{ plan: 'P3', feature: 'F07', title: 'The function', expected: 'It ran.', fields: [], checks: ['F07-deploy'], scripts: [] }], pr: { number: 7, url: 'https://github.com/acme/toy/pull/7' } } }) },
+      ...more,
+    });
+    const before = listNeeds(data([teardown], state('verify_failed')));
+    assert.deepEqual(before.map((n) => n.key), ['locked:web', 'request:r1', 'action:web/G2']);
+    assert.deepEqual(before.map(needTitle), ['[CHANGED_LOCKED_FILES] The Architect of web asks to change locked files', 'The Manager of web asks you', 'Gate web/G2: G2']);
+    const asked: OrderState = { requestId: 'o1', module: 'web', manager: 'web', askedAt: '2026-11-11T13:00:00.000Z', cards: orderCards(before) };
+
+    // Not asked, then asked and no answer yet: the standard order.
+    assert.deepEqual(orderNeeds(before, undefined), { needs: before, by: 'standard', why: {}, waiting: false });
+    assert.deepEqual(orderNeeds(before, asked), { needs: before, by: 'standard', why: {}, waiting: true });
+
+    // Its answer: the gate last and the question after the pull request, with a card it left out put last by the daemon.
+    const given: OrderState = {
+      ...asked,
+      suggestion: { at: '2026-11-11T13:01:00.000Z', call: 'c1', order: [{ key: 'locked:web', why: 'It fixes the check P3 failed.' }, { key: 'action:web/G2', why: 'Only once P3 is complete.' }, { key: 'request:r1', why: '' }] },
+    };
+    const ordered = orderNeeds(before, given);
+    assert.equal(ordered.by, 'manager');
+    assert.deepEqual(ordered.needs.map((n) => n.key), ['locked:web', 'action:web/G2', 'request:r1']);
+    assert.deepEqual(ordered.why, { 'locked:web': 'It fixes the check P3 failed.', 'action:web/G2': 'Only once P3 is complete.', 'request:r1': '' });
+
+    // The question answered: the rest keeps the Manager's order.
+    const answered = listNeeds(data([teardown], state('verify_failed', { ownerRequests: { r1: { ...question, answer: 'no' } } })));
+    assert.deepEqual(orderNeeds(answered, given).needs.map((n) => n.key), ['locked:web', 'action:web/G2']);
+    assert.equal(orderNeeds(answered, given).by, 'manager');
+
+    // The pull request merged and P3 checked again: the gate isn't the card the Manager saw.
+    const rechecking = listNeeds(data([teardown], state('verifying', { modules: { web: architect('web', 'frozen', { frozenCommit: 'c0ffee' }) } })));
+    assert.notEqual(needPrint(rechecking.at(-1)!), needPrint(before.at(-1)!));
+    assert.deepEqual(orderNeeds(rechecking, given), {
+      needs: rechecking, by: 'standard', why: {}, waiting: false, outdated: { added: [], changed: ['Gate web/G2: G2'] },
+    });
+    // A new commit on the pull request, and a card that came since.
+    const pushed = listNeeds(data([teardown], state('verify_failed', {
+      pipeline: { consecutiveFailures: 0, paused: { reason: 'the owner paused the pipeline', since: '2026-11-11T13:05:00.000Z' } },
+      modules: { web: architect('web', 'frozen', { frozenCommit: 'c0ffee', locked: { head: 'l2', summary: 'A fixed check.', changes: [], pr: { number: 7, url: 'https://github.com/acme/toy/pull/7' } } }) },
+    })));
+    assert.deepEqual(orderNeeds(pushed, given).outdated, { added: ['The pipeline is paused'], changed: ['[CHANGED_LOCKED_FILES] The Architect of web asks to change locked files'] });
+
+    // Every card of the request handled: nothing is left of it, whatever waits now.
+    const later = listNeeds(data([teardown], { plans: plansOf('completed'), actions: { 'web/G1': { status: 'done', at: '2026-11-09T21:00:00.000Z' }, 'web/G2': { status: 'done', at: '2026-11-11T14:00:00.000Z' } }, pipeline: { consecutiveFailures: 0, paused: { reason: 'the owner paused the pipeline', since: '2026-11-11T14:05:00.000Z' } } }));
+    assert.deepEqual(orderNeeds(later, given), { needs: later, by: 'standard', why: {}, waiting: false });
   });
 });

@@ -4,7 +4,7 @@ import type { CheckResult } from '../checks/runner.ts';
 import type { ReviewFinding, ReviewerRole } from '../design/schemas.ts';
 import type { Party, Role } from '../roles.ts';
 import type { Denial } from '../sandbox/refusals.ts';
-import type { ActionState, FeatureState, InfraMerge, LockedChange, Mode, PlanState } from './state.ts';
+import type { ActionState, FeatureState, InfraMerge, LockedChange, Mode, OrderCard, PlanState } from './state.ts';
 
 /** What an event is about. Ids repeat across modules, so a feature is always addressed with its module and plan. */
 export interface Ref {
@@ -87,7 +87,8 @@ interface Payloads {
   PLAN_CHECKS_FAILED: { results: CheckResult[] };
   /** A Manager's scope is its module, or one plan of it in Swarm (v3 §6.4): `plan` names it. */
   MANAGER_STARTING: { module: string; plan?: string; sandbox: string; sessionId: string };
-  MANAGER_LAUNCHED: { module: string; plan?: string; launch: number; outputBytes: number };
+  /** `tools`: the harness tools of a sandbox just made, which it keeps for its life; absent on a relaunch in the same sandbox. */
+  MANAGER_LAUNCHED: { module: string; plan?: string; launch: number; outputBytes: number; tools?: string[] };
   MANAGER_EXITED: { module: string; plan?: string; launch: number; code: number | null; stderr: string; started: boolean };
   MANAGER_ITEM_SENT: { module: string; plan?: string; key: string; launch: number; reminder: boolean };
   MANAGER_STOPPED: { module: string; plan?: string; reason: string };
@@ -167,6 +168,13 @@ interface Payloads {
   OWNER_ANSWER: { module: string; requestId: string; answer: string };
   /** `manager` names one Manager by key; without it, every Manager of the module hears it. */
   OWNER_MESSAGE: { module: string; text: string; manager?: string };
+  /**
+   * The owner asks a Manager in which order to handle the cards under Needs you: the cards
+   * as they are, and the request as the Manager reads it, with what handling each sets off.
+   */
+  ORDER_REQUESTED: { module: string; requestId: string; manager: string; cards: OrderCard[]; text: string };
+  /** The Manager's answer: the request's cards in its order, each with why; `call` is its tool call. It changes nothing else. */
+  ORDER_SUGGESTED: { module: string; requestId: string; call: string; order: Array<{ key: string; why: string }>; summary?: string };
   PLAN_SUBMITTED: { requestId: string; summary: string };
   /** The Manager asks for a fix round after CI failed, or the daemon after a reviewer blocked (`review`); `failure` is what was reported. */
   REQUEST_FIX: { requestId: string; guidance: string; failure: string; review?: ReviewerRole };
@@ -182,7 +190,8 @@ interface Payloads {
 export type EventType = keyof Payloads;
 
 const MESSAGES: ReadonlySet<EventType> = new Set<EventType>([
-  'QUESTION', 'CONTINUE', 'ACCEPT', 'REJECT', 'RETRY', 'ABORT', 'OWNER_REQUEST', 'OWNER_ANSWER', 'OWNER_MESSAGE', 'PLAN_SUBMITTED', 'REQUEST_FIX',
+  'QUESTION', 'CONTINUE', 'ACCEPT', 'REJECT', 'RETRY', 'ABORT', 'OWNER_REQUEST', 'OWNER_ANSWER', 'OWNER_MESSAGE', 'ORDER_REQUESTED', 'ORDER_SUGGESTED',
+  'PLAN_SUBMITTED', 'REQUEST_FIX',
   'PROPOSAL', 'DESIGN', 'ESCALATION', 'DECISION',
 ]);
 
