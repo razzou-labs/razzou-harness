@@ -894,7 +894,7 @@ describe('pull requests', () => {
     fake.statuses = () => ({ 'harness/security': 'success', 'harness/cost': 'success' });
     await until(o, () => plan(o)?.leftToOwner !== undefined);
     assert.equal(fake.prs[0]!.title, 'Plan: [INFRA] [demo/P1] Greeting and adding');
-    assert.match(plan(o)!.leftToOwner!.reason, /^an INFRA plan merges itself only with the cost job's estimate .* none was produced: the cost job needs iac\/ and the INFRACOST_API_KEY secret; the dashboard's button lets the daemon merge infra once CI and the reviewers pass$/);
+    assert.match(plan(o)!.leftToOwner!.reason, /^an INFRA plan merges itself only with the cost job's estimate .* none was produced: the cost job needs iac\/ and the INFRACOST_API_KEY secret; under Config, the Infra merges switch lets the daemon merge infra once CI and the reviewers pass$/);
 
     o.setMode('manual');
     skew += 61_000;
@@ -1096,6 +1096,141 @@ describe('pull requests', () => {
     skew += 120_000;
     await until(o, completed(o));
     assert.equal(plan(o)!.mergedBy, 'owner');
+  });
+
+  it("in Swarm, a reviewer the owner switched off reads nothing: its status says so, and the plan merges on the other's", async () => {
+    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true });
+    o.setMode('swarm');
+    assert.equal(o.setReviews('security', 'off'), undefined);
+    assert.equal(o.setReviews('security', 'off'), undefined, 'the same again changes nothing');
+    assert.equal(o.setReviews('security', 'infra'), 'only cost reviews can be for infrastructure plans only');
+    assert.equal(o.store.readAll().filter((e) => e.type === 'REVIEWS_SET').length, 1);
+    await until(o, completed(o));
+
+    const head = plan(o)!.pushed!;
+    assert.deepEqual(plan(o)!.reviews!.map((r) => [r.role, r.verdict]), [['cost', 'pass']]);
+    assert.deepEqual(plan(o)!.unreviewed!.map((u) => [u.role, u.head === head, u.why]), [['security', true, 'off']]);
+    assert.deepEqual(fake.statusesSet.map((s) => [s.sha === head, s.context, s.state, s.description]), [
+      [true, 'harness/security', 'success', 'not reviewed: the owner switched security reviews off'],
+      [true, 'harness/cost', 'success', 'passed'],
+    ]);
+    assert.equal(plan(o)!.mergedBy, 'daemon');
+  });
+
+  it('cost reviews for infrastructure plans only leave a CODE plan unread, and read an INFRA one', async () => {
+    const code = await setup((f) => solved(f), { github: true });
+    code.orchestrator.setMode('swarm');
+    assert.equal(code.orchestrator.setReviews('cost', 'infra'), undefined);
+    await until(code.orchestrator, completed(code.orchestrator));
+    assert.deepEqual(plan(code.orchestrator)!.reviews!.map((r) => r.role), ['security']);
+    assert.deepEqual(code.fake.statusesSet.map((s) => [s.context, s.state, s.description]), [
+      ['harness/security', 'success', 'passed'],
+      ['harness/cost', 'success', 'not reviewed: a CODE plan, and cost reviews are for infrastructure plans only'],
+    ]);
+    assert.equal(plan(code.orchestrator)!.mergedBy, 'daemon');
+
+    // The same switch on a plan of infrastructure: both read it. The owner's button for infra lets it merge.
+    const infra = await setup((f) => solved(f), { github: true, prepare: infraPlan });
+    infra.orchestrator.setMode('swarm');
+    infra.orchestrator.setInfraMerge('daemon');
+    infra.orchestrator.setReviews('cost', 'infra');
+    await until(infra.orchestrator, completed(infra.orchestrator));
+    assert.deepEqual(plan(infra.orchestrator)!.reviews!.map((r) => [r.role, r.verdict]), [['security', 'pass'], ['cost', 'pass']]);
+    assert.equal(plan(infra.orchestrator)!.unreviewed, undefined);
+    assert.equal(plan(infra.orchestrator)!.mergedBy, 'daemon');
+  });
+
+  it('a reviewer switched on again reads the open head it never read', async () => {
+    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true, config: { swarm: { merge: { code: 'owner' } } } });
+    o.setMode('swarm');
+    o.setReviews('security', 'off');
+    await until(o, () => plan(o)?.leftToOwner?.reason === "CODE plans are the owner's to merge (swarm.merge.code)");
+    assert.deepEqual(plan(o)!.reviews!.map((r) => r.role), ['cost']);
+
+    o.setReviews('security', 'on');
+    await until(o, () => plan(o)?.reviews?.filter((r) => r.posted).length === 2);
+    assert.deepEqual(fake.statusesSet.map((s) => [s.context, s.state, s.description]), [
+      ['harness/security', 'success', 'not reviewed: the owner switched security reviews off'],
+      ['harness/cost', 'success', 'passed'],
+      ['harness/security', 'success', 'passed'],
+    ]);
+    assert.equal(fake.prs[0]!.state, 'open');
+  });
+
+  it('switching a reviewer off releases the pull request it blocked; back on, its verdict on that head stands', async () => {
+    const review: ReviewBehavior = (role) => (role === 'security'
+      ? { verdict: 'block', summary: 'Still bad.', findings: [{ severity: 'blocking', title: 'Injection', detail: 'Quote it.' }] }
+      : { verdict: 'pass', summary: 'Fine.', findings: [] });
+    // No fix round, and CODE plans left to the owner: the pull request stays open through every switch.
+    const { orchestrator: o, fake } = await setup((f) => solved(f), {
+      github: true, review, config: { swarm: { securityFixRounds: 0, merge: { code: 'owner' } } },
+    });
+    o.setMode('swarm');
+    await until(o, () => o.state.pipeline.paused !== undefined);
+    assert.equal(plan(o)!.leftToOwner!.reason, 'the security reviewer still blocks PR #1 after 0 fix round(s): the owner decides');
+    const head = plan(o)!.pushed!;
+
+    // Off: its status passes over its verdict, saying it isn't one, and the cost reviewer gets its turn.
+    o.setReviews('security', 'off');
+    o.resume();
+    await until(o, () => plan(o)?.leftToOwner?.reason === "CODE plans are the owner's to merge (swarm.merge.code)");
+    assert.deepEqual(plan(o)!.unreviewed!.map((u) => [u.role, u.head === head, u.why]), [['security', true, 'off']]);
+    assert.deepEqual(fake.statusesSet.map((s) => [s.context, s.state, s.description]), [
+      ['harness/security', 'failure', '1 blocking finding'],
+      ['harness/security', 'success', 'not reviewed: the owner switched security reviews off'],
+      ['harness/cost', 'success', 'passed'],
+    ]);
+    assert.equal(o.state.pipeline.paused, undefined);
+
+    // On again: the verdict it gave this head stands, its status says it again, and it blocks as before.
+    o.setReviews('security', 'on');
+    await until(o, () => o.state.pipeline.paused !== undefined);
+    assert.match(o.state.pipeline.paused!.reason, /^the security reviewer still blocks PR #1 after 0 fix round/);
+    assert.deepEqual(fake.statusesSet.slice(3).map((s) => [s.context, s.state, s.description]), [['harness/security', 'failure', '1 blocking finding']]);
+    assert.equal(fake.reviews.length, 2, 'its review is on the pull request already: it is not posted twice');
+    // Off once more: said again, over the verdict, though it was said for this head before.
+    o.setReviews('security', 'off');
+    o.resume();
+    await until(o, () => plan(o)!.unreviewed!.length === 2);
+    assert.deepEqual(fake.statusesSet.slice(4).map((s) => [s.context, s.state]), [['harness/security', 'success']]);
+    assert.equal(fake.prs[0]!.state, 'open');
+    assert.equal(plan(o)!.reviews!.filter((r) => r.role === 'security').length, 1, 'one session read the head: its verdict was not asked for again');
+  });
+
+  it('stops the session of a reviewer switched off while it reads, and counts it as no failure', async () => {
+    // The security reviewer runs until its sandbox goes.
+    const held = (stub: AgentAdapter): AgentAdapter => ({
+      ...stub,
+      launchReviewer(run: AgentRun) {
+        if (!/as the security reviewer/.test(readFileSync(run.taskFile, 'utf8'))) return stub.launchReviewer(run);
+        return detach(run.workDir, [`echo $$ > ${sh(run.pidFile)}`, 'while :; do sleep 0.1; done'].join('\n'));
+      },
+    });
+    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true, agent: held });
+    o.setMode('swarm');
+    await until(o, () => plan(o)?.reviews?.[0]?.status === 'running');
+
+    o.setReviews('security', 'off');
+    await until(o, completed(o));
+    assert.deepEqual(plan(o)!.reviews!.map((r) => [r.role, r.status, r.outcome, r.reason ?? r.verdict]), [
+      ['security', 'failed', 'aborted', 'the owner switched security reviews off'],
+      ['cost', 'reported', 'done', 'pass'],
+    ]);
+    assert.deepEqual(fake.statusesSet.map((s) => [s.context, s.description]), [
+      ['harness/security', 'not reviewed: the owner switched security reviews off'],
+      ['harness/cost', 'passed'],
+    ]);
+    assert.equal(plan(o)!.mergedBy, 'daemon');
+  });
+
+  it('in Manual with reviewersInManual, a reviewer switched off comments on nothing, and no status is set for it', async () => {
+    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true, config: { swarm: { reviewersInManual: true } } });
+    o.setReviews('security', 'off');
+    await until(o, () => plan(o)?.reviews?.filter((r) => r.posted).length === 1);
+    for (let i = 0; i < 5; i++) await o.tick();
+    assert.deepEqual(plan(o)!.reviews!.map((r) => r.role), ['cost']);
+    assert.equal(plan(o)!.unreviewed, undefined);
+    assert.deepEqual(fake.statusesSet.map((s) => [s.context, s.state]), [['harness/cost', 'success']]);
   });
 
   it('in Swarm, a status the App cannot set leaves the PR to the owner with the reason', async () => {
@@ -1495,11 +1630,31 @@ describe('dashboard', () => {
     // Every section of the file, the toy having neither AWS nor Terraform.
     assert.deepEqual([...new Set(view.settings.map((s) => s.path.split('.')[0]))], ['harnessVersion', 'project', 'roles', 'sandbox', 'network', 'checks', 'protect', 'github', 'brakes', 'ownerTime', 'swarm', 'dashboard']);
     const fact = (facts: Array<{ name: string; value: string }>, name: string) => facts.find((f) => f.name === name)?.value;
-    assert.match(fact(view.daemon, 'Mode')!, /^Manual/);
+    // The mode and who merges infrastructure are switches of the page now, read from its state.
+    assert.deepEqual(view.daemon.map((f) => f.name), ['Your hours', 'Pipeline', 'Daemon', 'Project folder']);
     assert.equal(fact(view.daemon, 'Your hours'), 'not set');
     assert.equal(fact(view.machine, 'Node.js'), process.version);
     assert.equal(fact(view.machine, 'GitHub App'), 'acme-harness (acme-harness, id 42), owned by acme; its private key is on this machine');
     assert.doesNotMatch(JSON.stringify(view), /PRIVATE KEY|not a real key/);
+  });
+
+  it('switches a reviewer from the page: on or off, and the cost reviewer to infrastructure plans only', async () => {
+    const { o, port, bearer } = await dashboard();
+    const post = async (body: object) => JSON.parse((await callWith(port, '/api/reviews', bearer, body)).body) as { done: boolean; error?: string };
+    assert.deepEqual(await post({ role: 'cost', scope: 'infra' }), { done: true });
+    assert.deepEqual(await post({ role: 'security', scope: 'off' }), { done: true });
+    assert.deepEqual(await post({ role: 'security', scope: 'infra' }), { done: false, error: 'only cost reviews can be for infrastructure plans only' });
+    assert.deepEqual(await post({ role: 'style', scope: 'off' }), { done: false, error: 'role is security or cost; scope is on, infra or off' });
+    assert.deepEqual(await post({ role: 'cost', scope: 'sometimes' }), { done: false, error: 'role is security or cost; scope is on, infra or off' });
+    assert.deepEqual(o.state.reviews, { cost: 'infra', security: 'off' });
+    // The page reads the switches from the state, and where a reviewer can run from the design.
+    const page = JSON.parse((await call(port, '/api/state', bearer)).body) as DashboardState;
+    assert.deepEqual(page.state.reviews, { cost: 'infra', security: 'off' });
+    assert.deepEqual([page.design.swarm.requiredStatuses, page.design.swarm.reviewersInManual], [['harness/security', 'harness/cost'], false]);
+    assert.deepEqual(await post({ role: 'security', scope: 'on' }), { done: true });
+    assert.deepEqual(o.store.readAll().filter((e) => e.type === 'REVIEWS_SET').map((e) => e.payload), [
+      { role: 'cost', scope: 'infra' }, { role: 'security', scope: 'off' }, { role: 'security', scope: 'on' },
+    ]);
   });
 
   it('sets and clears only the hours of your time: the agent-hours threshold is gone', async () => {

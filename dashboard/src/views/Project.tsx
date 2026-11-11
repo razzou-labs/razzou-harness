@@ -507,11 +507,24 @@ const PlanDetails = defineComponent({
               {r.role === 'security' ? 'Security' : 'Cost'} review of {r.head.slice(0, 8)}:{' '}
               {r.status === 'reported'
                 ? <><Badge status={r.verdict === 'pass' ? 'passed' : 'failed'} label={r.verdict ?? 'reported'} /> {r.findings?.filter((f) => f.severity === 'blocking').length ?? 0} blocking, {r.findings?.filter((f) => f.severity === 'advisory').length ?? 0} advisory{r.posted?.problem ? <span class="text-negative"> · {r.posted.problem}</span> : null}</>
-                : r.status === 'failed'
-                  ? <span class="text-negative">failed: {r.reason}</span>
-                  : <Badge status={r.status} />}
+                : r.outcome === 'aborted'
+                  ? <span class="text-muted">stopped: {r.reason}</span>
+                  : r.status === 'failed'
+                    ? <span class="text-negative">failed: {r.reason}</span>
+                    : <Badge status={r.status} />}
             </p>
           ))}
+          {/* A reviewer the owner switched off, or away from CODE plans: its status says "not reviewed", until a review of the head is posted. */}
+          {(['security', 'cost'] as const).flatMap((role) => {
+            const said = plan.unreviewed?.findLast((u) => u.role === role && u.head === plan.pushed);
+            if (!said || plan.reviews?.some((r) => r.role === role && r.head === said.head && r.posted !== undefined && r.posted.at > said.at)) return [];
+            return [(
+              <p key={`unreviewed-${role}`} class="q-my-xs">
+                {role === 'security' ? 'Security' : 'Cost'} review of {said.head.slice(0, 8)}:{' '}
+                <span class="text-muted">not reviewed, {said.why === 'off' ? `${role} reviews being off` : `a CODE plan, with ${role} reviews for infrastructure plans only`}</span>
+              </p>
+            )];
+          })}
           {plan.deploy && (
             <p class="q-my-xs">
               Deploy of {plan.deploy.commit.slice(0, 8)}: <Badge status={plan.deploy.status} />

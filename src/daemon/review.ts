@@ -21,19 +21,48 @@ export type ReviewOutcome = 'progress' | 'busy' | 'ready' | 'owner';
 
 const short = (sha: string) => sha.slice(0, 8);
 
-/** Which reviewers run: in Swarm, those whose status the policy requires; in Manual, both when the owner asked for comments. */
-export function reviewRoles(o: Orchestrator): ReviewerRole[] {
+/** Which reviewers the configuration runs: in Swarm, those whose status the policy requires; in Manual, both when the owner asked for comments. */
+export function configuredReviewers(o: Orchestrator): ReviewerRole[] {
   const swarm = o.design.config.swarm;
   if (o.state.mode === 'swarm') return REVIEWER_ROLES.filter((role) => swarm.requiredStatuses.includes(statusContext(role)));
   return swarm.reviewersInManual ? [...REVIEWER_ROLES] : [];
 }
+
+/**
+ * Why a configured reviewer doesn't read a plan's pull request, if it doesn't: the owner
+ * switched it off, or to infrastructure plans only while this one is CODE. A plan the
+ * design no longer has counts as infrastructure, as everywhere.
+ */
+export function notReviewed(o: Orchestrator, plan: PlanState, role: ReviewerRole): 'off' | 'code' | undefined {
+  const scope = o.state.reviews?.[role] ?? 'on';
+  if (scope === 'off') return 'off';
+  if (scope === 'on') return undefined;
+  const definition = o.design.modules.find((m) => m.id === plan.module)?.plans.find((p) => p.id === plan.plan);
+  return definition && planKind(definition) === 'CODE' ? 'code' : undefined;
+}
+
+/** The status of a reviewer that didn't read the head, which main's rules and the merge policy still require in Swarm. */
+const UNREVIEWED: Record<'off' | 'code', (role: ReviewerRole) => string> = {
+  off: (role) => `not reviewed: the owner switched ${role} reviews off`,
+  code: (role) => `not reviewed: a CODE plan, and ${role} reviews are for infrastructure plans only`,
+};
 
 /** A reviewer's session under way on the plan's pushed head, if any: stepped before GitHub is read. */
 export function activeReview(plan: PlanState): ReviewState | undefined {
   return plan.reviews?.find((r) => r.head === plan.pushed && (r.status === 'starting' || r.status === 'running'));
 }
 
+/** A session under way goes on; one whose reviewer the owner switched off since, or away from this plan, stops: nothing waits for it any more. */
 export async function stepReview(o: Orchestrator, plan: PlanState, review: ReviewState): Promise<'progress' | 'wait'> {
+  const why = notReviewed(o, plan, review.role);
+  if (why) {
+    if (review.status === 'running') await o.killAgent(review.sandbox).catch(() => {});
+    o.stopFollowingReview(review.sandbox);
+    await o.driver.remove(review.sandbox);
+    const reason = why === 'off' ? `the owner switched ${review.role} reviews off` : `the owner switched ${review.role} reviews to infrastructure plans only`;
+    o.record({ type: 'REVIEW_ENDED', ref: { module: plan.module, plan: plan.plan }, payload: { role: review.role, head: review.head, outcome: 'aborted', reason } });
+    return 'progress';
+  }
   return review.status === 'starting' ? prepare(o, plan, review) : poll(o, plan, review);
 }
 
@@ -57,11 +86,27 @@ export async function pollRunningReviews(o: Orchestrator): Promise<boolean> {
  */
 export async function reviewStep(o: Orchestrator, plan: PlanState, pr: PullRequest): Promise<ReviewOutcome> {
   const ref = { module: plan.module, plan: plan.plan };
-  for (const role of reviewRoles(o)) {
+  for (const role of configuredReviewers(o)) {
     const reviews = (plan.reviews ?? []).filter((r) => r.role === role && r.head === pr.head);
     const review = reviews.at(-1);
-    // A usage limit isn't the reviewer's failure: the session runs again once the pause lifts.
-    const failures = reviews.filter((r) => r.status === 'failed' && r.outcome !== 'usage_limit').length;
+    const why = notReviewed(o, plan, role);
+    // When the head's status last said "not reviewed", which a verdict posted later replaces, and the other way round.
+    const said = plan.unreviewed?.findLast((u) => u.role === role && u.head === pr.head);
+    if (why) {
+      // In Manual nothing requires its status. In Swarm it is set as passed, once per head, and again
+      // over a verdict posted since: switching a reviewer off releases what it blocked.
+      if (o.state.mode !== 'swarm' || (said && !(review?.posted && review.posted.at > said.at))) continue;
+      try {
+        await o.forge.setCommitStatus(pr.head, { context: statusContext(role), state: 'success', description: UNREVIEWED[why](role) });
+      } catch (error) {
+        leaveToOwner(o, plan, pr, `could not set ${statusContext(role)} as not reviewed: ${clip((error as Error).message, 300)}`);
+        return 'owner';
+      }
+      o.record({ type: 'REVIEW_SKIPPED', ref, payload: { role, head: pr.head, why } });
+      return 'progress';
+    }
+    // Neither a usage limit nor the owner's switch is the reviewer's failure: the session runs again once it may.
+    const failures = reviews.filter((r) => r.status === 'failed' && r.outcome !== 'usage_limit' && r.outcome !== 'aborted').length;
     if (!review || (review.status === 'failed' && failures < 2)) {
       const minutes = o.design.config.swarm.reviewTimeoutMinutes;
       o.record({
@@ -85,6 +130,11 @@ export async function reviewStep(o: Orchestrator, plan: PlanState, pr: PullReque
     }
     if (!review.posted) {
       await post(o, plan, pr, review);
+      return 'progress';
+    }
+    // Switched on again after its status said "not reviewed" over its verdict on this head: the verdict stands, and its status says it again.
+    if (said && said.at > review.posted.at && o.state.mode === 'swarm') {
+      await restate(o, plan, review);
       return 'progress';
     }
     if (review.verdict === 'block' && o.state.mode === 'swarm') {
@@ -247,9 +297,7 @@ async function post(o: Orchestrator, plan: PlanState, pr: PullRequest, review: R
     `<!-- harness: ${review.role} review ${review.head} -->`,
   ].join('\n');
   const posting: ReviewPost = { head: review.head, body, comments: inline.map((f) => ({ path: f.file!, line: f.line!, body: `${title(f)}\n\n${f.detail}` })) };
-  const blocking = findings.filter((f) => f.severity === 'blocking').length;
-  const state = review.verdict === 'pass' ? 'success' : 'failure';
-  const description = review.verdict === 'pass' ? `passed${findings.length ? `, ${findings.length} advisory` : ''}` : `${blocking} blocking finding${blocking === 1 ? '' : 's'}`;
+  const { state, description } = verdictStatus(review);
   let comments = 0;
   let problem: string | undefined;
   try {
@@ -263,6 +311,31 @@ async function post(o: Orchestrator, plan: PlanState, pr: PullRequest, review: R
     problem = `${problem ? `${problem}; ` : ''}could not set ${statusContext(review.role)}: ${clip((error as Error).message, 300)}`;
   }
   o.record({ type: 'REVIEW_POSTED', ref, payload: { role: review.role, head: review.head, status: problem ? 'error' : state, comments, ...(problem ? { problem } : {}) } });
+}
+
+/** A verdict as the reviewer's commit status. */
+function verdictStatus(review: ReviewState): { state: 'success' | 'failure'; description: string } {
+  const findings = review.findings ?? [];
+  const blocking = findings.filter((f) => f.severity === 'blocking').length;
+  return review.verdict === 'pass'
+    ? { state: 'success', description: `passed${findings.length ? `, ${findings.length} advisory` : ''}` }
+    : { state: 'failure', description: `${blocking} blocking finding${blocking === 1 ? '' : 's'}` };
+}
+
+/** The verdict's status alone, set again: the review is on the PR already. */
+async function restate(o: Orchestrator, plan: PlanState, review: ReviewState): Promise<void> {
+  const { state, description } = verdictStatus(review);
+  let problem: string | undefined;
+  try {
+    await o.forge.setCommitStatus(review.head, { context: statusContext(review.role), state, description });
+  } catch (error) {
+    problem = `could not set ${statusContext(review.role)}: ${clip((error as Error).message, 300)}`;
+  }
+  o.record({
+    type: 'REVIEW_POSTED',
+    ref: { module: plan.module, plan: plan.plan },
+    payload: { role: review.role, head: review.head, status: problem ? 'error' : state, comments: review.posted?.comments ?? 0, ...(problem ? { problem } : {}) },
+  });
 }
 
 /** A blocking verdict in Swarm: a fix round with the findings as the Developer's guidance, within the reviewer's rounds. */
