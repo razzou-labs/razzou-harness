@@ -378,6 +378,12 @@ infrastructure: **Config** switches both. Its last button switches between light
 dark: the browser remembers your choice, and until you make one, the dashboard follows
 your system's.
 
+**Notifications.** The bell in the header switches this browser's notifications. Once
+they are on, the browser tells you when a card arrives under **Needs you** while you
+look elsewhere: a question from the Manager, a pull request that waits for you, a
+pause. It needs the dashboard open in a tab, in front or not, and says nothing of what
+already waited when the page loaded. The tab's title counts the cards in any case.
+
 ## Swarm mode
 
 Manual mode, the default, is what the rest of this README describes: you review and

@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
-import { heldBack, listNeeds, moduleCompleted, needPrint, needTitle, orderCards, orderNeeds, upstream, waitText, type Need } from '../src/dashboard/needs.ts';
+import { arrivals, heldBack, listNeeds, moduleCompleted, needPrint, needTitle, orderCards, orderNeeds, QUIET_MS, upstream, waitText, type Need } from '../src/dashboard/needs.ts';
 import type { DashboardState } from '../src/dashboard/server.ts';
 import type { ModuleState, OrderState, PlanState, State } from '../src/state/state.ts';
 
@@ -231,5 +231,34 @@ describe('needs you', () => {
     // Every card of the request handled: nothing is left of it, whatever waits now.
     const later = listNeeds(data([teardown], { plans: plansOf('completed'), actions: { 'web/G1': { status: 'done', at: '2026-11-09T21:00:00.000Z' }, 'web/G2': { status: 'done', at: '2026-11-11T14:00:00.000Z' } }, pipeline: { consecutiveFailures: 0, paused: { reason: 'the owner paused the pipeline', since: '2026-11-11T14:05:00.000Z' } } }));
     assert.deepEqual(orderNeeds(later, given), { needs: later, by: 'standard', why: {}, waiting: false });
+  });
+});
+
+describe('notifications', () => {
+  const paused = (reason: string): Need => ({ kind: 'paused', key: 'paused', paused: { reason, since: '2026-11-12T10:00:00.000Z' } });
+  const request = (id: string): Need => ({ kind: 'request', key: `request:${id}`, request: { requestId: id, module: 'web', question: 'Which region?', blocking: false, askedAt: '2026-11-12T10:00:00.000Z' } });
+  const keys = (needs: Need[]) => needs.map((need) => need.key);
+
+  it('announces a card that arrives, and neither what waited when the page loaded nor one that stays', () => {
+    const first = arrivals([request('r1')], undefined, 0);
+    assert.deepEqual(keys(first.fresh), [], 'what already waits is not news');
+    const second = arrivals([request('r1'), request('r2')], first.told, 60_000);
+    assert.deepEqual(keys(second.fresh), ['request:r2']);
+    const third = arrivals([request('r1'), request('r2')], second.told, 120_000);
+    assert.deepEqual(keys(third.fresh), []);
+  });
+
+  it("announces once an hour at most a card that goes and comes back, as the pause that waits to look again does every ten minutes", () => {
+    let told = arrivals([], undefined, 0).told;
+    const announced: number[] = [];
+    // The card comes, lifts ten minutes later, and comes back at once, for two hours.
+    for (let minute = 0; minute <= 120; minute += 10) {
+      const now = minute * 60_000;
+      const there = arrivals([paused('GitHub does not answer')], told, now);
+      if (there.fresh.length > 0) announced.push(minute);
+      told = arrivals([], there.told, now + 1_000).told;
+    }
+    assert.deepEqual(announced, [0, 60, 120]);
+    assert.equal(QUIET_MS, 60 * 60_000);
   });
 });

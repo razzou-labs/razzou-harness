@@ -230,6 +230,28 @@ export function needPrint(need: Need): string {
   return JSON.stringify(facts());
 }
 
+/** What the page already told the owner of: the cards that were there at its last look, and when it last announced each. */
+export interface Told {
+  present: Set<string>;
+  at: Map<string, number>;
+}
+
+/** A card announced within this long isn't announced again: the card of a pause that only waits to look again comes back every ten minutes. */
+export const QUIET_MS = 3_600_000;
+
+/**
+ * The cards that arrived since the page's last look, for its notifications, and what it
+ * has told by now. The first look announces nothing: what already waits isn't news.
+ */
+export function arrivals(needs: Need[], told: Told | undefined, now: number): { fresh: Need[]; told: Told } {
+  const present = new Set(needs.map((need) => need.key));
+  if (!told) return { fresh: [], told: { present, at: new Map() } };
+  const at = new Map(told.at);
+  const fresh = needs.filter((need) => !told.present.has(need.key) && now - (at.get(need.key) ?? -Infinity) >= QUIET_MS);
+  for (const need of fresh) at.set(need.key, now);
+  return { fresh, told: { present, at } };
+}
+
 /** The cards as an order request records them. */
 export const orderCards = (needs: Need[]): OrderCard[] => needs.map((need) => ({ key: need.key, title: needTitle(need), print: needPrint(need) }));
 
