@@ -3,6 +3,92 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## 0.6.0 (2026-11-12)
+
+**Upgrading from 0.5.9:** install the new version, rebuild the agents' image with
+`harness doctor --build-images` (its tag follows the harness's version), then restart the
+daemon with `harness down` and `harness up`, and reload the dashboard. From this version
+on, `harness upgrade` does all of it. Two things change by themselves in Swarm: a Fix PR
+merges under the plans' policy, unless you switch **Fix PR merges** to yours under
+**Config**; and a module has one Manager, while a Manager that a plan got before the
+upgrade keeps that plan until it is complete. Agents started before the upgrade keep the
+role text they have: the items they are sent say what to do, with tools they already have.
+
+This release is about what reaches you while a module is built: a problem goes to the
+Manager first, to the Architect when it concerns the design, and to you last. The README
+has the table, under **When something goes wrong**.
+
+- **One Manager per module, in Swarm too.** Swarm gave each plan in flight a Manager of
+  its own, which saw that plan alone. A module now has one Manager in both modes: it
+  reviews every plan's features, so that what happens between two plans, such as a
+  conflict, has one agent that knows both sides and can act on both, and you have one
+  Manager to write to.
+  - When a plan completed, the Managers of its module forgot everything they had been
+    sent, and a module's Manager was then sent a second time what still waited for it in
+    the other plans. It now forgets that plan's items alone.
+  - The pipeline no longer pauses for a Manager's silence on an item while the item
+    waits for the Architect's decision, or for a design change you haven't merged.
+- **Each item is shown in a folder of its own.** The daemon used to check out an
+  attempt at the top of the Manager's clone as it sent the review, and a second review
+  sent meanwhile moved the files under the first. Each item now names a folder,
+  `harness-shown/<name>/`, that holds its commit for as long as the item waits, and
+  names commits by their ids instead of `HEAD`.
+- **Accepted work that stops passing its checks goes to the Manager.** Git can merge
+  `main` into a plan's branch without a conflict and still break what the plan built.
+  It used to end in a pause, "the full check run failed", or "environment: checks of
+  accepted work fail before the attempt starts". Now:
+  - The daemon runs the checks a second time on the same commit: a failure that doesn't
+    repeat ends there, and nobody is asked.
+  - Failed twice, they go to the Manager with their output. Nothing new starts in that
+    plan; its attempts under way finish, and the other plans go on.
+  - The Manager says what breaks and where, with `request_fix`, and a Developer fixes
+    the branch in a round of its own, which the Manager reviews like a feature.
+  - A check that is itself wrong goes to the Architect, and a cause outside the code to
+    you, as a question; the checks run again once the design change reaches the branch,
+    or once you answer.
+  - An attempt doesn't pay for a broken branch. One stopped because the branch was
+    broken before it started doesn't count. One whose checks fail after the branch's
+    head moved under it, as when `main` is merged in while it is built, is judged only
+    once the branch was checked by itself: when the branch fails alone, the attempt is
+    interrupted and doesn't count either.
+  - A fix round no longer waits for the checks to pass before it starts, since their
+    failure can be why it is there.
+- **Failed attempts in a row no longer pause the pipeline.** Each failure already goes
+  to the Manager. From `brakes.consecutiveFailures` on, the item says that they add up,
+  and that a blocking question to you holds new attempts when their cause is outside
+  the code.
+- **A feature out of attempts goes to the Architect first.** Its card offered you one
+  more attempt, when the Manager knew more about it than you. Now the Manager takes it
+  to the Architect, which defined the feature and its checks:
+  - The Architect grants another attempt, and its decision lets the Manager start one;
+    or it changes the design, and the feature starts again once you merged the change.
+  - You see the question to the Architect under **Needs you**, and no card for the
+    feature; the Project view says where it stands. `harness retry` still gives it one
+    more attempt yourself.
+  - In a module designed by hand, which has no Architect, nothing changes.
+- **Questions about the design go to the Architect, not to you.** The Manager's role
+  says who to ask: the Architect for a contradiction, a choice the design left open or a
+  check that tests the wrong thing; you for what only you can do outside the design, an
+  account, a credential, a host to allow. The Architect is told to settle the choices
+  that are yours in its proposal, while you are with it.
+- **The daemon looks again by itself when GitHub doesn't answer.** A plan's step that
+  kept failing, a pull request with no CI after ten minutes, or a merge with no deploy
+  job after fifteen paused the pipeline until you resumed. The daemon now waits ten
+  minutes and looks again, for as long as it lasts, and **Needs you** says why and since
+  when. Nothing a resume of yours sets off happens in between.
+- **Fix PRs merge themselves in Swarm.** After a failed deploy, the Manager's Fix PR
+  goes through the reviewers and merges under the same policy as its plan's pull
+  request, and the deploy runs again without you. **Fix PR merges**, a new line of
+  **Mode and reviews** under **Config**, keeps them for you.
+- **Notifications.** The bell in the dashboard's header switches this browser's
+  notifications: once on, the browser tells you when a card arrives under **Needs you**
+  while the page is open in a tab and you look elsewhere. The tab's title counts the
+  cards in any case.
+- **`harness upgrade`.** One command for the steps above: it stops the daemon, installs
+  the latest version from npm, or the one you name, builds the agents' image, and
+  starts the daemon again in that terminal. When npm fails, the daemon starts again on
+  the version still installed.
+
 ## 0.5.9 (2026-11-11)
 
 **Upgrading from 0.5.8:** install the new version, rebuild the agents' image with
