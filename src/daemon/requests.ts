@@ -6,7 +6,7 @@ import { INPUTS, TOOLS, type Role, type ToolInput, type ToolName } from '../role
 import { activeAttempts, attemptInSandbox, featureKey, managerKey, planKey, type Attempt, type FeatureState } from '../state/state.ts';
 import { clip, sh, sha256, tail } from '../util.ts';
 import type { AgentRequest } from './channel.ts';
-import { attemptsLeft, ciReport, conflictReport, CONFLICT_STATUSES, deployReport } from './items.ts';
+import { attemptsLeft, checksFail, checksReport, ciReport, conflictReport, CONFLICT_STATUSES, deployReport, fixPrMerge, grantFor, outOfAttempts } from './items.ts';
 import type { Orchestrator } from './orchestrator.ts';
 import { refOf } from './refs.ts';
 
@@ -111,7 +111,17 @@ const HANDLERS: Handlers = {
     const state = o.state.features[feature];
     if (!state || !inScope(agent, state)) return refuse(`${feature} has no attempt in your ${scopeName(agent)}.`);
     const last = state.attempts.at(-1)!;
-    if (state.status === 'escalated') return refuse(`${feature} is escalated: the owner decides now.`);
+    if (state.status === 'escalated') {
+      // Out of attempts: one more starts once the Architect decided on it, or the owner answered about it.
+      if (!outOfAttempts(o, state)) return refuse(`${feature} is escalated: the owner decides now.`);
+      const granted = grantFor(o, state);
+      if (!granted) {
+        return refuse(`${feature} used up its attempts: take it to the Architect with escalate_to_architect(feature: "${feature}", question). Another attempt starts once its decision has come, or the owner's answer to a question of yours.`);
+      }
+      o.record({ type: 'RETRY', ref: refOf(state, last), from: 'manager', to: 'daemon', payload: { requestId, guidance, granted } });
+      o.kick();
+      return ok(`One more attempt of ${feature} starts with your guidance.`);
+    }
     if (!state.awaitingGuidanceSince) {
       return state.guidance !== undefined ? ok('The next attempt is already scheduled with guidance.') : refuse(`${feature} is not waiting for guidance (it is ${state.status}).`);
     }
@@ -187,8 +197,9 @@ const HANDLERS: Handlers = {
       plan: planKey(p),
       status: p.status,
       ...(p.validation ? { fullCheckRun: p.validation.status } : {}),
+      ...(checksFail(p) ? { waitingFor: 'your fix of the checks that fail on its branch (request_fix)' } : {}),
       ...(p.mainConflict ? { conflictsWithMainIn: p.mainConflict.files } : {}),
-      features: Object.values(o.state.features).filter((f) => f.module === module && f.plan === p.plan).map(featureSummary),
+      features: Object.values(o.state.features).filter((f) => f.module === module && f.plan === p.plan).map((f) => featureSummary(o, f)),
     }));
     const requests = Object.values(o.state.ownerRequests).filter((r) => r.module === module)
       .map((r) => ({ id: r.requestId, question: clip(r.question, 300), blocking: r.blocking, answer: r.answer ?? null }));
@@ -214,12 +225,21 @@ const HANDLERS: Handlers = {
       o.kick();
       return ok(`Merge round ${state.mergeRounds} of ${plan} starts: a Developer merges main into the plan branch with your guidance, and you review the merge.`);
     }
+    // Accepted work fails its checks on the branch: a round of its own, before the plan's build goes on.
+    if (checksFail(state)) {
+      o.record({
+        type: 'REQUEST_FIX', ref: { module: state.module, plan: state.plan }, from: 'manager', to: 'daemon',
+        payload: { requestId, guidance, failure: checksReport(state), checks: true },
+      });
+      o.kick();
+      return ok(`Fix round ${state.checkRounds} of ${plan} starts on the plan branch: a Developer makes the checks of accepted work pass again with your diagnosis, and you review the fix.`);
+    }
     if (state.status === 'deploy_failed' || state.status === 'verify_failed') {
       const limit = o.design.config.brakes.deployFixRounds;
       if ((state.deployFixRounds ?? 0) >= limit) return refuse(`${plan} used its ${limit} Fix PR(s): the owner decides now.`);
       o.record({ type: 'REQUEST_FIX', ref: { module: state.module, plan: state.plan }, from: 'manager', to: 'daemon', payload: { requestId, guidance, failure: deployReport(state) } });
       o.kick();
-      return ok(`Fix PR round ${state.deployFixRounds} of ${plan} starts on ${state.branch}: a Developer fixes it, you review it, and it goes through CI and the owner's merge.`);
+      return ok(`Fix PR round ${state.deployFixRounds} of ${plan} starts on ${state.branch}: a Developer fixes it, you review it, and its pull request goes through CI and ${fixPrMerge(o)}.`);
     }
     if (state.status !== 'pr_open' || state.ci?.status !== 'failed') {
       return refuse(`${plan} has no failed CI to fix: it is ${state.status}, CI ${state.ci?.status ?? 'not run yet'}.`);
@@ -244,7 +264,7 @@ const HANDLERS: Handlers = {
       });
       o.kick();
     }
-    return ok(`Sent as escalation ${requestId}. The Architect answers when the owner next works with it, so it can take a while; the decision comes to you as a message.`);
+    return ok(`Sent as escalation ${requestId}. The Architect is told at once; its decision comes to you as a message, which can take a while when the choice is the owner's.`);
   },
 
   async submit_proposal({ o, agent, requestId }, { version }) {
@@ -347,11 +367,16 @@ function underReview(o: Orchestrator, agent: AgentIdentity, requestId: string, f
   return { state, attempt };
 }
 
-function featureSummary(feature: FeatureState) {
+function featureSummary(o: Orchestrator, feature: FeatureState) {
+  const waitingFor = feature.awaitingGuidanceSince
+    ? 'your guidance (retry_feature)'
+    : !outOfAttempts(o, feature) ? undefined
+      : grantFor(o, feature) ? 'retry_feature, if the decision you got grants another attempt; a design change otherwise'
+        : "the Architect's decision on it (escalate_to_architect, if you haven't yet)";
   return {
     feature: featureKey(feature),
     status: feature.status,
-    ...(feature.awaitingGuidanceSince ? { waitingFor: 'your guidance (retry_feature)' } : {}),
+    ...(waitingFor ? { waitingFor } : {}),
     ...(feature.escalation ? { escalation: feature.escalation } : {}),
     attempts: feature.attempts.map((a) => ({
       n: a.n,

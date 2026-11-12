@@ -183,6 +183,9 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
           return sendJson(res, { done: orchestrator.resume() });
         case 'POST /api/infra-merge':
           return sendJson(res, body.by === 'daemon' || body.by === 'ceiling' ? { done: orchestrator.setInfraMerge(body.by) } : { done: false, error: 'by is daemon or ceiling' });
+        case 'POST /api/fix-merge':
+          // Who merges a Fix PR in Swarm: the daemon, under the plans' policy, or the owner.
+          return sendJson(res, body.by === 'daemon' || body.by === 'owner' ? { done: orchestrator.setFixMerge(body.by) } : { done: false, error: 'by is daemon or owner' });
         case 'POST /api/reviews': {
           // A reviewer's switch: every plan's pull request, infrastructure plans' only (the cost reviewer's), or none.
           const { role, scope } = body;

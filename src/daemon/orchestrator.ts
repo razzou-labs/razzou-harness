@@ -24,7 +24,7 @@ import { orderCards } from '../dashboard/needs.ts';
 import { EventStore, type CiJob, type HarnessEvent, type NewEvent, type Ref } from '../state/events.ts';
 import {
   activeAttempts, apply, countedAttempts, featureKey, interruptions, isActive, managerKey, managersOf, planKey, planMerged, project, writeSnapshot,
-  type Attempt, type FeatureState, type InfraMerge, type ManagerState, type Mode, type PlanState, type ReviewScope, type ReviewState, type State,
+  type Attempt, type FeatureState, type FixMerge, type InfraMerge, type ManagerState, type Mode, type PlanState, type ReviewScope, type ReviewState, type State,
 } from '../state/state.ts';
 import { clip, machineSize, sh, sleep } from '../util.ts';
 import { Architects } from './architects.ts';
@@ -64,8 +64,11 @@ export interface OrchestratorOptions {
 /** One step either changed something, so the loop runs again at once, or has to wait for the world. */
 type Step = 'progress' | 'wait';
 
-/** After this many errors in a row on the same attempt or plan (infrastructure, not the agent), the attempt is interrupted, or the pipeline pauses. */
+/** After this many errors in a row on the same attempt or plan (infrastructure, not the agent), the attempt is interrupted, or the pipeline waits to look again. */
 const STEP_ERROR_LIMIT = 5;
+
+/** How long the pipeline waits before it looks again by itself, after something outside the build didn't answer. */
+const LOOK_AGAIN_MS = 10 * 60_000;
 
 /** How often the daemon deletes this project's left-over sandboxes, besides when it starts. */
 const SWEEP_EVERY_MS = 3_600_000;
@@ -313,12 +316,23 @@ export class Orchestrator {
    * Pauses the pipeline, unless a pause that holds at least as long is there. A pause
    * without `until` (the owner's, a brake's) holds until the owner lifts it, so a timed
    * one never replaces it; a timed one gives way to an untimed one, or to a later `until`.
+   * `retry` marks a timed pause that only waits to look again (`lookAgainLater`).
    */
-  pausePipeline(reason: string, until?: string): boolean {
+  pausePipeline(reason: string, until?: string, retry = false): boolean {
     const current = this.state.pipeline.paused;
     if (current && (current.until === undefined || (until !== undefined && Date.parse(until) <= Date.parse(current.until)))) return false;
-    this.record({ type: 'PIPELINE_PAUSED', payload: { reason, ...(until ? { until } : {}) } });
+    this.record({ type: 'PIPELINE_PAUSED', payload: { reason, ...(until ? { until } : {}), ...(retry && until ? { retry: true } : {}) } });
     return true;
+  }
+
+  /**
+   * Something outside the build didn't answer, such as GitHub or the network: nothing new
+   * starts for ten minutes, then the daemon looks again by itself, and waits again if it
+   * is still so. The owner sees why under Needs you, and has nothing to lift: what a
+   * resume of theirs sets off, such as fresh turns for the Managers, doesn't happen.
+   */
+  private lookAgainLater(reason: string): void {
+    this.pausePipeline(reason, new Date(this.now() + LOOK_AGAIN_MS).toISOString(), true);
   }
 
   /** The owner lifts a pause. An API key stored meanwhile counts at once. */
@@ -371,6 +385,19 @@ export class Orchestrator {
   setInfraMerge(by: InfraMerge): boolean {
     if (this.state.infraMerge === by) return false;
     this.record({ type: 'INFRA_MERGE_SET', payload: { by } });
+    this.nextPoll.clear();
+    this.kick();
+    return true;
+  }
+
+  /**
+   * The owner lets the daemon merge Fix PRs in Swarm, under the same policy as a plan's
+   * pull request, or keeps them: the fix of a failed deploy then waits for their merge.
+   * Open PRs are looked at again at once.
+   */
+  setFixMerge(by: FixMerge): boolean {
+    if ((this.state.fixMerge ?? 'daemon') === by) return false;
+    this.record({ type: 'FIX_MERGE_SET', payload: { by } });
     this.nextPoll.clear();
     this.kick();
     return true;
@@ -535,7 +562,7 @@ export class Orchestrator {
   private async step(): Promise<Step> {
     const paused = this.state.pipeline.paused;
     if (paused?.until && this.now() >= Date.parse(paused.until)) {
-      this.record({ type: 'PIPELINE_RESUMED', payload: {} });
+      this.record({ type: 'PIPELINE_RESUMED', payload: { auto: true } });
       return 'progress';
     }
     // A design change merged meanwhile stops the attempts whose features it redefined, in both
@@ -646,6 +673,9 @@ export class Orchestrator {
     if (await this.mergeMain(planState)) return 'progress';
     // Main conflicts with the branch: what would start now would build without main, so the plan waits for its merge round.
     if (planState.mainConflict) return 'wait';
+    // Accepted work fails its checks on the branch: what would start now would build on it, so the plan waits for its fix.
+    const failing = await this.acceptedWorkFails(planState);
+    if (failing) return failing;
     if (this.state.mode === 'swarm') {
       const own = activeAttempts(this.state).filter(({ feature }) => feature.module === module.id && feature.plan === plan.id).length;
       return this.scheduleParallel(planRef, plan, planState, own, running, limit);
@@ -661,8 +691,9 @@ export class Orchestrator {
 
   /**
    * A plan's step, its errors counted for that plan alone: a plan that keeps failing is
-   * left alone for a while so the others go on, and past the limit the pipeline pauses
-   * with the error, where the owner sees it.
+   * left alone for a while so the others go on, and past the limit the pipeline waits ten
+   * minutes with the error, where the owner sees it, then looks again by itself: GitHub or
+   * the network not answering is nobody's to lift.
    */
   private async isolated(plan: PlanState, step: () => Promise<Step>): Promise<Step> {
     const key = planKey(plan);
@@ -680,7 +711,7 @@ export class Orchestrator {
         this.planErrors.set(key, { count, retryAt: this.now() + 30_000 });
       } else {
         this.planErrors.delete(key);
-        this.pausePipeline(`${key} keeps failing: ${clip(message.replace(/\s+/g, ' '), 300)}`);
+        this.lookAgainLater(`${key} keeps failing: ${clip(message.replace(/\s+/g, ' '), 300)}`);
       }
       return 'wait';
     }
@@ -711,8 +742,9 @@ export class Orchestrator {
         return this.recheckIfChanged(plan);
       case 'fixing': {
         const fix = this.state.features[`${planKey(planRef)}/fix${plan.fixes}`]!;
-        // A merge round has the plan branch to itself: the plan's attempts under way land first.
-        if (fix.fix?.kind === 'merge' && !isActive(fix) && activeAttempts(this.state).some(({ feature }) => feature.module === plan.module && feature.plan === plan.plan)) return 'wait';
+        // A merge round, or one that makes accepted work pass again, has the plan branch to itself: the plan's attempts under way land first.
+        const alone = fix.fix?.kind === 'merge' || fix.fix?.kind === 'checks';
+        if (alone && !isActive(fix) && activeAttempts(this.state).some(({ feature }) => feature.module === plan.module && feature.plan === plan.plan)) return 'wait';
         // A Fix PR's branch starts from the merge.
         if (!(await this.repo.revParse(`refs/heads/${plan.branch}`))) await this.repo.setRef(`refs/heads/${plan.branch}`, plan.base, '');
         return (await this.scheduleWork({ ...planRef, feature: fix.feature }, this.lookup(fix).feature, fix)) ?? 'wait';
@@ -806,12 +838,12 @@ export class Orchestrator {
     if (acceptedAsDefined(state, definition)) return undefined;
     if (state && isActive(state)) return 'wait';
     const hash = definitionHash(definition);
-    // The owner decides about an escalated feature, unless a design change redefined it since (§7.1).
+    // An escalated feature waits for another attempt to be granted, unless a design change redefined it since (§7.1).
     if (state?.status === 'escalated' && state.attempts.at(-1)?.definitionHash === hash) return 'wait';
     const used = state ? countedAttempts(state, hash) : 0;
     const allowed = this.design.config.roles.developer.maxAttempts + (state?.extraAttempts ?? 0);
     if (used >= allowed) {
-      this.record({ type: 'ESCALATED', ref, payload: { reason: `${used} attempt(s) failed; the owner decides what happens next` } });
+      this.record({ type: 'ESCALATED', ref, payload: { reason: `${used} attempt(s) failed; ${this.whoDecides(ref.module)}` } });
       return 'progress';
     }
     // A second attempt never starts without the Manager's guidance (§7.4).
@@ -963,6 +995,7 @@ export class Orchestrator {
       regressionChecks: merge ? distinct([...mustKeep, ...(await this.regressionChecks(merge.main, ref))]) : mustKeep,
       progressTail: progress.split('\n').slice(-21).join('\n'),
       ...(merge ? { merge } : {}),
+      ...(state.fix ? { fix: state.fix.kind } : {}),
     }));
     copyFileSync(join(this.options.packageDir, 'roles', 'developer.md'), join(dir, 'developer.md'));
     writeFileSync(join(dir, 'report.schema.json'), reportJsonSchema());
@@ -984,17 +1017,20 @@ export class Orchestrator {
     if (clone.code !== 0) return this.interrupt(state, attempt, `could not clone the plan branch: ${clone.stderr.trim()}`);
 
     const init = await initEnvironment(this.driver, sandbox, p.work);
-    if (init && init.exit !== 0) return this.baselineFailed(state, attempt, 'init.sh failed', [init]);
-    const regression = await runChecks(this.driver, sandbox, p.work, mustKeep, this.checkOptions(sandbox));
-    if (!allPassed(regression)) {
-      return this.baselineFailed(state, attempt, 'checks of accepted work fail before the attempt starts', regression);
+    // A fix round is there because something fails, which may be the environment script or these very checks: its Developer starts all the same.
+    if (!state.fix) {
+      if (init && init.exit !== 0) return this.baselineFailed(state, attempt, 'init.sh failed', [init]);
+      const regression = await runChecks(this.driver, sandbox, p.work, mustKeep, this.checkOptions(sandbox));
+      if (!allPassed(regression)) {
+        return this.baselineFailed(state, attempt, 'checks of accepted work fail before the attempt starts', regression);
+      }
     }
     const own = preMerge(feature.checks);
     // A feature built again after a design change redefined it has its earlier work in place: its checks may pass already.
     const rebuilding = state.attempts.some((a) => a.status === 'accepted');
     if (!rebuilding && own.length > 0 && allPassed(await runChecks(this.driver, sandbox, p.work, own, this.checkOptions(sandbox)))) {
       this.record({ type: 'ATTEMPT_INTERRUPTED', ref, payload: { reason: "the feature's checks already pass", counts: false } });
-      this.record({ type: 'ESCALATED', ref, payload: { reason: 'its checks pass before anything is built: the feature is already done, or its checks are too weak' } });
+      this.record({ type: 'ESCALATED', ref, payload: { reason: `its checks pass before anything is built: the feature is already done, or its checks are too weak; ${this.whoDecides(ref.module)}` } });
       await this.driver.remove(sandbox);
       return 'progress';
     }
@@ -1131,6 +1167,12 @@ export class Orchestrator {
       [...(await this.regressionChecks(checkRef, ref)), ...preMerge(feature.checks)],
     );
     if (!allPassed(results)) {
+      // The head moved under the attempt, and what fails may be the work accepted there, as when main merged in breaks
+      // it: the branch is checked by itself before the attempt is blamed. A broken branch is its Manager's to have
+      // fixed (`acceptedWorkFails`), and the attempt, which did nothing wrong, doesn't count.
+      if (merged && !state.fix && (await this.branchFails(ref))) {
+        return this.interrupt(state, attempt, `the work accepted on ${branch} fails its checks since its head moved: the next attempt starts once the branch is fixed`);
+      }
       this.record({ type: 'CHECKS_FAILED', ref, payload: { results } });
       const failing = results.filter((r) => r.exit !== 0).map((r) => r.id).join(', ');
       return this.fail(state, attempt, `checks failed${merged ? ` once merged with ${branch}'s new head` : ''}: ${failing}`);
@@ -1138,6 +1180,12 @@ export class Orchestrator {
     if (merged) this.record({ type: 'ATTEMPT_REBASED', ref, payload: { onto: merged.onto, commit: merged.commit, results } });
     if (attempt.status === 'checking') this.record({ type: 'CHECKS_PASSED', ref, payload: { results } });
     return 'progress';
+  }
+
+  /** Whether the work accepted on a plan's branch fails its own checks there, as run now and recorded. */
+  private async branchFails(ref: Ref): Promise<boolean> {
+    await this.runPlanChecks(this.state.plans[planKey(ref)]!);
+    return this.state.plans[planKey(ref)]!.validation?.status === 'failed';
   }
 
   /** The plan's head merged into the attempt's work, when the head moved since the attempt's base and the last merge. */
@@ -1193,20 +1241,10 @@ export class Orchestrator {
   private async validatePlan(plan: PlanState): Promise<Step> {
     const ref = { module: plan.module, plan: plan.plan };
     const validation = plan.validation;
-    if (!validation || validation.status === 'running') {
-      const results = await this.runChecksIn(
-        sandboxName('chk', this.design.config.project.name, planKey(ref), 'plan'),
-        `refs/heads/${plan.branch}`,
-        this.planDir(ref),
-        await this.regressionChecks(`refs/heads/${plan.branch}`),
-      );
-      this.record({ type: allPassed(results) ? 'PLAN_CHECKS_PASSED' : 'PLAN_CHECKS_FAILED', ref, payload: { results } });
+    // A failed run is run once more. Failed twice, the plan is back in its build (`acceptedWorkFails`): its Manager has it fixed.
+    if (!validation || validation.status !== 'passed') {
+      await this.runPlanChecks(plan);
       return 'progress';
-    }
-    if (validation.status === 'failed') {
-      const failing = (validation.results ?? []).filter((r) => r.exit !== 0).map((r) => r.id).join(', ');
-      this.pausePipeline(`the full check run of ${planKey(ref)} failed: ${failing}`);
-      return 'wait';
     }
     if (plan.summary === undefined) return 'wait';
     if (this.forge.kind === 'local') {
@@ -1214,6 +1252,34 @@ export class Orchestrator {
       return 'progress';
     }
     return this.openPullRequest(plan);
+  }
+
+  /** Every check of the work accepted on a plan's branch, in a fresh sandbox, recorded with the commit it ran on. */
+  private async runPlanChecks(plan: PlanState): Promise<void> {
+    const ref = { module: plan.module, plan: plan.plan };
+    const results = await this.runChecksIn(
+      sandboxName('chk', this.design.config.project.name, planKey(ref), 'plan'),
+      `refs/heads/${plan.branch}`,
+      this.planDir(ref),
+      await this.regressionChecks(`refs/heads/${plan.branch}`),
+    );
+    this.record({ type: allPassed(results) ? 'PLAN_CHECKS_PASSED' : 'PLAN_CHECKS_FAILED', ref, payload: { results, head: plan.head } });
+  }
+
+  /**
+   * The work accepted on the branch of a plan being built failed its checks: before an
+   * attempt, or at the full run. They run once more by themselves, since a registry that
+   * didn't answer or a check that flakes is nobody's to fix. Failed twice on the same
+   * commit, they are the plan's Manager's: it has a Developer fix the branch in a round of
+   * its own, and nothing new starts in the plan meanwhile. A head that moved since, as
+   * main merged in moves it, is checked afresh. Undefined when nothing failed.
+   */
+  private async acceptedWorkFails(plan: PlanState): Promise<Step | undefined> {
+    const validation = plan.validation;
+    if (validation?.status !== 'failed') return undefined;
+    if (validation.head === plan.head && (validation.runs ?? 0) >= 2) return 'wait';
+    await this.runPlanChecks(plan);
+    return 'progress';
   }
 
   // ── The pull request (§11.3, §11.7) ──────────────────────────────────────────
@@ -1294,7 +1360,9 @@ export class Orchestrator {
       const step = await this.readCi(plan);
       if (step) return step;
     }
-    if (plan.ci?.status === 'passed' && plan.branch.startsWith('fix/')) {
+    // A Fix PR is the daemon's to merge in Swarm, like a plan's, unless the owner keeps Fix PRs: then it gets the reviewers' statuses as not reviewed.
+    const fixForOwner = plan.branch.startsWith('fix/') && !(this.state.mode === 'swarm' && this.state.fixMerge !== 'owner');
+    if (plan.ci?.status === 'passed' && fixForOwner) {
       await this.markUnreviewed(pr.head, 'a Fix PR, which the owner merges');
     } else if (plan.ci?.status === 'passed') {
       // The cost job's estimate (v3 §5.3), then the reviewers (v3 §5), then the merge policy (v3 §3.2).
@@ -1351,7 +1419,8 @@ export class Orchestrator {
   /**
    * Swarm's merge policy (v3 §3.2): the daemon merges a plan's PR once CI passed, when
    * every clause holds; otherwise the PR is left to the owner, with the reason, once per
-   * head and reason. Fix PRs never come here: a failed deploy is the owner's to look at.
+   * head and reason. A Fix PR comes here too, as its plan's kind, unless the owner keeps
+   * Fix PRs for themselves (`fixMerge`).
    */
   private async mergeUnderPolicy(plan: PlanState, pr: PullRequest): Promise<boolean> {
     const ref = { module: plan.module, plan: plan.plan };
@@ -1486,8 +1555,10 @@ export class Orchestrator {
       return 'progress';
     }
     const running = [apply, later].some((r) => r !== undefined && r.status !== 'completed');
-    if (!running && this.now() - Date.parse(plan.mergedAt!) > 15 * 60_000) {
-      this.pausePipeline(`no ${name} job ran on main for ${commit.slice(0, 8)} within 15 minutes: is the harness workflow up to date?`);
+    const waited = this.now() - Date.parse(plan.mergedAt!);
+    if (!running && waited > 15 * 60_000) {
+      // GitHub may only be late: the daemon looks again by itself, and the owner sees for how long it has.
+      this.lookAgainLater(`no ${name} job has run on main for ${commit.slice(0, 8)}, ${Math.floor(waited / 60_000)} minutes after the merge of ${key}: is the harness workflow up to date?`);
     }
     return 'wait';
   }
@@ -1615,8 +1686,10 @@ export class Orchestrator {
     for (const run of await this.forge.checkRuns(ci.sha)) {
       if (required.includes(run.name) && run.id >= (latest.get(run.name)?.id ?? 0)) latest.set(run.name, run);
     }
-    if (ci.status === 'pending' && latest.size === 0 && this.now() - Date.parse(ci.since) > 10 * 60_000) {
-      this.pausePipeline(`no CI ran on PR #${plan.pr!.number} within 10 minutes: is the harness workflow on main?`);
+    const waited = this.now() - Date.parse(ci.since);
+    if (ci.status === 'pending' && latest.size === 0 && waited > 10 * 60_000) {
+      // GitHub may only be late: the daemon looks again by itself, and the owner sees for how long it has.
+      this.lookAgainLater(`no CI has run on PR #${plan.pr!.number} for ${Math.floor(waited / 60_000)} minutes: is the harness workflow on main?`);
       return 'wait';
     }
     if (latest.size < required.length || [...latest.values()].some((r) => r.status !== 'completed')) return undefined;
@@ -1740,14 +1813,24 @@ export class Orchestrator {
 
   // ── Outcomes and brakes (§7.4) ───────────────────────────────────────────────
 
-  /** The attempt counts. Unless it was a rejection, which carries guidance, the next one waits for the Manager's. */
+  /**
+   * The attempt counts. Unless it was a rejection, which carries guidance, the next one
+   * waits for the Manager's. Failures in a row pause nothing: each goes to the Manager,
+   * which is told from `brakes.consecutiveFailures` on that they add up, and holds new
+   * attempts with a blocking question to the owner when their cause is outside the code.
+   */
   private async fail(state: FeatureState, attempt: Attempt, reason: string): Promise<Step> {
     this.record({ type: 'ATTEMPT_FAILED', ref: refOf(state, attempt), payload: { reason } });
     this.stopFollowing(attempt.sandbox);
     await this.driver.remove(attempt.sandbox);
-    const limit = this.design.config.brakes.consecutiveFailures;
-    if (this.state.pipeline.consecutiveFailures >= limit) this.pausePipeline(`${limit} attempts failed in a row`);
     return 'progress';
+  }
+
+  /** Who a feature out of attempts waits for, as the end of its escalation's reason. */
+  private whoDecides(module: string): string {
+    return this.state.modules[module]
+      ? 'its Manager takes it to the Architect, which grants another attempt or changes the design'
+      : 'the owner decides what happens next';
   }
 
   /** Not the Developer's fault: doesn't count, except from the third interruption of the same feature. */
@@ -1772,13 +1855,18 @@ export class Orchestrator {
     return 'progress';
   }
 
+  /**
+   * Before a feature's attempt, the environment script or the checks of accepted work fail
+   * on the plan's branch: not this attempt's doing, so it doesn't count, and it is the
+   * branch that is looked at next (`acceptedWorkFails`), not the pipeline that pauses.
+   */
   private async baselineFailed(state: FeatureState, attempt: Attempt, reason: string, results: CheckResult[]): Promise<Step> {
     // init.sh runs in the attempt's sandbox: a dependency it couldn't fetch shows here.
     await this.keepRefusals(state, attempt);
     const ref = refOf(state, attempt);
     this.record({ type: 'BASELINE_FAILED', ref, payload: { reason, results } });
     this.record({ type: 'ATTEMPT_INTERRUPTED', ref, payload: { reason, counts: false } });
-    this.pausePipeline(`environment: ${reason}`);
+    this.record({ type: 'PLAN_CHECKS_FAILED', ref: { module: ref.module, plan: ref.plan }, payload: { results, head: attempt.base } });
     this.stopFollowing(attempt.sandbox);
     await this.driver.remove(attempt.sandbox);
     return 'progress';
@@ -2255,7 +2343,7 @@ export class Orchestrator {
   /** This attempt's line, after any waiting for a commit, such as satisfied gates (§8.5). */
   private progressLine(ref: Ref, attempt: Attempt, fix?: FeatureState['fix']): string {
     const summary = clip((attempt.summary ?? '').replace(/\s+/g, ' ').replaceAll('"', "'"), 160);
-    const what = fix ? `${fix.kind === 'merge' ? 'merge' : 'fix'}.accepted ${ref.module}/${ref.plan} round=${fix.round}` : `feature.accepted ${featureKey(ref)}`;
+    const what = fix ? `${fix.kind === 'merge' ? 'merge' : fix.kind === 'checks' ? 'checks' : 'fix'}.accepted ${ref.module}/${ref.plan} round=${fix.round}` : `feature.accepted ${featureKey(ref)}`;
     return [...this.state.pendingProgress, `${new Date(this.now()).toISOString()} ${what} attempt=${ref.attempt} "${summary}"`].join('\n');
   }
 }
@@ -2277,6 +2365,20 @@ function fixDefinition(id: string, plan: string, fix: NonNullable<FeatureState['
       kind: 'app',
       description: `Main no longer merges into the branch of plan ${plan}. Merge it, and resolve the conflicts so that the work of both sides holds, without changing anything else.\n\n${fix.failure}`,
       expected: 'The plan branch contains main, the work of both sides holds, and every check listed below passes.',
+      dependsOn: [],
+      supersedes: [],
+      gates: [],
+      resources: [],
+      checks: [],
+    };
+  }
+  if (fix.kind === 'checks') {
+    return {
+      id,
+      title: `Fix the checks, round ${fix.round}`,
+      kind: 'app',
+      description: `The work accepted on the branch of plan ${plan} no longer passes its checks there. Find what broke it and fix it, without touching protected files: the checks and the design stand.\n\n${fix.failure}`,
+      expected: 'Every check listed below passes again, and nothing an accepted feature does is lost.',
       dependsOn: [],
       supersedes: [],
       gates: [],
@@ -2373,7 +2475,7 @@ function outcomeReason(attempt: Attempt): string {
 function commitMessage(ref: Ref, feature: Feature, attempt: Attempt, results: CheckResult[], fix?: FeatureState['fix']): string {
   const subject = !fix ? `feat(${featureKey(ref)}): ${feature.title}`
     : fix.kind === 'merge' ? `merge(${ref.module}/${ref.plan}): main, round ${fix.round}`
-      : `fix(${ref.module}/${ref.plan}): ${fix.kind === 'ci' ? 'CI' : fix.kind === 'review' ? `the ${fix.role} review` : 'the deploy'}, round ${fix.round}`;
+      : `fix(${ref.module}/${ref.plan}): ${fix.kind === 'ci' ? 'CI' : fix.kind === 'checks' ? 'the checks' : fix.kind === 'review' ? `the ${fix.role} review` : 'the deploy'}, round ${fix.round}`;
   return [
     subject,
     ...(fix?.kind === 'merge' ? ['', `Conflicts resolved in ${(fix.files ?? []).join(', ')}.`] : []),

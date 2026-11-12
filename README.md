@@ -200,8 +200,9 @@ With `harness up` running and the dashboard open:
    once CI passes. The build starts.
 5. **Watch the build.** In **Agents**, each Developer's session and the Manager's are
    live transcripts. **Project** shows each feature's attempts, checks and commits.
-6. **Answer what comes up.** A question from the Manager, or a feature that ran out of
-   attempts, appears in **Needs you** with a form or buttons.
+6. **Answer what comes up.** What goes wrong, the Manager and the Architect settle
+   between them. What only you can settle, such as a question from the Manager or a
+   design change to merge, appears in **Needs you** with a form or buttons.
 7. **Merge the plan.** When all of a plan's features are accepted and its checks pass
    again, the daemon opens one `Plan:` pull request. Merge it with a merge commit once
    CI passes. The next plan starts.
@@ -240,8 +241,9 @@ plans it finds there (see [Configuration](#configuration)).
   after an infrastructure deploy.
 - **Attempt:** one Developer session on one feature, in a fresh sandbox, with a deadline
   (180 minutes) and a budget (2 attempts per feature). A failed attempt's successor
-  starts with the Manager's guidance. Once the budget is spent, the feature is escalated
-  to you.
+  starts with the Manager's guidance. Once the budget is spent, the Manager takes the
+  feature to the Architect, which grants another attempt or changes the design; in a
+  module designed by hand, which has no Architect, the feature is escalated to you.
 - **Owner actions:** what only you can do, such as creating an account, approving a
   policy or setting a secret. A **gate** holds back the plans or features it blocks
   until you mark it done; a **task** holds nothing back.
@@ -262,7 +264,7 @@ plans it finds there (see [Configuration](#configuration)).
   | Type | Opened for | Tags | Who merges |
   |---|---|---|---|
   | `Plan:` | a plan's features, built by the Developers | `[CODE]`, `[INFRA]`, `[MIXED_INFRA_AND_CODE]`: its kind | you in Manual, the daemon in Swarm under its policy |
-  | `Fix:` | a fix after a merged plan's deploy failed | `[DEPLOY_FAILED]`: the apply; `[VERIFY_FAILED]`: its post-deploy checks | you |
+  | `Fix:` | a fix after a merged plan's deploy failed | `[DEPLOY_FAILED]`: the apply; `[VERIFY_FAILED]`: its post-deploy checks | you in Manual; the daemon in Swarm, under the same policy as a plan's, unless you keep Fix PRs |
   | `Arch:` | the Architect's design | `[DESIGN]`: a module's first design, once, which freezes it; `[DESIGN_MODIFY]`: every later change | you |
   | `Arch:` | built features' definitions, on `locked/<module>` | `[CHANGED_LOCKED_FILES]`: only those definitions and the module's scripts their checks run | you |
   | `Harness:`, `Owner:` | yours | none | you |
@@ -276,11 +278,29 @@ plans it finds there (see [Configuration](#configuration)).
   whenever those checks change on `main`, your own commits included.
 - **`progress.txt`:** one line per accepted feature and satisfied gate, committed with
   the work. It only grows. When plans in parallel both add lines, the daemon keeps both.
-- **Brakes:** counters and deadlines, not judgment. Three failed attempts in a row, a
-  Manager that leaves an item waiting for 180 minutes, or CI still failing after two fix
-  rounds pause the pipeline until you resume it. A usage limit pauses it until the
-  limit resets, or for an hour when no agent said when, and never shortens a pause
-  already there.
+- **Brakes:** counters and deadlines, not judgment. A Manager that leaves an item
+  waiting for 180 minutes, CI still failing after two fix rounds, or a deploy still
+  failing after two Fix PRs pause the pipeline until you resume it. A usage limit pauses
+  it until the limit resets, or for an hour when no agent said when, and never shortens
+  a pause already there. Failed attempts in a row pause nothing: each goes to the
+  Manager, which is told from the third on that they add up.
+- **When something goes wrong:** the Manager deals with it, the Architect decides what
+  concerns the design, and you hear of it last.
+
+  | What happens | Who handles it | What reaches you |
+  |---|---|---|
+  | An attempt fails | The Manager gives guidance, and the next attempt starts | Nothing |
+  | A feature uses up its attempts | The Manager takes it to the Architect, which grants another attempt or changes the design | A design change to merge, if one comes. Without an Architect: the feature itself |
+  | The work accepted on a plan's branch stops passing its checks | The daemon runs them once more; then the Manager has a Developer fix the branch | Nothing, unless the Manager asks you |
+  | `main` conflicts with a plan's branch | The Manager says how each file must come out, and a Developer merges | Nothing, unless the Manager asks you |
+  | CI fails on a plan's pull request | The Manager has a Developer fix it | After two rounds, the pipeline pauses |
+  | A reviewer blocks a pull request | A Developer fixes the findings | After two rounds, the pull request waits for you |
+  | A deploy fails, or its post-deploy checks do | The Manager's Fix PR, which the daemon merges in Swarm | After two Fix PRs, the pipeline pauses; each Fix PR, if you keep them |
+  | A question about the design comes up | The Architect decides | The question, when the choice is yours |
+  | GitHub or the network doesn't answer | The daemon waits ten minutes, then looks again by itself | The reason, and nothing to do |
+
+  The Manager asks you only for what you alone can do outside the design: an account,
+  a credential, a host to allow.
 
 ## The dashboard
 
@@ -343,8 +363,9 @@ behind a token. Its views:
 - **Events:** the event log, live, with a filter.
 - **Config:** every setting the harness runs with. First, **Mode and reviews**: your
   switches, each a line with its toggle. The mode, Manual or Swarm; who merges INFRA
-  and MIXED plans in Swarm, you or the daemon; the security reviews, on or off; the
-  cost reviews, on, for infrastructure plans only, or off. The daemon keeps them in its
+  and MIXED plans in Swarm, you or the daemon; who merges Fix PRs in Swarm, the daemon
+  or you; the security reviews, on or off; the cost reviews, on, for infrastructure
+  plans only, or off. The daemon keeps them in its
   state and records each switch: `harness/config.json` isn't written. Then all of
   `harness/config.json` on `main`, each value from the file or the default, with the
   default a value of the file replaces, and a filter. What else the daemon's state
@@ -394,14 +415,17 @@ once CI passed and every status in `swarm.requiredStatuses` is green on its head
 Only an estimate of the pull request's current head counts: after a fix round, the new
 head needs its own. Before it merges, the daemon merges `main` into the pull request's
 branch if `main` moved since CI ran, so CI and the reviewers judge what `main` gets; a
-conflict goes to the plan's Manager, as described under **Conflicts with `main`**.
+conflict goes to the Manager, as described under **Conflicts with `main`**.
 
-Anything else waits for you, under **Needs you** with the reason. `Arch:` and `Fix:`
-pull requests are yours in both modes. In Swarm, GitHub's rules need no approval but
-require the reviewers' statuses, pinned to the App, so even the daemon can't merge
-before they pass. The reviewers read plan pull requests only: the daemon gives an
-`Arch:` or `Fix:` pull request the two statuses as "not reviewed", so you merge it
-without bypassing the rules, and CI still gates it.
+Anything else waits for you, under **Needs you** with the reason. `Arch:` pull requests
+are yours in both modes. A `Fix:` pull request, which the Manager has a Developer write
+after a failed deploy, merges under the same policy as its plan's, reviewers included,
+and the deploy then runs again without you. Switch **Fix PR merges** to yours under
+**Config** to keep them: the switch starts on the daemon's. In Swarm, GitHub's rules
+need no approval but require the reviewers' statuses, pinned to the App, so even the
+daemon can't merge before they pass. The reviewers read the pull requests the daemon
+merges: it gives an `Arch:` pull request, and a `Fix:` one you keep, the two statuses
+as "not reviewed", so you merge it without bypassing the rules, and CI still gates it.
 
 **Before a launch.** In Swarm the daemon checks your subscription's usage before it
 starts an attempt, and at or above `swarm.usageCeilingPercent` the pipeline waits for
@@ -462,21 +486,21 @@ blocked by a reviewer, or merges.
 **Parallel plans.** A plan may declare `dependsOn`, the plans of its module that must
 be merged before it starts; without it, it waits for the previous plan, as always. In
 Swarm, up to `swarm.maxPlans` plans of the module under way whose dependencies are
-merged build at once, each on its own branch with its own Manager, keyed `module/plan`
-in the Agents view. When one merges, `main` is merged into the others, `progress.txt`
-keeping both sides' lines. A
+merged build at once, each on its own branch. One Manager has the whole module, in both
+modes: it reviews every plan's features, so that what happens between two plans, such
+as a conflict, has one agent that knows both sides and can act on both. When a plan
+merges, `main` is merged into the others, `progress.txt` keeping both sides' lines. A
 feature may also depend on a feature of an earlier plan, as `P1/F03`, and then waits
 for that plan's merge. The Project view draws each module's features as trees, one per
 plan: a feature hangs from the feature it waits for, the end of the longest chain when it
 waits for several, and the others, an earlier plan's included, are named beside it. Green
 is accepted, blue under way, amber waiting for a decision, red escalated, grey not started;
-hover a feature for where it stands. Manual mode builds one plan at a time with one Manager
-per module, as before.
+hover a feature for where it stands. Manual mode builds one plan at a time.
 
 **Conflicts with `main`.** `main` moves while a plan is built or its pull request is open:
 another plan merges, or a design change does. Git merges it into the plan's branch when
-the two sides changed different lines. When they changed the same lines, the plan's
-Manager resolves it, in both modes, and you are not asked:
+the two sides changed different lines. When they changed the same lines, the Manager
+resolves it, in both modes, and you are not asked:
 - Nothing new starts in the plan, and its pull request, which GitHub can't merge and
   runs no CI on, shows no card under **Needs you**. The Project view says which files
   conflict.
@@ -489,9 +513,33 @@ Manager resolves it, in both modes, and you are not asked:
 - The Manager reviews the merge like a feature. Accepted, it lands as one merge commit;
   on an open pull request it is pushed, and CI and the reviewers run again.
 
-A merge that uses up its attempts is escalated like a feature: under **Needs you** you
-give it one more, with a note. The Architect hears of each conflict in one line, as
-plans meant to build together should stay off the same files.
+A merge that uses up its attempts goes the way of a feature that does: the Manager takes
+it to the Architect. The Architect hears of each conflict in one line, as plans meant to
+build together should stay off the same files.
+
+**Checks that stop passing.** Git can merge `main` into a plan's branch without a
+conflict and still break what the plan built, and two features can each pass alone and
+fail together. The checks of accepted work run before every attempt, and all together
+once a plan's features are accepted. When they fail on the branch:
+- The daemon runs them a second time on the same commit. A registry that didn't answer,
+  or a check that flakes, ends there, and nobody is asked.
+- Failed twice, they go to the Manager with their output. Nothing new starts in that
+  plan; its attempts under way finish, and the module's other plans go on.
+- The Manager says what breaks and where, and a Developer fixes the branch in a round of
+  its own, which the Manager reviews like a feature. The plan then goes on, and the full
+  run comes again once every feature is accepted.
+- A check that is itself wrong goes to the Architect, and a cause outside the code to
+  you, as a question: the checks run again once the design change reaches the branch,
+  or once you answer.
+- An attempt doesn't pay for a broken branch: one that finds it broken before it
+  starts, or whose checks fail after the branch's head moved under it while the branch
+  fails by itself, is interrupted and doesn't count.
+
+**When GitHub doesn't answer.** A plan's step that keeps failing, such as a push GitHub
+refuses, or a pull request on which no CI has run for ten minutes, makes the daemon wait
+ten minutes and look again by itself, for as long as it lasts. **Needs you** says why
+and since when, and you have nothing to lift: if the cause is yours, such as a workflow
+missing on `main`, fix it, and the next look goes on.
 
 **The cost job.** `harness install-ci` adds a `cost` job to the workflow: on a pull
 request that has `iac/`, it runs [Infracost](https://www.infracost.io) on the base and
@@ -586,7 +634,7 @@ through an `Arch:` pull request, or a commit of your own on `main`.
 | `roles.<role>.model` | `claude-fable-5-2` for the Architect, `claude-opus-5-5` for the Manager and the Developers | The role's model. The reviewers run on the Manager's model and effort. |
 | `roles.<role>.effort` | `max` | Claude Code's `--effort`; `null` for a model without effort levels, such as Haiku |
 | `roles.developer.attemptTimeoutMinutes` | 180 | An attempt's deadline |
-| `roles.developer.maxAttempts` | 2 | Attempts per feature before it is escalated to you |
+| `roles.developer.maxAttempts` | 2 | Attempts per feature before its Manager takes it to the Architect, or to you in a module without one |
 | `network.bundles` | `["all"]` | The hosts sandboxes reach directly, read-only, by bundle: `core`, `node`, `python`, `aws`, `terraform`, `go`, `rust`, `jvm`, `opentofu`, `browsers`, or `all` for every one, those later versions add included. The Architect gets them all. |
 | `network.extraHosts` | `[]` | More hosts, read-only |
 | `network.apis` | `[]` | Third-party APIs the code may call with any method, like a payment provider's test API: `{ "host": "api.stripe.com" }`, with `"key": "STRIPE_API_KEY"` for one that needs a key. `harness doctor` asks for the key at a hidden prompt and stores it in OpenShell; in a sandbox the variable holds a placeholder, which OpenShell replaces with the key on requests to that host alone, in headers and URLs, not in request bodies. CI gets no key. |
@@ -596,7 +644,7 @@ through an `Arch:` pull request, or a commit of your own on `main`.
 | `sandbox.claudeProvider` | `claude-sub` | The OpenShell provider that holds your Claude token |
 | `sandbox.env` | `{}` | Environment variables for every sandbox |
 | `github.requiredChecks` | `["verify", "checks"]` | The CI jobs a pull request must pass; `tf-plan` is added with Terraform |
-| `brakes.consecutiveFailures` | 3 | Failed attempts in a row that pause the pipeline |
+| `brakes.consecutiveFailures` | 3 | Failed attempts in a row from which the Manager is told that they add up; nothing pauses |
 | `brakes.managerTurnMinutes` | 90 | How long an item waits for the Manager before a reminder; as long again, and the pipeline pauses |
 | `brakes.ciFixRounds`, `brakes.deployFixRounds` | 2, 2 | Fix rounds after CI fails, and `Fix:` pull requests after a deploy fails |
 | `ownerTime.reservePercent` | 20 | The share of your hours designs may not plan for owner actions |
@@ -811,17 +859,22 @@ To report a vulnerability, see `SECURITY.md` in the source repository.
 | `.github/… differs from this version of the harness` | `harness install-ci`, then commit the files yourself |
 
 While the daemon runs:
-- **The pipeline is paused.** **Needs you** says why: attempts that failed in a row, a
-  Manager that didn't act, CI still failing after its fix rounds, a deploy still failing
-  after its Fix PRs, a usage limit, an invalid design on `main`, or a broken environment.
-  Fix the cause, then **Resume**. On resume, a failed full check run runs again and a
-  failed deploy is looked at again: a later successful apply on `main` counts.
+- **The pipeline is paused.** **Needs you** says why: a Manager that didn't act, CI
+  still failing after its fix rounds, a deploy still failing after its Fix PRs, a usage
+  limit, an invalid design on `main`, or a broken environment. Fix the cause, then
+  **Resume**. On resume, checks that failed run again and a failed deploy is looked at
+  again: a later successful apply on `main` counts. A pause that says when the daemon
+  looks again lifts by itself: GitHub or the network didn't answer.
 - **CI fails for a reason outside the code.** Fix it (a secret, the runner), then re-run
   the jobs on GitHub: a passing re-run counts. To fix the code yourself, push to the pull
   request's branch, or resolve a conflict in GitHub's editor: the daemon builds on your
   push, and CI runs again.
-- **A feature is escalated.** It used its attempts. In **Needs you**, give it one more
-  attempt with your guidance, send it to the Architect (the design may change), or pause.
+- **A feature is escalated.** It used its attempts, and its Manager takes it to the
+  Architect: the Project view says so on the feature, and **Needs you** shows the
+  question to the Architect, which you can weigh in on at its terminal. `harness retry`
+  gives it one more attempt yourself. In a module designed by hand, with no Architect,
+  the feature has a card under **Needs you**: give it one more attempt with your
+  guidance, or pause.
 - **The dashboard asks for its token.** Each `harness up` prints a new link: open that
   one. Each project's dashboard keeps its own cookie, named after its port, so several
   can be open at once. The browser it opens by itself logs in with a code that works once, for two

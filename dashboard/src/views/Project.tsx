@@ -463,7 +463,8 @@ const Plan = defineComponent({
         ...fixes.map((f) => ({ id: f.feature, title: fixTitle(f.fix!), kind: f.fix!.kind === 'merge' ? 'merge' : 'fix', state: f })),
       ];
       // A merge round under way: a Developer merges main, after a conflict the plan's Manager took.
-      const merging = planState?.status === 'fixing' && state.features[`${key}/fix${planState.fixes}`]?.fix?.kind === 'merge';
+      const round = planState?.status === 'fixing' ? state.features[`${key}/fix${planState.fixes}`]?.fix?.kind : undefined;
+      const merging = round === 'merge';
       // Each plan in a card of its own: its heading, its details and its features' table together.
       return (
         <QCard flat bordered class="plan q-mt-md">
@@ -475,7 +476,7 @@ const Plan = defineComponent({
               {planState?.mergedBy === 'daemon' && <span class="text-muted text-caption">merged by the daemon</span>}
               {planState?.ci && <Badge status={planState.ci.status} label={`CI ${planState.ci.status}`} />}
             </div>
-            {planState && <PlanDetails plan={planState} merging={merging} />}
+            {planState && <PlanDetails plan={planState} merging={merging} mending={round === 'checks'} />}
             <QTable class="features q-mt-sm" flat bordered dense wrapCells hideBottom rowKey="id" rows={rows} columns={FEATURE_COLUMNS} pagination={{ rowsPerPage: 0 }} tableStyle="table-layout: fixed">
               {{
                 body: ({ row }: { row: (typeof rows)[number] }) => (
@@ -493,21 +494,46 @@ const Plan = defineComponent({
   },
 });
 
-/** A fix work item's title: what it follows, or the merge of main after a conflict. */
+/** A fix work item's title: what it follows, the merge of main after a conflict, or the checks of accepted work made to pass again. */
 function fixTitle(fix: NonNullable<FeatureState['fix']>): string {
   if (fix.kind === 'merge') return `Merge of main, round ${fix.round}`;
+  if (fix.kind === 'checks') return `Fix of the checks, round ${fix.round}`;
   return `Fix after ${fix.kind === 'ci' ? 'CI' : fix.kind === 'review' ? `the ${fix.role} review` : 'the deploy'}, round ${fix.round}`;
 }
 
 const PlanDetails = defineComponent({
-  props: { plan: { type: Object as PropType<PlanState>, required: true }, merging: { type: Boolean, default: false } },
+  props: {
+    plan: { type: Object as PropType<PlanState>, required: true },
+    merging: { type: Boolean, default: false },
+    /** A Developer is making the checks of accepted work pass again, in a fix round of their own. */
+    mending: { type: Boolean, default: false },
+  },
   setup(props) {
     return () => {
       const plan = props.plan;
       const failedJobs = plan.ci?.jobs?.filter((j) => j.conclusion !== 'success') ?? [];
       const postDeploy = plan.postDeploy;
+      // Accepted work fails its checks on the branch: run once more by the daemon, then the Manager's to have fixed.
+      const failing = plan.validation?.status === 'failed' ? (plan.validation.results ?? []).filter((r) => r.exit !== 0) : [];
+      const twice = (plan.validation?.runs ?? 0) >= 2;
       return (
         <div class="text-caption q-mt-xs">
+          {failing.length > 0 && (
+            <Fold
+              headerClass="text-warning"
+              label={() => `Accepted work fails its checks on the branch (${failing.map((r) => r.id).join(', ')}): ${
+                props.mending ? 'a Developer is fixing it, for the Manager to review'
+                  : twice ? 'the Manager says what breaks, then a Developer fixes it'
+                    : 'the daemon runs them once more before anyone is asked'}. Nothing new starts in this plan meanwhile.`}
+            >
+              {failing.map((r) => (
+                <div key={r.id}>
+                  <b class="text-negative">{r.id}</b> <span class="text-muted">{duration(r.durationMs)}</span>
+                  <pre>{r.output}</pre>
+                </div>
+              ))}
+            </Fold>
+          )}
           {/* Main no longer merges into the branch: nothing new starts in the plan until a merge round lands. */}
           {plan.mainConflict && (
             <p class="q-my-xs text-warning">
@@ -632,6 +658,8 @@ const FeatureRow = defineComponent({
           <QTd>
             <Badge status={feature?.status ?? 'pending'} />
             {feature?.awaitingGuidanceSince && <div class="text-muted text-caption">waiting for the Manager's guidance</div>}
+            {/* Out of attempts: who has it now, the Architect through the Manager, or the owner. */}
+            {feature?.status === 'escalated' && feature.escalation && <div class="text-muted text-caption">{feature.escalation}</div>}
           </QTd>
           <QTd class="mono">{feature ? `${feature.attempts.length}${counted ? ` (${counted} of ${props.max + feature.extraAttempts} counted)` : ''}` : '0'}</QTd>
           <QTd>

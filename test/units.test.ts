@@ -53,6 +53,45 @@ describe('state projection', () => {
     assert.equal(state.plans['demo/P1']!.head, 'c1');
   });
 
+  it("starts nothing afresh when the daemon lifts a pause that only waited to look again, as it does after the owner's resume", () => {
+    const store = new EventStore(join(tempDir('state'), 'events.jsonl'));
+    const plan = { module: 'demo', plan: 'P1' };
+    store.append({ type: 'PLAN_STARTED', ref: plan, payload: { branch: 'plan/demo/P1', base: 'b0' } });
+    store.append({ type: 'PLAN_CHECKS_FAILED', ref: plan, payload: { results: [], head: 'b0' } });
+    store.append({ type: 'MANAGER_STARTING', payload: { module: 'demo', sandbox: 'mgr', sessionId: 'x' } });
+    store.append({ type: 'MANAGER_LAUNCHED', payload: { module: 'demo', launch: 1, outputBytes: 0 } });
+    store.append({ type: 'MANAGER_ITEM_SENT', payload: { module: 'demo', key: 'review:demo/P1/F01#1', launch: 1, reminder: false } });
+    const sentAndFailing = (state: ReturnType<typeof project>) => [Object.keys(state.managers.demo!.sent), state.plans['demo/P1']!.validation?.status, state.pipeline.paused?.retry];
+
+    // GitHub didn't answer: the daemon waits, then looks again. Nobody looked, so what waits goes on waiting.
+    store.append({ type: 'PIPELINE_PAUSED', payload: { reason: 'demo/P1 keeps failing', until: '2030-01-01T00:10:00Z', retry: true } });
+    assert.deepEqual(sentAndFailing(project(store.readAll())), [['review:demo/P1/F01#1'], 'failed', true]);
+    store.append({ type: 'PIPELINE_RESUMED', payload: { auto: true } });
+    assert.deepEqual(sentAndFailing(project(store.readAll())), [['review:demo/P1/F01#1'], 'failed', undefined]);
+
+    // The owner lifts the same kind of pause themselves: they looked, so the Manager's turn and the failed checks start afresh.
+    store.append({ type: 'PIPELINE_PAUSED', payload: { reason: 'demo/P1 keeps failing', until: '2030-01-01T00:20:00Z', retry: true } });
+    store.append({ type: 'PIPELINE_RESUMED', payload: {} });
+    assert.deepEqual(sentAndFailing(project(store.readAll())), [[], undefined, undefined]);
+  });
+
+  it('runs failing checks twice on a commit before they are anybody\'s, and sends a plan whose full run failed twice back to its build', () => {
+    const store = new EventStore(join(tempDir('state'), 'events.jsonl'));
+    const plan = { module: 'demo', plan: 'P1' };
+    const validation = () => project(store.readAll()).plans['demo/P1']!;
+    store.append({ type: 'PLAN_STARTED', ref: plan, payload: { branch: 'plan/demo/P1', base: 'b0' } });
+    store.append({ type: 'PLAN_VALIDATING', ref: plan, payload: { head: 'h1' } });
+    store.append({ type: 'PLAN_CHECKS_FAILED', ref: plan, payload: { results: [], head: 'h1' } });
+    assert.deepEqual([validation().status, validation().validation?.runs], ['validating', 1]);
+    store.append({ type: 'PLAN_CHECKS_FAILED', ref: plan, payload: { results: [], head: 'h1' } });
+    assert.deepEqual([validation().status, validation().validation?.runs, validation().validation?.head], ['active', 2, 'h1']);
+    // Another commit is counted afresh, and a run that passes ends the count.
+    store.append({ type: 'PLAN_CHECKS_FAILED', ref: plan, payload: { results: [], head: 'h2' } });
+    assert.equal(validation().validation?.runs, 1);
+    store.append({ type: 'PLAN_CHECKS_PASSED', ref: plan, payload: { results: [], head: 'h2' } });
+    assert.deepEqual([validation().validation?.status, validation().validation?.runs], ['passed', undefined]);
+  });
+
   it("keeps the owner's latest order request alone, with the answer to it, and a Manager's tools from when its sandbox was made", () => {
     const store = new EventStore(join(tempDir('state'), 'events.jsonl'));
     const cards = [{ key: 'action:demo/T1', title: 'Task demo/T1: Read', print: '[]' }, { key: 'action:demo/T2', title: 'Task demo/T2: Copy', print: '[]' }];

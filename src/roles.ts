@@ -89,13 +89,14 @@ export const TOOLS: Record<Role, ToolSpec[]> = {
     {
       name: 'retry_feature',
       description:
-        'After a failed attempt, starts the next one with your guidance. The next Developer starts fresh: it sees the feature, why the last attempt failed, and your guidance.',
+        "After a failed attempt, starts the next one with your guidance. The next Developer starts fresh: it sees the feature, why the last attempt failed, and your guidance. For a feature out of attempts, it is accepted once the Architect's decision on your escalation about it has come.",
       waitSec: 120,
     },
     { name: 'abort_attempt', description: 'Stops the running attempt. It counts as failed. Use it only when the attempt cannot succeed.', waitSec: 120 },
     {
       name: 'ask_owner',
-      description: 'Asks the owner in the dashboard. The answer arrives later, as a message. With blocking: true, no new attempt starts until the owner answers.',
+      description:
+        'Asks the owner in the dashboard, for what only they can do outside the design: an account, a credential, a host to allow, money. A question about the design goes to the Architect, with escalate_to_architect. The answer arrives later, as a message. With blocking: true, no new attempt starts until the owner answers.',
       waitSec: 120,
     },
     {
@@ -120,13 +121,13 @@ export const TOOLS: Record<Role, ToolSpec[]> = {
     {
       name: 'request_fix',
       description:
-        "Starts a round of work by a Developer on a plan's branch, guided by what you write. After CI failed on its pull request, or after its deploy failed: a fix round, with your diagnosis, and a limited number of rounds. When main no longer merges into the branch: a merge round, with how each conflicting file must come out; you review the merge.",
+        "Starts a round of work by a Developer on a plan's branch, guided by what you write. After CI failed on its pull request, or after its deploy failed: a fix round, with your diagnosis, and a limited number of rounds. When the work accepted on the branch no longer passes its checks: a fix round too, before the plan's build goes on. When main no longer merges into the branch: a merge round, with how each conflicting file must come out; you review the merge.",
       waitSec: 120,
     },
     {
       name: 'escalate_to_architect',
       description:
-        'Asks the Architect about the design: a contradiction, a decision it left open, a check that tests the wrong thing. The owner sees it too. The Architect answers when the owner next works with it, so plan for a wait.',
+        "Asks the Architect, which decides everything about the design: a contradiction, a choice it left open, a check that tests the wrong thing, a feature out of attempts (name it in `feature`). The owner sees the question, and isn't asked. The Architect answers by itself, or once the owner next works with it when the choice is theirs: plan for a wait.",
       waitSec: 120,
     },
     webRead,

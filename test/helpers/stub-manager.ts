@@ -85,6 +85,10 @@ function act(item: string): void {
     if (feature) call('retry_feature', { feature, guidance: `The ${m[1]!.startsWith('ANSWER') ? 'owner' : 'Architect'} says: ${answer}` });
   } else if ((m = /^\[harness\] (?:DEPLOY FAILED|POST-DEPLOY CHECKS FAILED) (\S+)/.exec(header))) {
     call('request_fix', { plan: m[1], guidance: 'Stub diagnosis: the deployed infrastructure is incomplete; add what the check looks for.' });
+  } else if ((m = /^\[harness\] ATTEMPTS USED UP (\S+)/.exec(header))) {
+    call('escalate_to_architect', { question: `How should ${m[1]} be done?`, feature: m[1] });
+  } else if ((m = /^\[harness\] PLAN CHECKS FAILED (\S+)/.exec(header))) {
+    call('request_fix', { plan: m[1], guidance: 'Stub diagnosis: accepted work fails its checks; make them pass again.' });
   } else if ((m = /^\[harness\] CONFLICT WITH MAIN (\S+)/.exec(header))) {
     call('request_fix', { plan: m[1], guidance: 'Stub resolution: keep the lines of both sides in every file that conflicts.' });
   } else if ((m = /^\[harness\] CI FAILED (\S+)/.exec(header))) {

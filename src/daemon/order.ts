@@ -109,7 +109,10 @@ export function orderRequest(o: Orchestrator, requestId: string, needs: Need[], 
 function describe(o: Orchestrator, need: Need, manager: ManagerState): string[] {
   switch (need.kind) {
     case 'paused':
-      return [`Paused since ${need.paused.since}${need.paused.until ? `, until ${need.paused.until}` : ''}. Reason: ${need.paused.reason}`];
+      return [
+        `Paused since ${need.paused.since}${need.paused.until ? `, until ${need.paused.until}` : ''}. Reason: ${need.paused.reason}`,
+        ...(need.paused.retry ? ['It only waits to look again: the daemon lifts it by itself then, and the owner has nothing to do unless the reason is theirs to fix.'] : []),
+      ];
     case 'locked': {
       const locked = need.module.locked!;
       return [

@@ -101,7 +101,10 @@ describe('needs you', () => {
         'web/P1': built('web', 'P1', 'pr_open', { pr: { number: 3, url: 'https://github.com/acme/toy/pull/3' }, leftToOwner: { head: 'b', reason: 'an INFRA plan', at: '2026-11-10T09:00:00.000Z' } }),
       },
       features: {
+        // Out of attempts in a module with an Architect: its Manager takes it there, and the owner has no card for it.
         'web/P2/F02': { module: 'web', plan: 'P2', feature: 'F02', status: 'escalated', attempts: [] } as unknown as State['features'][string],
+        // In a module designed by hand, with no Architect, the owner decides.
+        'ops/P1/F09': { module: 'ops', plan: 'P1', feature: 'F09', status: 'escalated', attempts: [] } as unknown as State['features'][string],
       },
       actions: { 'web/T2': { status: 'done', at: '2026-11-10T09:00:00.000Z' } },
     }));
@@ -110,7 +113,7 @@ describe('needs you', () => {
       'locked:web', 'design:web', 'escalation:e2', 'proposal:api',
       'request:r3', 'request:r4', 'request:r1',
       'left:web/P1', 'merge:web/P2',
-      'escalated:web/P2/F02',
+      'escalated:ops/P1/F09',
       'action:web/T1', 'action:web/G1',
     ]);
   });

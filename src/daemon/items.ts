@@ -1,7 +1,7 @@
 import type { CheckResult } from '../checks/runner.ts';
-import { definitionHash } from '../design/schemas.ts';
+import { definitionHash, planDependencies } from '../design/schemas.ts';
 import type { Ref } from '../state/events.ts';
-import { countedAttempts, featureKey, planKey, type Attempt, type FeatureState, type ManagerState, type PlanState } from '../state/state.ts';
+import { countedAttempts, featureKey, managerKey, planKey, type Attempt, type FeatureState, type ManagerState, type PlanState } from '../state/state.ts';
 import { clip, tail } from '../util.ts';
 import type { Orchestrator } from './orchestrator.ts';
 import { attemptRefName, refOf } from './refs.ts';
@@ -16,17 +16,51 @@ export interface Item {
   title: string;
   /** What the Manager is expected to call. */
   ask: string;
-  /** What to check out in the Manager's clone first: an attempt's commits, or else the branch; with `main`, main comes along as `harness/main`. */
-  show?: { attempt?: Ref; branch: string; main?: boolean };
+  /** What the Manager is shown, in a folder of its clone: an attempt's commits, or else the branch's head; with `main`, main comes along as `harness/main`. */
+  show?: Show;
   text: () => Promise<string>;
 }
 
-/** What waits for a Manager: the items of its module, or of its plan alone for a plan's Manager (v3 §6.4). */
+export interface Show {
+  attempt?: Ref;
+  branch: string;
+  main?: boolean;
+}
+
+/** The folder of a Manager's clone that holds what its items show, each in a folder of its own. */
+export const SHOWN_DIR = 'harness-shown';
+
+/**
+ * What an item shows, resolved: the commit, and the folder of the Manager's clone that
+ * holds it. The folder is the item's alone and never moves, where the top of the clone
+ * follows the latest item: several wait at once, and a review read from the top could be
+ * of another attempt's files.
+ */
+export async function shown(o: Orchestrator, show: Show): Promise<{ commit: string; dir: string } | undefined> {
+  const attempt = show.attempt ? await o.repo.revParse(attemptRefName(show.attempt)) : undefined;
+  const commit = attempt ?? (await o.repo.revParse(`refs/heads/${show.branch}`));
+  if (!commit) return undefined;
+  const label = attempt && show.attempt ? `${show.attempt.plan}-${show.attempt.feature}-a${show.attempt.attempt}` : show.branch.replace(/[^A-Za-z0-9._-]+/g, '-');
+  return { commit, dir: `${SHOWN_DIR}/${label}-${commit.slice(0, 8)}` };
+}
+
+/** "`harness-shown/…/` of your clone", or the top of the clone when the commit is gone. */
+async function folder(o: Orchestrator, show: Show): Promise<string> {
+  const at = await shown(o, show);
+  return at ? `\`${at.dir}/\` of your clone` : 'your clone';
+}
+
+/**
+ * What waits for a Manager: the items of its module. A plan's Manager, which Swarm
+ * started before 0.6.0 and which keeps its plan until that is complete, gets its plan's
+ * alone, and the module's Manager leaves that plan to it: no item is delivered twice.
+ */
 export function pendingItems(o: Orchestrator, scope: { module: string; plan?: string | undefined }): Item[] {
   const { module, plan: only } = scope;
+  const mine = (plan: string) => (only !== undefined ? plan === only : !hasOwnManager(o, module, plan));
   const questions: Item[] = [];
   const others: Item[] = [];
-  for (const feature of Object.values(o.state.features).filter((f) => f.module === module && (only === undefined || f.plan === only))) {
+  for (const feature of Object.values(o.state.features).filter((f) => f.module === module && mine(f.plan))) {
     const last = feature.attempts.at(-1);
     // A feature a design change dropped waits for nobody: an attempt under way stops (v3 §6.6).
     if (!last || !o.featureDefinition(feature)) continue;
@@ -39,43 +73,49 @@ export function pendingItems(o: Orchestrator, scope: { module: string; plan?: st
     if (feature.awaitingGuidanceSince && feature.status !== 'escalated' && attemptsLeft(o, feature) > 0) {
       others.push(failureItem(o, feature, last));
     }
+    // Out of attempts: the Manager takes it to the Architect, once, and the owner isn't asked first.
+    if (outOfAttempts(o, feature) && !takenToArchitect(o, feature)) others.push(exhaustedItem(o, feature, last));
   }
   const rounds = o.design.config.brakes.ciFixRounds;
   const deployRounds = o.design.config.brakes.deployFixRounds;
-  for (const plan of Object.values(o.state.plans).filter((p) => p.module === module && (only === undefined || p.plan === only))) {
+  for (const plan of Object.values(o.state.plans).filter((p) => p.module === module && mine(p.plan))) {
     if ((plan.status === 'deploy_failed' || plan.status === 'verify_failed') && (plan.deployFixRounds ?? 0) < deployRounds) {
       const key = planKey(plan);
       const what = plan.status === 'deploy_failed' ? 'DEPLOY FAILED' : 'POST-DEPLOY CHECKS FAILED';
+      const show: Show = { branch: 'main' };
       others.push({
         key: `${plan.status}:${key}@${plan.mergeCommit}`,
         title: `the failed deploy of ${key}`,
         ask: `Call request_fix(plan: "${key}", guidance) to start a Fix PR, or ask_owner if it can't be fixed in code.`,
-        show: { branch: 'main' },
+        show,
         text: async () => [
           `[harness] ${what} ${key} (merged as ${short(plan.mergeCommit)}, ${plan.deployFixRounds ?? 0} of ${deployRounds} Fix PRs used)`,
           '',
           deployReport(plan),
           '',
-          'Your clone has main checked out. Diagnose the failure, then call',
-          `request_fix(plan: "${key}", guidance): a Developer fixes it on a new fix branch, and it goes through review, CI and the owner's merge again. If the cause isn't in the code (a missing permission, a quota, an account setting), use ask_owner instead.`,
+          `Main is checked out in ${await folder(o, show)}. Diagnose the failure, then call`,
+          `request_fix(plan: "${key}", guidance): a Developer fixes it on a new fix branch, you review the fix, and its pull request goes through CI and ${fixPrMerge(o)}. If a check is wrong while the deploy is right, that is the Architect's: escalate_to_architect. If the cause is outside the code and the design (a missing permission, a quota, an account setting), use ask_owner.`,
         ].join('\n'),
       });
     }
     // Main no longer merges into the branch (v3 §6.6): the Manager says how the files must come out, and a merge round starts.
     if (plan.mainConflict && CONFLICT_STATUSES.includes(plan.status)) others.push(conflictItem(o, plan));
+    // Accepted work fails its checks on the branch, twice: the Manager says what breaks, and a fix round starts.
+    if (checksFail(plan)) others.push(checksItem(o, plan));
     if (plan.status === 'pr_open' && plan.ci?.status === 'failed' && (plan.fixRounds ?? 0) < rounds) {
       const key = planKey(plan);
+      const show: Show = { branch: plan.branch };
       others.push({
         key: `ci:${key}@${plan.ci.sha}`,
         title: `the failed CI of ${key}`,
         ask: `Call request_fix(plan: "${key}", guidance), or ask_owner if it can't be fixed in code.`,
-        show: { branch: plan.branch },
+        show,
         text: async () => [
           `[harness] CI FAILED ${key} (PR #${plan.pr?.number}, ${plan.fixRounds ?? 0} of ${rounds} fix rounds used)`,
           '',
           ciReport(plan),
           '',
-          'Your clone has the plan branch checked out. Diagnose the failure from the code and the logs, then call',
+          `The plan branch is checked out in ${await folder(o, show)}. Diagnose the failure from the code and the logs, then call`,
           `request_fix(plan: "${key}", guidance) with what fails, why, and where to fix it: a Developer then fixes it on the plan branch, and CI runs again. If the cause isn't in the code (CI setup, a secret, a flaky runner), use ask_owner instead.`,
         ].join('\n'),
       });
@@ -104,19 +144,126 @@ export function pendingItems(o: Orchestrator, scope: { module: string; plan?: st
 /** Where a plan stands when a conflict with main can go to its Manager: being built, or with its pull request open. */
 export const CONFLICT_STATUSES: PlanState['status'][] = ['active', 'pr_open', 'ready_to_merge'];
 
+/**
+ * The work accepted on a plan's branch failed its checks twice on the commit the branch
+ * is at, while the plan is built: its Manager has it fixed, and nothing new starts in it.
+ */
+export const checksFail = (plan: PlanState): boolean =>
+  plan.status === 'active' && plan.validation?.status === 'failed' && plan.validation.head === plan.head && (plan.validation.runs ?? 0) >= 2;
+
+/** What fails on a plan's branch, with the end of each failing check's output. */
+export function checksReport(plan: PlanState): string {
+  const failing = (plan.validation?.results ?? []).filter((r) => r.exit !== 0);
+  return [
+    `The work accepted on ${plan.branch} no longer passes its checks there, at ${short(plan.head)}. The daemon ran them twice; the second time:`,
+    ...checkLines(failing, true),
+  ].join('\n');
+}
+
+function checksItem(o: Orchestrator, plan: PlanState): Item {
+  const key = planKey(plan);
+  const show: Show = { branch: plan.branch };
+  return {
+    key: `checks:${key}@${plan.head}`,
+    title: `the failing checks of ${key}`,
+    ask: `Call request_fix(plan: "${key}", guidance), or escalate_to_architect if a check is wrong, or ask_owner if the cause is outside the code.`,
+    show,
+    text: async () => [
+      `[harness] PLAN CHECKS FAILED ${key}`,
+      '',
+      checksReport(plan),
+      '',
+      `Nothing new starts in this plan until they pass again; its attempts under way finish, and the module's other plans go on. The branch is checked out in ${await folder(o, show)}, and \`git log --oneline -8 ${short(plan.head)}\` shows what reached it last: a feature landed beside another, or main merged in.`,
+      '',
+      `Find the cause, then call request_fix(plan: "${key}", guidance) with what breaks, why, and where to fix it: a Developer fixes it on the plan branch, every check of accepted work runs on the result, and you review the fix like a feature. If a check itself is wrong, or two features ask for contradictory things, that is the design's: escalate_to_architect, and the checks run again once its change reaches the branch. If the cause is outside the code and the design, such as a registry that doesn't answer or a host the sandbox can't reach, use ask_owner: the checks run again once the owner answers.`,
+    ].join('\n'),
+  };
+}
+
+/** A feature that used up its attempts, in a module with an Architect: the Manager takes it there before the owner hears of it. */
+export const outOfAttempts = (o: Orchestrator, feature: FeatureState): boolean =>
+  feature.status === 'escalated' && o.state.modules[feature.module] !== undefined;
+
+/** Since when a feature is escalated; one escalated before 0.6.0 has only its last attempt's end. */
+const escalatedSince = (feature: FeatureState): string => feature.escalatedAt ?? feature.attempts.at(-1)?.endedAt ?? feature.attempts.at(-1)?.startedAt ?? '';
+
+/** The Manager's escalations about a feature since it ran out of attempts, oldest first. */
+function escalationsAbout(o: Orchestrator, feature: FeatureState) {
+  const since = escalatedSince(feature);
+  return (o.state.modules[feature.module]?.escalations ?? []).filter((e) => e.feature === featureKey(feature) && e.askedAt >= since);
+}
+
+const takenToArchitect = (o: Orchestrator, feature: FeatureState): boolean => escalationsAbout(o, feature).length > 0;
+
+/**
+ * What lets a Manager give a feature out of attempts one more: a decision of the
+ * Architect on an escalation about it, or the owner's answer to a question asked since,
+ * either of which came after it stopped. Undefined while neither has.
+ */
+export function grantFor(o: Orchestrator, feature: FeatureState): string | undefined {
+  const decided = escalationsAbout(o, feature).find((e) => e.decision !== undefined);
+  if (decided) return `escalation:${decided.id}`;
+  const since = escalatedSince(feature);
+  const answered = Object.values(o.state.ownerRequests).find((r) => r.module === feature.module && r.askedAt >= since && r.answer !== undefined);
+  return answered ? `request:${answered.requestId}` : undefined;
+}
+
+function exhaustedItem(o: Orchestrator, feature: FeatureState, last: Attempt): Item {
+  const key = featureKey(feature);
+  const ref = refOf(feature, last);
+  const show: Show = { attempt: ref, branch: o.state.plans[planKey(ref)]!.branch };
+  return {
+    key: `exhausted:${key}#${feature.attempts.length}`,
+    title: `${key}, which is out of attempts`,
+    ask: `Call escalate_to_architect(feature: "${key}", question).`,
+    show,
+    text: async () => {
+      const { feature: definition } = o.lookup(feature);
+      return [
+        `[harness] ATTEMPTS USED UP ${key}`,
+        '',
+        `Feature "${definition.title}": ${definition.description}`,
+        `Expected: ${definition.expected}`,
+        '',
+        `Why it stopped: ${feature.escalation ?? 'its attempts are used up'}`,
+        ...feature.attempts.map((a) => `- attempt ${a.n}: ${a.status}${a.reason ? `, ${clip(a.reason, 300)}` : ''}${a.guidance ? `. It had this guidance: ${clip(a.guidance, 300)}` : ''}`),
+        ...inARow(o),
+        '',
+        `Its last attempt is checked out in ${await folder(o, show)}; get_attempt gives each one in full.`,
+        '',
+        `You have no attempt left to give, and the owner isn't asked first: take it to the Architect, which defined the feature and its checks. Call escalate_to_architect(feature: "${key}", question) with what failed each time, what your guidance already tried, and your own view: is the definition wrong or contradictory, the feature too large for one attempt, a check testing the wrong thing, or would one more attempt with different guidance be enough?`,
+        '',
+        `Its decision comes to you as a message. When it grants another attempt, call retry_feature(feature: "${key}", guidance) with its direction: that is accepted once per decision. When it changes the design instead, do nothing: the feature starts again by itself once the change is merged. Use ask_owner only for what neither of you can settle, such as an account, a credential or a host to allow; retry_feature is accepted after the owner's answer too.`,
+      ].join('\n');
+    },
+  };
+}
+
+/** From `brakes.consecutiveFailures` on, what a Manager is told with a failure: they add up, and nothing pauses by itself. */
+function inARow(o: Orchestrator): string[] {
+  const row = o.state.pipeline.consecutiveFailures;
+  if (row < o.design.config.brakes.consecutiveFailures) return [];
+  return [
+    '',
+    `${row} attempts have now failed in a row in this module, with nothing accepted in between, and nothing pauses by itself. If they share a cause outside the Developers' work, such as the environment, an account or a host the sandbox can't reach, the next attempt fails the same way: use ask_owner with blocking: true, which holds new attempts until the owner answers. If the design is the cause, escalate_to_architect.`,
+  ];
+}
+
 function conflictItem(o: Orchestrator, plan: PlanState): Item {
   const key = planKey(plan);
+  const show: Show = { branch: plan.branch, main: true };
+  const [ours, theirs] = [short(plan.head), short(plan.mainConflict!.main)];
   return {
     key: `conflict:${key}@${plan.mainConflict!.main}`,
     title: `the conflict of ${key} with main`,
     ask: `Call request_fix(plan: "${key}", guidance) with how each file must come out, or escalate_to_architect if the two sides contradict each other.`,
-    show: { branch: plan.branch, main: true },
+    show,
     text: async () => [
       `[harness] CONFLICT WITH MAIN ${key}`,
       '',
       await conflictReport(o, plan),
       '',
-      'Your clone has the plan branch checked out, and main as `harness/main`. For a file, `git diff harness/main...HEAD -- <file>` shows what your plan did to it since the two diverged, and `git diff HEAD...harness/main -- <file>` what main did.',
+      `The plan branch, at ${ours}, is checked out in ${await folder(o, show)}, and your clone has main at ${theirs}. For a file, \`git diff ${theirs}...${ours} -- <file>\` shows what the plan did to it since the two diverged, and \`git diff ${ours}...${theirs} -- <file>\` what main did; \`git show ${theirs}:<file>\` is the file as main has it.`,
       '',
       `Nothing new starts in this plan until main is merged in. Work out how each file must come out so that the work of both sides holds, then call request_fix(plan: "${key}", guidance) with that, file by file: a Developer merges main into the plan branch following it, every check of accepted work runs on the result, and you review the merge like a feature. If the two sides contradict each other in a way only the design can settle, use escalate_to_architect first, or ask_owner when the module has no Architect, and call request_fix once you have the decision.`,
     ].join('\n'),
@@ -159,13 +306,16 @@ function reviewItem(o: Orchestrator, feature: FeatureState, attempt: Attempt): I
   const branch = o.state.plans[planKey(ref)]!.branch;
   // A merge round's result (v3 §6.6): main comes along, to compare with.
   const merge = feature.fix?.kind === 'merge' ? feature.fix : undefined;
+  const show: Show = { attempt: ref, branch, ...(merge ? { main: true } : {}) };
+  const [base, head] = [short(attempt.base), short(attempt.head)];
   return {
     key: `review:${key}#${attempt.n}`,
     title: `the review of ${key} attempt ${attempt.n}`,
     ask: `Call accept_feature or reject_feature for ${key} attempt ${attempt.n}.`,
-    show: { attempt: ref, branch, ...(merge ? { main: true } : {}) },
+    show,
     text: async () => {
       const { feature: definition } = o.lookup(feature);
+      const where = await folder(o, show);
       return [
         `[harness] REVIEW ${key} attempt ${attempt.n}`,
         '',
@@ -183,13 +333,13 @@ function reviewItem(o: Orchestrator, feature: FeatureState, attempt: Attempt): I
         ...(merge
           ? [
             `It conflicted in: ${(merge.files ?? []).join(', ')}`,
-            `Your clone has the merge checked out, and main as \`harness/main\`. HEAD is ${short(attempt.head)}, the plan branch at ${short(attempt.base)} with main at ${short(merge.main)} merged in. \`git diff harness/main HEAD\` is what the plan holds on top of main, and \`git diff ${short(attempt.base)} HEAD\` what the merge brought to the plan branch.`,
+            `The merge is checked out in ${where}: read its files there. Its head is ${head}, the plan branch at ${base} with main at ${short(merge.main)} merged in. \`git diff ${short(merge.main)} ${head}\` is what the plan holds on top of main, and \`git diff ${base} ${head}\` what the merge brought to the plan branch.`,
             '',
             `Review the files that conflicted: the work of both sides must hold in each, and nothing else may have changed beyond what the merge needs. Then call accept_feature or reject_feature (feature: "${key}", attempt: ${attempt.n}). Accepted, it lands as the merge of main into the plan branch.`,
           ]
           : [
             `Changed files: ${(attempt.files ?? []).join(', ') || '(none)'}`,
-            `Your clone has the attempt checked out. HEAD is ${short(attempt.head)}, on top of the plan branch at ${short(attempt.base)}: see \`git diff ${short(attempt.base)} HEAD\` and \`git log ${short(attempt.base)}..HEAD\`.`,
+            `The attempt is checked out in ${where}: read its files there. Its head is ${head}, on top of the plan branch at ${base}: see \`git diff ${base} ${head}\` and \`git log ${base}..${head}\`.`,
             '',
             `Review it against the feature and the design, then call accept_feature or reject_feature (feature: "${key}", attempt: ${attempt.n}).`,
           ]),
@@ -203,14 +353,16 @@ function failureItem(o: Orchestrator, feature: FeatureState, attempt: Attempt): 
   const ref = refOf(feature, attempt);
   const branch = o.state.plans[planKey(ref)]!.branch;
   const left = attemptsLeft(o, feature);
+  const show: Show = { attempt: ref, branch };
   return {
     key: `guidance:${key}#${attempt.n}`,
     title: `the guidance for ${key} after attempt ${attempt.n}`,
     ask: `Call retry_feature(feature: "${key}", guidance), or ask_owner if only the owner can unblock it.`,
-    show: { attempt: ref, branch },
+    show,
     text: async () => {
       const { feature: definition } = o.lookup(feature);
       const head = await o.repo.revParse(attemptRefName(ref));
+      const where = await folder(o, show);
       const finding = attempt.finding;
       const failing = (attempt.checks ?? []).filter((c) => c.exit !== 0);
       return [
@@ -227,12 +379,15 @@ function failureItem(o: Orchestrator, feature: FeatureState, attempt: Attempt): 
         ...questionsAsked(attempt),
         ...refusedLines(attempt, true),
         ...(failing.length ? ['', 'Failing checks:', ...checkLines(failing, true)] : []),
+        ...inARow(o),
         '',
         head
-          ? `Your clone has its commits checked out (HEAD ${short(head)}, on top of ${short(attempt.base)}).`
-          : 'It committed nothing; your clone shows the plan branch.',
+          ? `Its commits are checked out in ${where} (head ${short(head)}, on top of ${short(attempt.base)}): \`git diff ${short(attempt.base)} ${short(head)}\` is what it wrote.`
+          : `It committed nothing: ${where} holds the plan branch as it found it.`,
         '',
-        `${left} attempt${left === 1 ? '' : 's'} left. The next Developer starts fresh: it sees the feature, why this attempt failed, and your guidance. Call retry_feature(feature: "${key}", guidance) with what would have prevented this failure. If only the owner can unblock it, use ask_owner, then retry_feature once you have the answer.`,
+        `${left} attempt${left === 1 ? '' : 's'} left. The next Developer starts fresh: it sees the feature, why this attempt failed, and your guidance. Call retry_feature(feature: "${key}", guidance) with what would have prevented this failure. ${o.state.modules[feature.module]
+          ? 'If the design is the cause, such as a contradiction, a decision it left open or a check that tests the wrong thing, use escalate_to_architect; if only the owner can unblock it, such as an account, a credential or a host to allow, use ask_owner. Then retry_feature once you have the answer.'
+          : 'If only the owner can unblock it, use ask_owner, then retry_feature once you have the answer.'}`,
       ].join('\n');
     },
   };
@@ -270,8 +425,19 @@ export function mailText(o: Orchestrator, manager: ManagerState, mail: ManagerSt
   // Written whole when the owner asked: the cards as they were then.
   if (mail.kind === 'order_request') return mail.text;
   if (mail.kind === 'decision') {
-    const question = o.state.modules[manager.module]?.escalations.find((e) => e.id === mail.requestId)?.question ?? '';
-    return [`[harness] DECISION from the Architect on your escalation ${mail.requestId}`, '', `You asked: ${clip(question, 800)}`, '', `Decision: ${mail.text}`].join('\n');
+    const escalation = o.state.modules[manager.module]?.escalations.find((e) => e.id === mail.requestId);
+    const about = escalation?.feature ? o.state.features[escalation.feature] : undefined;
+    return [
+      `[harness] DECISION from the Architect on your escalation ${mail.requestId}`,
+      '',
+      `You asked: ${clip(escalation?.question ?? '', 800)}`,
+      '',
+      `Decision: ${mail.text}`,
+      // The feature is out of attempts: this decision is what lets the Manager start one more.
+      ...(about && outOfAttempts(o, about)
+        ? ['', `${escalation!.feature} is out of attempts. If this decision grants another one, call retry_feature(feature: "${escalation!.feature}", guidance) now, with the Architect's direction in your guidance. If it changes the design instead, do nothing: the feature starts again by itself once the change is merged.`]
+        : []),
+    ].join('\n');
   }
   if (mail.kind === 'owner_answer') {
     const question = o.state.ownerRequests[mail.requestId ?? '']?.question ?? '';
@@ -296,15 +462,32 @@ export function mailText(o: Orchestrator, manager: ManagerState, mail: ManagerSt
       `The plan is harness/modules/${manager.module}/plans/${manager.plan}.json in your clone, next to the others. Read it now, with ARCHITECTURE.md and README.md if they exist, so you're ready for questions and reviews. Then reply in one line and wait for the next item.`,
     ].join('\n');
   }
-  const plans = (module?.plans ?? []).map((p) => `- ${p.id} "${p.title}": ${features(p)}`);
+  // Every plan of the module is this Manager's, in both modes: in Swarm, those that depend on no unfinished plan are built at once.
+  const plans = (module?.plans ?? []).map((p) => {
+    const after = module ? planDependencies(module, p) : [];
+    return `- ${p.id} "${p.title}" (${after.length > 0 ? `after ${after.join(', ')}` : 'after no other plan'}): ${features(p)}`;
+  });
   return [
     `[harness] WELCOME: you are the Manager of module "${manager.module}".`,
     '',
-    'Its plans, built in this order:',
+    'Its plans, all yours. One starts once the plans it comes after are merged, so several may be built at the same time, and their items reach you in turn:',
     ...plans,
     '',
     `The plans are in harness/modules/${manager.module}/plans/ in your clone. Read them now, with ARCHITECTURE.md and README.md if they exist, so you're ready for questions and reviews. Then reply in one line and wait for the next item.`,
   ].join('\n');
+}
+
+/** Whether a plan has a Manager of its own still running: one that Swarm started before 0.6.0. */
+export function hasOwnManager(o: Orchestrator, module: string, plan: string): boolean {
+  const own = o.state.managers[managerKey({ module, plan })];
+  return own !== undefined && own.status !== 'stopped';
+}
+
+/** Who merges a Fix PR, as the end of "its pull request goes through CI and …". */
+export function fixPrMerge(o: Orchestrator): string {
+  return o.state.mode === 'swarm' && o.state.fixMerge !== 'owner'
+    ? "the reviewers, then the daemon's merge under the same policy as a plan's"
+    : "the owner's merge";
 }
 
 export function attemptsLeft(o: Orchestrator, feature: FeatureState): number {

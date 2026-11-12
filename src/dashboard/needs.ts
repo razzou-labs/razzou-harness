@@ -36,7 +36,8 @@ export type Need =
  *    proposal, a Manager's question to it. They may redefine what the cards below are
  *    about, a gate's check among them.
  * 3. The build's own: the Managers' questions, the blocking ones first, then the oldest;
- *    the plans' pull requests, in the design's order; the escalated features.
+ *    the plans' pull requests, in the design's order; the escalated features of a module
+ *    without an Architect.
  * 4. Gates and tasks, since marking one done starts the work it held back: those whose
  *    work builds on nothing unfinished first.
  *
@@ -78,7 +79,9 @@ export function listNeeds({ state, design }: { state: State; design: Design }): 
   }
 
   for (const feature of Object.values(state.features)) {
-    if (feature.status === 'escalated') needs.push({ kind: 'escalated', key: `escalated:${feature.module}/${feature.plan}/${feature.feature}`, feature });
+    // Out of attempts in a module with an Architect, a feature is its Manager's to take there: the owner sees the
+    // question to the Architect, and a design change if one comes. Without an Architect, the owner decides.
+    if (feature.status === 'escalated' && !state.modules[feature.module]) needs.push({ kind: 'escalated', key: `escalated:${feature.module}/${feature.plan}/${feature.feature}`, feature });
   }
 
   const actions: Array<Extract<Need, { kind: 'action' }>> = [];

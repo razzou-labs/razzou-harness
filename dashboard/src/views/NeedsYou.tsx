@@ -16,8 +16,14 @@ function content(need: Need, go: Go): { body: () => VNodeChild } {
       return {
         body: () => (
           <>
-            <p>{paused.reason}{paused.until ? ` (until ${clock(paused.until)})` : ''}</p>
-            <Action label="Resume" run={() => post('/api/resume')} />
+            <p>{paused.reason}{paused.until && !paused.retry ? ` (until ${clock(paused.until)})` : ''}</p>
+            {/* Something outside the build didn't answer: nothing to lift, the daemon looks again by itself. */}
+            {paused.retry && paused.until && (
+              <p class="text-caption text-muted">
+                Nothing new starts until {clock(paused.until)}, when the daemon looks again by itself, and goes on if it is over. You have nothing to do unless the reason is yours to fix.
+              </p>
+            )}
+            <Action label={paused.retry ? 'Look again now' : 'Resume'} run={() => post('/api/resume')} />
           </>
         ),
       };

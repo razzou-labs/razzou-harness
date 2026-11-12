@@ -7,7 +7,7 @@ import type { Follower } from '../sandbox/driver.ts';
 import { managerKey, type ManagerState } from '../state/state.ts';
 import { clip, sh } from '../util.ts';
 import type { AgentChannel } from './channel.ts';
-import { mailText, pendingItems, type Item } from './items.ts';
+import { hasOwnManager, mailText, pendingItems, shown, SHOWN_DIR, type Item } from './items.ts';
 import type { Orchestrator } from './orchestrator.ts';
 import { attemptRefName, probeScript, sandboxName, waitForFile } from './refs.ts';
 
@@ -15,7 +15,7 @@ import { attemptRefName, probeScript, sandboxName, waitForFile } from './refs.ts
 const ERROR_LIMIT = 5;
 const HOUR = 3_600_000;
 
-/** What a Manager is in charge of: a module, or one plan of it in Swarm (v3 §6.4). */
+/** What a Manager is in charge of: a module. One with `plan` was started for that plan alone by Swarm before 0.6.0 (v3 §6.4). */
 export interface ManagerScope {
   module: string;
   plan?: string;
@@ -23,10 +23,11 @@ export interface ManagerScope {
 
 /**
  * The Managers (proposal v2 §7.5, v3 §6.4): long-lived Claude Code sessions, each in its
- * own sandbox, fed from a file so that they outlive the daemon. In Manual there is one
- * per module being built; in Swarm one per plan in flight. On each pass the daemon
- * starts or relaunches the ones wanted, keeps their channels and transcripts attached,
- * and delivers what waits for each.
+ * own sandbox, fed from a file so that they outlive the daemon. There is one for the
+ * module being built, in both modes: every plan of the module is its own, so that what
+ * happens between two plans has one agent that knows both and can act on both. On each
+ * pass the daemon starts or relaunches the one wanted, keeps its channel and transcript
+ * attached, and delivers what waits for it.
  */
 export class Managers {
   private readonly o: Orchestrator;
@@ -93,28 +94,20 @@ export class Managers {
   }
 
   /**
-   * Who should be running, all in the module being built: in Manual, one Manager for the
-   * module, as in v2; in Swarm, one per plan in flight (v3 §6.4). A Manager started under
-   * the other mode keeps its scope until it stops, so no item is ever delivered twice: a
-   * module's Manager serves every plan of its module, and a plan's Manager its plan.
+   * Who should be running: one Manager for the module being built, in both modes. A
+   * plan's Manager, which Swarm started before 0.6.0, keeps its plan until that is
+   * complete, and the module's Manager has the others: no item is ever delivered twice.
+   * The module's Manager waits only while every plan in flight still has one of its own.
    */
   private wanted(): ManagerScope[] {
     const o = this.o;
     const module = o.currentModule();
     if (!module) return [];
-    const alive = (key: string) => o.state.managers[key] !== undefined && o.state.managers[key]!.status !== 'stopped';
-    const scopes = new Map<string, ManagerScope>();
     const inFlight = Object.values(o.state.plans).filter((p) => p.module === module && o.inFlight(p));
-    if (o.state.mode === 'swarm') {
-      for (const plan of inFlight) {
-        const scope: ManagerScope = alive(module) ? { module } : { module, plan: plan.plan };
-        scopes.set(managerKey(scope), scope);
-      }
-    } else {
-      const ofPlans = inFlight.filter((p) => alive(managerKey(p))).map((p): ManagerScope => ({ module, plan: p.plan }));
-      for (const scope of ofPlans.length > 0 ? ofPlans : [{ module }]) scopes.set(managerKey(scope), scope);
-    }
-    return [...scopes.values()];
+    const own = inFlight.filter((p) => hasOwnManager(o, module, p.plan));
+    const scopes: ManagerScope[] = own.map((p) => ({ module, plan: p.plan }));
+    if (own.length === 0 || own.length < inFlight.length) scopes.push({ module });
+    return scopes;
   }
 
   /** A fresh sandbox and conversation. `existing` resumes a start that was cut short. */
@@ -222,7 +215,7 @@ export class Managers {
   /**
    * Sends what waits for the Manager: mail once, and each pending item once per launch.
    * An item left without a decision for a turn gets a reminder; after another turn the
-   * pipeline pauses (§7.4), unless the Manager is waiting for the owner.
+   * pipeline pauses (§7.4), unless the Manager is waiting for the owner or the Architect.
    */
   private async deliver(manager: ManagerState): Promise<void> {
     const o = this.o;
@@ -231,14 +224,20 @@ export class Managers {
       o.record({ type: 'MANAGER_ITEM_SENT', payload: { ...identity(manager), key: mail.key, launch: manager.launch, reminder: false } });
     }
     const turnMs = o.design.config.brakes.managerTurnMinutes * 60_000;
-    const waitingForOwner = Object.values(o.state.ownerRequests).some((r) => r.module === manager.module && r.answer === undefined);
-    for (const item of pendingItems(o, manager)) {
+    // An item may wait for somebody else's move: the owner's answer, or the Architect's decision or design change, which
+    // the owner merges. The Manager isn't reminded of it meanwhile, and the pipeline doesn't pause for its silence.
+    const module = o.state.modules[manager.module];
+    const waitingForOthers = Object.values(o.state.ownerRequests).some((r) => r.module === manager.module && r.answer === undefined)
+      || (module !== undefined && (module.escalations.some((e) => e.decision === undefined) || module.locked !== undefined || module.lockedSubmission !== undefined))
+      || o.designChanging(manager.module);
+    const pending = pendingItems(o, manager);
+    for (const item of pending) {
       const sent = manager.sent[item.key];
       if (!sent || sent.launch !== manager.launch) {
-        if (item.show) await this.show(manager, item);
+        if (item.show) await this.show(manager, item, pending);
         await this.send(manager, await item.text());
         o.record({ type: 'MANAGER_ITEM_SENT', payload: { ...identity(manager), key: item.key, launch: manager.launch, reminder: false } });
-      } else if (waitingForOwner) {
+      } else if (waitingForOthers) {
         continue;
       } else if (!sent.reminded && o.now() - Date.parse(sent.at) >= turnMs) {
         await this.send(manager, `[harness] REMINDER: ${item.title} is still waiting for you. ${item.ask}`);
@@ -256,8 +255,14 @@ export class Managers {
     if (result.code !== 0) throw new Error(`could not write to the Manager: ${(result.stderr || result.stdout).trim()}`);
   }
 
-  /** Checks out an attempt in the Manager's clone, so it reviews the real files with git. */
-  private async show(manager: ManagerState, item: Item): Promise<void> {
+  /**
+   * Puts what an item shows into the Manager's clone, so it reviews the real files with
+   * git: the commits, fetched, and a folder of the item's own that holds them checked out
+   * (`shown`). Several items wait at once, each sent as soon as it comes: one checkout for
+   * all would move under a review still being read. The top of the clone follows the
+   * latest item, as before; the folders of items no longer waiting are removed.
+   */
+  private async show(manager: ManagerState, item: Item, pending: Item[]): Promise<void> {
     const o = this.o;
     const { attempt, branch, main } = item.show!;
     const attemptRef = attempt ? attemptRefName(attempt) : undefined;
@@ -268,10 +273,23 @@ export class Managers {
     await o.repo.bundle([...refs], local);
     const p = this.paths(manager);
     await o.uploadBundle(manager.sandbox, local, p.harness);
+    const at = await shown(o, item.show!);
+    const waiting = new Set<string>();
+    for (const other of pending) {
+      const dir = other.show ? (await shown(o, other.show))?.dir : undefined;
+      if (dir) waiting.add(dir);
+    }
     const result = await o.exec(manager.sandbox, [
       `cd ${sh(p.work)}`,
       `git fetch --quiet --force ${sh(`${p.harness}/review.bundle`)} '+refs/heads/*:refs/remotes/harness/*' '+refs/attempts/*:refs/remotes/harness/attempts/*'`,
       `git checkout --quiet --detach ${sh(head ?? `refs/remotes/harness/${branch}`)}`,
+      ...(at ? [
+        // The folders are the clone's own: git, and a search from the top, leave them out.
+        `mkdir -p .git/info && { grep -qxF ${sh(`${SHOWN_DIR}/`)} .git/info/exclude 2>/dev/null || echo ${sh(`${SHOWN_DIR}/`)} >> .git/info/exclude; }`,
+        `for dir in ${SHOWN_DIR}/*/; do case ${sh(` ${[...waiting].join(' ')} `)} in *" \${dir%/} "*) ;; *) git worktree remove --force "$dir" 2>/dev/null || rm -rf "$dir" ;; esac; done`,
+        'git worktree prune',
+        `{ [ -e ${sh(at.dir)} ] || git worktree add --quiet --detach ${sh(at.dir)} ${sh(at.commit)}; }`,
+      ] : []),
     ].join(' && '));
     if (result.code !== 0) throw new Error(`could not show the attempt to the Manager: ${result.stderr.trim()}`);
   }

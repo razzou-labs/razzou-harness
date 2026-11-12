@@ -14,6 +14,8 @@ export interface TaskInput {
   progressTail: string;
   /** Set for a merge round: main at that commit conflicts with the plan branch in `files`. */
   merge?: { main: string; files: string[] };
+  /** Set for a fix round, with its kind: it starts whatever the checks say, since a failure is why it is there. */
+  fix?: 'ci' | 'deploy' | 'review' | 'merge' | 'checks';
 }
 
 /** The Developer's task, given on stdin. Its role text is appended to the system prompt separately. */
@@ -67,6 +69,14 @@ function featureLines(input: TaskInput): string[] {
       '',
       ...featureChecks.map((c) => `- \`${c.run}\` (${c.id})`),
     );
+  } else if (input.fix === 'checks') {
+    // The work accepted on the branch fails its own checks: making them pass again is the whole task.
+    lines.push(
+      '',
+      '## How it is checked',
+      '',
+      'After you finish, the harness runs every check of the work accepted on this branch, from the repository root, in a fresh sandbox. Each must exit 0. Some fail now, as the report above shows, and they are not yours to change: fix the code they check.',
+    );
   } else {
     lines.push(
       '',
@@ -76,7 +86,9 @@ function featureLines(input: TaskInput): string[] {
     );
   }
   if (input.regressionChecks.length > 0) {
-    lines.push('', 'These already pass and must keep passing:', '', ...input.regressionChecks.map((c) => `- \`${c.run}\` (${c.id})`));
+    // Before a feature these were run and pass. Before a fix round they weren't: one of them failing can be why it is there.
+    const heading = input.fix === 'checks' ? 'The checks of accepted work:' : input.fix ? 'These are the checks of accepted work, and must all pass:' : 'These already pass and must keep passing:';
+    lines.push('', heading, '', ...input.regressionChecks.map((c) => `- \`${c.run}\` (${c.id})`));
   }
   return lines;
 }
