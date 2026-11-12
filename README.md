@@ -136,6 +136,10 @@ cd path/to/project && harness setup   # the rest, asking only for what is yours
 The command is also installed as `razzou-harness`, for machines where another `harness`,
 such as the Harness.io CLI, comes first on the PATH.
 
+To move to a newer version later, run `harness upgrade` in the project's folder: it
+stops the daemon, installs the latest version from npm, builds the agents' image for
+it, and starts the daemon again in that terminal. The sandboxes keep running meanwhile.
+
 `harness setup` does every step it can and asks only for what is yours: a `gh` login,
 the token from `claude setup-token` at a hidden prompt, two clicks on GitHub for the
 App, since GitHub creates and installs Apps only in the browser, two questions (AWS or
@@ -602,6 +606,7 @@ too.
 | `harness install-ci [--owner <login>]` | Writes the workflow, its CI script and `CODEOWNERS` again, after an upgrade |
 | `harness lock` | Writes `harness/lock.json`, the hashes of the protected files |
 | `harness up`, `harness down` | Starts the daemon and the dashboard, or stops the daemon; sandboxes keep running |
+| `harness upgrade [<version>]` | Installs the latest harness from npm, or the version named, builds the agents' image for it, and starts the project's daemon again in this terminal if one was running |
 | `harness status` | Plans, features, modules and open questions, in the terminal |
 | `harness module new <id> <title>` | Starts a module and its Architect |
 | `harness attach <module>` | Opens the Architect's terminal here; detach with Ctrl-P, then Ctrl-Q |
