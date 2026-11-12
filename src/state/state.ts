@@ -83,8 +83,22 @@ export interface FeatureState {
   guidance?: string;
   /** Since when the Manager owes guidance, after a counted failure. */
   awaitingGuidanceSince?: string;
-  /** Set for a fix, which is built like a feature but isn't in the design: after CI failed, or after the deploy. */
-  fix?: { round: number; kind: 'ci' | 'deploy' | 'review'; failure: string; requestId: string; role?: ReviewerRole };
+  /**
+   * Set for a fix, which is built like a feature but isn't in the design: after CI failed,
+   * after the deploy, after a reviewer blocked, or to merge main when it conflicts with
+   * the plan branch. A merge round merges `main` at that commit, which conflicted in
+   * `files`, and the plan goes back to `resume` once it lands.
+   */
+  fix?: {
+    round: number;
+    kind: 'ci' | 'deploy' | 'review' | 'merge';
+    failure: string;
+    requestId: string;
+    role?: ReviewerRole;
+    main?: string;
+    files?: string[];
+    resume?: 'active' | 'pr_open';
+  };
   /**
    * The definitions that CHANGED_LOCKED_FILES PRs gave the feature since it was accepted
    * (v5): it stays accepted under each, as nothing was rebuilt.
@@ -126,8 +140,13 @@ export interface PlanState {
   mergedBy?: 'owner' | 'daemon';
   /** In Swarm, the policy left this head's PR to the owner: the reason shows under Needs you. */
   leftToOwner?: { head: string; reason: string; at: string };
-  /** Main at `main` conflicts with the plan branch in `files`: tried once per main, and resolved in the PR. */
+  /**
+   * Main at `main` conflicts with the plan branch in `files`: tried once per main. Nothing
+   * new starts in the plan until a merge round, which its Manager asks for, has landed.
+   */
   mainConflict?: { main: string; files: string[] };
+  /** Merge rounds so far: main merged into the plan branch by a Developer, after a conflict. */
+  mergeRounds?: number;
   /** The cost job's estimate of the monthly cost the PR adds, for the head it was computed on (v3 §5.3). */
   costEstimate?: { head: string; monthlyUsd: number };
   /** The reviewers' sessions on the PR's heads (v3 §5), oldest first. */
@@ -381,12 +400,17 @@ export function apply(state: State, event: HarnessEvent): State {
     }
     case 'PLAN_MAIN_CONFLICT':
       state.plans[planKey(ref!)]!.mainConflict = { main: event.payload.main, files: event.payload.files };
+      digest(state, event.id, ref!, `Plan ${ref!.plan}'s branch conflicts with main in ${event.payload.files.join(', ')}: its Manager has it resolved by a Developer. Plans that may build together should stay off the same files.`);
       break;
-    case 'PLAN_HEAD_ADOPTED':
-      Object.assign(state.plans[planKey(ref!)]!, {
+    case 'PLAN_HEAD_ADOPTED': {
+      const plan = state.plans[planKey(ref!)]!;
+      Object.assign(plan, {
         status: 'pr_open', head: event.payload.head, pushed: event.payload.head, ci: { sha: event.payload.head, status: 'pending', since: event.ts },
       });
+      // The owner's push may be the resolution: the daemon looks at the new head again.
+      delete plan.mainConflict;
       break;
+    }
     case 'PLAN_VALIDATING':
       Object.assign(state.plans[planKey(ref!)]!, { status: 'validating', head: event.payload.head, validation: { status: 'running', since: event.ts } });
       break;
@@ -538,9 +562,14 @@ export function apply(state: State, event: HarnessEvent): State {
     }
     case 'REQUEST_FIX': {
       const plan = state.plans[planKey(ref!)]!;
-      const kind = event.payload.review ? 'review' : plan.status === 'deploy_failed' || plan.status === 'verify_failed' ? 'deploy' : 'ci';
+      const kind = event.payload.merge ? 'merge' : event.payload.review ? 'review' : plan.status === 'deploy_failed' || plan.status === 'verify_failed' ? 'deploy' : 'ci';
+      // A merge round may start while the plan is built: it goes back to its build once the merge lands.
+      const resume = plan.status === 'active' ? 'active' as const : 'pr_open' as const;
       let round: number;
-      if (kind === 'review') {
+      if (kind === 'merge') {
+        round = (plan.mergeRounds ?? 0) + 1;
+        plan.mergeRounds = round;
+      } else if (kind === 'review') {
         // A reviewer blocked the PR: its own rounds, on the plan branch like a CI fix (v3 §5.4).
         const role = event.payload.review!;
         round = (plan.reviewFixRounds?.[role] ?? 0) + 1;
@@ -566,7 +595,11 @@ export function apply(state: State, event: HarnessEvent): State {
       state.features[`${planKey(ref!)}/fix${n}`] = {
         module: plan.module, plan: plan.plan, feature: `fix${n}`, status: 'pending', attempts: [], extraAttempts: 0,
         guidance: event.payload.guidance,
-        fix: { round, kind, failure: event.payload.failure, requestId: event.payload.requestId, ...(event.payload.review ? { role: event.payload.review } : {}) },
+        fix: {
+          round, kind, failure: event.payload.failure, requestId: event.payload.requestId,
+          ...(event.payload.review ? { role: event.payload.review } : {}),
+          ...(event.payload.merge ? { main: event.payload.merge.main, files: event.payload.merge.files, resume } : {}),
+        },
       };
       break;
     }
@@ -691,8 +724,16 @@ export function apply(state: State, event: HarnessEvent): State {
       Object.assign(feature, { status: 'accepted', commit: event.payload.commit });
       const plan = state.plans[planKey(ref!)]!;
       plan.head = event.payload.commit;
-      // A fix landed: the PR waits for it to be pushed, and for CI again.
-      if (feature.fix) {
+      if (feature.fix?.kind === 'merge') {
+        // Main is in the plan branch again: the build goes on, or the PR waits for the push and for CI.
+        plan.status = feature.fix.resume ?? 'pr_open';
+        if (feature.fix.main) plan.base = feature.fix.main;
+        delete plan.mainConflict;
+        // What left the earlier head to the owner, such as GitHub refusing a merge that conflicted, is about a head that is gone.
+        delete plan.leftToOwner;
+        if (plan.status === 'pr_open') delete plan.ci;
+      } else if (feature.fix) {
+        // A fix landed: the PR waits for it to be pushed, and for CI again.
         plan.status = 'pr_open';
         delete plan.ci;
       }

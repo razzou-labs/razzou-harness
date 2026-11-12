@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { runOk } from '../../src/util.ts';
@@ -8,8 +8,25 @@ export const SOLUTIONS = {
   F02: { 'src/add.sh': 'echo $(( $1 + $2 ))\n' },
 };
 
+/**
+ * The folders this process made, removed when it ends: each holds git repositories of
+ * hundreds of files, and left behind they use up the disk's file count, run after run.
+ */
+const made: string[] = [];
+process.on('exit', () => {
+  for (const dir of made) {
+    try {
+      rmSync(dir, { recursive: true, force: true, maxRetries: 2 });
+    } catch {
+      // A stub still writing there keeps a folder: the next run's own folders are still removed.
+    }
+  }
+});
+
 export function tempDir(prefix: string): string {
-  return mkdtempSync(join(tmpdir(), `harness-test-${prefix}-`));
+  const dir = mkdtempSync(join(tmpdir(), `harness-test-${prefix}-`));
+  made.push(dir);
+  return dir;
 }
 
 /** The toy plan of a module: two features whose checks are plain bash. */

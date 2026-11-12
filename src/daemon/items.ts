@@ -16,8 +16,8 @@ export interface Item {
   title: string;
   /** What the Manager is expected to call. */
   ask: string;
-  /** What to check out in the Manager's clone first: an attempt's commits, or else the branch. */
-  show?: { attempt?: Ref; branch: string };
+  /** What to check out in the Manager's clone first: an attempt's commits, or else the branch; with `main`, main comes along as `harness/main`. */
+  show?: { attempt?: Ref; branch: string; main?: boolean };
   text: () => Promise<string>;
 }
 
@@ -61,6 +61,8 @@ export function pendingItems(o: Orchestrator, scope: { module: string; plan?: st
         ].join('\n'),
       });
     }
+    // Main no longer merges into the branch (v3 §6.6): the Manager says how the files must come out, and a merge round starts.
+    if (plan.mainConflict && CONFLICT_STATUSES.includes(plan.status)) others.push(conflictItem(o, plan));
     if (plan.status === 'pr_open' && plan.ci?.status === 'failed' && (plan.fixRounds ?? 0) < rounds) {
       const key = planKey(plan);
       others.push({
@@ -99,6 +101,42 @@ export function pendingItems(o: Orchestrator, scope: { module: string; plan?: st
   return [...questions, ...others];
 }
 
+/** Where a plan stands when a conflict with main can go to its Manager: being built, or with its pull request open. */
+export const CONFLICT_STATUSES: PlanState['status'][] = ['active', 'pr_open', 'ready_to_merge'];
+
+function conflictItem(o: Orchestrator, plan: PlanState): Item {
+  const key = planKey(plan);
+  return {
+    key: `conflict:${key}@${plan.mainConflict!.main}`,
+    title: `the conflict of ${key} with main`,
+    ask: `Call request_fix(plan: "${key}", guidance) with how each file must come out, or escalate_to_architect if the two sides contradict each other.`,
+    show: { branch: plan.branch, main: true },
+    text: async () => [
+      `[harness] CONFLICT WITH MAIN ${key}`,
+      '',
+      await conflictReport(o, plan),
+      '',
+      'Your clone has the plan branch checked out, and main as `harness/main`. For a file, `git diff harness/main...HEAD -- <file>` shows what your plan did to it since the two diverged, and `git diff HEAD...harness/main -- <file>` what main did.',
+      '',
+      `Nothing new starts in this plan until main is merged in. Work out how each file must come out so that the work of both sides holds, then call request_fix(plan: "${key}", guidance) with that, file by file: a Developer merges main into the plan branch following it, every check of accepted work runs on the result, and you review the merge like a feature. If the two sides contradict each other in a way only the design can settle, use escalate_to_architect first, or ask_owner when the module has no Architect, and call request_fix once you have the decision.`,
+    ].join('\n'),
+  };
+}
+
+/** What conflicts between main and a plan's branch, and what main gained since the two diverged. */
+export async function conflictReport(o: Orchestrator, plan: PlanState): Promise<string> {
+  const { main, files } = plan.mainConflict!;
+  const base = await o.repo.mergeBase(main, plan.head);
+  const gained = await o.repo.gained(base, main, 15);
+  return [
+    `Main moved to ${short(main)} and no longer merges into ${plan.branch} (at ${short(plan.head)}): both changed the same lines in`,
+    ...files.map((file) => `- ${file}`),
+    '',
+    `What main gained since the two diverged at ${short(base)}, newest first:`,
+    ...gained.map((line) => `- ${line}`),
+  ].join('\n');
+}
+
 function questionItem(feature: FeatureState, attempt: Attempt, requestId: string, question: string): Item {
   const key = featureKey(feature);
   return {
@@ -119,11 +157,13 @@ function reviewItem(o: Orchestrator, feature: FeatureState, attempt: Attempt): I
   const key = featureKey(feature);
   const ref = refOf(feature, attempt);
   const branch = o.state.plans[planKey(ref)]!.branch;
+  // A merge round's result (v3 §6.6): main comes along, to compare with.
+  const merge = feature.fix?.kind === 'merge' ? feature.fix : undefined;
   return {
     key: `review:${key}#${attempt.n}`,
     title: `the review of ${key} attempt ${attempt.n}`,
     ask: `Call accept_feature or reject_feature for ${key} attempt ${attempt.n}.`,
-    show: { attempt: ref, branch },
+    show: { attempt: ref, branch, ...(merge ? { main: true } : {}) },
     text: async () => {
       const { feature: definition } = o.lookup(feature);
       return [
@@ -140,10 +180,19 @@ function reviewItem(o: Orchestrator, feature: FeatureState, attempt: Attempt): I
         'Every check passed in a fresh sandbox:',
         ...checkLines(attempt.checks ?? []),
         '',
-        `Changed files: ${(attempt.files ?? []).join(', ') || '(none)'}`,
-        `Your clone has the attempt checked out. HEAD is ${short(attempt.head)}, on top of the plan branch at ${short(attempt.base)}: see \`git diff ${short(attempt.base)} HEAD\` and \`git log ${short(attempt.base)}..HEAD\`.`,
-        '',
-        `Review it against the feature and the design, then call accept_feature or reject_feature (feature: "${key}", attempt: ${attempt.n}).`,
+        ...(merge
+          ? [
+            `It conflicted in: ${(merge.files ?? []).join(', ')}`,
+            `Your clone has the merge checked out, and main as \`harness/main\`. HEAD is ${short(attempt.head)}, the plan branch at ${short(attempt.base)} with main at ${short(merge.main)} merged in. \`git diff harness/main HEAD\` is what the plan holds on top of main, and \`git diff ${short(attempt.base)} HEAD\` what the merge brought to the plan branch.`,
+            '',
+            `Review the files that conflicted: the work of both sides must hold in each, and nothing else may have changed beyond what the merge needs. Then call accept_feature or reject_feature (feature: "${key}", attempt: ${attempt.n}). Accepted, it lands as the merge of main into the plan branch.`,
+          ]
+          : [
+            `Changed files: ${(attempt.files ?? []).join(', ') || '(none)'}`,
+            `Your clone has the attempt checked out. HEAD is ${short(attempt.head)}, on top of the plan branch at ${short(attempt.base)}: see \`git diff ${short(attempt.base)} HEAD\` and \`git log ${short(attempt.base)}..HEAD\`.`,
+            '',
+            `Review it against the feature and the design, then call accept_feature or reject_feature (feature: "${key}", attempt: ${attempt.n}).`,
+          ]),
       ].join('\n');
     },
   };

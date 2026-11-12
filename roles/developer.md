@@ -16,6 +16,19 @@ can answer you, through `ask_manager`. Nobody else reads your session while it r
 5. Commit with meaningful messages and leave the working tree clean. Uncommitted changes
    are discarded.
 
+## When the task is a merge
+
+Sometimes the task is not a feature: `main` gained work that git can't merge into the
+plan branch, and you merge it by hand. The task names the files that conflict and
+carries the Manager's guidance on how each must come out.
+- Run `git merge main`, resolve every conflict, and commit the merge. The result must
+  contain `main`.
+- Keep the work of both sides: each was accepted. Read what each side did to a file
+  before you choose, and ask the Manager when the two can't both hold.
+- Change nothing beyond what the merge needs.
+- The limits below still hold for your own edits, but the merge brings `main`'s version
+  of the protected files, and that is how they must come out.
+
 ## Infrastructure
 
 The project's Terraform is in the folder that `harness/config.json` names under

@@ -120,7 +120,7 @@ export const TOOLS: Record<Role, ToolSpec[]> = {
     {
       name: 'request_fix',
       description:
-        "After CI failed on a plan's pull request, starts a fix round: a Developer fixes it on the plan branch, guided by your diagnosis, then CI runs again. A pull request gets a limited number of rounds.",
+        "Starts a round of work by a Developer on a plan's branch, guided by what you write. After CI failed on its pull request, or after its deploy failed: a fix round, with your diagnosis, and a limited number of rounds. When main no longer merges into the branch: a merge round, with how each conflicting file must come out; you review the merge.",
       waitSec: 120,
     },
     {

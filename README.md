@@ -394,7 +394,7 @@ once CI passed and every status in `swarm.requiredStatuses` is green on its head
 Only an estimate of the pull request's current head counts: after a fix round, the new
 head needs its own. Before it merges, the daemon merges `main` into the pull request's
 branch if `main` moved since CI ran, so CI and the reviewers judge what `main` gets; a
-conflict leaves the pull request to you, to resolve on GitHub.
+conflict goes to the plan's Manager, as described under **Conflicts with `main`**.
 
 Anything else waits for you, under **Needs you** with the reason. `Arch:` and `Fix:`
 pull requests are yours in both modes. In Swarm, GitHub's rules need no approval but
@@ -464,8 +464,7 @@ be merged before it starts; without it, it waits for the previous plan, as alway
 Swarm, up to `swarm.maxPlans` plans of the module under way whose dependencies are
 merged build at once, each on its own branch with its own Manager, keyed `module/plan`
 in the Agents view. When one merges, `main` is merged into the others, `progress.txt`
-keeping both sides' lines; a conflict in other files is resolved in that plan's pull
-request. A
+keeping both sides' lines. A
 feature may also depend on a feature of an earlier plan, as `P1/F03`, and then waits
 for that plan's merge. The Project view draws each module's features as trees, one per
 plan: a feature hangs from the feature it waits for, the end of the longest chain when it
@@ -473,6 +472,26 @@ waits for several, and the others, an earlier plan's included, are named beside 
 is accepted, blue under way, amber waiting for a decision, red escalated, grey not started;
 hover a feature for where it stands. Manual mode builds one plan at a time with one Manager
 per module, as before.
+
+**Conflicts with `main`.** `main` moves while a plan is built or its pull request is open:
+another plan merges, or a design change does. Git merges it into the plan's branch when
+the two sides changed different lines. When they changed the same lines, the plan's
+Manager resolves it, in both modes, and you are not asked:
+- Nothing new starts in the plan, and its pull request, which GitHub can't merge and
+  runs no CI on, shows no card under **Needs you**. The Project view says which files
+  conflict.
+- The Manager gets the files with both sides in its clone, and says how each must come
+  out. When the two plans ask for contradictory things, it asks the Architect instead.
+- A Developer merges `main` in a fresh sandbox, following that. The daemon runs the
+  checks of everything accepted on both sides on the result, and refuses a result that
+  leaves `main` out, keeps a conflict marker, or holds a protected file otherwise than
+  `main` does.
+- The Manager reviews the merge like a feature. Accepted, it lands as one merge commit;
+  on an open pull request it is pushed, and CI and the reviewers run again.
+
+A merge that uses up its attempts is escalated like a feature: under **Needs you** you
+give it one more, with a note. The Architect hears of each conflict in one line, as
+plans meant to build together should stay off the same files.
 
 **The cost job.** `harness install-ci` adds a `cost` job to the workflow: on a pull
 request that has `iac/`, it runs [Infracost](https://www.infracost.io) on the base and
@@ -548,7 +567,7 @@ through an `Arch:` pull request, or a commit of your own on `main`.
 
 ```json
 {
-  "harnessVersion": "0.5.8",
+  "harnessVersion": "0.5.9",
   "project": { "name": "shop", "repo": "<org>/shop", "bot": "<org>-harness[bot]" },
   "roles": {
     "architect": { "model": "claude-fable-5-2", "effort": "max" },

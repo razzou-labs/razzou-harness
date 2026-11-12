@@ -21,6 +21,8 @@ export interface StubBehavior {
   ask?: string;
   /** Hosts and ports its sandbox's policy refuses it, logged as OpenShell would. */
   refused?: string[];
+  /** In a merge round, leaves main out: it commits its files on the plan branch alone. */
+  skipMerge?: boolean;
 }
 
 /**
@@ -81,6 +83,8 @@ export function stubAgent(
         steps.push(`printf '%s\\n' ${sh(line)} >> ${sh(join(dirname(run.pidFile), 'openshell.log'))}`);
       }
       if (behavior.sleepSec) steps.push(`sleep ${behavior.sleepSec}`);
+      // A merge round: main is merged first, and the files written next are the resolution, committed as the merge.
+      if (/^## The merge$/m.test(task) && !behavior.skipMerge) steps.push('git merge --quiet --no-edit main > /dev/null 2>&1 || true');
       for (const [path, content] of Object.entries(behavior.files ?? {})) {
         steps.push(`mkdir -p "$(dirname ${sh(path)})"`, `printf %s ${sh(content)} > ${sh(path)}`);
       }
