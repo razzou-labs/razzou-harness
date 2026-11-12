@@ -98,7 +98,7 @@ type Scope = 'on' | 'infra' | 'off';
 
 /**
  * The owner's switches, each a line with its toggle: the mode, who merges infrastructure
- * in Swarm, and which reviewers read the plans' pull requests. The daemon records each
+ * and Fix PRs in Swarm, and which reviewers read the plans' pull requests. The daemon records each
  * choice in its state, and harness/config.json isn't written. A switch that hands merges
  * to the daemon, or takes a review away, asks first; its toggle moves once the daemon
  * has recorded it.
@@ -120,6 +120,7 @@ const ModeAndReviews = defineComponent({
       const { state, design } = props.data;
       const swarm = (state.mode ?? 'manual') === 'swarm';
       const infra = state.infraMerge ?? 'ceiling';
+      const fixes = state.fixMerge ?? 'daemon';
       const scope = (role: Reviewer): Scope => state.reviews?.[role] ?? 'on';
       // The configuration decides where a reviewer can run at all: the switches narrow it.
       const required = (role: Reviewer) => design.swarm.requiredStatuses.includes(`harness/${role}`);
@@ -146,6 +147,13 @@ const ModeAndReviews = defineComponent({
           ? `INFRA and MIXED_INFRA_AND_CODE plans will merge themselves once they pass CI${reviewing.length > 0 ? ' and the reviews switched on' : ', with no review switched on'}, like CODE plans. An estimate over the ceiling still waits for you. Let the daemon merge infra?`
           : "INFRA and MIXED_INFRA_AND_CODE plans will wait for you again, unless the cost job's estimate is under the ceiling. Keep their merges for you?",
         () => post('/api/infra-merge', { by }),
+      );
+      const setFixes = (by: 'owner' | 'daemon') => change(
+        'fixes',
+        by === 'daemon'
+          ? `After a failed deploy, the Fix PR will merge itself once it passes CI${reviewing.length > 0 ? ' and the reviews switched on' : ', with no review switched on'}, under the same policy as its plan's pull request, and the deploy runs again without you. Let the daemon merge Fix PRs?`
+          : undefined,
+        () => post('/api/fix-merge', { by }),
       );
       // Only a switch that takes a review away asks first.
       const less: Record<Scope, number> = { on: 2, infra: 1, off: 0 };
@@ -213,6 +221,15 @@ const ModeAndReviews = defineComponent({
                   : infra === 'daemon'
                     ? `INFRA and MIXED_INFRA_AND_CODE plans merge like CODE plans, once they pass CI${reviewing.length > 0 ? ' and the reviews switched on below' : ''}. An estimate over the ceiling still waits for you.`
                     : "INFRA and MIXED_INFRA_AND_CODE plans wait for you, unless the cost job's estimate is under the ceiling.",
+              })}
+              {line({
+                key: 'fixes', title: 'Fix PR merges', value: fixes, set: setFixes, disable: !swarm,
+                choices: [{ label: 'Yours', value: 'owner' }, { label: "The daemon's", value: 'daemon' }],
+                note: !swarm
+                  ? 'In Swarm only: in Manual, every merge is yours.'
+                  : fixes === 'daemon'
+                    ? `After a failed deploy, the Manager's Fix PR merges like its plan's pull request, once it passes CI${reviewing.length > 0 ? ' and the reviews switched on below' : ''}, and the deploy runs again. What the policy holds back for a plan, such as an estimate over the ceiling, it holds back here too.`
+                    : "After a failed deploy, the Manager's Fix PR waits for you, under Needs you.",
               })}
               {line({
                 key: 'security', title: 'Security reviews', value: scope('security'), set: (next) => setReviews('security', next), disable: swarm && !required('security'),

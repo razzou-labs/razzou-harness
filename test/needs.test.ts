@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
-import { heldBack, listNeeds, moduleCompleted, needPrint, needTitle, orderCards, orderNeeds, upstream, waitText, type Need } from '../src/dashboard/needs.ts';
+import { arrivals, heldBack, listNeeds, moduleCompleted, needPrint, needTitle, orderCards, orderNeeds, QUIET_MS, upstream, waitText, type Need } from '../src/dashboard/needs.ts';
 import type { DashboardState } from '../src/dashboard/server.ts';
 import type { ModuleState, OrderState, PlanState, State } from '../src/state/state.ts';
 
@@ -101,7 +101,10 @@ describe('needs you', () => {
         'web/P1': built('web', 'P1', 'pr_open', { pr: { number: 3, url: 'https://github.com/acme/toy/pull/3' }, leftToOwner: { head: 'b', reason: 'an INFRA plan', at: '2026-11-10T09:00:00.000Z' } }),
       },
       features: {
+        // Out of attempts in a module with an Architect: its Manager takes it there, and the owner has no card for it.
         'web/P2/F02': { module: 'web', plan: 'P2', feature: 'F02', status: 'escalated', attempts: [] } as unknown as State['features'][string],
+        // In a module designed by hand, with no Architect, the owner decides.
+        'ops/P1/F09': { module: 'ops', plan: 'P1', feature: 'F09', status: 'escalated', attempts: [] } as unknown as State['features'][string],
       },
       actions: { 'web/T2': { status: 'done', at: '2026-11-10T09:00:00.000Z' } },
     }));
@@ -110,7 +113,7 @@ describe('needs you', () => {
       'locked:web', 'design:web', 'escalation:e2', 'proposal:api',
       'request:r3', 'request:r4', 'request:r1',
       'left:web/P1', 'merge:web/P2',
-      'escalated:web/P2/F02',
+      'escalated:ops/P1/F09',
       'action:web/T1', 'action:web/G1',
     ]);
   });
@@ -228,5 +231,34 @@ describe('needs you', () => {
     // Every card of the request handled: nothing is left of it, whatever waits now.
     const later = listNeeds(data([teardown], { plans: plansOf('completed'), actions: { 'web/G1': { status: 'done', at: '2026-11-09T21:00:00.000Z' }, 'web/G2': { status: 'done', at: '2026-11-11T14:00:00.000Z' } }, pipeline: { consecutiveFailures: 0, paused: { reason: 'the owner paused the pipeline', since: '2026-11-11T14:05:00.000Z' } } }));
     assert.deepEqual(orderNeeds(later, given), { needs: later, by: 'standard', why: {}, waiting: false });
+  });
+});
+
+describe('notifications', () => {
+  const paused = (reason: string): Need => ({ kind: 'paused', key: 'paused', paused: { reason, since: '2026-11-12T10:00:00.000Z' } });
+  const request = (id: string): Need => ({ kind: 'request', key: `request:${id}`, request: { requestId: id, module: 'web', question: 'Which region?', blocking: false, askedAt: '2026-11-12T10:00:00.000Z' } });
+  const keys = (needs: Need[]) => needs.map((need) => need.key);
+
+  it('announces a card that arrives, and neither what waited when the page loaded nor one that stays', () => {
+    const first = arrivals([request('r1')], undefined, 0);
+    assert.deepEqual(keys(first.fresh), [], 'what already waits is not news');
+    const second = arrivals([request('r1'), request('r2')], first.told, 60_000);
+    assert.deepEqual(keys(second.fresh), ['request:r2']);
+    const third = arrivals([request('r1'), request('r2')], second.told, 120_000);
+    assert.deepEqual(keys(third.fresh), []);
+  });
+
+  it("announces once an hour at most a card that goes and comes back, as the pause that waits to look again does every ten minutes", () => {
+    let told = arrivals([], undefined, 0).told;
+    const announced: number[] = [];
+    // The card comes, lifts ten minutes later, and comes back at once, for two hours.
+    for (let minute = 0; minute <= 120; minute += 10) {
+      const now = minute * 60_000;
+      const there = arrivals([paused('GitHub does not answer')], told, now);
+      if (there.fresh.length > 0) announced.push(minute);
+      told = arrivals([], there.told, now + 1_000).told;
+    }
+    assert.deepEqual(announced, [0, 60, 120]);
+    assert.equal(QUIET_MS, 60 * 60_000);
   });
 });

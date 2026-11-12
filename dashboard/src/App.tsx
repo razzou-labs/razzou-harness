@@ -1,8 +1,9 @@
-import { matDarkMode, matLightMode, matPause, matPlayArrow } from '@quasar/extras/material-icons';
+import { matDarkMode, matLightMode, matNotificationsActive, matNotificationsOff, matPause, matPlayArrow } from '@quasar/extras/material-icons';
 import { Dark, QBadge, QBanner, QBtn, QHeader, QLayout, QPage, QPageContainer, QTab, QTabs, QToolbar, QToolbarTitle, QTooltip } from 'quasar';
 import { defineComponent, onUnmounted, ref } from 'vue';
 import { connect, harness, post, type DashboardState } from './api.ts';
 import { listNeeds } from '../../src/dashboard/needs.ts';
+import { canNotify, notifying, toggleNotifications, watchNeeds } from './notify.ts';
 import { Action, Badge, Command, Loading, toggleDark } from './ui.tsx';
 import { Agents } from './views/Agents.tsx';
 import { Config } from './views/Config.tsx';
@@ -27,6 +28,7 @@ function route(hash: string): { view: View; detail?: string } {
 export const App = defineComponent({
   setup() {
     connect();
+    watchNeeds();
     const current = ref(route(location.hash));
     const onHash = () => (current.value = route(location.hash));
     window.addEventListener('hashchange', onHash);
@@ -69,7 +71,7 @@ export const App = defineComponent({
   },
 });
 
-/** The project, the pipeline's pause, the mode and who merges infrastructure as they are, and light or dark. */
+/** The project, the pipeline's pause, the mode and who merges infrastructure as they are, the notifications, and light or dark. */
 const Toolbar = defineComponent({
   props: { data: { type: Object as () => DashboardState, required: true } },
   setup(props) {
@@ -92,6 +94,16 @@ const Toolbar = defineComponent({
             {!harness.connected ? 'reconnecting…' : state.daemon ? `daemon ${state.daemon.version}, pid ${state.daemon.pid}` : 'daemon stopped'}
           </span>
           <div class="col" />
+          {/* This browser's notifications of what arrives under Needs you: the owner's choice, kept here and not by the daemon. */}
+          {canNotify && (
+            <QBtn flat round dense icon={notifying.value ? matNotificationsActive : matNotificationsOff} color={notifying.value ? 'primary' : undefined} aria-label={notifying.value ? 'Notifications are on' : 'Notifications are off'} onClick={() => void toggleNotifications()}>
+              <QTooltip>
+                {notifying.value
+                  ? 'Notifications are on: this browser tells you when something new waits under Needs you, while the page is open. Click to switch them off.'
+                  : 'Notifications are off. Click to have this browser tell you when something new waits under Needs you, while the page is open.'}
+              </QTooltip>
+            </QBtn>
+          )}
           <QBtn flat round dense icon={Dark.isActive ? matLightMode : matDarkMode} aria-label={Dark.isActive ? 'Light mode' : 'Dark mode'} onClick={toggleDark}>
             <QTooltip>{Dark.isActive ? 'Light mode' : 'Dark mode'}</QTooltip>
           </QBtn>

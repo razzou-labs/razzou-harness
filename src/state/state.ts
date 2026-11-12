@@ -16,6 +16,8 @@ export type Mode = 'manual' | 'swarm';
  * the reviewers pass, like CODE plans, an estimate over the ceiling still being the owner's.
  */
 export type InfraMerge = 'ceiling' | 'daemon';
+/** Who merges a Fix PR in Swarm: the daemon, under the same policy as a plan's pull request, or the owner. */
+export type FixMerge = 'daemon' | 'owner';
 
 /**
  * The owner's switch for a reviewer: `on`, it reads every plan's pull request; `infra`,
@@ -75,9 +77,11 @@ export interface FeatureState {
   feature: string;
   status: FeatureStatus;
   attempts: Attempt[];
-  /** Attempts granted by the owner after an escalation. */
+  /** Attempts granted after an escalation: by the owner, or by the Manager once the Architect decided. */
   extraAttempts: number;
   escalation?: string;
+  /** Since when it is escalated: a decision that grants another attempt is one that came after. */
+  escalatedAt?: string;
   commit?: string;
   /** Guidance for the next attempt. A counted failure needs it before another attempt starts. */
   guidance?: string;
@@ -85,13 +89,14 @@ export interface FeatureState {
   awaitingGuidanceSince?: string;
   /**
    * Set for a fix, which is built like a feature but isn't in the design: after CI failed,
-   * after the deploy, after a reviewer blocked, or to merge main when it conflicts with
-   * the plan branch. A merge round merges `main` at that commit, which conflicted in
-   * `files`, and the plan goes back to `resume` once it lands.
+   * after the deploy, after a reviewer blocked, to merge main when it conflicts with the
+   * plan branch, or when the work accepted on the branch no longer passes its checks
+   * (`checks`). A merge round merges `main` at that commit, which conflicted in `files`.
+   * After a merge or a checks round, the plan goes back to `resume` once it lands.
    */
   fix?: {
     round: number;
-    kind: 'ci' | 'deploy' | 'review' | 'merge';
+    kind: 'ci' | 'deploy' | 'review' | 'merge' | 'checks';
     failure: string;
     requestId: string;
     role?: ReviewerRole;
@@ -119,8 +124,13 @@ export interface PlanState {
   branch: string;
   base: string;
   head: string;
-  /** The full check run once every feature is accepted. */
-  validation?: { status: 'running' | 'passed' | 'failed'; since: string; results?: CheckResult[] };
+  /**
+   * The checks of the work accepted on the branch, as last run: the full run once every
+   * feature is accepted, or the one before an attempt. `head` is the commit it ran on, and
+   * `runs` how many times in a row it failed there: after the second the plan's Manager
+   * has it fixed, and nothing new starts in the plan meanwhile.
+   */
+  validation?: { status: 'running' | 'passed' | 'failed'; since: string; results?: CheckResult[]; head?: string; runs?: number };
   /** The Manager's summary when it submitted the plan. */
   summary?: string;
   /** The plan branch's head as last pushed to GitHub. */
@@ -147,6 +157,8 @@ export interface PlanState {
   mainConflict?: { main: string; files: string[] };
   /** Merge rounds so far: main merged into the plan branch by a Developer, after a conflict. */
   mergeRounds?: number;
+  /** Fix rounds so far for accepted work that no longer passed its checks on the branch. */
+  checkRounds?: number;
   /** The cost job's estimate of the monthly cost the PR adds, for the head it was computed on (v3 §5.3). */
   costEstimate?: { head: string; monthlyUsd: number };
   /** The reviewers' sessions on the PR's heads (v3 §5), oldest first. */
@@ -191,7 +203,7 @@ export interface ReviewState {
 
 export interface ManagerState {
   module: string;
-  /** Set for a plan's Manager, in Swarm (v3 §6.4): its scope is that plan, and its key `module/plan`. */
+  /** Set for a Manager that Swarm started for one plan, before 0.6.0 (v3 §6.4): its scope is that plan, and its key `module/plan`. */
   plan?: string;
   sandbox: string;
   sessionId: string;
@@ -310,10 +322,13 @@ export interface State {
   v: 1;
   lastEventId?: string;
   daemon?: { pid: number; version: string; startedAt: string };
-  pipeline: { paused?: { reason: string; since: string; until?: string }; consecutiveFailures: number };
+  /** `retry`: a pause that only waits to look again, which the daemon lifts at `until`. */
+  pipeline: { paused?: { reason: string; since: string; until?: string; retry?: boolean }; consecutiveFailures: number };
   mode: Mode;
   /** The owner's button for INFRA and MIXED plans in Swarm (v3 D36). */
   infraMerge: InfraMerge;
+  /** The owner's switch for Fix PRs in Swarm; one never switched is the daemon's. */
+  fixMerge?: FixMerge;
   /** The owner's switch for each reviewer; one never switched is `on`. */
   reviews?: Partial<Record<ReviewerRole, ReviewScope>>;
   /**
@@ -345,7 +360,7 @@ export interface State {
 
 export const planKey = (ref: Ref) => `${ref.module}/${ref.plan}`;
 export const featureKey = (ref: Ref) => `${ref.module}/${ref.plan}/${ref.feature}`;
-/** A Manager's key in `state.managers`: its module, or `module/plan` for a plan's Manager (v3 §6.4). */
+/** A Manager's key in `state.managers`: its module, or `module/plan` for one that has that plan alone (v3 §6.4). */
 export const managerKey = (scope: { module: string; plan?: string | undefined }) => (scope.plan ? `${scope.module}/${scope.plan}` : scope.module);
 
 /** The Managers that aren't stopped and whose scope covers the module, or one plan of it: the plan's own, and the module's. */
@@ -415,13 +430,18 @@ export function apply(state: State, event: HarnessEvent): State {
       Object.assign(state.plans[planKey(ref!)]!, { status: 'validating', head: event.payload.head, validation: { status: 'running', since: event.ts } });
       break;
     case 'PLAN_CHECKS_PASSED':
-    case 'PLAN_CHECKS_FAILED':
-      state.plans[planKey(ref!)]!.validation = {
-        status: event.type === 'PLAN_CHECKS_PASSED' ? 'passed' : 'failed',
-        since: event.ts,
-        results: event.payload.results,
-      };
+    case 'PLAN_CHECKS_FAILED': {
+      const plan = state.plans[planKey(ref!)]!;
+      const { results, head } = event.payload;
+      const failed = event.type === 'PLAN_CHECKS_FAILED';
+      const before = plan.validation;
+      // A failure is run once more before anyone is asked: a registry that didn't answer, a check that flakes.
+      const runs = failed ? (before?.status === 'failed' && head !== undefined && before.head === head ? (before.runs ?? 1) + 1 : 1) : undefined;
+      plan.validation = { status: failed ? 'failed' : 'passed', since: event.ts, results, ...(head ? { head } : {}), ...(runs ? { runs } : {}) };
+      // Failed twice at the full run: the plan is back in its build, where its Manager has it fixed.
+      if (plan.status === 'validating' && (runs ?? 0) >= 2) plan.status = 'active';
       break;
+    }
     case 'PLAN_SUBMITTED':
       state.plans[planKey(ref!)]!.summary = event.payload.summary;
       break;
@@ -444,6 +464,9 @@ export function apply(state: State, event: HarnessEvent): State {
       break;
     case 'INFRA_MERGE_SET':
       state.infraMerge = event.payload.by;
+      break;
+    case 'FIX_MERGE_SET':
+      state.fixMerge = event.payload.by;
       break;
     case 'REVIEWS_SET':
       state.reviews = { ...state.reviews, [event.payload.role]: event.payload.scope };
@@ -527,7 +550,7 @@ export function apply(state: State, event: HarnessEvent): State {
       delete plan.leftToOwner;
       delete plan.deploy;
       delete plan.postDeploy;
-      if (event.payload.next === 'completed') for (const manager of managersOf(state, ref!.module, ref!.plan)) manager.sent = {};
+      if (event.payload.next === 'completed') forgetSent(state, ref!);
       digest(state, event.id, ref!, `Plan ${ref!.plan} is merged on main${plan.mergedBy === 'daemon' ? ' by the daemon' : ''}${event.payload.next === 'completed' ? ', and complete' : `: it is ${event.payload.next}`}.`);
       break;
     }
@@ -541,7 +564,7 @@ export function apply(state: State, event: HarnessEvent): State {
       break;
     case 'PLAN_VERIFIED': {
       Object.assign(state.plans[planKey(ref!)]!, { status: 'completed', postDeploy: { status: 'passed', results: event.payload.results } });
-      for (const manager of managersOf(state, ref!.module, ref!.plan)) manager.sent = {};
+      forgetSent(state, ref!);
       break;
     }
     case 'POST_DEPLOY_CHECKS_FAILED': {
@@ -562,13 +585,16 @@ export function apply(state: State, event: HarnessEvent): State {
     }
     case 'REQUEST_FIX': {
       const plan = state.plans[planKey(ref!)]!;
-      const kind = event.payload.merge ? 'merge' : event.payload.review ? 'review' : plan.status === 'deploy_failed' || plan.status === 'verify_failed' ? 'deploy' : 'ci';
+      const kind = event.payload.merge ? 'merge' : event.payload.checks ? 'checks' : event.payload.review ? 'review' : plan.status === 'deploy_failed' || plan.status === 'verify_failed' ? 'deploy' : 'ci';
       // A merge round may start while the plan is built: it goes back to its build once the merge lands.
       const resume = plan.status === 'active' ? 'active' as const : 'pr_open' as const;
       let round: number;
       if (kind === 'merge') {
         round = (plan.mergeRounds ?? 0) + 1;
         plan.mergeRounds = round;
+      } else if (kind === 'checks') {
+        round = (plan.checkRounds ?? 0) + 1;
+        plan.checkRounds = round;
       } else if (kind === 'review') {
         // A reviewer blocked the PR: its own rounds, on the plan branch like a CI fix (v3 §5.4).
         const role = event.payload.review!;
@@ -599,6 +625,7 @@ export function apply(state: State, event: HarnessEvent): State {
           round, kind, failure: event.payload.failure, requestId: event.payload.requestId,
           ...(event.payload.review ? { role: event.payload.review } : {}),
           ...(event.payload.merge ? { main: event.payload.merge.main, files: event.payload.merge.files, resume } : {}),
+          ...(kind === 'checks' ? { resume } : {}),
         },
       };
       break;
@@ -636,14 +663,15 @@ export function apply(state: State, event: HarnessEvent): State {
       const plan = state.plans[planKey(ref!)]!;
       plan.status = 'completed';
       plan.head = event.payload.head;
-      for (const manager of managersOf(state, ref!.module, ref!.plan)) manager.sent = {};
+      forgetSent(state, ref!);
       break;
     }
     case 'ATTEMPT_STARTING': {
       const feature = featureOf(state, ref!);
       feature.status = 'in_progress';
-      // An escalated feature starts again after the owner's retry, or a design change.
+      // An escalated feature starts again after a retry it was granted, or a design change.
       delete feature.escalation;
+      delete feature.escalatedAt;
       feature.attempts.push({
         n: ref!.attempt!,
         status: 'starting',
@@ -732,6 +760,10 @@ export function apply(state: State, event: HarnessEvent): State {
         // What left the earlier head to the owner, such as GitHub refusing a merge that conflicted, is about a head that is gone.
         delete plan.leftToOwner;
         if (plan.status === 'pr_open') delete plan.ci;
+      } else if (feature.fix?.kind === 'checks') {
+        // Accepted work passes its checks again: the build goes on, and the full run comes once every feature is accepted.
+        plan.status = feature.fix.resume ?? 'active';
+        delete plan.validation;
       } else if (feature.fix) {
         // A fix landed: the PR waits for it to be pushed, and for CI again.
         plan.status = 'pr_open';
@@ -757,11 +789,18 @@ export function apply(state: State, event: HarnessEvent): State {
       const feature = featureOf(state, ref!);
       feature.guidance = event.payload.guidance;
       delete feature.awaitingGuidanceSince;
+      // A feature out of attempts gets one more: the Architect's decision, or the owner's answer, granted it.
+      if (feature.status === 'escalated') {
+        feature.extraAttempts += 1;
+        feature.status = 'pending';
+        delete feature.escalation;
+        delete feature.escalatedAt;
+      }
       break;
     }
     case 'ESCALATED': {
       const feature = featureOf(state, ref!);
-      Object.assign(feature, { status: 'escalated', escalation: event.payload.reason });
+      Object.assign(feature, { status: 'escalated', escalation: event.payload.reason, escalatedAt: event.ts });
       delete feature.awaitingGuidanceSince;
       break;
     }
@@ -770,6 +809,7 @@ export function apply(state: State, event: HarnessEvent): State {
       feature.extraAttempts += 1;
       feature.status = 'pending';
       delete feature.escalation;
+      delete feature.escalatedAt;
       delete feature.awaitingGuidanceSince;
       if (event.payload.note) feature.guidance = event.payload.note;
       break;
@@ -787,6 +827,10 @@ export function apply(state: State, event: HarnessEvent): State {
     case 'OWNER_ANSWER': {
       const request = state.ownerRequests[event.payload.requestId];
       if (request) Object.assign(request, { answer: event.payload.answer, answeredAt: event.ts });
+      // The owner may have fixed what a Manager asked about, such as a host to allow: checks that failed run again.
+      for (const plan of Object.values(state.plans)) {
+        if (plan.module === event.payload.module && plan.validation?.status === 'failed') delete plan.validation;
+      }
       for (const manager of mailTargets(state, event.payload.module, request?.manager)) {
         manager.mail.push({ key: `mail:${event.id}`, kind: 'owner_answer', text: event.payload.answer, requestId: event.payload.requestId });
       }
@@ -847,10 +891,13 @@ export function apply(state: State, event: HarnessEvent): State {
       state.managers[managerKey(event.payload)]!.status = 'stopped';
       break;
     case 'PIPELINE_PAUSED':
-      state.pipeline.paused = { reason: event.payload.reason, since: event.ts, until: event.payload.until };
+      state.pipeline.paused = { reason: event.payload.reason, since: event.ts, until: event.payload.until, ...(event.payload.retry ? { retry: true } : {}) };
       break;
-    case 'PIPELINE_RESUMED':
+    case 'PIPELINE_RESUMED': {
+      // A pause that only waited to look again, lifted by the daemon: nobody looked, so nothing starts afresh.
+      const lookedAgain = event.payload.auto === true && state.pipeline.paused?.retry === true;
       delete state.pipeline.paused;
+      if (lookedAgain) break;
       state.pipeline.consecutiveFailures = 0;
       // The owner looked: waiting items start a fresh turn, a failed full check run runs again,
       // a failed deploy is looked at again (the owner may have fixed it, or re-run the apply),
@@ -867,6 +914,7 @@ export function apply(state: State, event: HarnessEvent): State {
         }
       }
       break;
+    }
     case 'MODULE_CREATED': {
       const { module, title, sandbox, sessionId } = event.payload;
       state.modules[module] = {
@@ -1008,9 +1056,14 @@ export function apply(state: State, event: HarnessEvent): State {
         id: event.payload.requestId, question: event.payload.question, askedAt: event.ts,
         ...(event.payload.feature ? { feature: event.payload.feature } : {}), ...(event.payload.manager ? { manager: event.payload.manager } : {}),
       });
+      // A feature out of attempts: the Architect grants another one, or changes what it defined.
+      const stopped = event.payload.feature ? state.features[event.payload.feature] : undefined;
+      const outOfAttempts = stopped?.status === 'escalated'
+        ? `\n${event.payload.feature} has used up its attempts (${stopped.escalation ?? 'escalated'}), and waits for you, not for the owner. Either its definition holds and another attempt can succeed: say so in your reply, with what must be done differently, and the Manager starts one. Or the cause is in what you defined, its description, its size or its checks: change the design with submit_design, split the feature if it is too large for one attempt, and say so in your reply; it starts again by itself once the change is merged.`
+        : '';
       module.notes.push({
         key: `note:${event.id}`,
-        text: `The Manager asks (escalation ${event.payload.requestId}${event.payload.feature ? `, about ${event.payload.feature}` : ''}):\n${event.payload.question}\nDecide with the owner if needed, then call reply_to_manager.`,
+        text: `The Manager asks (escalation ${event.payload.requestId}${event.payload.feature ? `, about ${event.payload.feature}` : ''}):\n${event.payload.question}${outOfAttempts}\nDecide with the owner if needed, then call reply_to_manager.`,
       });
       break;
     }
@@ -1079,6 +1132,22 @@ export function writeSnapshot(file: string, state: State): void {
   const tmp = `${file}.tmp`;
   writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`);
   renameSync(tmp, file);
+}
+
+/**
+ * A plan is complete: its Managers forget what they were sent about it, and nothing
+ * else. A module's Manager has the items of its other plans still waiting, and one
+ * forgotten would be sent to it a second time.
+ */
+function forgetSent(state: State, ref: Ref): void {
+  const plan = planKey(ref);
+  for (const manager of managersOf(state, ref.module, ref.plan)) {
+    for (const key of Object.keys(manager.sent)) {
+      // An item's key is its kind, then what it is about: the plan, or a feature, an attempt or a commit of it.
+      const about = key.slice(key.indexOf(':') + 1);
+      if (about === plan || ['/', '@', '#'].some((mark) => about.startsWith(`${plan}${mark}`))) delete manager.sent[key];
+    }
+  }
 }
 
 /** Who gets a piece of mail: the Manager named, while it runs, or else every Manager of the module. */

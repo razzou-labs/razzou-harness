@@ -36,7 +36,8 @@ export type Need =
  *    proposal, a Manager's question to it. They may redefine what the cards below are
  *    about, a gate's check among them.
  * 3. The build's own: the Managers' questions, the blocking ones first, then the oldest;
- *    the plans' pull requests, in the design's order; the escalated features.
+ *    the plans' pull requests, in the design's order; the escalated features of a module
+ *    without an Architect.
  * 4. Gates and tasks, since marking one done starts the work it held back: those whose
  *    work builds on nothing unfinished first.
  *
@@ -78,7 +79,9 @@ export function listNeeds({ state, design }: { state: State; design: Design }): 
   }
 
   for (const feature of Object.values(state.features)) {
-    if (feature.status === 'escalated') needs.push({ kind: 'escalated', key: `escalated:${feature.module}/${feature.plan}/${feature.feature}`, feature });
+    // Out of attempts in a module with an Architect, a feature is its Manager's to take there: the owner sees the
+    // question to the Architect, and a design change if one comes. Without an Architect, the owner decides.
+    if (feature.status === 'escalated' && !state.modules[feature.module]) needs.push({ kind: 'escalated', key: `escalated:${feature.module}/${feature.plan}/${feature.feature}`, feature });
   }
 
   const actions: Array<Extract<Need, { kind: 'action' }>> = [];
@@ -225,6 +228,28 @@ export function needPrint(need: Need): string {
     }
   };
   return JSON.stringify(facts());
+}
+
+/** What the page already told the owner of: the cards that were there at its last look, and when it last announced each. */
+export interface Told {
+  present: Set<string>;
+  at: Map<string, number>;
+}
+
+/** A card announced within this long isn't announced again: the card of a pause that only waits to look again comes back every ten minutes. */
+export const QUIET_MS = 3_600_000;
+
+/**
+ * The cards that arrived since the page's last look, for its notifications, and what it
+ * has told by now. The first look announces nothing: what already waits isn't news.
+ */
+export function arrivals(needs: Need[], told: Told | undefined, now: number): { fresh: Need[]; told: Told } {
+  const present = new Set(needs.map((need) => need.key));
+  if (!told) return { fresh: [], told: { present, at: new Map() } };
+  const at = new Map(told.at);
+  const fresh = needs.filter((need) => !told.present.has(need.key) && now - (at.get(need.key) ?? -Infinity) >= QUIET_MS);
+  for (const need of fresh) at.set(need.key, now);
+  return { fresh, told: { present, at } };
 }
 
 /** The cards as an order request records them. */

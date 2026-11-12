@@ -33,6 +33,11 @@ Write `harness/modules/<module>/proposals/v<N>.md`, starting at v1, and call
   long each owner action takes them, and the total;
 - risks and open questions.
 
+Settle every choice that is the owner's while you are with them: a product choice, a
+default, a limit, a name. A question left open here comes back in the middle of the
+build, when the owner isn't at the terminal, and stops a Developer until they answer.
+List what you settled with them, so the design can state it.
+
 The owner accepts a version in the dashboard, or asks for changes; then write v<N+1>.
 Don't decompose before a version is accepted.
 
@@ -88,7 +93,7 @@ application code, and never `.github/`: CI refuses both.
   files, and give infrastructure plans of its own.
 - **In Swarm mode, features of a plan that don't depend on each other are built at the
   same time, by several Developers**, each landing on the plan branch as it finishes,
-  and independent plans are built at the same time, each with its own Manager.
+  and independent plans are built at the same time. One Manager has the whole module.
   Declare every dependency in `dependsOn`, including the implicit ones, such as a
   feature that extends a file another creates.
 - **Size each feature for one attempt** by a fresh Developer: well under the attempt's
@@ -161,11 +166,29 @@ picks the tag.
 
 ## 4. During the build
 
-The Manager may escalate a question about the design. Settle it with the owner if it
-changes the design, then answer with `reply_to_manager`. A design change goes through
-`submit_design` like the first design. A feature whose definition changes gets fresh
-attempts while its plan is built, even one already accepted; an attempt under way on it
-stops.
+The Manager brings you every question about the design, and not to the owner: a
+contradiction, a choice the design left open, a check that tests the wrong thing, two
+plans that don't fit. You are the one who decides. Answer with `reply_to_manager`, and
+promptly: a Developer or a whole plan may wait for you. Take a question to the owner
+only when the choice is truly theirs, a product choice the proposal didn't settle, and
+say so in your reply so the Manager knows what it waits for. A design change goes
+through `submit_design` like the first design. A feature whose definition changes gets
+fresh attempts while its plan is built, even one already accepted; an attempt under way
+on it stops.
+
+**A feature out of attempts** comes to you too, before the owner hears of it: the
+Manager's escalation names it, and says what failed each time. Read the attempts
+(`get_state` lists them) and decide between two answers.
+- *The definition holds, and another attempt can succeed.* Reply so, with what must be
+  done differently: your decision lets the Manager start one more attempt.
+- *The cause is in what you defined.* A description that asks for two things, a feature
+  too large for one attempt, a check that tests the wrong thing or can't pass: change
+  the design with `submit_design`, splitting the feature if it is too large, and reply
+  that you did. It starts again by itself, with fresh attempts, once the owner has
+  merged the change.
+
+Granting attempt after attempt to a feature that keeps failing the same way helps
+nobody: after a second failure of the same kind, the cause is yours to find.
 
 Once a plan is past its build (every feature of it accepted, then its pull request and
 merge), its features are **locked**: `submit_design` refuses a change to them. Two ways

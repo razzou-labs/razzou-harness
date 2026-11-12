@@ -12,6 +12,7 @@ import { askSecret, doctor } from './setup/doctor.ts';
 import { CHECKLIST, init } from './setup/init.ts';
 import { recover } from './setup/recover.ts';
 import { setup } from './setup/setup.ts';
+import { upgrade } from './setup/upgrade.ts';
 import type { Mode, State } from './state/state.ts';
 import { sleep } from './util.ts';
 
@@ -57,6 +58,9 @@ Usage: harness <command> [--dir <project>]
                      Check this machine and the project, and set up the providers;
                      --probe tries everything an agent must not do
   recover            Rebuild a lost .harness/ from git and GitHub
+  upgrade [<version>]
+                     Install the latest harness from npm, or the version named, build the agents' image
+                     for it, and start the project's daemon again here if one was running
   version            Print the version
 
 --dir defaults to the current directory.`;
@@ -212,6 +216,26 @@ async function main(): Promise<void> {
       console.log(`wrote harness/lock.json: ${lock.entries.length} entries`);
       return;
     }
+    case 'upgrade': {
+      const cli = join(packageRoot, 'dist', 'cli.js');
+      await upgrade({
+        version,
+        packageDir: packageRoot,
+        ...(argument ? { target: argument } : {}),
+        project: existsSync(join(projectDir, 'harness', 'config.json')),
+        say: (line) => console.log(line),
+        run: attached,
+        capture: async (file, args) => {
+          const result = spawnSync(file, args, { encoding: 'utf8' });
+          return result.status === 0 ? result.stdout : undefined;
+        },
+        // The package's own entry, at the path npm installs every version to: after the install, it is the new one.
+        harness: (args) => attached(process.execPath, [cli, ...args, '--dir', projectDir]),
+        daemon: () => runningDaemon(harnessDir)?.pid,
+        stop: () => down(harnessDir),
+      });
+      return;
+    }
     case 'version':
       console.log(version);
       return;
@@ -223,6 +247,34 @@ async function main(): Promise<void> {
       console.error(`unknown command: ${command}\n\n${HELP}`);
       process.exitCode = 1;
   }
+}
+
+/**
+ * Runs a command in this terminal and gives its exit code. Ctrl-C reaches it directly,
+ * as it shares the terminal, and this process waits for it to end: a daemon started here
+ * stops in its own time. The other signals that stop a daemon are passed on.
+ */
+function attached(file: string, args: string[]): Promise<number> {
+  return new Promise((done, failed) => {
+    const child = spawn(file, args, { stdio: 'inherit' });
+    const wait = () => {};
+    const pass = (signal: NodeJS.Signals) => () => void child.kill(signal);
+    const passed = { SIGTERM: pass('SIGTERM'), SIGHUP: pass('SIGHUP') };
+    process.on('SIGINT', wait);
+    for (const [signal, handler] of Object.entries(passed)) process.on(signal, handler);
+    const end = () => {
+      process.off('SIGINT', wait);
+      for (const [signal, handler] of Object.entries(passed)) process.off(signal, handler);
+    };
+    child.on('error', (error) => {
+      end();
+      failed(error);
+    });
+    child.on('exit', (code) => {
+      end();
+      done(code ?? 1);
+    });
+  });
 }
 
 async function ask(question: string): Promise<string> {

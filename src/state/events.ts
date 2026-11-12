@@ -4,7 +4,7 @@ import type { CheckResult } from '../checks/runner.ts';
 import type { ReviewFinding, ReviewerRole } from '../design/schemas.ts';
 import type { Party, Role } from '../roles.ts';
 import type { Denial } from '../sandbox/refusals.ts';
-import type { ActionState, FeatureState, InfraMerge, LockedChange, Mode, OrderCard, PlanState, ReviewScope } from './state.ts';
+import type { ActionState, FeatureState, FixMerge, InfraMerge, LockedChange, Mode, OrderCard, PlanState, ReviewScope } from './state.ts';
 
 /** What an event is about. Ids repeat across modules, so a feature is always addressed with its module and plan. */
 export interface Ref {
@@ -83,11 +83,20 @@ interface Payloads {
   ATTEMPT_FAILED: { reason: string };
   ESCALATED: { reason: string };
   OWNER_RETRY: { note?: string };
-  PIPELINE_PAUSED: { reason: string; until?: string };
-  PIPELINE_RESUMED: Record<string, never>;
+  /**
+   * `until`: the daemon lifts the pause itself then. `retry`: it only waits to look again,
+   * after something outside the build didn't answer, such as GitHub; nobody is asked.
+   */
+  PIPELINE_PAUSED: { reason: string; until?: string; retry?: boolean };
+  /** `auto`: the daemon lifted a timed pause, not the owner. */
+  PIPELINE_RESUMED: { auto?: boolean };
   PLAN_VALIDATING: { head: string };
-  PLAN_CHECKS_PASSED: { results: CheckResult[] };
-  PLAN_CHECKS_FAILED: { results: CheckResult[] };
+  /**
+   * The checks of the work accepted on a plan's branch, run at `head`: the full run once
+   * every feature is accepted, the one before an attempt starts, or either run again.
+   */
+  PLAN_CHECKS_PASSED: { results: CheckResult[]; head?: string };
+  PLAN_CHECKS_FAILED: { results: CheckResult[]; head?: string };
   /** A Manager's scope is its module, or one plan of it in Swarm (v3 §6.4): `plan` names it. */
   MANAGER_STARTING: { module: string; plan?: string; sandbox: string; sessionId: string };
   /** `tools`: the harness tools of a sandbox just made, which it keeps for its life; absent on a relaunch in the same sandbox. */
@@ -134,6 +143,8 @@ interface Payloads {
   MODE_CHANGED: { mode: Mode };
   /** The owner's button (v3 D36): the daemon merges INFRA and MIXED plans like CODE ones, or only under the cost ceiling. */
   INFRA_MERGE_SET: { by: InfraMerge };
+  /** The owner's switch for Fix PRs in Swarm: the daemon merges them under the plans' policy, or they wait for the owner. */
+  FIX_MERGE_SET: { by: FixMerge };
   /** The owner switched a reviewer: every plan's pull request, those of infrastructure plans only, or none. */
   REVIEWS_SET: { role: ReviewerRole; scope: ReviewScope };
   /** The owner set, or cleared with null, the hours the whole project may take of their time (v3 §4.1). */
@@ -168,7 +179,8 @@ interface Payloads {
   CONTINUE: { requestId: string; answer: string };
   ACCEPT: { requestId: string; note?: string };
   REJECT: { requestId: string; guidance: string };
-  RETRY: { requestId: string; guidance: string };
+  /** `granted`: what gave a feature out of attempts one more, the Architect's decision (`escalation:<id>`) or the owner's answer (`request:<id>`). */
+  RETRY: { requestId: string; guidance: string; granted?: string };
   ABORT: { requestId: string; reason: string };
   /** `manager` is the key of the Manager that asked, so the answer reaches it when several manage the module (v3 §6.4). */
   OWNER_REQUEST: { module: string; requestId: string; question: string; blocking: boolean; manager?: string };
@@ -186,9 +198,10 @@ interface Payloads {
   /**
    * The Manager asks for a fix round after CI failed, or the daemon after a reviewer
    * blocked (`review`); `failure` is what was reported. With `merge`, the round merges
-   * main at that commit into the plan branch, which conflicts with it in `files`.
+   * main at that commit into the plan branch, which conflicts with it in `files`. With
+   * `checks`, it makes the work accepted on the plan branch pass its checks again.
    */
-  REQUEST_FIX: { requestId: string; guidance: string; failure: string; review?: ReviewerRole; merge?: { main: string; files: string[] } };
+  REQUEST_FIX: { requestId: string; guidance: string; failure: string; review?: ReviewerRole; merge?: { main: string; files: string[] }; checks?: boolean };
   PROPOSAL: { module: string; requestId: string; version: number; sha256: string };
   /** The Architect submits its design; `head` is its commit, now in the daemon's repository. */
   DESIGN: { module: string; requestId: string; summary: string; head: string };

@@ -171,6 +171,19 @@ const feature = (o: Orchestrator, id: string) => o.state.features[`demo/P1/${id}
 /** The git bundles left in `.harness/modules/`: each sandbox has its own copy, so none should be. */
 const bundlesIn = (harnessDir: string) => (existsSync(join(harnessDir, 'modules')) ? readdirSync(join(harnessDir, 'modules'), { recursive: true, encoding: 'utf8' }).filter((f) => f.endsWith('.bundle')) : []);
 const completed = (o: Orchestrator) => () => o.state.plans['demo/P1']?.status === 'completed';
+/** What an agent is sent from now on, as its transcript shows it: the stub Manager writes back each item it reads. */
+function sentTo(o: Orchestrator, agent: string): string[] {
+  const sent: string[] = [];
+  o.events.on('transcript', (event: { agent: string; line: string }) => {
+    try {
+      const item = JSON.parse(event.line) as { type?: string; message?: { content?: unknown } };
+      if (event.agent === agent && item.type === 'user' && typeof item.message?.content === 'string') sent.push(item.message.content);
+    } catch {
+      // Not a line of JSON.
+    }
+  });
+  return sent;
+}
 
 describe('orchestrator', () => {
   it('takes the owner hours left for it by harness budget when it starts, once', async () => {
@@ -275,14 +288,19 @@ describe('orchestrator', () => {
     assert.equal(feature(o, 'F01')!.attempts[2]!.guidance, 'Print exactly hello.');
   });
 
-  it('pauses the pipeline after too many failures in a row', async () => {
-    const { orchestrator: o } = await setup(() => ({ files: { 'src/greet.sh': 'echo nope\n' } }), { config: { brakes: { consecutiveFailures: 2 } } });
-    await until(o, () => o.state.pipeline.paused !== undefined);
-    assert.equal(o.state.pipeline.paused!.reason, '2 attempts failed in a row');
-    assert.equal(feature(o, 'F01')!.attempts.length, 2);
-
-    assert.equal(o.resume(), true);
+  it('pauses nothing after failures in a row: the Manager is told they add up, and how to hold new attempts', async () => {
+    const { orchestrator: o } = await setup(() => ({ files: { 'src/greet.sh': 'echo nope\n' } }), {
+      config: { brakes: { consecutiveFailures: 2 }, roles: { developer: { maxAttempts: 3, attemptTimeoutMinutes: 5 } } },
+    });
+    const sent = sentTo(o, 'manager:demo');
     await until(o, () => feature(o, 'F01')?.status === 'escalated');
+    assert.equal(feature(o, 'F01')!.attempts.length, 3);
+    assert.equal(o.store.readAll().some((e) => e.type === 'PIPELINE_PAUSED'), false);
+    assert.equal(o.state.pipeline.consecutiveFailures, 3);
+    const [first, second] = sent.filter((text) => text.startsWith('[harness] ATTEMPT FAILED demo/P1/F01'));
+    assert.doesNotMatch(first!, /in a row/);
+    assert.match(second!, /\n2 attempts have now failed in a row in this module, with nothing accepted in between, and nothing pauses by itself\./);
+    assert.match(second!, /use ask_owner with blocking: true, which holds new attempts until the owner answers/);
   });
 
   it('pauses, without counting the attempt, when Claude Code does not start', async () => {
@@ -312,15 +330,7 @@ describe('orchestrator', () => {
   it("keeps what an attempt's sandbox policy refused, for its card and the Manager's guidance", async () => {
     const refused = ['pypi.org:443', 'pypi.org:443', 'example.com:443'];
     const { orchestrator: o } = await setup((f, attempt) => (f === 'F01' && attempt === 1 ? { outcome: 'blocked', commit: false, refused } : solved(f)));
-    const sent: string[] = [];
-    o.events.on('transcript', ({ agent, line }: { agent: string; line: string }) => {
-      try {
-        const item = JSON.parse(line) as { type?: string; message?: { content?: unknown } };
-        if (agent === 'manager:demo' && item.type === 'user' && typeof item.message?.content === 'string') sent.push(item.message.content);
-      } catch {
-        // Not a line of JSON.
-      }
-    });
+    const sent = sentTo(o, 'manager:demo');
     await until(o, () => feature(o, 'F01')?.status === 'accepted');
     const [first, second] = feature(o, 'F01')!.attempts;
     const kept = first!.refused!.map((d) => [d.program, d.target, d.count]).sort((a, b) => String(a[1]).localeCompare(String(b[1])));
@@ -747,14 +757,52 @@ describe('parallel plans', () => {
   }
   const index = (o: Orchestrator, type: string, plan: string) => o.store.readAll().findIndex((e) => e.type === type && e.ref?.plan === plan);
 
-  it('in Swarm, independent plans build at once, each with its own Manager', async () => {
+  it('in Swarm, independent plans build at once, with one Manager for the module', async () => {
     const { orchestrator: o } = await setup((f) => ({ files: files(f), sleepSec: f === 'F01' ? 3 : 0 }), { prepare: split({ dependsOn: [] }) });
     o.setMode('swarm');
     const max = await untilMaxPlans(o, allComplete(o, ['P1', 'P2']));
     assert.equal(max, 2);
     assert.ok(index(o, 'PLAN_STARTED', 'P2') < index(o, 'PLAN_COMPLETED', 'P1'), 'P2 started before P1 was complete');
-    assert.deepEqual(Object.values(o.state.managers).map((m) => [m.module, m.plan, m.status]).sort(), [['demo', 'P1', 'stopped'], ['demo', 'P2', 'stopped']]);
-    assert.deepEqual(Object.keys(o.state.managers).sort(), ['demo/P1', 'demo/P2']);
+    // Every plan of the module is its Manager's: it reviewed both, and stopped once both were complete.
+    assert.deepEqual(Object.values(o.state.managers).map((m) => [m.module, m.plan, m.status]), [['demo', undefined, 'stopped']]);
+    assert.equal(o.store.readAll().filter((e) => e.type === 'MANAGER_STARTING').length, 1);
+    const reviews = o.store.readAll().filter((e) => e.type === 'MANAGER_ITEM_SENT' && (e.payload as { key: string }).key.startsWith('review:')).map((e) => e.payload as { key: string; plan?: string });
+    assert.deepEqual(reviews.map((r) => [r.key, r.plan]).sort(), [['review:demo/P1/F01#1', undefined], ['review:demo/P2/F02#1', undefined]]);
+  });
+
+  it("in Swarm, a plan that completes doesn't make the Manager forget what waits for it in the module's other plans", async () => {
+    // The Manager leaves every review waiting, and the test accepts P2's in its place: P2 completes while P1's review still waits.
+    const { orchestrator: o } = await setup((f) => ({ files: files(f) }), { prepare: split({ dependsOn: [] }), manager: { ignore: ['REVIEW', 'REMINDER'] } });
+    o.setMode('swarm');
+    const sentKeys = () => Object.keys(o.state.managers.demo?.sent ?? {}).sort();
+    await until(o, () => sentKeys().length === 2);
+    assert.deepEqual(sentKeys(), ['review:demo/P1/F01#1', 'review:demo/P2/F02#1']);
+    const accepted = await handleRequest(o, { role: 'manager', sandbox: o.state.managers.demo!.sandbox, module: 'demo' }, {
+      v: 1, id: 'accept-p2', tool: 'accept_feature', args: { feature: 'demo/P2/F02', attempt: 1 },
+    });
+    assert.equal(accepted!.ok, true);
+    await until(o, () => o.state.plans['demo/P2']?.status === 'completed');
+    for (let i = 0; i < 3; i++) await o.tick();
+
+    // What it was sent about P2 is forgotten; P1's review still waits, sent once.
+    assert.deepEqual(sentKeys(), ['review:demo/P1/F01#1']);
+    const reviews = o.store.readAll().filter((e) => e.type === 'MANAGER_ITEM_SENT').map((e) => (e.payload as { key: string }).key).filter((key) => key.startsWith('review:'));
+    assert.deepEqual(reviews.sort(), ['review:demo/P1/F01#1', 'review:demo/P2/F02#1']);
+  });
+
+  it('in Swarm, a Manager a plan got before 0.6.0 keeps that plan until it is complete, and the module\'s Manager has the others', async () => {
+    const { orchestrator: o } = await setup((f) => ({ files: files(f), sleepSec: 1 }), { prepare: split({ dependsOn: [] }) });
+    o.setMode('swarm');
+    // What Swarm did before 0.6.0: P1 has a Manager of its own, started with the plan.
+    o.record({ type: 'MANAGER_STARTING', payload: { module: 'demo', plan: 'P1', sandbox: 'mgr-toy-demo-p1', sessionId: 'session-p1' } });
+    await untilMaxPlans(o, allComplete(o, ['P1', 'P2']));
+    assert.deepEqual(Object.keys(o.state.managers).sort(), ['demo', 'demo/P1']);
+    assert.deepEqual(Object.values(o.state.managers).map((m) => m.status), ['stopped', 'stopped']);
+    // Each item went to one Manager: P1's to its own, P2's to the module's.
+    const sent = o.store.readAll().filter((e) => e.type === 'MANAGER_ITEM_SENT').map((e) => e.payload as { key: string; plan?: string }).filter((item) => !item.key.startsWith('mail:'));
+    assert.deepEqual(sent.map((item) => `${item.key} to ${item.plan ?? 'the module'}'s`).sort(), [
+      "plan:demo/P1 to P1's", "plan:demo/P2 to the module's", "review:demo/P1/F01#1 to P1's", "review:demo/P2/F02#1 to the module's",
+    ]);
   });
 
   it('in Swarm, a plan waits for the plan it depends on to merge, and starts from the main that holds it', async () => {
@@ -839,8 +887,8 @@ describe('pull requests', () => {
     assert.equal(plan(o)!.mergeCommit, main);
     const merged = o.store.readAll().find((e) => e.type === 'PR_MERGED_BY_DAEMON');
     assert.ok(merged && merged.type === 'PR_MERGED_BY_DAEMON' && merged.payload.commit === main);
-    // Switched before the plan started, so its Manager is the plan's (v3 §6.4).
-    assert.equal(o.state.managers['demo/P1']!.status, 'stopped');
+    // In Swarm too, the module has one Manager for all its plans.
+    assert.equal(o.state.managers.demo!.status, 'stopped');
   });
 
   it('in Swarm, leaves the PR to the owner while a required status is missing, and merges once it passes', async () => {
@@ -1342,6 +1390,66 @@ describe('deploys', () => {
     assert.equal(o.state.plans['demo/P1']!.deployFixRounds, 1);
   });
 
+  /** Ticks until `done`, the daemon's clock running fast, so that a pull request it looks at once a minute doesn't hold the test. */
+  async function fast(o: Orchestrator, advance: (ms: number) => void, done: () => boolean, timeoutMs = 120_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (!done()) {
+      if (Date.now() > deadline) throw new Error(`timed out; last events: ${o.store.readAll().slice(-10).map((e) => e.type).join(', ')}`);
+      await o.tick();
+      await sleep(100);
+      advance(2_000);
+    }
+    await o.tick();
+  }
+
+  it("in Swarm, merges a Fix PR itself under the plans' policy: a failed deploy is fixed, merged and verified without the owner", async () => {
+    let skew = 0;
+    const { orchestrator: o, fake } = await setup(infra, {
+      github: true, config: { terraform: {}, swarm: { requiredStatuses: [] } }, prepare: withPostDeploy('test -f iac/fixed.tf'), now: () => Date.now() + skew,
+    });
+    fake.ci = allGreen;
+    o.setMode('swarm');
+    await fast(o, (ms) => (skew += ms), completed(o));
+
+    assert.equal(o.state.pipeline.paused, undefined);
+    assert.deepEqual(fake.prs.map((pr) => [pr.branch, pr.state]), [['plan/demo/P1', 'closed'], ['fix/demo/P1-1', 'closed']]);
+    const merges = o.store.readAll().filter((e) => e.type === 'PR_MERGED_BY_DAEMON').map((e) => (e.payload as { number: number }).number);
+    assert.deepEqual(merges, [1, 2]);
+    assert.equal(o.state.plans['demo/P1']!.postDeploy!.status, 'passed');
+    assert.equal(o.state.plans['demo/P1']!.deployFixRounds, 1);
+    assert.equal(o.store.readAll().some((e) => e.type === 'PR_LEFT_TO_OWNER'), false);
+    // The Manager was told who merges its fix.
+    const fixed = o.store.readAll().find((e) => e.type === 'REQUEST_FIX')!;
+    assert.equal(feature(o, 'fix1')!.fix!.kind, 'deploy');
+    assert.equal(fixed.from, 'manager');
+  });
+
+  it('in Swarm, a Fix PR waits for the owner once they keep Fix PRs for themselves, and the switch is theirs to turn back', async () => {
+    let skew = 0;
+    const { orchestrator: o, fake } = await setup(infra, {
+      github: true, config: { terraform: {}, swarm: { requiredStatuses: [] } }, prepare: withPostDeploy('test -f iac/fixed.tf'), now: () => Date.now() + skew,
+    });
+    fake.ci = allGreen;
+    o.setMode('swarm');
+    assert.equal(o.setFixMerge('daemon'), false, 'the daemon merges them unless told otherwise');
+    assert.equal(o.setFixMerge('owner'), true);
+    const plan = () => o.state.plans['demo/P1']!;
+    await fast(o, (ms) => (skew += ms), () => plan()?.status === 'ready_to_merge' && plan().pr?.number === 2);
+    for (let i = 0; i < 5; i++) {
+      skew += 61_000;
+      await o.tick();
+    }
+    assert.equal(fake.prs[1]!.state, 'open');
+    assert.equal(plan().status, 'ready_to_merge');
+    assert.deepEqual(needsNow(o).map((need) => need.key), ['merge:demo/P1']);
+
+    // Turned back, the daemon merges the Fix PR that waited, at once.
+    assert.equal(o.setFixMerge('daemon'), true);
+    await fast(o, (ms) => (skew += ms), completed(o));
+    assert.deepEqual(o.store.readAll().filter((e) => e.type === 'FIX_MERGE_SET').map((e) => e.payload), [{ by: 'owner' }, { by: 'daemon' }]);
+    assert.equal(o.store.readAll().filter((e) => e.type === 'PR_MERGED_BY_DAEMON').length, 2);
+  });
+
   it('checks a plan again by itself once its post-deploy checks change on main, without a resume', async () => {
     let skew = 0;
     const { orchestrator: o, fake } = await setup(infra, {
@@ -1655,6 +1763,19 @@ describe('dashboard', () => {
     assert.deepEqual(o.store.readAll().filter((e) => e.type === 'REVIEWS_SET').map((e) => e.payload), [
       { role: 'cost', scope: 'infra' }, { role: 'security', scope: 'off' }, { role: 'security', scope: 'on' },
     ]);
+  });
+
+  it('switches who merges Fix PRs from the page, and takes nothing else for an answer', async () => {
+    const { o, port, bearer } = await dashboard();
+    const post = async (body: object) => JSON.parse((await callWith(port, '/api/fix-merge', bearer, body)).body) as { done: boolean; error?: string };
+    assert.equal(o.state.fixMerge, undefined, "never switched: the daemon's");
+    assert.deepEqual(await post({ by: 'owner' }), { done: true });
+    assert.deepEqual(await post({ by: 'owner' }), { done: false });
+    assert.deepEqual(await post({ by: 'nobody' }), { done: false, error: 'by is daemon or owner' });
+    const page = JSON.parse((await call(port, '/api/state', bearer)).body) as DashboardState;
+    assert.equal(page.state.fixMerge, 'owner');
+    assert.deepEqual(await post({ by: 'daemon' }), { done: true });
+    assert.equal(o.state.fixMerge, 'daemon');
   });
 
   it('sets and clears only the hours of your time: the agent-hours threshold is gone', async () => {
@@ -2148,7 +2269,7 @@ describe('parallel work, continued', () => {
     for (const key of ['demo/P1/F01', 'demo/P2/F02', 'demo/P2/F03']) assert.match(progress, new RegExp(`feature\\.accepted ${key} `));
   });
 
-  it('in Swarm, a plan whose step keeps failing leaves the other going, then pauses with its error', async () => {
+  it('in Swarm, a plan whose step keeps failing leaves the other going, then the daemon waits ten minutes and looks again by itself', async () => {
     let skew = 0;
     const { orchestrator: o, fake } = await setup((f) => ({ files: files(f) }), {
       github: true, prepare: twoPlans, config: { swarm: { requiredStatuses: [] } }, now: () => Date.now() + skew,
@@ -2164,7 +2285,19 @@ describe('parallel work, continued', () => {
       skew += 31_000;
       await o.tick();
     }
-    assert.match(o.state.pipeline.paused?.reason ?? '', /^demo\/P1 keeps failing: remote rejected/);
+    // Not the owner's to lift: the daemon looks again by itself, ten minutes later.
+    const paused = o.state.pipeline.paused!;
+    assert.match(paused.reason, /^demo\/P1 keeps failing: remote rejected/);
+    assert.equal(paused.retry, true);
+    assert.equal(Date.parse(paused.until!) - Date.parse(paused.since), 10 * 60_000);
+
+    // GitHub takes the push again: the pause lifts when its time comes, and the plan goes on, with nobody's resume.
+    fake.push = push;
+    skew += 10 * 60_000 + 1_000;
+    await until(o, () => o.state.plans['demo/P1']?.pr !== undefined, 60_000);
+    assert.equal(o.state.pipeline.paused, undefined);
+    const resumed = o.store.readAll().findLast((e) => e.type === 'PIPELINE_RESUMED')!;
+    assert.deepEqual(resumed.payload, { auto: true });
   });
 });
 
@@ -2452,16 +2585,16 @@ describe('one module at a time', () => {
     assert.equal(o.state.features['demo/P1/F01']!.attempts[0]!.reason, dropped);
   });
 
-  it('in Swarm, a plan dropped while it is built leaves its place under swarm.maxPlans, and its Manager stays stopped', async () => {
+  it("in Swarm, a plan dropped while it is built leaves its place under swarm.maxPlans, and the module's Manager goes on with the next", async () => {
     const { orchestrator: o, harnessDir } = await setup(slowF01, { prepare: twoPlans(true), config: { swarm: { maxPlans: 1 } } });
     o.setMode('swarm');
-    await until(o, () => o.state.features['demo/P1/F01']?.attempts[0]?.status === 'running' && o.state.managers['demo/P1']?.status === 'running');
+    await until(o, () => o.state.features['demo/P1/F01']?.attempts[0]?.status === 'running' && o.state.managers.demo?.status === 'running');
     await dropP1(join(harnessDir, '..'));
     await until(o, () => o.state.plans['demo/P2']?.status === 'completed', 60_000);
     assert.equal(o.state.features['demo/P1/F01']!.attempts[0]!.reason, dropped);
-    const starts = o.store.readAll().filter((e) => e.type === 'MANAGER_STARTING' && e.payload.plan === 'P1');
-    assert.equal(starts.length, 1);
-    assert.equal(o.state.managers['demo/P1']!.status, 'stopped');
+    // One Manager from the first plan to the last: the dropped plan stops none, and starts none.
+    assert.equal(o.store.readAll().filter((e) => e.type === 'MANAGER_STARTING').length, 1);
+    await until(o, () => o.state.managers.demo!.status === 'stopped');
   });
 
   it('in Swarm, with two modules under way, as 0.2.0 could leave them, only the older one has Developers and Managers until it is complete', async () => {
@@ -2607,7 +2740,7 @@ describe('conflicts with main', () => {
     assert.deepEqual(needsNow(o).map((need) => need.kind), []);
   });
 
-  it('in Swarm, two plans that wrote the same file both merge: the later one takes main in through its own Manager', async () => {
+  it("in Swarm, two plans that wrote the same file both merge: the later one takes main in through the module's Manager, which reviewed both", async () => {
     // P1 greets, and P2 adds and then writes a third file slowly, so that P1 merges while P2 is built; both write the shared file.
     const split = async (dir: string) => {
       const plans = join(dir, 'harness/modules/demo/plans');
@@ -2639,15 +2772,250 @@ describe('conflicts with main', () => {
     assert.equal(o.state.pipeline.paused, undefined);
     const merges = Object.values(o.state.features).filter((f) => f.fix?.kind === 'merge');
     assert.deepEqual(merges.map((f) => [f.plan, f.status]), [['P2', 'accepted']]);
-    // P2's own Manager asked for the merge round, and nobody was left a pull request to resolve.
+    // The module's Manager asked for the merge round, and nobody was left a pull request to resolve.
     const request = o.store.readAll().find((e) => e.type === 'REQUEST_FIX')!;
     assert.deepEqual([request.from, request.ref!.plan], ['manager', 'P2']);
-    const sent = o.store.readAll().filter((e) => e.type === 'MANAGER_ITEM_SENT' && (e.payload as { key: string }).key.startsWith('conflict:')).map((e) => e.payload as { key: string; plan?: string });
-    assert.deepEqual(sent.map((item) => [item.key, item.plan]), [[`conflict:demo/P2@${plan(o)!.mergeCommit}`, 'P2']]);
+    const sent = o.store.readAll().filter((e) => e.type === 'MANAGER_ITEM_SENT' && (e.payload as { key: string }).key.startsWith('conflict:')).map((e) => e.payload as { key: string; module: string; plan?: string });
+    assert.deepEqual(sent.map((item) => [item.key, item.module, item.plan]), [[`conflict:demo/P2@${plan(o)!.mergeCommit}`, 'demo', undefined]]);
+    assert.deepEqual(Object.keys(o.state.managers), ['demo']);
     assert.equal(o.store.readAll().some((e) => e.type === 'PR_LEFT_TO_OWNER' && /conflict/i.test((e.payload as { reason: string }).reason)), false);
     assert.deepEqual(fake.prs.map((pr) => pr.state), ['closed', 'closed']);
     assert.equal(await o.repo.show('refs/heads/main', 'src/shared.txt'), 'one\ntwo\n');
     assert.equal(await o.repo.show('refs/heads/main', 'src/add.sh'), SOLUTIONS.F02['src/add.sh']);
     assert.equal(await o.repo.show('refs/heads/main', 'src/three.txt'), '3\n');
+  });
+});
+
+describe('problems of the build', () => {
+  const plan = (o: Orchestrator) => o.state.plans['demo/P1'];
+  /** The toy plan with F02 independent of F01. */
+  const independent = async (dir: string) => {
+    const file = join(dir, 'harness/modules/demo/plans/P1.json');
+    const design = JSON.parse(readFileSync(file, 'utf8')) as { features: Array<Record<string, unknown>> };
+    for (const f of design.features) delete f.dependsOn;
+    await commitOnMain(dir, { 'harness/modules/demo/plans/P1.json': JSON.stringify(design, null, 2) }, 'independent features');
+  };
+  const shownIn = (o: Orchestrator, f: string) => `harness-shown/P1-${f}-a1-${feature(o, f)!.attempts[0]!.head!.slice(0, 8)}`;
+  const workOf = (o: Orchestrator, driver: LocalDriver) => join(driver.rootOf(o.state.managers.demo!.sandbox), 'work');
+
+  it("shows each waiting item in a folder of its own in the Manager's clone, so that a second review doesn't move the first one's files", async () => {
+    // Two features build at once, and the Manager leaves both reviews waiting.
+    const { orchestrator: o, driver } = await setup((f) => solved(f), { prepare: independent, manager: { ignore: ['REVIEW', 'REMINDER'] } });
+    o.setMode('swarm');
+    const sent = sentTo(o, 'manager:demo');
+    await until(o, () => ['F01', 'F02'].every((f) => o.state.managers.demo?.sent[`review:demo/P1/${f}#1`] !== undefined));
+    await until(o, () => sent.filter((text) => text.startsWith('[harness] REVIEW')).length === 2);
+
+    const work = workOf(o, driver);
+    assert.equal(readFileSync(join(work, shownIn(o, 'F01'), 'src/greet.sh'), 'utf8'), SOLUTIONS.F01['src/greet.sh']);
+    assert.equal(existsSync(join(work, shownIn(o, 'F01'), 'src/add.sh')), false);
+    assert.equal(readFileSync(join(work, shownIn(o, 'F02'), 'src/add.sh'), 'utf8'), SOLUTIONS.F02['src/add.sh']);
+    assert.equal(existsSync(join(work, shownIn(o, 'F02'), 'src/greet.sh')), false);
+    // The top of the clone holds one of them alone, whichever came last: the items name their folder, and commits by id.
+    assert.equal(existsSync(join(work, 'src/greet.sh')) && existsSync(join(work, 'src/add.sh')), false);
+    for (const f of ['F01', 'F02']) {
+      const item = sent.find((text) => text.startsWith(`[harness] REVIEW demo/P1/${f} attempt 1`))!;
+      const { base, head } = feature(o, f)!.attempts[0]!;
+      assert.ok(item.includes(`The attempt is checked out in \`${shownIn(o, f)}/\` of your clone: read its files there.`), item);
+      assert.ok(item.includes(`see \`git diff ${base.slice(0, 8)} ${head!.slice(0, 8)}\` and \`git log ${base.slice(0, 8)}..${head!.slice(0, 8)}\`.`), item);
+      assert.doesNotMatch(item, /HEAD/);
+    }
+    // Git leaves the folders out of the clone's own files.
+    assert.match(readFileSync(join(work, '.git/info/exclude'), 'utf8'), /^harness-shown\/$/m);
+  });
+
+  it("removes an item's folder from the Manager's clone once the item is decided and another is shown", async () => {
+    // The Manager reviews both features, then leaves the plan unsubmitted: its sandbox stays to be looked at.
+    const { orchestrator: o, driver } = await setup((f) => solved(f), { manager: { ignore: ['PLAN', 'REMINDER'] } });
+    await until(o, () => plan(o)?.validation?.status === 'passed');
+    assert.deepEqual(readdirSync(join(workOf(o, driver), 'harness-shown')), [shownIn(o, 'F02').split('/')[1]]);
+  });
+
+  it('has the Manager fix a plan whose accepted work fails its checks after main merged in without a conflict, and pauses nothing', async () => {
+    // The project's own check: no poison without its antidote. Main gets the poison while the plan is built.
+    const config = { checks: [{ id: 'antidote', run: 'test ! -f src/poison.txt || test -f src/antidote.txt', phase: 'pre-merge', timeoutSec: 30 }] };
+    const decide = (f: string): StubBehavior => (f.startsWith('fix') ? { files: { 'src/antidote.txt': 'x\n' } } : { ...solved(f), sleepSec: f === 'F02' ? 3 : 0 });
+    const { orchestrator: o, harnessDir } = await setup(decide, { config });
+    const sent = sentTo(o, 'manager:demo');
+    await until(o, () => feature(o, 'F01')?.status === 'accepted');
+    await commitOnMain(join(harnessDir, '..'), { 'src/poison.txt': 'x\n' }, 'the owner adds a file the check forbids');
+    await until(o, completed(o), 90_000);
+
+    const events = o.store.readAll();
+    assert.equal(events.some((e) => e.type === 'PIPELINE_PAUSED'), false);
+    assert.ok(events.some((e) => e.type === 'PLAN_MAIN_MERGED'), 'main merged in by itself: git saw no conflict');
+    // The checks ran twice on the same commit before anyone was asked.
+    const failed = events.filter((e) => e.type === 'PLAN_CHECKS_FAILED').map((e) => e.payload as { head?: string });
+    assert.equal(failed.length, 2);
+    assert.equal(failed[0]!.head, failed[1]!.head);
+    const item = sent.find((text) => text.startsWith('[harness] PLAN CHECKS FAILED demo/P1'))!;
+    assert.match(item, /The daemon ran them twice; the second time:\n- antidote: exited 1/);
+    assert.match(item, /Nothing new starts in this plan until they pass again/);
+    assert.match(item, /The branch is checked out in `harness-shown\/plan-demo-P1-[0-9a-f]{8}\/` of your clone/);
+
+    const request = events.find((e) => e.type === 'REQUEST_FIX')!;
+    assert.deepEqual([request.from, (request.payload as { checks?: boolean }).checks], ['manager', true]);
+    const fix = feature(o, 'fix1')!;
+    assert.deepEqual([fix.status, fix.fix!.kind, fix.fix!.round, fix.fix!.resume], ['accepted', 'checks', 1, 'active']);
+    const task = readFileSync(join(harnessDir, 'modules/demo/attempts/P1-fix1-a1/task.md'), 'utf8');
+    assert.match(task, /^# Feature demo\/P1\/fix1: Fix the checks, round 1$/m);
+    assert.match(task, /no longer passes its checks there[\s\S]*- antidote: exited 1/);
+    assert.match(task, /Some fail now, as the report above shows, and they are not yours to change: fix the code they check\.\n\nThe checks of accepted work:\n\n- `test ! -f src\/poison\.txt \|\| test -f src\/antidote\.txt` \(antidote\)/);
+    assert.match(task, /## Guidance for this attempt\n\nStub diagnosis: accepted work fails its checks/);
+
+    const head = plan(o)!.head;
+    assert.match((await o.repo.commitInfo(fix.commit!)).message, /^fix\(demo\/P1\): the checks, round 1\n/);
+    assert.match((await o.repo.show(head, 'progress.txt'))!, /checks\.accepted demo\/P1 round=1 attempt=1/);
+    assert.equal(await o.repo.show(head, 'src/poison.txt'), 'x\n');
+    assert.equal(await o.repo.show(head, 'src/antidote.txt'), 'x\n');
+    // The full run came again once the fix had landed, and passed.
+    assert.equal(plan(o)!.validation?.status, 'passed');
+    assert.equal(plan(o)!.checkRounds, 1);
+  });
+
+  it("in Swarm, doesn't blame an attempt for a branch that main broke under it: the branch is checked by itself, and the attempt doesn't count", async () => {
+    // In Swarm main is merged into the plan's branch while F02 is built: its checks then run on a head that fails by itself.
+    const config = { checks: [{ id: 'antidote', run: 'test ! -f src/poison.txt || test -f src/antidote.txt', phase: 'pre-merge', timeoutSec: 30 }] };
+    const decide = (f: string): StubBehavior => (f.startsWith('fix') ? { files: { 'src/antidote.txt': 'x\n' } } : { ...solved(f), sleepSec: f === 'F02' ? 3 : 0 });
+    const { orchestrator: o, harnessDir } = await setup(decide, { config });
+    o.setMode('swarm');
+    await until(o, () => feature(o, 'F02')?.attempts[0]?.status === 'running');
+    await commitOnMain(join(harnessDir, '..'), { 'src/poison.txt': 'x\n' }, 'the owner adds a file the check forbids');
+    await until(o, completed(o), 90_000);
+
+    const f02 = feature(o, 'F02')!;
+    assert.deepEqual(f02.attempts.map((a) => [a.status, a.counts ?? null]), [['interrupted', false], ['accepted', null]]);
+    assert.match(f02.attempts[0]!.reason!, /^the work accepted on plan\/demo\/P1 fails its checks since its head moved: the next attempt starts once the branch is fixed$/);
+    const events = o.store.readAll();
+    assert.equal(events.some((e) => e.type === 'ATTEMPT_FAILED' || e.type === 'PIPELINE_PAUSED'), false);
+    assert.deepEqual([feature(o, 'fix1')!.fix!.kind, feature(o, 'fix1')!.status], ['checks', 'accepted']);
+    assert.equal(await o.repo.show(plan(o)!.head, 'src/antidote.txt'), 'x\n');
+  });
+
+  /** A project check that fails while a file outside the repository exists, unless the branch holds the mend: what a test breaks and when. */
+  const breakable = () => {
+    const marker = join(tempDir('marker'), 'broken');
+    return {
+      marker,
+      config: { checks: [{ id: 'sound', run: `test ! -e ${marker} || test -f src/mended.txt`, phase: 'pre-merge', timeoutSec: 30 }] },
+      decide: (f: string): StubBehavior => (f.startsWith('fix') ? { files: { 'src/mended.txt': 'x\n' } } : solved(f)),
+    };
+  };
+
+  it("before an attempt, accepted work that fails its checks is the plan's Manager's to have fixed: the attempt doesn't count, and nothing pauses", async () => {
+    const { marker, config, decide } = breakable();
+    const { orchestrator: o } = await setup(decide, { config });
+    // The branch breaks once F01 has landed: F02's attempt finds the checks of accepted work failing before it starts.
+    o.events.on('event', (e: { type: string; ref?: { feature?: string } }) => {
+      if (e.type === 'FEATURE_ACCEPTED' && e.ref?.feature === 'F01') writeFileSync(marker, '');
+    });
+    await until(o, completed(o), 90_000);
+
+    const events = o.store.readAll();
+    assert.equal(events.some((e) => e.type === 'PIPELINE_PAUSED'), false);
+    const f02 = feature(o, 'F02')!;
+    assert.deepEqual(f02.attempts.map((a) => a.status), ['interrupted', 'accepted']);
+    assert.deepEqual([f02.attempts[0]!.reason, f02.attempts[0]!.counts], ['checks of accepted work fail before the attempt starts', false]);
+    assert.deepEqual([feature(o, 'fix1')!.fix!.kind, feature(o, 'fix1')!.status], ['checks', 'accepted']);
+    // F02 started again only once the fix had landed.
+    const order = events.filter((e) => e.type === 'REQUEST_FIX' || (e.type === 'FEATURE_ACCEPTED' && e.ref?.feature === 'fix1') || (e.type === 'ATTEMPT_STARTING' && e.ref?.feature === 'F02')).map((e) => e.type);
+    assert.deepEqual(order, ['ATTEMPT_STARTING', 'REQUEST_FIX', 'FEATURE_ACCEPTED', 'ATTEMPT_STARTING']);
+    assert.equal(await o.repo.show(plan(o)!.head, 'src/mended.txt'), 'x\n');
+  });
+
+  it('runs failing checks once more before anyone is asked: a failure that does not repeat reaches neither the Manager nor the owner', async () => {
+    const { marker, config, decide } = breakable();
+    const { orchestrator: o } = await setup(decide, { config });
+    // Broken when F02's attempt looks, and whole again when the daemon looks once more: a registry that didn't answer, a check that flakes.
+    o.events.on('event', (e: { type: string; ref?: { feature?: string } }) => {
+      if (e.type === 'FEATURE_ACCEPTED' && e.ref?.feature === 'F01') writeFileSync(marker, '');
+      if (e.type === 'PLAN_CHECKS_FAILED') rmSync(marker, { force: true });
+    });
+    await until(o, completed(o), 90_000);
+
+    const events = o.store.readAll();
+    assert.deepEqual(events.filter((e) => e.type === 'PLAN_CHECKS_FAILED' || e.type === 'PLAN_CHECKS_PASSED').map((e) => e.type), ['PLAN_CHECKS_FAILED', 'PLAN_CHECKS_PASSED', 'PLAN_CHECKS_PASSED']);
+    assert.equal(events.some((e) => e.type === 'REQUEST_FIX' || e.type === 'PIPELINE_PAUSED' || e.type === 'OWNER_REQUEST'), false);
+    assert.equal(events.some((e) => e.type === 'MANAGER_ITEM_SENT' && (e.payload as { key: string }).key.startsWith('checks:')), false);
+    assert.deepEqual(feature(o, 'F02')!.attempts.map((a) => a.status), ['interrupted', 'accepted']);
+    assert.equal(feature(o, 'fix1'), undefined);
+  });
+
+  it('waits ten minutes and looks again by itself when no CI runs on a pull request, and goes on once it has', async () => {
+    let skew = 0;
+    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true, now: () => Date.now() + skew });
+    const ci = fake.ci;
+    fake.ci = () => undefined;
+    await until(o, () => plan(o)?.pr !== undefined && plan(o)!.ci?.status === 'pending', 60_000);
+    skew += 11 * 60_000;
+    await until(o, () => o.state.pipeline.paused !== undefined);
+    const first = o.state.pipeline.paused!;
+    assert.equal(first.reason, 'no CI has run on PR #1 for 11 minutes: is the harness workflow on main?');
+    assert.equal(first.retry, true);
+    assert.equal(Date.parse(first.until!) - Date.parse(first.since), 10 * 60_000);
+
+    // Still none ten minutes later: it waits again, and says for how long it has.
+    skew += 10 * 60_000 + 1_000;
+    await until(o, () => o.state.pipeline.paused !== undefined && o.state.pipeline.paused.since !== first.since);
+    assert.match(o.state.pipeline.paused!.reason, /^no CI has run on PR #1 for 21 minutes:/);
+
+    // GitHub runs it at last: the next look finds it, and the plan goes on with nobody's resume.
+    fake.ci = ci;
+    skew += 10 * 60_000 + 1_000;
+    await until(o, () => plan(o)?.status === 'ready_to_merge');
+    assert.equal(o.state.pipeline.paused, undefined);
+    assert.ok(o.store.readAll().filter((e) => e.type === 'PIPELINE_RESUMED').every((e) => (e.payload as { auto?: boolean }).auto === true));
+  });
+
+  it("takes a feature out of attempts to the Architect: its decision lets the Manager start one more, and the owner has no card for it", async () => {
+    let skew = 0;
+    let fixed = false;
+    const decide = (f: string): StubBehavior => (f === 'F01' && !fixed ? { files: { 'src/greet.sh': 'echo nope\n' } } : solved(f));
+    const { orchestrator: o, fake } = await setup(decide, {
+      github: true, design: false, now: () => Date.now() + skew, manager: { ignore: ['ATTEMPTS', 'REMINDER'] },
+      architect: { module: 'shop', design: toyDesign('shop'), summary: 'Greeting and adding', decision: 'The definition holds: print exactly hello.' },
+    });
+    o.createModule('shop', 'A tiny shop');
+    await until(o, () => o.state.modules.shop?.status === 'proposed');
+    o.acceptProposal('shop', 1);
+    await until(o, () => o.state.modules.shop?.status === 'in_review');
+    await fake.merge(1);
+    skew += 120_000;
+    const f01 = () => o.state.features['shop/P1/F01'];
+    await until(o, () => f01()?.status === 'escalated', 60_000);
+    assert.equal(f01()!.escalation, '2 attempt(s) failed; its Manager takes it to the Architect, which grants another attempt or changes the design');
+
+    // The Manager is sent it, and the owner has no card to handle.
+    const sent = sentTo(o, 'manager:shop');
+    await until(o, () => o.state.managers.shop?.sent['exhausted:shop/P1/F01#2'] !== undefined);
+    assert.deepEqual(needsNow(o).map((need) => need.kind), []);
+    const manager = { role: 'manager' as const, sandbox: o.state.managers.shop!.sandbox, module: 'shop' };
+    const call = (tool: string, args: Record<string, unknown>) => handleRequest(o, manager, { v: 1, id: `r-${tool}-${Math.random().toString(36).slice(2)}`, tool, args });
+    const guidance = 'Print exactly hello, as the Architect says.';
+
+    // No attempt is the Manager's to give before the Architect has decided.
+    const early = (await call('retry_feature', { feature: 'shop/P1/F01', guidance }))!;
+    assert.equal(early.ok, false);
+    assert.match(early.text, /used up its attempts: take it to the Architect with escalate_to_architect\(feature: "shop\/P1\/F01", question\)/);
+    assert.equal((await call('escalate_to_architect', { feature: 'shop/P1/F01', question: 'Two attempts printed the wrong word. Is the check right?' }))!.ok, true);
+    assert.ok(o.state.modules.shop!.notes.some((n) => /shop\/P1\/F01 has used up its attempts \(2 attempt\(s\) failed; .*\), and waits for you, not for the owner\./.test(n.text)));
+    // The owner sees the question to the Architect, and still nothing to decide.
+    assert.deepEqual(needsNow(o).map((need) => need.kind), ['escalation']);
+
+    await until(o, () => o.state.modules.shop!.escalations.at(-1)?.decision !== undefined);
+    await until(o, () => sent.some((text) => text.startsWith('[harness] DECISION from the Architect')));
+    const decision = sent.find((text) => text.startsWith('[harness] DECISION from the Architect'))!;
+    assert.match(decision, /shop\/P1\/F01 is out of attempts\. If this decision grants another one, call retry_feature\(feature: "shop\/P1\/F01", guidance\) now/);
+    fixed = true;
+    const granted = (await call('retry_feature', { feature: 'shop/P1/F01', guidance }))!;
+    assert.deepEqual([granted.ok, granted.text], [true, 'One more attempt of shop/P1/F01 starts with your guidance.']);
+    await until(o, () => f01()?.status === 'accepted', 60_000);
+
+    assert.equal(f01()!.attempts.length, 3);
+    assert.equal(f01()!.extraAttempts, 1);
+    assert.equal(f01()!.attempts[2]!.guidance, guidance);
+    const retry = o.store.readAll().findLast((e) => e.type === 'RETRY')!;
+    assert.equal((retry.payload as { granted?: string }).granted, `escalation:${o.state.modules.shop!.escalations.at(-1)!.id}`);
+    assert.equal(o.store.readAll().some((e) => e.type === 'OWNER_RETRY' || e.type === 'PIPELINE_PAUSED'), false);
   });
 });
