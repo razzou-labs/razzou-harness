@@ -47,7 +47,7 @@ const SETS_OFF: Record<Need['kind'], string> = {
     "A Manager's question to the owner: the answer goes to the Manager that asked. A blocking one holds every new attempt in its module until it is answered. A question stays until the owner answers it, even when something that happened since made it pointless: say so if one is.",
   left: "A plan's pull request left to the owner: they merge it on GitHub. Plans that depend on it can start once it is merged. If it holds infrastructure, CI applies it after the merge, then its post-deploy checks run.",
   merge: "A plan's pull request that passed CI: the owner merges it on GitHub. Plans that depend on it can start once it is merged. If it holds infrastructure, CI applies it after the merge, then its post-deploy checks run.",
-  escalated: 'An escalated feature: it used its attempts. The owner gives it one more, sends it to the Architect, or pauses the pipeline.',
+  escalated: 'An escalated feature: it used its attempts. The owner gives it one more, or pauses the pipeline.',
   action:
     'A gate or a task: something only the owner can do, which they then mark done. A gate holds back the plans or features it blocks, and the features that name it; a task holds nothing back. If it has a verify command, the daemon runs it first, from main. Once a gate is done, the work it held back starts as soon as the plans that work depends on are merged, whether or not their deploy or their post-deploy checks passed, and marking it done can\'t be undone. Its "when" is the Architect\'s sentence for the owner: the daemon doesn\'t check it.',
 };

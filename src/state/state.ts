@@ -196,7 +196,8 @@ export interface ReviewState {
   usage?: Usage;
   /** Why there is no report. */
   reason?: string;
-  posted?: { status: 'success' | 'failure' | 'error'; comments: number; at: string; problem?: string };
+  /** `tries`: how many times the post was made; one that failed for a reason that may pass (`retry`) is made again. */
+  posted?: { status: 'success' | 'failure' | 'error'; comments: number; at: string; problem?: string; tries?: number; retry?: boolean };
   /** A fix round was opened for this review's blocking findings. */
   fixRequested?: boolean;
 }
@@ -220,6 +221,8 @@ export interface ManagerState {
   lastExit?: { code: number | null; stderr: string; started: boolean };
   /** Items that need a decision, by key: when they were sent in the current launch, and reminded. */
   sent: Record<string, { launch: number; at: string; reminded?: string }>;
+  /** After a turn that ended on the model's API failing: nothing is sent to it before then. */
+  heldUntil?: string;
   /** Things to deliver once: the owner's messages and answers, the Architect's decisions, and the welcome. */
   mail: Array<{ key: string; kind: 'welcome' | 'owner_message' | 'owner_answer' | 'decision' | 'order_request'; text: string; requestId?: string }>;
 }
@@ -261,12 +264,17 @@ export interface ModuleState {
   /** A design the daemon is checking before it opens the Arch PR. */
   submission?: { requestId: string; summary: string; head: string; at: string };
   /** The design under review: its branch head with the hash list, and its PR. */
-  design?: { head: string; suspect: string[]; summary: string; pr?: { number: number; url: string }; ciNoted?: string };
+  /** `settings`: the settings of harness/config.json it changes, as its PR lists them. */
+  design?: { head: string; suspect: string[]; settings?: string[]; summary: string; pr?: { number: number; url: string }; ciNoted?: string };
+  /** The design of a pull request the owner closed: they may open it again, and it is then the design under review again. */
+  closedDesign?: { head: string; suspect: string[]; settings?: string[]; summary: string; pr?: { number: number; url: string } };
   /** A CHANGED_LOCKED_FILES change the daemon is checking before it opens its PR (v5). */
   lockedSubmission?: { requestId: string; summary: string; head: string; at: string };
   /** A CHANGED_LOCKED_FILES change under review: what it changes in each built feature, and its PR (v5). */
   locked?: { head: string; summary: string; changes: LockedChange[]; pr?: { number: number; url: string }; ciNoted?: string };
   frozenCommit?: string;
+  /** When its first design was merged: modules are built in that order. */
+  frozenAt?: string;
   /** Messages for the Architect, written into its sandbox once and shown with the owner's next prompt. */
   notes: Array<{ key: string; text: string; sent?: boolean }>;
   escalations: Array<{ id: string; question: string; feature?: string; manager?: string; askedAt: string; decision?: string; decidedAt?: string }>;
@@ -332,11 +340,11 @@ export interface State {
   /** The owner's switch for each reviewer; one never switched is `on`. */
   reviews?: Partial<Record<ReviewerRole, ReviewScope>>;
   /**
-   * What the owner set in the dashboard (v3 §4): their hours for the whole project. An
-   * older log may hold AGENT_HOURS_SET, the agent-hours threshold before 0.4.22: nothing
-   * reads it any more.
+   * The hours of the owner's time that each module may take, by module, as the owner set
+   * them: a module's own, which no other module draws on. A module without an entry is
+   * designed without a limit.
    */
-  budgets: { ownerHours?: number; ownerHoursSetAt?: string };
+  ownerHours: Record<string, { hours: number; setAt: string }>;
   /**
    * The tokens and active time of the Managers and Architects, by agent (`manager:<key>`,
    * `architect:<module>`): the total so far, and the last reading of their sandbox. A
@@ -372,7 +380,7 @@ export function managersOf(state: State, module: string, plan?: string): Manager
 export const planMerged = (plan: PlanState | undefined): boolean => plan !== undefined && (plan.mergeCommit !== undefined || plan.status === 'completed');
 
 export function initialState(): State {
-  return { v: 1, pipeline: { consecutiveFailures: 0 }, mode: 'manual', infraMerge: 'ceiling', budgets: {}, plans: {}, features: {}, managers: {}, ownerRequests: {}, modules: {}, actions: {}, pendingProgress: [] };
+  return { v: 1, pipeline: { consecutiveFailures: 0 }, mode: 'manual', infraMerge: 'ceiling', ownerHours: {}, plans: {}, features: {}, managers: {}, ownerRequests: {}, modules: {}, actions: {}, pendingProgress: [] };
 }
 
 export function project(events: HarnessEvent[]): State {
@@ -476,24 +484,19 @@ export function apply(state: State, event: HarnessEvent): State {
       (state.plans[planKey(ref!)]!.unreviewed ??= []).push({ role, head, why, at: event.ts });
       break;
     }
-    case 'OWNER_HOURS_SET':
-      if (event.payload.hours === null) {
-        delete state.budgets.ownerHours;
-        delete state.budgets.ownerHoursSetAt;
-      } else {
-        state.budgets.ownerHours = event.payload.hours;
-        state.budgets.ownerHoursSetAt = event.ts;
-      }
-      // Every Architect learns of it: the budget bounds the owner actions it may design (v3 §4.1).
-      for (const module of Object.values(state.modules)) {
-        module.notes.push({
-          key: `note:${event.id}`,
-          text: event.payload.hours === null
-            ? 'The owner cleared their time budget: estimatedMinutes on owner actions is welcome, not required.'
-            : `The owner set their time budget: ${event.payload.hours} hours for the whole project. Call get_owner_time for what this module may plan; every owner action needs estimatedMinutes, and submit_design refuses a design over the budget.`,
-        });
-      }
+    case 'OWNER_HOURS_SET': {
+      const { module, hours } = event.payload;
+      if (hours === null) delete state.ownerHours[module];
+      else state.ownerHours[module] = { hours, setAt: event.ts };
+      // The module's Architect learns of it: the hours bound the owner actions it may design.
+      state.modules[module]?.notes.push({
+        key: `note:${event.id}`,
+        text: hours === null
+          ? 'The owner cleared the hours of their time for this module: estimatedMinutes on owner actions is welcome, not required.'
+          : `The owner set the hours of their time this module may take: ${hours} h, for this module alone. Call get_owner_time for what your design may plan; every owner action needs estimatedMinutes, and submit_design refuses a design over it.`,
+      });
       break;
+    }
     case 'AGENT_TOKENS': {
       const { agent, reading } = event.payload;
       const tokens = (state.agentTokens ??= {});
@@ -612,6 +615,10 @@ export function apply(state: State, event: HarnessEvent): State {
         delete plan.pr;
         delete plan.pushed;
         delete plan.ci;
+        // A new pull request: the reviewers' rounds, and what the earlier one left to the owner, start afresh.
+        delete plan.reviewFixRounds;
+        delete plan.leftToOwner;
+        delete plan.mergedBy;
       } else {
         round = (plan.fixRounds ?? 0) + 1;
         plan.fixRounds = round;
@@ -636,9 +643,12 @@ export function apply(state: State, event: HarnessEvent): State {
       (plan.reviews ??= []).push({ role, head, status: 'starting', sandbox, sessionId, startedAt: event.ts, deadline });
       break;
     }
-    case 'REVIEW_STARTED':
-      reviewOf(state, ref!, event.payload).status = 'running';
+    case 'REVIEW_STARTED': {
+      const review = reviewOf(state, ref!, event.payload);
+      review.status = 'running';
+      if (event.payload.deadline) review.deadline = event.payload.deadline;
       break;
+    }
     case 'REVIEW_ENDED': {
       const review = reviewOf(state, ref!, event.payload);
       const { outcome, verdict, summary, findings, usage, reason } = event.payload;
@@ -651,8 +661,8 @@ export function apply(state: State, event: HarnessEvent): State {
     }
     case 'REVIEW_POSTED': {
       const review = reviewOf(state, ref!, event.payload);
-      const { status, comments, problem } = event.payload;
-      review.posted = { status, comments, at: event.ts, ...(problem ? { problem } : {}) };
+      const { status, comments, problem, retry } = event.payload;
+      review.posted = { status, comments, at: event.ts, ...(problem ? { problem } : {}), ...(retry ? { retry } : {}), tries: (review.posted?.tries ?? 0) + 1 };
       if (review.verdict === 'block') {
         const blocking = (review.findings ?? []).filter((f) => f.severity === 'blocking').map((f) => f.title).join('; ');
         digest(state, event.id, ref!, `The ${review.role} reviewer blocked plan ${ref!.plan}'s pull request at ${review.head.slice(0, 8)}: ${blocking}`);
@@ -825,7 +835,7 @@ export function apply(state: State, event: HarnessEvent): State {
       };
       break;
     case 'OWNER_ANSWER': {
-      const request = state.ownerRequests[event.payload.requestId];
+      const request = Object.hasOwn(state.ownerRequests, event.payload.requestId) ? state.ownerRequests[event.payload.requestId] : undefined;
       if (request) Object.assign(request, { answer: event.payload.answer, answeredAt: event.ts });
       // The owner may have fixed what a Manager asked about, such as a host to allow: checks that failed run again.
       for (const plan of Object.values(state.plans)) {
@@ -890,6 +900,12 @@ export function apply(state: State, event: HarnessEvent): State {
     case 'MANAGER_STOPPED':
       state.managers[managerKey(event.payload)]!.status = 'stopped';
       break;
+    case 'MANAGER_TURN_FAILED': {
+      const manager = state.managers[managerKey(event.payload)];
+      // Whatever it was sent may be what the failed turn was about: all of it is sent again, later.
+      if (manager) Object.assign(manager, { sent: {}, heldUntil: event.payload.until });
+      break;
+    }
     case 'PIPELINE_PAUSED':
       state.pipeline.paused = { reason: event.payload.reason, since: event.ts, until: event.payload.until, ...(event.payload.retry ? { retry: true } : {}) };
       break;
@@ -920,6 +936,18 @@ export function apply(state: State, event: HarnessEvent): State {
       state.modules[module] = {
         module, title, status: 'designing', architect: { sandbox, sessionId, status: 'starting' }, proposals: [], notes: [], escalations: [],
       };
+      break;
+    }
+    case 'ARCHITECT_STARTING': {
+      const module = state.modules[event.payload.module]!;
+      module.architect.status = 'starting';
+      // What the old sandbox was told is gone with it: a question still waiting for a decision is asked again.
+      for (const escalation of module.escalations.filter((e) => e.decision === undefined)) {
+        module.notes.push({
+          key: `note:${event.id}:${escalation.id}`,
+          text: `The Manager asks (escalation ${escalation.id}${escalation.feature ? `, about ${escalation.feature}` : ''}):\n${escalation.question}\nDecide with the owner if needed, then call reply_to_manager.`,
+        });
+      }
       break;
     }
     case 'ARCHITECT_LAUNCHED':
@@ -955,8 +983,13 @@ export function apply(state: State, event: HarnessEvent): State {
     }
     case 'DESIGN_SUBMITTED': {
       const module = state.modules[event.payload.module]!;
-      module.design = { head: event.payload.head, suspect: event.payload.suspect, summary: module.submission?.summary ?? '', ...(module.design?.pr ? { pr: module.design.pr } : {}) };
+      module.design = {
+        head: event.payload.head, suspect: event.payload.suspect, summary: event.payload.summary ?? module.submission?.summary ?? '',
+        ...(event.payload.settings?.length ? { settings: event.payload.settings } : {}),
+        ...(module.design?.pr ? { pr: module.design.pr } : {}),
+      };
       delete module.submission;
+      delete module.closedDesign;
       module.status = 'in_review';
       break;
     }
@@ -1015,6 +1048,12 @@ export function apply(state: State, event: HarnessEvent): State {
       const module = state.modules[event.payload.module]!;
       // A design change that was closed leaves the merged design as it was.
       module.status = module.frozenCommit ? 'frozen' : 'decomposing';
+      if (module.design?.pr) {
+        module.closedDesign = {
+          head: module.design.head, suspect: module.design.suspect, summary: module.design.summary, pr: module.design.pr,
+          ...(module.design.settings ? { settings: module.design.settings } : {}),
+        };
+      }
       delete module.design;
       module.notes.push({ key: `note:${event.id}`, text: 'The owner closed your Arch PR without merging it. Ask them why before you submit again.' });
       break;
@@ -1036,7 +1075,7 @@ export function apply(state: State, event: HarnessEvent): State {
     }
     case 'DESIGN_FROZEN': {
       const module = state.modules[event.payload.module]!;
-      Object.assign(module, { status: 'frozen', frozenCommit: event.payload.commit });
+      Object.assign(module, { status: 'frozen', frozenCommit: event.payload.commit, frozenAt: module.frozenAt ?? event.ts });
       delete module.design;
       module.notes.push({
         key: `note:${event.id}`,
@@ -1152,7 +1191,7 @@ function forgetSent(state: State, ref: Ref): void {
 
 /** Who gets a piece of mail: the Manager named, while it runs, or else every Manager of the module. */
 function mailTargets(state: State, module: string, manager?: string): ManagerState[] {
-  const named = manager ? state.managers[manager] : undefined;
+  const named = manager && Object.hasOwn(state.managers, manager) ? state.managers[manager] : undefined;
   return named && named.status !== 'stopped' ? [named] : managersOf(state, module);
 }
 

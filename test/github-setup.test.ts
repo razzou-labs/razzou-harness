@@ -1,11 +1,13 @@
 import { strict as assert } from 'node:assert';
 import { generateKeyPairSync } from 'node:crypto';
-import { writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
-import { GitHubClient, GitHubError } from '../src/github/app.ts';
+import { configDir, GitHubClient, GitHubError } from '../src/github/app.ts';
 import { GitHubForge, type BranchRules } from '../src/github/forge.ts';
-import { checkApp, ciFiles, mainRuleset, rulesProblems } from '../src/github/setup.ts';
+import { checkApp, ciFiles, installCi, mainRuleset, rulesProblems, staleCiFiles } from '../src/github/setup.ts';
+import { run } from '../src/util.ts';
 import { tempDir } from './helpers/toy-repo.ts';
 
 interface Ruleset {
@@ -104,6 +106,67 @@ describe('CODEOWNERS', () => {
       assert.ok(codeowners.includes(line), line);
     }
   });
+
+  it("keeps the project's CODEOWNERS, and writes one when there is none, with the login given or gh's", async () => {
+    const packageDir = join(import.meta.dirname, '..');
+    const kept = tempDir('install-ci');
+    mkdirSync(join(kept, '.github'), { recursive: true });
+    writeFileSync(join(kept, '.github', 'CODEOWNERS'), '* @someone\n');
+    assert.ok(!(await installCi(kept, packageDir, 'boss')).includes('.github/CODEOWNERS'));
+    assert.equal(readFileSync(join(kept, '.github', 'CODEOWNERS'), 'utf8'), '* @someone\n');
+
+    const given = tempDir('install-ci');
+    assert.ok((await installCi(given, packageDir, 'boss')).includes('.github/CODEOWNERS'));
+    assert.match(readFileSync(join(given, '.github', 'CODEOWNERS'), 'utf8'), /^\/harness\/ @boss$/m);
+
+    // No login given: gh's, here a stand-in on the PATH.
+    const bin = tempDir('gh');
+    writeFileSync(join(bin, 'gh'), '#!/bin/sh\necho gh-login\n', { mode: 0o755 });
+    const fromGh = tempDir('install-ci');
+    const path = process.env.PATH;
+    process.env.PATH = `${bin}:${path}`;
+    try {
+      await installCi(fromGh, packageDir);
+    } finally {
+      process.env.PATH = path;
+    }
+    assert.match(readFileSync(join(fromGh, '.github', 'CODEOWNERS'), 'utf8'), /^\/harness\/ @gh-login$/m);
+  });
+});
+
+describe('the workflow', () => {
+  const workflow = readFileSync(join(import.meta.dirname, '..', 'templates', 'harness.yml'), 'utf8');
+  /** A job's lines, from its key to the next job's. */
+  const job = (name: string) => new RegExp(`\\n  ${name}:\\n([\\s\\S]*?)(?=\\n  [a-z-]+:\\n|$)`).exec(workflow)?.[1] ?? '';
+
+  it("plans a pull request's Terraform only once verify passed, without the state lock, and keeps the plan a day", () => {
+    assert.match(job('tf-plan'), /\n {4}needs: \[verify\]\n/);
+    assert.match(job('tf-plan'), /terraform plan [^\n]*-lock=false/);
+    assert.match(job('tf-plan'), /name: tfplan\n[^\n]*\n {10}retention-days: 1\n/);
+    assert.match(job('tf-apply'), /terraform apply [^\n]*-lock-timeout=10m/);
+  });
+
+  it('always starts the checks, and fails them first when tf-plan failed', () => {
+    const checks = job('checks');
+    assert.match(checks, /\n {4}if: \$\{\{ !cancelled\(\) \}\}\n/);
+    assert.match(checks, /\n {4}steps:\n {6}- name: The Terraform plan passed\n {8}if: needs\.tf-plan\.result == 'failure'\n[\s\S]*?exit 1\n/);
+  });
+});
+
+describe('the CI files', () => {
+  it('run in a project whose package.json says "type": "commonjs", and are stale until written again', async () => {
+    const packageDir = join(import.meta.dirname, '..');
+    const project = tempDir('commonjs');
+    writeFileSync(join(project, 'package.json'), JSON.stringify({ name: 'p', version: '1.0.0', type: 'commonjs' }));
+    assert.deepEqual(staleCiFiles(project, packageDir), ['.github/workflows/harness.yml', '.github/harness/harness-ci.ts', '.github/harness/package.json']);
+    await installCi(project, packageDir, 'boss');
+    assert.deepEqual(staleCiFiles(project, packageDir), []);
+    const lock = await run('node', [join(project, '.github', 'harness', 'harness-ci.ts'), 'lock', '--dir', project]);
+    assert.equal(lock.code, 0, lock.stderr);
+    assert.ok((JSON.parse(lock.stdout) as { entries: unknown[] }).entries.length > 0);
+    writeFileSync(join(project, '.github', 'harness', 'package.json'), '{}\n');
+    assert.deepEqual(staleCiFiles(project, packageDir), ['.github/harness/package.json']);
+  });
 });
 
 describe('the App on GitHub', () => {
@@ -129,6 +192,51 @@ describe('the App on GitHub', () => {
     assert.equal(await client.token(), 't3');
     assert.equal(client.canWriteStatuses, true);
     assert.deepEqual(asked, ['write', 'read', 'write']);
+  });
+
+  it('tries a call GitHub answers 401 once more, with a token minted anew', async () => {
+    let minted = 0;
+    const seen: string[] = [];
+    // Tokens that last an hour: only a 401 makes the client mint another.
+    const fake = async (url: string | URL | Request, init?: RequestInit) => {
+      const path = new URL(String(url)).pathname;
+      if (path === '/repos/acme/shop/installation') return json({ id: 7 });
+      if (path.endsWith('/access_tokens')) return json({ token: `t${++minted}`, expires_at: new Date(Date.now() + 3_600_000).toISOString() }, 201);
+      const auth = String((init?.headers as Record<string, string>).authorization);
+      seen.push(`${path} ${auth}`);
+      // GitHub revoked the first token.
+      return auth === 'token t1' ? json({ message: 'Bad credentials' }, 401) : path.endsWith('/logs') ? new Response('the log') : json({ ok: true });
+    };
+    const client = new GitHubClient({ appId: 1, slug: 'acme-harness', privateKey }, 'acme/shop', fake as typeof fetch);
+    assert.deepEqual(await client.request('GET', '/repos/{repo}/pulls/1'), { ok: true });
+    assert.deepEqual(seen, ['/repos/acme/shop/pulls/1 token t1', '/repos/acme/shop/pulls/1 token t2']);
+    assert.equal(await client.download('/repos/{repo}/actions/jobs/1/logs'), 'the log');
+    assert.equal(minted, 2, 'the new token serves the next calls');
+
+    // Twice refused: GitHub means it.
+    const always = new GitHubClient({ appId: 1, slug: 'acme-harness', privateKey }, 'acme/shop', (async (url: string | URL | Request) => {
+      const path = new URL(String(url)).pathname;
+      if (path === '/repos/acme/shop/installation') return json({ id: 7 });
+      if (path.endsWith('/access_tokens')) return json({ token: 't', expires_at: new Date(Date.now() + 3_600_000).toISOString() }, 201);
+      return json({ message: 'Bad credentials' }, 401);
+    }) as typeof fetch);
+    await assert.rejects(always.request('GET', '/repos/{repo}/pulls/1'), (error: unknown) => error instanceof GitHubError && error.status === 401);
+  });
+
+  it('keeps the App in ~/.config/harness unless XDG_CONFIG_HOME is an absolute path', () => {
+    const before = process.env.XDG_CONFIG_HOME;
+    try {
+      for (const value of ['', 'relative/config']) {
+        process.env.XDG_CONFIG_HOME = value;
+        assert.equal(configDir(), join(homedir(), '.config', 'harness'), JSON.stringify(value));
+      }
+      const absolute = tempDir('xdg');
+      process.env.XDG_CONFIG_HOME = absolute;
+      assert.equal(configDir(), join(absolute, 'harness'));
+    } finally {
+      if (before === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = before;
+    }
   });
 
   it("reads every rule on a branch, on every page, and the strictest of the pull request's", async () => {

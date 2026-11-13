@@ -10,6 +10,7 @@ import { clip, sh } from '../util.ts';
 import type { AgentChannel } from './channel.ts';
 import { architectRef, lockedRef, submitDesign, submitLockedChange } from './design.ts';
 import type { Orchestrator } from './orchestrator.ts';
+import { BUNDLE_BYTES } from './refs.ts';
 
 /**
  * The Architects (proposal v2 §7.1, §7.5): one long-lived interactive Claude Code session
@@ -20,7 +21,6 @@ import type { Orchestrator } from './orchestrator.ts';
 export class Architects {
   private readonly o: Orchestrator;
   private readonly channels = new Map<string, AgentChannel>();
-  private readonly busy = new Set<string>();
   private readonly nextPoll = new Map<string, number>();
 
   constructor(o: Orchestrator) {
@@ -57,7 +57,8 @@ export class Architects {
       `cd ${sh(p.work)} || exit 1`,
       '[ -z "$(git status --porcelain)" ] || { echo "commit everything first: uncommitted changes would be left out" >&2; exit 4; }',
       '[ "$(git rev-list --count main..HEAD)" -gt 0 ] || { echo "there is nothing committed since main" >&2; exit 4; }',
-      `mkdir -p ${sh(p.out)} && git bundle create --quiet ${sh(`${p.out}/design.bundle`)} main..HEAD`,
+      `mkdir -p ${sh(p.out)} && git bundle create --quiet ${sh(`${p.out}/design.bundle`)} main..HEAD || exit 1`,
+      `[ "$(wc -c < ${sh(`${p.out}/design.bundle`)})" -le ${BUNDLE_BYTES} ] || { echo "what you committed since main is more than ${BUNDLE_BYTES / 1024 / 1024} MB: a design is text, and data belongs outside the repository" >&2; exit 4; }`,
     ].join('\n'));
     if (result.code === 4) return { problem: result.stderr.trim() };
     if (result.code !== 0) throw new Error(`could not take the design: ${(result.stderr || result.stdout).trim()}`);
@@ -68,7 +69,19 @@ export class Architects {
 
   private async syncModule(module: ModuleState): Promise<void> {
     const o = this.o;
-    if (module.architect.status === 'starting' || (await o.driver.status(module.architect.sandbox)) === 'missing') {
+    // GitHub first: what the owner merged or closed is seen whatever state the Architect's sandbox is in.
+    // A change to locked files has its own PR, which doesn't hold the build (v5).
+    if (module.status === 'in_review' && module.design?.pr) await this.followPullRequest(module);
+    else if (!module.design && module.closedDesign?.pr) await this.followClosed(module);
+    if (module.locked?.pr) await this.followLocked(module);
+    if (module.architect.status !== 'starting') {
+      const where = await o.driver.status(module.architect.sandbox);
+      // Gone, so made again with a new conversation. Recorded first: a start cut short is taken up again.
+      if (where === 'missing') o.record({ type: 'ARCHITECT_STARTING', payload: { module: module.module } });
+      // What a reboot of the machine leaves: started again, its launcher resumes the conversation.
+      else if (where === 'stopped') await o.driver.start(module.architect.sandbox);
+    }
+    if (module.architect.status === 'starting') {
       await this.start(module);
       return;
     }
@@ -76,11 +89,10 @@ export class Architects {
     await this.sendNotes(module);
     await o.noteTokens(`architect:${module.module}`, module.architect.sandbox);
     await this.refreshMainIfMoved(module);
-    if (module.submission && !this.busy.has(module.module)) await this.process(module);
-    if (module.status === 'in_review' && module.design?.pr) await this.followPullRequest(module);
-    // A change to locked files has its own PR, which doesn't hold the build (v5).
-    if (module.lockedSubmission && !this.busy.has(`${module.module}:locked`)) await this.processLocked(module);
-    if (module.locked?.pr) await this.followLocked(module);
+    // A submitted design is checked beside the pass: its new checks run once on the unbuilt repository, which takes
+    // minutes, and the build of another module must not stand still for it.
+    if (module.submission) o.runBeside(`design:${module.module}`, () => this.process(module));
+    if (module.lockedSubmission) o.runBeside(`locked:${module.module}`, () => this.processLocked(module));
   }
 
   /** A sandbox whose main command waits for the launcher; the launcher, uploaded last, starts Claude. */
@@ -128,7 +140,7 @@ export class Architects {
       return folder;
     };
     copyFileSync(join(o.options.packageDir, 'roles', 'architect.md'), join(staging('harness'), 'architect.md'));
-    writeFileSync(join(staging('harness'), 'welcome.md'), welcome(module, o.state.budgets.ownerHours !== undefined));
+    writeFileSync(join(staging('harness'), 'welcome.md'), welcome(module, o.state.ownerHours[module.module] !== undefined));
     for (const file of ['architect.md', 'welcome.md']) await o.driver.upload(sandbox, join(staging('harness'), file), p.harness);
     await o.uploadAgentFiles(sandbox, 'architect', dir);
     writeFileSync(join(staging('home'), '.claude.json'), claudeJson(p.work));
@@ -177,14 +189,15 @@ export class Architects {
       if (result.code !== 0) throw new Error(`could not write to the Architect's inbox: ${result.stderr.trim()}`);
       o.record({ type: 'ARCHITECT_NOTE_SENT', payload: { module: module.module, key: note.key } });
     }
-    if (unsent.length > 0) o.events.emit('architect-inbox', { module: module.module, sandbox: module.architect.sandbox });
+    // A digest line tells what happened to a plan, and asks for nothing: it waits in the inbox for the next prompt.
+    // Announcing each would cost a turn of the Architect's model on its whole conversation, several times a plan.
+    if (unsent.some((n) => !n.text.startsWith('[digest]'))) o.events.emit('architect-inbox', { module: module.module, sandbox: module.architect.sandbox });
   }
 
   private async process(module: ModuleState): Promise<void> {
     const o = this.o;
     const submission = module.submission!;
-    this.busy.add(module.module);
-    try {
+    {
       const outcome = await submitDesign(o, module, submission.summary, submission.head).catch((error: Error) => ({
         ok: false as const,
         problems: [`the harness failed while handling it (${error.message.split('\n')[0]}); submit again`],
@@ -194,24 +207,24 @@ export class Architects {
         await this.reply(module.module, submission.requestId, false, `Refused:\n${outcome.problems.map((p) => `- ${p}`).join('\n')}`);
         return;
       }
-      o.record({ type: 'DESIGN_SUBMITTED', payload: { module: module.module, head: outcome.head, suspect: outcome.suspect } });
-      if (outcome.opened) o.record({ type: 'ARCH_PR_OPENED', payload: { module: module.module, number: outcome.pr.number, url: outcome.pr.url } });
+      o.record({ type: 'DESIGN_SUBMITTED', payload: { module: module.module, head: outcome.head, suspect: outcome.suspect, ...(outcome.settings.length > 0 ? { settings: outcome.settings } : {}) } });
+      // Also a pull request found open that the state no longer knew, as one the owner closed and opened again: without it nothing follows the design.
+      if (outcome.opened || module.design?.pr?.number !== outcome.pr.number) {
+        o.record({ type: 'ARCH_PR_OPENED', payload: { module: module.module, number: outcome.pr.number, url: outcome.pr.url } });
+      }
       await this.syncBranch(module);
       const checks = outcome.suspect.length
         ? `These checks already pass on the unbuilt repository, so they may be too weak: ${outcome.suspect.join(', ')}. The PR lists them for the owner.`
         : 'Every new check failed on the unbuilt repository, as it should.';
-      await this.reply(module.module, submission.requestId, true, `Arch PR #${outcome.pr.number}: ${outcome.pr.url}. ${checks} The owner reviews and merges it.`);
-    } finally {
-      this.busy.delete(module.module);
+      const settings = outcome.settings.length > 0 ? ` It changes ${outcome.settings.length} setting(s) of harness/config.json, which the PR lists first for the owner.` : '';
+      await this.reply(module.module, submission.requestId, true, `Arch PR #${outcome.pr.number}: ${outcome.pr.url}. ${checks}${settings} The owner reviews and merges it.`);
     }
   }
 
   private async processLocked(module: ModuleState): Promise<void> {
     const o = this.o;
     const submission = module.lockedSubmission!;
-    const key = `${module.module}:locked`;
-    this.busy.add(key);
-    try {
+    {
       const outcome = await submitLockedChange(o, module, submission.summary, submission.head).catch((error: Error) => ({
         ok: false as const,
         problems: [`the harness failed while handling it (${error.message.split('\n')[0]}); submit again`],
@@ -222,7 +235,9 @@ export class Architects {
         return;
       }
       o.record({ type: 'LOCKED_CHANGE_SUBMITTED', payload: { module: module.module, head: outcome.head, changes: outcome.changes } });
-      if (outcome.opened) o.record({ type: 'ARCH_PR_OPENED', payload: { module: module.module, number: outcome.pr.number, url: outcome.pr.url, locked: true } });
+      if (outcome.opened || module.locked?.pr?.number !== outcome.pr.number) {
+        o.record({ type: 'ARCH_PR_OPENED', payload: { module: module.module, number: outcome.pr.number, url: outcome.pr.url, locked: true } });
+      }
       await this.syncBranch(module, `locked/${module.module}`);
       await this.reply(
         module.module,
@@ -230,8 +245,6 @@ export class Architects {
         true,
         `CHANGED_LOCKED_FILES PR #${outcome.pr.number}: ${outcome.pr.url}. It changes ${outcome.changes.map((c) => `${c.plan}/${c.feature}`).join(', ')}, and their pre-merge checks pass. The owner reviews and merges it.`,
       );
-    } finally {
-      this.busy.delete(key);
     }
   }
 
@@ -252,7 +265,8 @@ export class Architects {
         return feature ? [{ feature: `${module.module}/${c.plan}/${c.feature}`, definitionHash: definitionHash(feature) }] : [];
       });
       o.record({ type: 'LOCKED_CHANGE_MERGED', payload: { module: module.module, commit, rehash } });
-      await this.refreshMain(module);
+      // The Architect's clone gets the new main whenever its sandbox answers (`refreshMainIfMoved`).
+      this.mainSent.delete(module.module);
       o.kick();
       return;
     }
@@ -334,7 +348,8 @@ export class Architects {
     const pr = await o.forge.pullRequest(module.design!.pr!.number);
     if (pr.merged) {
       o.record({ type: 'DESIGN_FROZEN', payload: { module: module.module, commit: pr.mergeCommit ?? '' } });
-      await this.refreshClone(module);
+      // The merge is recorded whatever the sandbox does: a clone that can't be refreshed now only keeps its old branch.
+      await this.refreshClone(module).catch((error: Error) => o.log(`architect of ${module.module}: its clone was not refreshed after the merge: ${error.message}`));
       o.kick();
       return;
     }
@@ -357,6 +372,25 @@ export class Architects {
       jobs.push({ name: run.name, conclusion, ...(conclusion === 'success' ? {} : { log: await o.forge.jobLog(run) }) });
     }
     o.record({ type: 'ARCH_CI_DONE', payload: { module: module.module, sha: pr.head, jobs } });
+  }
+
+  /**
+   * A pull request the owner closed may be opened again, and merged after that: looked at
+   * every five minutes, it is taken up as the design under review again. Without this the
+   * module stayed where the close left it, and a merge was never seen.
+   */
+  private async followClosed(module: ModuleState): Promise<void> {
+    const o = this.o;
+    const key = `${module.module}:closed`;
+    if (o.now() < (this.nextPoll.get(key) ?? 0)) return;
+    this.nextPoll.set(key, o.now() + 5 * 60_000);
+    const closed = module.closedDesign!;
+    const pr = await o.forge.pullRequest(closed.pr!.number);
+    if (pr.state !== 'open' && !pr.merged) return;
+    o.record({ type: 'DESIGN_SUBMITTED', payload: { module: module.module, head: closed.head, suspect: closed.suspect, summary: closed.summary, ...(closed.settings ? { settings: closed.settings } : {}) } });
+    o.record({ type: 'ARCH_PR_OPENED', payload: { module: module.module, number: closed.pr!.number, url: closed.pr!.url } });
+    this.nextPoll.delete(module.module);
+    o.kick();
   }
 
   /** After the merge: the Architect's clone gets the new main, and its branch starts from it. */
@@ -385,7 +419,7 @@ export class Architects {
 function welcome(module: ModuleState, budgeted: boolean): string {
   const latest = module.proposals.at(-1);
   // The owner's time is budgeted: the Architect designs owner actions within it (v3 §4.1).
-  const budget = budgeted ? ['The owner budgets their time: call get_owner_time before you propose, and estimate every owner action.'] : [];
+  const budget = budgeted ? ['The owner set the hours of their time this module may take: call get_owner_time before you propose, and estimate every owner action.'] : [];
   if (!latest) {
     return clip([
       `[harness] You are the Architect of the new module "${module.module}": ${module.title}.`,

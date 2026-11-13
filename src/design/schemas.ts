@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { z } from 'zod';
 import type { Repo } from '../git/repo.ts';
-import { ALL_BUNDLES, BUNDLES } from '../sandbox/allowlist.ts';
+import { ALL_BUNDLES, BUNDLES, HOST_PATTERN } from '../sandbox/allowlist.ts';
 import { canonicalJson, sha256 } from '../util.ts';
 
 /** The agents' image is tagged with the harness's version, which may change what goes into it: `harness doctor --build-images` builds it. */
@@ -59,6 +59,8 @@ export const PlanSchema = z
     const seen = new Set<string>();
     for (const feature of plan.features) {
       if (seen.has(feature.id)) ctx.addIssue({ code: 'custom', message: `feature ${feature.id} appears twice` });
+      // A plan's fix rounds are its work items fix1, fix2…: a feature of that name would be taken for one.
+      if (/^fix\d+$/.test(feature.id)) ctx.addIssue({ code: 'custom', message: `feature ${feature.id}: the ids fix1, fix2… are the harness's own, for a plan's fix rounds; pick another` });
       // A dependency on another plan's feature is checked against the module (checkReferences).
       for (const dep of feature.dependsOn.filter((d) => !d.includes('/'))) {
         if (!seen.has(dep)) ctx.addIssue({ code: 'custom', message: `${feature.id} depends on ${dep}, which is not an earlier feature of this plan` });
@@ -95,6 +97,9 @@ export function featureDependency(planId: string, dep: string): { plan: string; 
   return b === undefined ? { plan: planId, feature: a } : { plan: a, feature: b };
 }
 
+/** The hosts some bundle reaches with git: none of them can be an API. */
+const GIT_HOSTS = new Set(Object.values(BUNDLES).flat().filter((rule) => rule.access === 'git').map((rule) => rule.host));
+
 /** Variables the harness, OpenShell or the system set in a sandbox: an API's key can't take one of their names. */
 const RESERVED_VARIABLES = /^(AWS_|CLAUDE_|OPENSHELL_|HARNESS_|SSL_|NODE_|NPM_)|^(PATH|HOME|USER|SHELL|LANG|TERM|PWD|TMPDIR|REQUESTS_CA_BUNDLE|CURL_CA_BUNDLE|DISABLE_AUTOUPDATER|CHECKPOINT_DISABLE|MCP_TOOL_TIMEOUT)$/;
 
@@ -106,10 +111,14 @@ const ApiSchema = z.object({
 }).strict();
 
 export const ConfigSchema = z.object({
-  harnessVersion: z.string(),
+  /** The version of the harness that wrote the file: a record for the owner, which nothing reads. */
+  harnessVersion: z.string().optional(),
   project: z.object({
     name: Id,
-    /** The GitHub repository, like "acme/shop". Without it, the harness works locally and opens no pull requests. */
+    /**
+     * The GitHub repository, like "acme/shop": designs and plans land through its pull requests, so `harness up`
+     * refuses a project without it. The schema lets it out only for the daemon's tests, which run on a local forge.
+     */
     repo: z.string().regex(/^[\w.-]+\/[\w.-]+$/, 'owner/name').optional(),
     /** The harness App's bot login, like "acme-harness[bot]": CI tells its PRs from the owner's by it. */
     bot: z.string().regex(/^[\w.-]+\[bot\]$/, 'an App bot login, like "acme-harness[bot]"').optional(),
@@ -118,7 +127,6 @@ export const ConfigSchema = z.object({
     .object({
       developer: z
         .object({
-          agent: z.enum(['claude-code']).default('claude-code'),
           model: z.string().default('claude-opus-5-5'),
           /** Claude Code's `--effort`; `null` leaves it to Claude Code, for models without effort levels. */
           effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).nullable().default('max'),
@@ -129,7 +137,6 @@ export const ConfigSchema = z.object({
       // The reviewers run on the Manager's model and effort.
       manager: z
         .object({
-          agent: z.enum(['claude-code']).default('claude-code'),
           model: z.string().default('claude-opus-5-5'),
           effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).nullable().default('max'),
         })
@@ -137,7 +144,6 @@ export const ConfigSchema = z.object({
       // The most capable model designs: a better design saves Developers' attempts.
       architect: z
         .object({
-          agent: z.enum(['claude-code']).default('claude-code'),
           model: z.string().default('claude-fable-5-2'),
           effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).nullable().default('max'),
         })
@@ -155,7 +161,7 @@ export const ConfigSchema = z.object({
     .object({
       /** The hosts sandboxes reach directly, read-only, by bundle; `all`, the default, is every bundle. */
       bundles: z.array(z.string().refine((name) => name === ALL_BUNDLES || name in BUNDLES, `a bundle: ${ALL_BUNDLES}, ${Object.keys(BUNDLES).join(', ')}`)).default([ALL_BUNDLES]),
-      extraHosts: z.array(z.string()).default([]),
+      extraHosts: z.array(z.string().regex(HOST_PATTERN, 'a host name like docs.example.com or **.example.com: lowercase, a wildcard only as the first label followed by two others, no address, no port')).default([]),
       /**
        * Third-party APIs sandboxes may call with any method, like a payment provider's test
        * API. `key` names the variable the project's code reads the API's key from: in a
@@ -164,15 +170,21 @@ export const ConfigSchema = z.object({
        */
       apis: z.array(ApiSchema).default([])
         .refine((apis) => new Set(apis.map((a) => a.host)).size === apis.length, 'each host once')
-        .refine((apis) => { const keys = apis.flatMap((a) => (a.key ? [a.key] : [])); return new Set(keys).size === keys.length; }, 'each key once'),
+        .refine((apis) => { const keys = apis.flatMap((a) => (a.key ? [a.key] : [])); return new Set(keys).size === keys.length; }, 'each key once')
+        // An Architect's sandbox has every bundle: a git host there, as an API, would take every method, push included.
+        .refine((apis) => apis.every((api) => !GIT_HOSTS.has(api.host)), "a git host, such as github.com, which sandboxes only clone and fetch from, can't be an API"),
     })
     .prefault({}),
-  checks: z.array(CheckSchema).default([]),
+  /** The project's own checks, which every attempt and CI run: commands from the repository's root, as CI has it elsewhere than a sandbox does. */
+  checks: z.array(CheckSchema).default([])
+    .refine((checks) => checks.every((c) => !c.run.includes('/sandbox/')), 'a check uses a /sandbox/ path, which only harness sandboxes have; CI runs the repository elsewhere: use paths from the repository root'),
   /** More protected tool configs: whole files, and JSON fields by file (§8.7). */
   protect: z
     .object({
       files: z.array(z.string()).default([]),
       jsonFields: z.record(z.string(), z.array(z.string().startsWith('/'))).default({}),
+      /** TOML tables, or INI sections, by file or glob, such as `{ "pyproject.toml": ["tool.mypy"] }`. */
+      tomlTables: z.record(z.string(), z.array(z.string().min(1))).default({}),
     })
     .prefault({}),
   github: z
@@ -199,11 +211,16 @@ export const ConfigSchema = z.object({
   /** Where the project's Terraform lives, and how a plan is made against the real state (§12.4). */
   terraform: z
     .object({
-      /** A folder from the repository root, written `iac`, `./iac` or `iac/` alike, as CI's path rules read it. */
+      /**
+       * The folder `iac`, written `iac`, `./iac` or `iac/` alike, with its backend config and
+       * variables file: the three paths the CI workflow plans and applies with. They are
+       * settings only in name: another value would be planned in the sandboxes and never
+       * applied, while the daemon recorded a deploy.
+       */
       dir: z.string().transform((dir) => dir.replace(/^(?:\.?\/)+/, '').replace(/\/+$/, ''))
-        .refine((dir) => dir !== '' && dir !== '.' && !dir.split('/').includes('..'), 'a folder inside the repository, like iac: the CI workflow plans and applies iac/').default('iac'),
-      backendConfig: z.string().default('backend-configs/staging.hcl'),
-      varFile: z.string().default('env/staging.tfvars'),
+        .refine((dir) => dir === 'iac', 'the CI workflow plans and applies the folder iac/: keep "iac"').default('iac'),
+      backendConfig: z.string().refine((path) => path === 'backend-configs/staging.hcl', 'the CI workflow uses backend-configs/staging.hcl: keep it').default('backend-configs/staging.hcl'),
+      varFile: z.string().refine((path) => path === 'env/staging.tfvars', 'the CI workflow uses env/staging.tfvars: keep it').default('env/staging.tfvars'),
     })
     .optional(),
   brakes: z
@@ -399,7 +416,34 @@ export async function loadDesign(repo: Repo, ref: string): Promise<Design> {
   const byId = (a: { id: string }, b: { id: string }) => a.id.localeCompare(b.id, 'en', { numeric: true });
   const modules = [...byModule.values()].map((m) => ({ ...m, plans: m.plans.sort(byId) })).sort(byId);
   for (const module of modules) checkReferences(module);
+  uniqueCheckIds(config, modules);
   return { config, modules };
+}
+
+/**
+ * A check is told from the others by its id, in the whole design: in an attempt's report,
+ * in a run's results, and when a merge round puts the checks of both sides together. Two
+ * checks with one id would show one result for both, and only one of them would run.
+ */
+function uniqueCheckIds(config: Config, modules: ModuleDesign[]): void {
+  const owners = new Map<string, string>();
+  for (const check of config.checks) {
+    if (owners.has(check.id)) throw new Error(`harness/config.json: the check id ${check.id} appears twice`);
+    owners.set(check.id, 'harness/config.json');
+  }
+  for (const module of modules) {
+    for (const plan of module.plans) {
+      for (const feature of plan.features) {
+        for (const check of feature.checks) {
+          const other = owners.get(check.id);
+          if (other !== undefined) {
+            throw new Error(`harness/modules/${module.id}/plans/${plan.id}.json: ${feature.id}'s check ${check.id} has the id of a check of ${other}: every check of the project needs an id of its own`);
+          }
+          owners.set(check.id, `${module.id}/${plan.id}/${feature.id}`);
+        }
+      }
+    }
+  }
 }
 
 /** Every gate a feature names exists, and every action blocks something real. */

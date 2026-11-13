@@ -1,11 +1,12 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
-import { describeOwnerTime } from '../design/owner-time.ts';
+import { describeOwnerTime, moduleOwnerTime } from '../design/owner-time.ts';
 import { INPUTS, TOOLS, type Role, type ToolInput, type ToolName } from '../roles.ts';
 import { activeAttempts, attemptInSandbox, featureKey, managerKey, planKey, type Attempt, type FeatureState } from '../state/state.ts';
 import { clip, sh, sha256, tail } from '../util.ts';
 import type { AgentRequest } from './channel.ts';
+import { isBuilt } from './design.ts';
 import { attemptsLeft, checksFail, checksReport, ciReport, conflictReport, CONFLICT_STATUSES, deployReport, fixPrMerge, grantFor, outOfAttempts } from './items.ts';
 import type { Orchestrator } from './orchestrator.ts';
 import { refOf } from './refs.ts';
@@ -64,12 +65,27 @@ const HANDLERS: Handlers = {
   },
 
   async web_read({ o, agent }, { url }) {
-    const result = await o.webRead(url);
-    o.record({
-      type: 'WEB_READ',
-      payload: { role: agent.role, sandbox: agent.sandbox, url, finalUrl: result.finalUrl, status: result.status, bytes: result.bytes, ok: result.ok },
-    });
-    return { ok: result.ok, text: result.text };
+    // Recorded however the read ends, a failure included. The URLs are clipped: every call
+    // is a line of the event log, which the daemon reads whole when it starts.
+    const recorded = 300;
+    let result: Awaited<ReturnType<Orchestrator['webRead']>> | undefined;
+    try {
+      result = await o.webRead(url);
+      return { ok: result.ok, text: result.text };
+    } finally {
+      o.record({
+        type: 'WEB_READ',
+        payload: {
+          role: agent.role,
+          sandbox: agent.sandbox,
+          url: clip(url, recorded),
+          finalUrl: result?.finalUrl === undefined ? undefined : clip(result.finalUrl, recorded),
+          status: result?.status,
+          bytes: result?.bytes ?? 0,
+          ok: result?.ok ?? false,
+        },
+      });
+    }
   },
 
   async answer_developer({ o, agent }, { question_id, answer }) {
@@ -102,9 +118,11 @@ const HANDLERS: Handlers = {
     o.record({ type: 'REJECT', ref: refOf(found.state, found.attempt), from: 'manager', to: 'daemon', payload: { requestId, guidance } });
     o.kick();
     const left = attemptsLeft(o, found.state) - 1;
-    return ok(left > 0
-      ? `Rejected. The next attempt starts with your guidance (${left} left).`
-      : 'Rejected. That was its last attempt, so the owner decides what happens next.');
+    if (left > 0) return ok(`Rejected. The next attempt starts with your guidance (${left} left).`);
+    // Out of attempts, a feature goes to the Architect, not the owner: only a design written by hand has none.
+    return ok(o.state.modules[found.state.module]
+      ? `Rejected. That was its last attempt: take it to the Architect with escalate_to_architect(feature: "${feature}", question), saying what failed each time.`
+      : 'Rejected. That was its last attempt, and this module has no Architect, so the owner decides what happens next.');
   },
 
   retry_feature({ o, agent, requestId }, { feature, guidance }) {
@@ -113,7 +131,11 @@ const HANDLERS: Handlers = {
     const last = state.attempts.at(-1)!;
     if (state.status === 'escalated') {
       // Out of attempts: one more starts once the Architect decided on it, or the owner answered about it.
-      if (!outOfAttempts(o, state)) return refuse(`${feature} is escalated: the owner decides now.`);
+      if (!outOfAttempts(o, state)) {
+        return refuse(o.state.modules[state.module]
+          ? `${feature} is escalated: take it to the Architect with escalate_to_architect(feature: "${feature}", question). A change to its design starts it again.`
+          : `${feature} is escalated, and this module has no Architect: the owner decides now.`);
+      }
       const granted = grantFor(o, state);
       if (!granted) {
         return refuse(`${feature} used up its attempts: take it to the Architect with escalate_to_architect(feature: "${feature}", question). Another attempt starts once its decision has come, or the owner's answer to a question of yours.`);
@@ -314,8 +336,9 @@ const HANDLERS: Handlers = {
     return ok(module.notes.slice(-20).map((n) => n.text).join('\n\n---\n\n'));
   },
 
-  async get_owner_time({ o, agent }) {
-    return ok(describeOwnerTime(await o.ownerTime(), agent.module!));
+  get_owner_time({ o, agent }) {
+    const design = o.design.modules.find((m) => m.id === agent.module) ?? { id: agent.module!, plans: [], actions: [] };
+    return ok(describeOwnerTime(moduleOwnerTime(o.design.config, design, o.state)));
   },
 
   reply_to_manager({ o, agent, requestId }, { escalation_id, decision }) {
@@ -400,9 +423,11 @@ function architectState(o: Orchestrator, id: string): string {
     plan: planKey(p),
     status: p.status,
     // Past its build, a plan's features are locked: submit_locked_change, or a new plan that supersedes them (v5).
-    locked: p.status !== 'active',
+    locked: isBuilt(o, id, p.plan),
+    // Each attempt with how it ended: get_attempt shows one in full, its task, report and checks.
     features: Object.values(o.state.features).filter((f) => f.module === id && f.plan === p.plan).map((f) => ({
-      feature: f.feature, status: f.status, attempts: f.attempts.length, ...(f.escalation ? { escalation: f.escalation } : {}),
+      feature: f.feature, status: f.status, ...(f.escalation ? { escalation: f.escalation } : {}),
+      attempts: f.attempts.map((a) => ({ n: a.n, status: a.status, ...(a.outcome ? { outcome: a.outcome } : {}), ...(a.reason ? { reason: clip(a.reason, 300) } : {}) })),
     })),
   }));
   return JSON.stringify({

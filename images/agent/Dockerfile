@@ -1,8 +1,11 @@
-# The image of every harness sandbox: Developers and checks now, the Manager and the
-# Architect later. build.sh puts this machine's Claude Code binary next to this file.
+# The image of every harness sandbox: the Architect's, the Managers', the Developers', the
+# reviewers' and the checks'. build.sh puts this machine's Claude Code binary next to this
+# file. Checks run here and in CI, so the image carries the CI runners' tools they use,
+# zip among them: a check that passes in CI must not fail here for want of a tool.
 # OpenShell doesn't pass an image's ENV to sandbox processes, so settings come from the
 # daemon (--env), not from here.
-FROM ubuntu:24.04
+# Pinned by digest: the same base on every machine until the pin is moved.
+FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
 
 ARG NODE_VERSION=24.21.0
 ARG TERRAFORM_VERSION=1.16.3
@@ -18,7 +21,7 @@ LABEL org.opencontainers.image.title="razzou-harness agent" \
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         bash ca-certificates curl g++ git iproute2 jq make procps \
-        python3 python3-pip python3-venv unzip xz-utils \
+        python3 python3-pip python3-venv unzip xz-utils zip \
     && rm -rf /var/lib/apt/lists/*
 
 # Node and Terraform, each checked against its publisher's checksums; the AWS CLI against the sums above.

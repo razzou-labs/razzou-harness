@@ -120,8 +120,14 @@ export const Action = defineComponent({
     const error = ref<string>();
     const click = async () => {
       busy.value = true;
-      const result = await props.run();
-      busy.value = false;
+      let result: Outcome;
+      try {
+        result = await props.run();
+      } catch (error) {
+        result = { done: false, error: (error as Error).message };
+      } finally {
+        busy.value = false;
+      }
       const problem = result.done ? result.warning : result.error ?? 'refused';
       if (props.toast) {
         if (problem) Notify.create({ type: result.done ? 'warning' : 'negative', message: problem, timeout: 8000 });
@@ -163,8 +169,14 @@ export const Reply = defineComponent({
     const error = ref<string>();
     const go = async () => {
       busy.value = true;
-      const result = await props.send(value.value.trim());
-      busy.value = false;
+      let result: Outcome;
+      try {
+        result = await props.send(value.value.trim());
+      } catch (error) {
+        result = { done: false, error: (error as Error).message };
+      } finally {
+        busy.value = false;
+      }
       if (result.done) value.value = '';
       error.value = result.done ? undefined : result.error ?? 'refused: the state changed meanwhile';
     };
@@ -212,23 +224,36 @@ export const Command = defineComponent({
   },
 });
 
-// Links that agents write open in a new tab, and never with access to this page.
+// Links that agents write open in a new tab, and never with access to this page: any element with an href.
 DOMPurify.addHook('afterSanitizeAttributes', (node) => {
-  if (node.tagName === 'A') {
+  if (node.hasAttribute('href')) {
     node.setAttribute('target', '_blank');
     node.setAttribute('rel', 'noopener noreferrer');
   }
 });
 
 /**
- * Agent-written Markdown, through a sanitizer: agents can write HTML (§14.4). Without
- * styles too, which the page allows inline: agent text could cover or hide the rest of
- * Needs you, a warning included.
+ * What agent-written Markdown may hold: the tags Markdown makes, and their attributes. Not
+ * a class, which would give agent text Quasar's own (`fullscreen`, `z-max`,
+ * `no-pointer-events`) to cover Needs you or let clicks through to its buttons; no style;
+ * no SVG or MathML, whose links escape the hook above. USE_PROFILES is left out on purpose:
+ * DOMPurify lets a profile replace both lists.
  */
+export const MARKDOWN_HTML = {
+  ALLOWED_TAGS: [
+    'p', 'br', 'hr', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote', 'pre', 'code', 'em', 'strong', 'del', 's', 'a', 'img',
+    'ul', 'ol', 'li', 'input', 'table', 'thead', 'tbody', 'tr', 'th', 'td', 'details', 'summary', 'sup', 'sub', 'kbd',
+  ],
+  ALLOWED_ATTR: ['href', 'title', 'alt', 'src', 'align', 'start', 'type', 'checked', 'disabled', 'colspan', 'rowspan'],
+  ALLOW_DATA_ATTR: false,
+  ALLOW_ARIA_ATTR: false,
+};
+
+/** Agent-written Markdown, through a sanitizer that keeps only what Markdown makes: agents can write HTML (§14.4). */
 export const Markdown = defineComponent({
   props: { text: { type: String, required: true } },
   setup(props) {
-    const html = computed(() => DOMPurify.sanitize(marked.parse(props.text, { async: false, gfm: true }), { FORBID_TAGS: ['style'], FORBID_ATTR: ['style'] }));
+    const html = computed(() => DOMPurify.sanitize(marked.parse(props.text, { async: false, gfm: true }), MARKDOWN_HTML));
     return () => <div class="markdown" innerHTML={html.value} />;
   },
 });

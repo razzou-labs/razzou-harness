@@ -1,4 +1,4 @@
-import { existsSync, statSync } from 'node:fs';
+import { existsSync, rmSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { runningDaemon } from '../daemon/main.ts';
 import { makeForge } from '../daemon/orchestrator.ts';
@@ -30,8 +30,24 @@ export async function recover(options: RecoverOptions): Promise<string[]> {
   if (existsSync(log) && statSync(log).size > 0) {
     throw new Error(`${log} exists, so there is nothing to recover. If it is damaged, move .harness away first.`);
   }
+  // A snapshot or a mirror without a log is a .harness/ damaged, not lost: a new log would overrule what it holds.
+  const mirror = join(options.harnessDir, 'git', 'repo.git');
+  const left = [join(options.harnessDir, 'state.json'), mirror].filter((path) => existsSync(path));
+  if (left.length > 0) {
+    throw new Error(`${options.harnessDir} has no event log, but holds ${left.map((path) => path.slice(options.harnessDir.length + 1)).join(' and ')}: it isn't lost but damaged. Move .harness away, then run \`harness recover\` again.`);
+  }
+  try {
+    return await rebuild(options, log, mirror);
+  } catch (error) {
+    // The mirror this run made would refuse the next one.
+    rmSync(join(options.harnessDir, 'git'), { recursive: true, force: true });
+    throw error;
+  }
+}
+
+async function rebuild(options: RecoverOptions, log: string, mirror: string): Promise<string[]> {
   const at = new Date((options.now ?? Date.now)()).toISOString();
-  const repo = await Repo.open(join(options.harnessDir, 'git', 'repo.git'));
+  const repo = await Repo.open(mirror);
   // As in the daemon: the owner's checkout gives the config, and the config the forge. Main comes from the forge:
   // the owner's checkout may be behind the merges on GitHub.
   await repo.fetchMain(options.projectDir);
@@ -59,10 +75,11 @@ export async function recover(options: RecoverOptions): Promise<string[]> {
           ...(pr ? { pr: { number: pr.number, url: pr.url } } : {}),
         };
         notes.push(`${key}: completed${pr ? `, PR #${pr.number} merged` : ''}`);
-      } else if (pr?.state === 'open') {
+      } else if (pr) {
+        // A closed pull request is recorded too: the daemon pauses on it until the owner reopens it, and goes on from its branch.
         const head = await forge.fetchBranch(repo, branch);
         if (!head) {
-          notes.push(`${key}: PR #${pr.number} is open, but its branch couldn't be fetched. Close the PR and delete the branch, and the plan starts again.`);
+          notes.push(`${key}: PR #${pr.number} is ${pr.state}, but its branch couldn't be fetched. Close the PR and delete the branch, and the plan starts again.`);
           continue;
         }
         const onBranch = progress(await repo.show(`refs/heads/${branch}`, 'progress.txt'));
@@ -72,16 +89,19 @@ export async function recover(options: RecoverOptions): Promise<string[]> {
           module: module.id, plan: plan.id, status: 'pr_open', branch, base: await repo.mergeBase('refs/heads/main', head), head, pushed: head,
           pr: { number: pr.number, url: pr.url }, ci: { sha: head, status: 'pending', since: at },
         };
-        notes.push(`${key}: PR #${pr.number} is open; its CI is read again`);
-      } else if (pr) {
-        notes.push(`${key}: PR #${pr.number} was closed without being merged. Delete its branch on GitHub, and the plan starts again.`);
+        notes.push(pr.state === 'open'
+          ? `${key}: PR #${pr.number} is open; its CI is read again`
+          : `${key}: PR #${pr.number} was closed without being merged. Reopen it on GitHub, and the daemon goes on from its branch.`);
       }
     }
+    // The Architect's pull request outlives its session: merged, it brings the design to main, where the daemon builds it.
+    const design = await forge.findPullRequest(`arch/${module.id}`, { open: true });
+    if (design) notes.push(`${module.id}: the Architect's PR #${design.number} (arch/${module.id}) was open. Its session is gone: merge the PR on GitHub to build its design, or close it.`);
   }
   const actions: Record<string, ActionState> = {};
   for (const gate of onMain.gates) actions[gate] = { status: 'done', at, note: 'recovered from progress.txt' };
   if (onMain.gates.size > 0) notes.push(`gates satisfied: ${[...onMain.gates].join(', ')}`);
-  notes.push('Not recovered: attempts under way, the Architects\' and Managers\' sessions, unanswered questions, plan branches that were never pushed, and deploys a merge started.');
+  notes.push('Not recovered: attempts under way, the Architects\' and Managers\' sessions, the pull requests of modules whose design was never on main, unanswered questions, plan branches that were never pushed, and deploys a merge started.');
   notes.push('Nor what you set: the mode is Manual again (`harness mode swarm` switches back), the hours of your time are unset (`harness budget`), the switches under Config are back as they start (infra merges yours, both reviews on), and the owner tasks you marked done are pending again (gates come back from progress.txt; `harness done <module>/<task>` once the daemon runs).');
   new EventStore(log).append({ type: 'RECOVERED', payload: { plans, features, actions, notes } });
   return notes;

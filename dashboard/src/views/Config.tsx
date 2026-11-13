@@ -1,6 +1,6 @@
 import { matRefresh } from '@quasar/extras/material-icons';
 import { Notify, QBadge, QBtn, QBtnToggle, QCard, QCardSection, QInput, QItem, QItemLabel, QItemSection, QList, QTable, QTd, QTr, type QTableProps } from 'quasar';
-import { computed, defineComponent, onMounted, ref, type PropType } from 'vue';
+import { computed, defineComponent, onMounted, ref, watch, type PropType } from 'vue';
 import type { ConfigFact, ConfigSetting, ConfigView } from '../../../src/dashboard/config-view.ts';
 import { getJson, post, type DashboardState, type Outcome } from '../api.ts';
 import { confirm, Loading, text } from '../ui.tsx';
@@ -33,12 +33,18 @@ export const Config = defineComponent({
     const view = ref<ConfigView>();
     const failed = ref(false);
     const filter = ref('');
+    // Only the latest read lands: an older answer never covers a newer one.
+    let reads = 0;
     const load = async () => {
+      const read = ++reads;
       const next = await getJson<ConfigView>('/api/config').catch(() => undefined);
+      if (read !== reads) return;
       failed.value = next === undefined;
       if (next) view.value = next;
     };
     onMounted(() => void load());
+    // What the owner set through the CLI, or a new configuration on main, comes with a new state.
+    watch(() => props.data, () => void load());
     const settings = computed(() => {
       const words = filter.value.toLowerCase().split(/\s+/).filter(Boolean);
       return (view.value?.settings ?? []).filter((s) => words.every((word) => `${s.path} ${written(s.value)}`.toLowerCase().includes(word)));
@@ -111,8 +117,14 @@ const ModeAndReviews = defineComponent({
     const change = async (line: string, question: string | undefined, send: () => Promise<Outcome>) => {
       if (question && !(await confirm(question))) return;
       busy.value = line;
-      const result = await send();
-      busy.value = undefined;
+      let result: Outcome;
+      try {
+        result = await send();
+      } catch (error) {
+        result = { done: false, error: (error as Error).message };
+      } finally {
+        busy.value = undefined;
+      }
       const problem = result.done ? result.warning : result.error ?? 'refused';
       if (problem) Notify.create({ type: result.done ? 'warning' : 'negative', message: problem, timeout: 8000 });
     };

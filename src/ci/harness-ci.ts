@@ -9,8 +9,8 @@
 //   node harness-ci.ts lock --dir <dir>
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { appendFileSync, existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
-import { join, relative } from 'node:path';
+import { appendFileSync, existsSync, lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync } from 'node:fs';
+import { join, posix, relative } from 'node:path';
 import { parseArgs } from 'node:util';
 
 /** A tree to read: a checkout in CI, a commit in the daemon. */
@@ -20,27 +20,68 @@ export interface TreeReader {
   list(folder: string): Promise<string[]>;
 }
 
+/**
+ * A folder, read as git would commit it, so that its lock agrees with the daemon's, which
+ * hashes git's blobs: a symbolic link is its link's text, and in a work tree a file that
+ * hasn't changed since HEAD is read as committed, before what attributes such as `eol` do
+ * to a checkout.
+ */
 export function directoryReader(root: string): TreeReader {
-  const isFile = (file: string) => existsSync(file) && statSync(file).isFile();
   const git = (args: string[]) => spawnSync('git', ['-C', root, ...args], { encoding: 'utf8', maxBuffer: 1 << 30 });
+  const exists = (file: string) => {
+    const stat = lstatSync(file, { throwIfNoEntry: false });
+    return stat !== undefined && (stat.isFile() || stat.isSymbolicLink());
+  };
+  const workTree = git(['rev-parse', '--is-inside-work-tree']).stdout?.trim() === 'true';
+  // The paths that differ from HEAD, listed once; undefined when there is no HEAD to read from.
+  let changed: Set<string> | undefined | null = null;
+  const changedSinceHead = () => {
+    if (changed === null) {
+      const diff = workTree ? git(['diff', '--relative', '--name-only', '-z', '--no-renames', 'HEAD', '--']) : undefined;
+      changed = diff?.status === 0 ? new Set(diff.stdout.split('\0').filter(Boolean)) : undefined;
+    }
+    return changed;
+  };
   return {
     async read(path) {
       const file = join(root, path);
-      return isFile(file) ? readFileSync(file, 'utf8') : undefined;
+      if (!exists(file)) return undefined;
+      const differing = changedSinceHead();
+      if (differing && !differing.has(path)) {
+        const committed = git(['cat-file', 'blob', `HEAD:./${path}`]);
+        if (committed.status === 0) return committed.stdout;
+      }
+      return lstatSync(file).isSymbolicLink() ? readlinkSync(file) : readFileSync(file, 'utf8');
     },
     async list(folder) {
       // In a work tree, git's view: what it ignores, such as node_modules, isn't in a checkout either.
-      if (git(['rev-parse', '--is-inside-work-tree']).stdout?.trim() === 'true') {
+      if (workTree) {
         const listed = git(['ls-files', '-z', '--cached', '--others', '--exclude-standard', '--', folder || '.']);
         if (listed.status !== 0) throw new Error(`git ls-files failed in ${root}: ${listed.stderr}`);
-        return listed.stdout.split('\0').filter((path) => path !== '' && isFile(join(root, path)));
+        return listed.stdout.split('\0').filter((path) => path !== '' && exists(join(root, path)));
       }
       const start = join(root, folder);
       if (!existsSync(start)) return [];
       return (readdirSync(start, { recursive: true, encoding: 'utf8' }) as string[])
         .map((entry) => join(start, entry))
-        .filter((file) => isFile(file) && !relative(root, file).startsWith('.git/'))
+        .filter((file) => exists(file) && !relative(root, file).startsWith('.git/'))
         .map((file) => relative(root, file));
+    },
+  };
+}
+
+/** A commit of the repository at `root`, read with git. */
+export function commitReader(root: string, rev: string): TreeReader {
+  const git = (args: string[]) => spawnSync('git', ['-C', root, ...args], { encoding: 'utf8', maxBuffer: 1 << 30 });
+  return {
+    async read(path) {
+      const blob = git(['cat-file', 'blob', `${rev}:${path}`]);
+      return blob.status === 0 ? blob.stdout : undefined;
+    },
+    async list(folder) {
+      const listed = git(['ls-tree', '-r', '-z', '--name-only', '--full-tree', rev, '--', folder || '.']);
+      if (listed.status !== 0) throw new Error(`git ls-tree failed in ${root}: ${listed.stderr}`);
+      return listed.stdout.split('\0').filter(Boolean);
     },
   };
 }
@@ -55,24 +96,70 @@ export const ALWAYS_PROTECTED = [
   'ARCHITECTURE.md', 'init.sh', '.npmrc',
 ];
 
-/** Configs that decide what a tool or a test runner runs, written as code: protected whole when they exist. */
+/**
+ * Configs that decide what a tool or a test runner runs, written as code: protected whole
+ * when they exist, in any folder, since a monorepo's packages each have their own.
+ */
 const TOOL_FILES = [
-  'eslint.config.*', '.eslintrc', '.eslintrc.*', 'biome.json', 'biome.jsonc', '.prettierrc', '.prettierrc.*', 'prettier.config.*',
-  'vitest.config.*', 'vitest.workspace.*', 'vite.config.*', 'jest.config.*', 'babel.config.*', '**/.babelrc', '**/.babelrc.*',
-  'playwright.config.*', '.mocharc.*', '**/pytest.ini', '**/.pytest.ini', '**/tox.ini', '**/conftest.py',
-];
+  'eslint.config.*', '.eslintrc', '.eslintrc.*', '.eslintignore', 'biome.json', 'biome.jsonc', '.prettierrc', '.prettierrc.*', '.prettierignore', 'prettier.config.*',
+  'vitest.config.*', 'vitest.workspace.*', 'vite.config.*', 'jest.config.*', 'babel.config.*', '.babelrc', '.babelrc.*',
+  'playwright.config.*', '.mocharc.*', 'pytest.ini', '.pytest.ini', 'tox.ini', 'conftest.py',
+].map((name) => `**/${name}`);
 
-/** JSON configs: protected by field, so ordinary changes stay possible. */
+/** What npm applies on its own when it installs: patches to packages, and its extensions. */
+const INSTALL_FILES = ['patches/**', '.npm-extension.mjs', '.npm-extension.cjs'];
+
+/** The scripts npm runs by itself during `npm ci` or `npm install`, before any check. */
+const INSTALL_SCRIPTS = ['preinstall', 'install', 'postinstall', 'preprepare', 'prepare', 'postprepare'];
+
+/** JSON configs, in every folder: protected by field, so ordinary changes stay possible. */
 const JSON_FIELDS: Record<string, string[]> = {
-  'tsconfig.json': ['/compilerOptions/strict', '/compilerOptions/noImplicitAny', '/compilerOptions/skipLibCheck', '/exclude'],
-  'package.json': ['/jest', '/babel', '/mocha'],
+  '**/tsconfig.json': [
+    '/compilerOptions/strict', '/compilerOptions/noImplicitAny', '/compilerOptions/strictNullChecks', '/compilerOptions/skipLibCheck', '/exclude', '/include', '/extends',
+  ],
+  '**/package.json': [
+    '/jest', '/babel', '/mocha', '/eslintConfig', '/eslintIgnore', '/prettier', '/overrides', '/patchedDependencies', '/packageExtensions', '/allowScripts',
+    ...INSTALL_SCRIPTS.map((script) => `/scripts/${script}`),
+  ],
+};
+
+/** TOML tables, and INI sections, that configure a test runner inside a file that holds much else. */
+const TOML_TABLES: Record<string, string[]> = {
+  '**/pyproject.toml': ['tool.pytest.ini_options', 'tool.pytest', 'tool.tox', 'tool.coverage'],
+  '**/setup.cfg': ['tool:pytest'],
 };
 
 export interface ProtectionRules {
   /** A path matching one of these may not change at all. */
   paths: string[];
-  /** These JSON fields, by file, may not change. A missing field counts as a value. */
+  /** These JSON fields, by file or glob, may not change. A missing field counts as a value. */
   fields: Record<string, string[]>;
+  /** These TOML tables, by file or glob, may not change, compared as text. */
+  tables: Record<string, string[]>;
+}
+
+const isGlob = (pattern: string) => /[*?]/.test(pattern);
+
+/** The JSON pointers and TOML tables protected in one file, by every rule whose file or glob matches it. */
+function partsOf(rules: ProtectionRules, path: string): { pointers: string[]; tables: string[] } {
+  const pick = (byFile: Record<string, string[]>) => [...new Set(Object.entries(byFile).filter(([file]) => matches(path, file)).flatMap(([, names]) => names))];
+  return { pointers: pick(rules.fields), tables: pick(rules.tables) };
+}
+
+/** The files among `files` protected by field or table, and the rules' named files whether or not they exist. */
+function partFiles(rules: ProtectionRules, files: string[]): string[] {
+  const keys = [...Object.keys(rules.fields), ...Object.keys(rules.tables)];
+  const found = [...keys.filter((key) => !isGlob(key)), ...files.filter((file) => keys.some((key) => matches(file, key)))];
+  return [...new Set(found)].sort((a, b) => a.localeCompare(b, 'en'));
+}
+
+/** The hashes of a file's protected fields and tables, as the lock lists them. */
+export function partHashes(rules: ProtectionRules, path: string, text: string | undefined): { fields?: Record<string, string>; tables?: Record<string, string> } {
+  const { pointers, tables } = partsOf(rules, path);
+  return {
+    ...(pointers.length > 0 ? { fields: Object.fromEntries(pointers.map((pointer) => [pointer, fieldHash(text, pointer)])) } : {}),
+    ...(tables.length > 0 ? { tables: Object.fromEntries(tables.map((table) => [table, tableHash(text, table)])) } : {}),
+  };
 }
 
 interface Check {
@@ -85,43 +172,69 @@ interface Check {
 
 /** The rules a tree's own `harness/config.json` and plans set. The base of a change decides them. */
 export async function protectionRules(tree: TreeReader): Promise<ProtectionRules> {
-  const config = parseJson(await tree.read('harness/config.json')) as { checks?: Check[]; protect?: { files?: string[]; jsonFields?: Record<string, string[]> } } | undefined;
+  const config = parseJson(await tree.read('harness/config.json')) as {
+    checks?: Check[];
+    protect?: { files?: string[]; jsonFields?: Record<string, string[]>; tomlTables?: Record<string, string[]> };
+  } | undefined;
   const fields: Record<string, string[]> = {};
-  const add = (file: string, pointers: string[]) => {
-    fields[file] = [...new Set([...(fields[file] ?? []), ...pointers])];
+  const tables: Record<string, string[]> = {};
+  const add = (into: Record<string, string[]>, file: string, names: string[]) => {
+    const key = normalisePattern(file);
+    into[key] = [...new Set([...(into[key] ?? []), ...names])];
   };
-  for (const [file, pointers] of Object.entries(JSON_FIELDS)) add(file, pointers);
-  for (const [file, pointers] of Object.entries(config?.protect?.jsonFields ?? {})) add(file, pointers);
-  // A check written as `npm run X` is only as good as the script X, and the hooks npm runs around it.
+  for (const [file, pointers] of Object.entries(JSON_FIELDS)) add(fields, file, pointers);
+  for (const [file, pointers] of Object.entries(config?.protect?.jsonFields ?? {})) add(fields, file, pointers);
+  for (const [file, names] of Object.entries(TOML_TABLES)) add(tables, file, names);
+  for (const [file, names] of Object.entries(config?.protect?.tomlTables ?? {})) add(tables, file, names);
+  // A check written as `npm run X` is only as good as the script X, and the hooks npm runs around it, in the package.json it names.
   const checks = [...(config?.checks ?? []), ...(await designChecks(tree)).map((c) => c.check)];
-  for (const script of new Set(checks.flatMap((c) => npmScripts(c.run)))) {
-    add('package.json', [`/scripts/${script}`, `/scripts/pre${script}`, `/scripts/post${script}`]);
+  for (const { dir, script } of checks.flatMap((c) => npmScripts(c.run))) {
+    add(fields, dir ? `${dir}/package.json` : 'package.json', [`/scripts/${script}`, `/scripts/pre${script}`, `/scripts/post${script}`]);
   }
-  return { paths: [...ALWAYS_PROTECTED, ...TOOL_FILES, ...(config?.protect?.files ?? [])].map(normalisePattern), fields };
+  return { paths: [...ALWAYS_PROTECTED, ...TOOL_FILES, ...INSTALL_FILES, ...(config?.protect?.files ?? [])].map(normalisePattern), fields, tables };
 }
 
 /** npm's options that take the next word as their value. */
 const NPM_VALUE_OPTIONS = ['--prefix', '-C', '--workspace', '-w', '--userconfig', '--globalconfig', '--loglevel'];
 
-/** npm scripts a command line runs: `npm run lint`, `npm -s test`, `npm --prefix . start`, `node --run lint`. */
-export function npmScripts(command: string): string[] {
-  const scripts: string[] = [];
+/** npm's options that name the folder of the package.json it runs a script from. */
+const NPM_DIR_OPTIONS = ['--prefix', '-C', '--workspace', '-w'];
+
+/**
+ * npm scripts a command line runs, and the folder of the package.json that defines each, ''
+ * for the root: `npm run lint`, `npm -s test`, `npm --prefix web start`, `cd web && npm test`,
+ * `node --run lint`.
+ */
+export function npmScripts(command: string): Array<{ dir: string; script: string }> {
+  const scripts: Array<{ dir: string; script: string }> = [];
   const words = command.split(/[\s;&|()<>'"`]+/);
-  // The next word that isn't one of npm's options, or an option's value.
-  const next = (i: number) => {
-    while (words[++i]?.startsWith('-')) if (NPM_VALUE_OPTIONS.includes(words[i]!)) i++;
-    return i;
+  // A folder of the repository, from the one a command is in; '' for the root, and for one outside it.
+  const within = (from: string, to: string) => {
+    const dir = posix.normalize(posix.join(from, to));
+    return posix.isAbsolute(to) || dir === '.' || dir === '..' || dir.startsWith('../') ? '' : dir.replace(/\/$/, '');
   };
+  let cwd = '';
   for (let i = 0; i < words.length; i++) {
-    if (words[i] === 'node' && words[i + 1] === '--run' && words[i + 2]) scripts.push(words[i + 2]!);
-    if (words[i] === 'node' && words[i + 1]?.startsWith('--run=')) scripts.push(words[i + 1]!.slice('--run='.length));
+    if (words[i] === 'cd') cwd = words[i + 1] && words[i + 1] !== '-' ? within(cwd, words[i + 1]!) : '';
+    if (words[i] === 'node' && words[i + 1] === '--run' && words[i + 2]) scripts.push({ dir: cwd, script: words[i + 2]! });
+    if (words[i] === 'node' && words[i + 1]?.startsWith('--run=')) scripts.push({ dir: cwd, script: words[i + 1]!.slice('--run='.length) });
     if (words[i] !== 'npm') continue;
+    let dir = cwd;
+    // The next word that isn't one of npm's options, or an option's value.
+    const next = (at: number) => {
+      while (words[++at]?.startsWith('-')) {
+        const [option, value] = words[at]!.split('=', 2) as [string, string | undefined];
+        const given = value ?? (NPM_VALUE_OPTIONS.includes(option) ? words[++at] : undefined);
+        if (NPM_DIR_OPTIONS.includes(option) && given !== undefined) dir = within(cwd, given);
+      }
+      return at;
+    };
     const at = next(i);
     if (words[at] === 'run' || words[at] === 'run-script') {
       const script = words[next(at)];
-      if (script) scripts.push(script);
-    } else if (words[at] === 'test' || words[at] === 't') scripts.push('test');
-    else if (words[at] === 'start' || words[at] === 'stop' || words[at] === 'restart') scripts.push(words[at]!);
+      if (script) scripts.push({ dir, script });
+    } else if (words[at] === 'test' || words[at] === 't') scripts.push({ dir, script: 'test' });
+    else if (words[at] === 'start' || words[at] === 'stop' || words[at] === 'restart') scripts.push({ dir, script: words[at]! });
   }
   return scripts;
 }
@@ -159,28 +272,31 @@ export function matches(path: string, pattern: string): boolean {
 export function archMayChange(path: string, rules: ProtectionRules): boolean {
   if (path.startsWith('.github/')) return false;
   if (['README.md', 'package.json', 'package-lock.json'].includes(path)) return true;
-  return rules.paths.some((pattern) => matches(path, pattern)) || Object.hasOwn(rules.fields, path);
+  return rules.paths.some((pattern) => matches(path, pattern)) || partFiles(rules, [path]).includes(path);
 }
 
-/** What a change did to protected territory, compared with its base. Empty means nothing. */
+/**
+ * What a change did to protected territory. The rules are `base`'s; fields, tables and
+ * progress.txt are compared with `options.before`, the tree the change started from, when
+ * that isn't `base`: what the base changed since is no part of the change. Empty means nothing.
+ */
 export async function protectedChanges(
   base: TreeReader,
   head: TreeReader,
   changedPaths: string[],
-  options: { progress: 'append' | 'frozen' },
+  options: { progress: 'append' | 'frozen'; before?: TreeReader },
 ): Promise<string[]> {
   const rules = await protectionRules(base);
+  const start = options.before ?? base;
   const problems = changedPaths.filter((path) => rules.paths.some((pattern) => matches(path, pattern)));
-  for (const [file, pointers] of Object.entries(rules.fields)) {
-    if (!changedPaths.includes(file)) continue;
-    const [before, after] = [await base.read(file), await head.read(file)];
-    for (const pointer of pointers) {
-      if (fieldHash(before, pointer) !== fieldHash(after, pointer)) problems.push(`${file} ${pointer}`);
-    }
+  for (const file of partFiles(rules, changedPaths).filter((path) => changedPaths.includes(path))) {
+    const [before, after] = [partHashes(rules, file, await start.read(file)), partHashes(rules, file, await head.read(file))];
+    for (const [pointer, hash] of Object.entries(before.fields ?? {})) if (after.fields?.[pointer] !== hash) problems.push(`${file} ${pointer}`);
+    for (const [table, hash] of Object.entries(before.tables ?? {})) if (after.tables?.[table] !== hash) problems.push(`${file} [${table}]`);
   }
   if (changedPaths.includes('progress.txt')) {
     if (options.progress === 'frozen') problems.push('progress.txt');
-    else if (!((await head.read('progress.txt')) ?? '').startsWith((await base.read('progress.txt')) ?? '')) {
+    else if (!((await head.read('progress.txt')) ?? '').startsWith((await start.read('progress.txt')) ?? '')) {
       problems.push('progress.txt (only lines may be added)');
     }
   }
@@ -188,21 +304,36 @@ export async function protectedChanges(
 }
 
 /**
- * Packages in the head's package-lock.json that don't come from the public npm registry, and
- * links to a local folder that the base's doesn't have as they are: workspaces already on
- * the base keep working, and a new link comes through an Arch PR.
+ * Packages of the head that come from somewhere other than the public npm registry, and that
+ * the base doesn't have as they are: in package-lock.json, one resolved from elsewhere, a
+ * link to a folder, or a patched one; without a lockfile, a `file:` or `link:` dependency of
+ * package.json. What the base already has keeps working, a private registry or a workspace
+ * included, and a new one comes through an Arch PR.
  */
 export async function lockfileProblems(base: TreeReader, head: TreeReader): Promise<string[]> {
-  const packages = async (tree: TreeReader) =>
-    (parseJson(await tree.read('package-lock.json')) as { packages?: Record<string, { resolved?: string; link?: boolean }> } | undefined)?.packages ?? {};
-  const [before, after] = [await packages(base), await packages(head)];
+  type Entry = { resolved?: string; link?: boolean; patched?: unknown; integrity?: string };
+  const packages = async (tree: TreeReader) => (parseJson(await tree.read('package-lock.json')) as { packages?: Record<string, Entry> } | undefined)?.packages;
+  const after = await packages(head);
   const problems: string[] = [];
+  if (after === undefined) {
+    type Manifest = Record<string, Record<string, unknown> | undefined>;
+    const sections = ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'];
+    const [was, now] = [parseJson(await base.read('package.json')) as Manifest | undefined, parseJson(await head.read('package.json')) as Manifest | undefined];
+    for (const section of sections) {
+      for (const [name, spec] of Object.entries(now?.[section] ?? {})) {
+        if (typeof spec === 'string' && /^(?:file|link):/.test(spec) && was?.[section]?.[name] !== spec) problems.push(`${name} comes from ${spec}, which the base branch's package.json doesn't have`);
+      }
+    }
+    return problems;
+  }
+  const before = (await packages(base)) ?? {};
+  const pinned = (entry: Entry | undefined) => canonicalJson([entry?.resolved, entry?.link === true, entry?.patched, entry?.integrity]);
   for (const [name, entry] of Object.entries(after)) {
-    if (name === '') continue;
-    if (entry.link) {
-      if (before[name]?.link !== true || before[name].resolved !== entry.resolved) problems.push(`${name} links to ${entry.resolved}, which the base branch doesn't`);
-    } else if (entry.resolved !== undefined && !entry.resolved.startsWith('https://registry.npmjs.org/')) {
-      problems.push(`${name} resolves from ${entry.resolved}`);
+    if (name === '' || pinned(before[name]) === pinned(entry)) continue;
+    if (entry.link) problems.push(`${name} links to ${entry.resolved}, which the base branch doesn't`);
+    else if (entry.patched !== undefined) problems.push(`${name} is patched, which the base branch doesn't have`);
+    else if (entry.resolved !== undefined && !entry.resolved.startsWith('https://registry.npmjs.org/')) {
+      problems.push(`${name} resolves from ${entry.resolved}, which the base branch doesn't have`);
     }
   }
   return problems;
@@ -210,32 +341,84 @@ export async function lockfileProblems(base: TreeReader, head: TreeReader): Prom
 
 export interface Lock {
   version: 1;
-  entries: Array<{ path: string; sha256: string } | { path: string; fields: Record<string, string> }>;
+  entries: Array<{ path: string; sha256: string } | { path: string; fields?: Record<string, string>; tables?: Record<string, string> }>;
+}
+
+/** The files of a tree protected whole: those of `files` that a pattern matches, and the root's always-protected files, present or not. */
+function wholeFiles(rules: ProtectionRules, files: string[]): string[] {
+  const found = new Set(files.filter((file) => rules.paths.some((pattern) => matches(file, pattern))));
+  for (const path of ALWAYS_PROTECTED) if (!isGlob(path)) found.add(path);
+  found.delete('harness/lock.json');
+  return [...found].sort();
 }
 
 /** `harness/lock.json`: the hash of everything protected in a tree, so a design change shows every protected change. */
 export async function computeLock(tree: TreeReader): Promise<Lock> {
   const rules = await protectionRules(tree);
-  const files = new Set<string>();
-  let all: string[] | undefined;
-  for (const pattern of rules.paths) {
-    if (/[*?]/.test(pattern)) {
-      // A glob is matched against every file of the tree, listed once.
-      all ??= await tree.list('');
-      for (const file of all) if (matches(file, pattern)) files.add(file);
-    } else if ((await tree.read(pattern)) !== undefined || ALWAYS_PROTECTED.includes(pattern)) files.add(pattern);
-  }
-  files.delete('harness/lock.json');
+  const all = await tree.list('');
   const entries: Lock['entries'] = [];
-  for (const path of [...files].sort()) {
+  for (const path of wholeFiles(rules, all)) {
     const text = await tree.read(path);
     entries.push({ path, sha256: text === undefined ? 'absent' : sha256(text) });
   }
-  for (const [file, pointers] of Object.entries(rules.fields).sort(([a], [b]) => a.localeCompare(b, 'en'))) {
-    const text = await tree.read(file);
-    entries.push({ path: file, fields: Object.fromEntries(pointers.map((pointer) => [pointer, fieldHash(text, pointer)])) });
-  }
+  for (const path of partFiles(rules, all)) entries.push({ path, ...partHashes(rules, path, await tree.read(path)) });
   return { version: 1, entries };
+}
+
+/**
+ * What the tripwire of the checks watches in a checkout: the files protected whole that are
+ * there now, and those protected by part as they were at the start (`parts`), since a
+ * package.json that a build copies into dist/ is none the checks read. What installing
+ * writes, in node_modules, Terraform's modules or a Python virtual environment, is a
+ * dependency's, not the project's.
+ */
+export function guardTargets(rules: ProtectionRules, files: string[], parts?: string[]): { whole: string[]; parts: string[] } {
+  const venvs = files.filter((file) => file.endsWith('/pyvenv.cfg')).map((file) => file.slice(0, -'pyvenv.cfg'.length));
+  const own = files.filter((file) => !file.split('/').some((name) => INSTALLED.includes(name)) && !venvs.some((venv) => file.startsWith(venv)));
+  return { whole: wholeFiles(rules, own), parts: parts ?? partFiles(rules, own) };
+}
+
+/** The folders that installing fills, which the tripwire neither walks nor watches. */
+export const INSTALLED = ['node_modules', '.terraform'];
+
+/** The key of a file's protected parts in a checkout's state; NUL is in no path. */
+export const PARTS_KEY = '\0parts';
+
+/** The paths whose entry differs between two states of a checkout: changed, appeared or gone. */
+export function guardChanges(before: Map<string, string>, after: Map<string, string>): string[] {
+  const keys = new Set([...before.keys(), ...after.keys()]);
+  return [...new Set([...keys].filter((key) => before.get(key) !== after.get(key)).map((key) => key.replace(PARTS_KEY, '')))].sort();
+}
+
+/** Every file and symbolic link of a checkout, as git would see them, but by walking it: the code under test controls git's view. */
+function walkFiles(root: string): string[] {
+  const out: string[] = [];
+  const visit = (folder: string) => {
+    for (const entry of readdirSync(join(root, folder), { withFileTypes: true })) {
+      const path = folder ? `${folder}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) {
+        if (entry.name !== '.git' && !INSTALLED.includes(entry.name)) visit(path);
+      } else if (entry.isFile() || entry.isSymbolicLink()) out.push(path);
+    }
+  };
+  visit('');
+  return out;
+}
+
+/** A checkout's protected files as they are on disk: each one's hash, or link, or its protected parts' hashes. */
+function checkoutState(root: string, rules: ProtectionRules, targets: { whole: string[]; parts: string[] }): Map<string, string> {
+  const entry = (path: string, part: boolean) => {
+    const file = join(root, path);
+    const stat = lstatSync(file, { throwIfNoEntry: false });
+    if (stat?.isSymbolicLink()) return `link:${readlinkSync(file)}`;
+    if (!stat?.isFile()) return 'absent';
+    const bytes = readFileSync(file);
+    return part ? JSON.stringify(partHashes(rules, path, bytes.toString('utf8'))) : createHash('sha256').update(bytes).digest('hex');
+  };
+  const state = new Map<string, string>();
+  for (const path of targets.whole) state.set(path, entry(path, false));
+  for (const path of targets.parts) state.set(`${path}${PARTS_KEY}`, entry(path, true));
+  return state;
 }
 
 /** Differences between a tree's `harness/lock.json` and the tree itself. */
@@ -288,13 +471,15 @@ export async function designChecks(tree: TreeReader): Promise<Array<{ feature: s
 /**
  * The kind of a PR, from who opened it and its branch; the title must agree, and grants
  * nothing (§11.3). The Architect's changes to built features, `locked/<module>`, are Arch
- * PRs of their own tag (v5).
+ * PRs of their own tag (v5). The App opens no other kind: one of its on another branch is
+ * `Stray`, which always fails, rather than the owner's.
  */
-export function prKind(author: string, branch: string, bot: string | undefined): 'Plan' | 'Fix' | 'Arch' | 'Harness' | 'Owner' {
+export function prKind(author: string, branch: string, bot: string | undefined): 'Plan' | 'Fix' | 'Arch' | 'Harness' | 'Owner' | 'Stray' {
   const byBot = bot !== undefined && author === bot;
   if (byBot && /^plan\/[^/]+\/[^/]+$/.test(branch)) return 'Plan';
   if (byBot && /^fix\/[^/]+\/[^/]+-\d+$/.test(branch)) return 'Fix';
   if (byBot && /^(?:arch|locked)\/[^/]+$/.test(branch)) return 'Arch';
+  if (byBot) return 'Stray';
   if (!byBot && branch.startsWith('harness/upgrade-')) return 'Harness';
   return 'Owner';
 }
@@ -302,6 +487,9 @@ export function prKind(author: string, branch: string, bot: string | undefined):
 export interface VerifyInput {
   base: TreeReader;
   head: TreeReader;
+  /** The merge bases of the head with the base, `git merge-base --all`: the change starts from them. `[base]` when omitted. */
+  mergeBases?: TreeReader[];
+  /** What changed since the merge base: `git diff base...head`. */
   changedPaths: string[];
   author: string;
   branch: string;
@@ -371,8 +559,10 @@ async function lockedProblems(input: VerifyInput, module: string): Promise<strin
   // The scripts in the module's folder: another module's would redefine that module's features too.
   const scripts = new Set([...(await checkScriptsOf(input.base, module)), ...(await checkScriptsOf(input.head, module))]);
   for (const path of input.changedPaths) {
-    if (path === 'harness/lock.json' || (scripts.has(path) && path.startsWith(`harness/modules/${module}/`))) continue;
+    if (path === 'harness/lock.json') continue;
+    // A plan file is held to the plan rules even when a check's command names it, as a script.
     if (!plans.test(path)) {
+      if (scripts.has(path) && path.startsWith(`harness/modules/${module}/`)) continue;
       problems.push(`a CHANGED_LOCKED_FILES PR changes only the definitions of ${module}'s built features and the scripts in harness/modules/${module}/ that their checks run, not ${path}`);
       continue;
     }
@@ -403,13 +593,13 @@ async function checkScriptsOf(tree: TreeReader, module: string): Promise<string[
 }
 
 /**
- * The plan-kind rules of a Plan PR (v3 §3.1), from the plan file on the base branch: a
- * tag in the title must be the plan's kind, and a CODE plan stays off the Terraform
- * folder, so infrastructure can't reach main as code. The tag grants nothing, and a
- * title without one, from an older daemon, passes.
+ * The plan-kind rules of a Plan or Fix PR (v3 §3.1), from the plan file on the base branch:
+ * a tag in a Plan PR's title must be the plan's kind, and a CODE plan, and its fixes after
+ * the deploy, stay off the Terraform folder, so infrastructure can't reach main as code.
+ * The tag grants nothing.
  */
 async function planKindProblems(input: VerifyInput, config: BaseConfig | undefined): Promise<string[]> {
-  const [, module, plan] = /^plan\/([^/]+)\/([^/]+)$/.exec(input.branch) ?? [];
+  const [, module, plan] = /^(?:plan\/([^/]+)\/([^/]+)|fix\/([^/]+)\/([^/]+)-\d+)$/.exec(input.branch)?.filter(Boolean) ?? [];
   if (!module || !plan) return [];
   const file = `harness/modules/${module}/plans/${plan}.json`;
   const definition = parseJson(await input.base.read(file)) as { features?: unknown } | undefined;
@@ -436,15 +626,22 @@ export async function verify(input: VerifyInput): Promise<string[]> {
   const config = parseJson(await input.base.read('harness/config.json')) as BaseConfig | undefined;
   const kind = prKind(input.author, input.branch, config?.project?.bot);
   const problems: string[] = [];
+  if (kind === 'Stray') return [`the App opens pull requests from plan/, fix/, arch/ and locked/ branches only, not from ${input.branch}`];
   if (!input.title.startsWith(`${kind}: `)) problems.push(`this is a ${kind} PR (from ${input.author}, branch ${input.branch}), so its title must start with "${kind}: "`);
   else if (kind === 'Plan' || kind === 'Fix' || kind === 'Arch') problems.push(...(await titleProblems(input, kind)));
+  const [start = input.base, ...others] = input.mergeBases ?? [input.base];
+  if ((kind === 'Plan' || kind === 'Fix' || kind === 'Arch') && others.length > 0) {
+    // `git diff base...head` shows the change from one merge base only: merging can undo what another brought, unseen.
+    problems.push(`the head has ${others.length + 1} merge bases with the base branch, so merging it would change more than its diff shows`);
+  }
   if (kind === 'Plan' || kind === 'Fix') {
-    for (const change of await protectedChanges(input.base, input.head, input.changedPaths, { progress: 'append' })) {
+    // The base's rules, compared with where the change started: what the base changed since is no part of it.
+    for (const change of await protectedChanges(input.base, input.head, input.changedPaths, { progress: 'append', before: start })) {
       problems.push(`changes a protected file: ${change}`);
     }
-    for (const problem of await lockfileProblems(input.base, input.head)) problems.push(`package-lock.json: ${problem}`);
+    for (const problem of await lockfileProblems(start, input.head)) problems.push(`package-lock.json: ${problem}`);
   }
-  if (kind === 'Plan') problems.push(...(await planKindProblems(input, config)));
+  if (kind === 'Plan' || kind === 'Fix') problems.push(...(await planKindProblems(input, config)));
   if (kind === 'Arch') {
     // The base's rules, as for every PR: what its head protects opens nothing to the PR itself.
     const locked = /^locked\/([^/]+)$/.exec(input.branch)?.[1];
@@ -490,7 +687,19 @@ export async function runCiChecks(definitions: TreeReader, dir: string, log: (li
     log(`${exit === 0 ? 'passed' : `FAILED (exit ${exit})`}: ${id}`);
     return exit;
   };
-  if (existsSync(join(dir, 'init.sh')) && run('init.sh', 'bash init.sh', 900) !== 0) return outcomes;
+  // A tripwire: what init.sh or a check runs, such as a `prepare` script, could rewrite a protected file in the checkout,
+  // which verify judged as committed, and make a check pass. Taken before anything runs, compared after each step.
+  const rules = await protectionRules(definitions);
+  const start = guardTargets(rules, walkFiles(dir));
+  const before = checkoutState(dir, rules, start);
+  const tripped = () => {
+    const changed = guardChanges(before, checkoutState(dir, rules, guardTargets(rules, walkFiles(dir), start.parts)));
+    if (changed.length === 0) return false;
+    log(`::error::the code under test changed protected files while the checks ran: ${changed.join(', ')}`);
+    outcomes.push({ id: 'protected-files', exit: 1, durationMs: 0 });
+    return true;
+  };
+  if (existsSync(join(dir, 'init.sh')) && (run('init.sh', 'bash init.sh', 900) !== 0 || tripped())) return outcomes;
   for (const check of checks) {
     const needs = check.needs ?? [];
     // Checks that need AWS run in the harness's own sandboxes, with the view-only role: CI has none.
@@ -503,6 +712,7 @@ export async function runCiChecks(definitions: TreeReader, dir: string, log: (li
       continue;
     }
     run(check.id, check.run, check.timeoutSec ?? 600);
+    if (tripped()) return outcomes;
   }
   return outcomes;
 }
@@ -515,6 +725,31 @@ export function sha256(text: string): string {
 export function fieldHash(text: string | undefined, pointer: string): string {
   const value = text === undefined ? undefined : resolvePointer(parseJson(text), pointer);
   return value === undefined ? 'absent' : sha256(canonicalJson(value));
+}
+
+/**
+ * The hash of one TOML table, or INI section, as raw text, or "absent": the block of each
+ * header that is the table or under it, from the header to the next one, and a block above
+ * it that reaches into it with a dotted key, as `[tool]` then `pytest.ini_options.addopts = …`.
+ * Raw text needs no TOML parser, and any change to the table, a comment's too, counts.
+ */
+export function tableHash(text: string | undefined, table: string): string {
+  if (text === undefined) return 'absent';
+  const bare = (s: string) => s.replace(/["'\s]/g, '');
+  const blocks: Array<{ name: string; text: string }> = [{ name: '', text: '' }];
+  for (const line of text.split('\n')) {
+    const header = /^\s*\[\[?([^[\]]+)\]\]?\s*(?:#.*)?$/.exec(line);
+    if (header) blocks.push({ name: bare(header[1]!), text: '' });
+    blocks.at(-1)!.text += `${line}\n`;
+  }
+  const picked = blocks.filter(({ name, text: block }) => {
+    if (name === table || name.startsWith(`${table}.`)) return true;
+    if (name !== '' && !table.startsWith(`${name}.`)) return false;
+    const key = (name === '' ? table : table.slice(name.length + 1)).split('.')[0]!;
+    return block.split('\n').some((line) => bare(line).startsWith(`${key}.`) || bare(line).startsWith(`${key}=`));
+  });
+  // Without the blank lines that end a block: a table added after it leaves it as it was.
+  return picked.length === 0 ? 'absent' : sha256(picked.map((b) => `${b.text.trimEnd()}\n`).join(''));
 }
 
 export function resolvePointer(value: unknown, pointer: string): unknown {
@@ -590,9 +825,12 @@ async function main(): Promise<number> {
       // NUL-separated: otherwise git quotes a path with unusual bytes, and no pattern matches the quoted form.
       const diff = spawnSync('git', ['-C', values.head!, 'diff', '-z', '--name-only', '--no-renames', `${values['base-sha']}...${values['head-sha']}`], { encoding: 'utf8', maxBuffer: 1 << 30 });
       if (diff.status !== 0) throw new Error(`git diff failed: ${diff.stderr}`);
+      const bases = spawnSync('git', ['-C', values.head!, 'merge-base', '--all', values['base-sha']!, values['head-sha']!], { encoding: 'utf8' });
+      if (bases.status !== 0) throw new Error(`git merge-base failed: ${bases.stderr}`);
       const problems = await verify({
         base: directoryReader(values.base!),
         head: directoryReader(values.head!),
+        mergeBases: bases.stdout.split('\n').filter(Boolean).map((sha) => commitReader(values.head!, sha)),
         changedPaths: diff.stdout.split('\0').filter(Boolean),
         author: values.author!,
         branch: values.branch!,

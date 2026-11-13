@@ -1,3 +1,4 @@
+import type { ProtectionRules } from '../ci/harness-ci.ts';
 import type { Check, Feature, Plan } from '../design/schemas.ts';
 import type { Ref } from '../state/events.ts';
 import type { Attempt } from '../state/state.ts';
@@ -16,6 +17,10 @@ export interface TaskInput {
   merge?: { main: string; files: string[] };
   /** Set for a fix round, with its kind: it starts whatever the checks say, since a failure is why it is there. */
   fix?: 'ci' | 'deploy' | 'review' | 'merge' | 'checks';
+  /** The feature was built and accepted before, and a design change redefined it since: its earlier work is on the branch. */
+  rebuilding?: boolean;
+  /** What the attempt may not change, as CI judges it: the rules of the commit it starts from. */
+  protect?: ProtectionRules;
 }
 
 /** The Developer's task, given on stdin. Its role text is appended to the system prompt separately. */
@@ -30,6 +35,7 @@ export function buildTask(input: TaskInput): string {
   if (input.guidance) {
     lines.push('', '## Guidance for this attempt', '', input.guidance.trim());
   }
+  if (input.protect && !input.merge) lines.push('', ...protectedLines(input.protect));
   if (input.progressTail.trim() !== '') {
     lines.push('', '## Progress so far', '', '```', input.progressTail.trimEnd(), '```');
   }
@@ -42,6 +48,21 @@ export function buildTask(input: TaskInput): string {
     'If a decision is open that the task and the repository do not settle, ask the Manager with `ask_manager` before you guess.',
   );
   return `${lines.join('\n')}\n`;
+}
+
+/** What the attempt may not change: the files, and the parts of JSON and TOML files, that CI refuses a change to. */
+function protectedLines(rules: ProtectionRules): string[] {
+  const parts = (byFile: Record<string, string[]>, show: (name: string) => string) =>
+    Object.entries(byFile).filter(([, names]) => names.length > 0).map(([file, names]) => `- in \`${file}\`: ${names.map(show).join(', ')}`);
+  return [
+    '## What you may not change',
+    '',
+    'Changing any of these fails the attempt, by whatever means, a script or a build included, and CI refuses them too. If one stands in your way, finish as `blocked` and say why in your finding.',
+    '',
+    `- these files: ${[...rules.paths, 'progress.txt'].map((path) => `\`${path}\``).join(', ')}`,
+    ...parts(rules.fields, (pointer) => `\`${pointer}\``),
+    ...parts(rules.tables, (table) => `\`[${table}]\``),
+  ];
 }
 
 /** What a feature's task opens with: the feature, how it is checked, and what must keep passing. */
@@ -65,10 +86,16 @@ function featureLines(input: TaskInput): string[] {
       '',
       '## How it is checked',
       '',
-      'After you finish, the harness runs these commands from the repository root, in a fresh sandbox. Each must exit 0. They fail now.',
+      `After you finish, the harness runs these commands from the repository root, in a fresh sandbox. Each must exit 0. ${input.rebuilding ? 'Some may pass already.' : 'They fail now.'}`,
       '',
       ...featureChecks.map((c) => `- \`${c.run}\` (${c.id})`),
     );
+    if (input.rebuilding) {
+      lines.push(
+        '',
+        'This feature was built and accepted before, and the design changed its definition since: its earlier work is on the branch. Read the definition above against the code. Change what no longer fits; if the code already meets it and every check passes, commit nothing and report done.',
+      );
+    }
   } else if (input.fix === 'checks') {
     // The work accepted on the branch fails its own checks: making them pass again is the whole task.
     lines.push(
@@ -77,12 +104,23 @@ function featureLines(input: TaskInput): string[] {
       '',
       'After you finish, the harness runs every check of the work accepted on this branch, from the repository root, in a fresh sandbox. Each must exit 0. Some fail now, as the report above shows, and they are not yours to change: fix the code they check.',
     );
-  } else {
+  } else if (input.fix) {
     lines.push(
       '',
       '## How it is checked',
       '',
       "CI is the check: after you finish, the harness runs the checks below in a fresh sandbox, then pushes your commits and CI runs again on the pull request. The failure above may not reproduce here; reason from CI's output.",
+    );
+  } else {
+    // Every check of the feature runs once the plan is merged and deployed: none of them can run here.
+    const later = feature.checks.filter((c) => c.phase === 'post-deploy');
+    lines.push(
+      '',
+      '## How it is checked',
+      '',
+      'Its checks run after the deploy: once the plan is merged and CI has applied it, the harness runs them against the real environment, and they must exit 0 there. They cannot pass here, so build what they test and check what you can before you finish, such as with a Terraform plan.',
+      '',
+      ...later.map((c) => `- \`${c.run}\` (${c.id})`),
     );
   }
   if (input.regressionChecks.length > 0) {

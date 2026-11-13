@@ -1,4 +1,5 @@
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, truncateSync, writeSync } from 'node:fs';
+import { closeSync, existsSync, fstatSync, fsyncSync, ftruncateSync, mkdirSync, openSync, readSync, writeSync } from 'node:fs';
+import { StringDecoder } from 'node:string_decoder';
 import { dirname } from 'node:path';
 import type { CheckResult } from '../checks/runner.ts';
 import type { ReviewFinding, ReviewerRole } from '../design/schemas.ts';
@@ -35,7 +36,8 @@ export interface Finding {
   needs?: string;
 }
 
-export type AttemptOutcome = 'done' | 'blocked' | 'timed_out' | 'no_report' | 'error' | 'usage_limit' | 'aborted';
+/** `usage_limit` and `api_error` are nobody's failure: the subscription's limit was reached, or the model's API failed. */
+export type AttemptOutcome = 'done' | 'blocked' | 'timed_out' | 'no_report' | 'error' | 'usage_limit' | 'api_error' | 'aborted';
 
 /** One required CI job, as the daemon saw it. */
 export interface CiJob {
@@ -104,6 +106,11 @@ interface Payloads {
   MANAGER_EXITED: { module: string; plan?: string; launch: number; code: number | null; stderr: string; started: boolean };
   MANAGER_ITEM_SENT: { module: string; plan?: string; key: string; launch: number; reminder: boolean };
   MANAGER_STOPPED: { module: string; plan?: string; reason: string };
+  /**
+   * A turn of the Manager ended on the model's API failing: what it was sent is sent
+   * again, once `until` has passed, since a failing API is tried no faster than that.
+   */
+  MANAGER_TURN_FAILED: { module: string; plan?: string; reason: string; until: string };
   WEB_READ: { role: Role; sandbox: string; url: string; finalUrl?: string; status?: number; bytes: number; ok: boolean };
   PLAN_PUSHED: { head: string };
   PR_OPENED: { number: number; url: string };
@@ -120,10 +127,13 @@ interface Payloads {
   POST_DEPLOY_RECHECK: { reason: string };
   PR_CLOSED: Record<string, never>;
   MODULE_CREATED: { module: string; title: string; sandbox: string; sessionId: string };
+  /** The Architect's sandbox is gone, and is made again: a new conversation, which starts from what the state knows. */
+  ARCHITECT_STARTING: { module: string };
   ARCHITECT_LAUNCHED: { module: string };
   ARCHITECTURE_ACCEPTED: { module: string; version: number };
   DESIGN_REFUSED: { module: string; requestId: string; problems: string[] };
-  DESIGN_SUBMITTED: { module: string; head: string; suspect: string[] };
+  /** `summary`: for a design taken up again from a pull request the owner closed, then opened again. */
+  DESIGN_SUBMITTED: { module: string; head: string; suspect: string[]; summary?: string; settings?: string[] };
   /** `locked`: the PR of a CHANGED_LOCKED_FILES change, not of a design (v5). */
   ARCH_PR_OPENED: { module: string; number: number; url: string; locked?: boolean };
   ARCH_PR_CLOSED: { module: string; locked?: boolean };
@@ -147,8 +157,8 @@ interface Payloads {
   FIX_MERGE_SET: { by: FixMerge };
   /** The owner switched a reviewer: every plan's pull request, those of infrastructure plans only, or none. */
   REVIEWS_SET: { role: ReviewerRole; scope: ReviewScope };
-  /** The owner set, or cleared with null, the hours the whole project may take of their time (v3 §4.1). */
-  OWNER_HOURS_SET: { hours: number | null };
+  /** The owner set, or cleared with null, the hours a module may take of their time: each module has its own. */
+  OWNER_HOURS_SET: { module: string; hours: number | null };
   /**
    * What a long-lived agent, a Manager or an Architect, has used of Claude, read from the
    * conversations saved in its sandbox: a running count, which a new sandbox starts again.
@@ -164,7 +174,8 @@ interface Payloads {
   PR_MERGED_BY_DAEMON: { number: number; head: string; commit: string };
   /** A reviewer's session on a PR head (v3 §5): starting, started, and ended with its report or why there is none. */
   REVIEW_STARTING: { role: ReviewerRole; head: string; sandbox: string; sessionId: string; deadline: string };
-  REVIEW_STARTED: { role: ReviewerRole; head: string };
+  /** `deadline`: its clock starts once its session does. */
+  REVIEW_STARTED: { role: ReviewerRole; head: string; deadline?: string };
   REVIEW_ENDED: {
     role: ReviewerRole; head: string; outcome: AttemptOutcome;
     verdict?: 'pass' | 'block'; summary?: string; findings?: ReviewFinding[]; usage?: Usage; reason?: string;
@@ -172,7 +183,8 @@ interface Payloads {
   /** A reviewer the owner switched off, or away from CODE plans, didn't read this head: in Swarm its status is set as passed, saying so. */
   REVIEW_SKIPPED: { role: ReviewerRole; head: string; why: 'off' | 'code' };
   /** The review posted on the PR as comments, and the commit status set, or what went wrong. */
-  REVIEW_POSTED: { role: ReviewerRole; head: string; status: 'success' | 'failure' | 'error'; comments: number; problem?: string };
+  /** `retry`: what went wrong may pass, as a server error does, so the post is made again. */
+  REVIEW_POSTED: { role: ReviewerRole; head: string; status: 'success' | 'failure' | 'error'; comments: number; problem?: string; retry?: boolean };
 
   // Messages.
   QUESTION: { requestId: string; question: string };
@@ -216,7 +228,7 @@ export type EventType = keyof Payloads;
 const MESSAGES: ReadonlySet<EventType> = new Set<EventType>([
   'QUESTION', 'CONTINUE', 'ACCEPT', 'REJECT', 'RETRY', 'ABORT', 'OWNER_REQUEST', 'OWNER_ANSWER', 'OWNER_MESSAGE', 'ORDER_REQUESTED', 'ORDER_SUGGESTED',
   'PLAN_SUBMITTED', 'REQUEST_FIX',
-  'PROPOSAL', 'DESIGN', 'ESCALATION', 'DECISION',
+  'PROPOSAL', 'DESIGN', 'LOCKED_CHANGE', 'ESCALATION', 'DECISION',
 ]);
 
 export type HarnessEvent = {
@@ -253,18 +265,36 @@ export class EventStore {
     this.dropTornLastLine();
   }
 
+  /** Every event, read a piece of the file at a time: a log of months is larger than the longest string Node can hold. */
   readAll(): HarnessEvent[] {
     if (!existsSync(this.file)) return [];
-    return readFileSync(this.file, 'utf8')
-      .split('\n')
-      .filter((line) => line.trim() !== '')
-      .map((line, i) => {
+    const events: HarnessEvent[] = [];
+    const fd = openSync(this.file, 'r');
+    try {
+      const decoder = new StringDecoder('utf8');
+      const buffer = Buffer.alloc(1024 * 1024);
+      let rest = '';
+      let n = 0;
+      const take = (line: string) => {
+        n += 1;
+        if (line.trim() === '') return;
         try {
-          return JSON.parse(line) as HarnessEvent;
+          events.push(JSON.parse(line) as HarnessEvent);
         } catch {
-          throw new Error(`${this.file}: line ${i + 1} is not valid JSON`);
+          throw new Error(`${this.file}: line ${n} is not valid JSON`);
         }
-      });
+      };
+      for (let read = readSync(fd, buffer); read > 0; read = readSync(fd, buffer)) {
+        const lines = (rest + decoder.write(buffer.subarray(0, read))).split('\n');
+        rest = lines.pop()!;
+        lines.forEach(take);
+      }
+      rest += decoder.end();
+      if (rest !== '') take(rest);
+    } finally {
+      closeSync(fd);
+    }
+    return events;
   }
 
   append(event: NewEvent): HarnessEvent {
@@ -281,18 +311,42 @@ export class EventStore {
   }
 
   /** A crash can leave half a line at the end of the log; drop it so the next append starts clean. */
+  /**
+   * A last line without its newline is what a crash mid-write leaves: kept with a newline
+   * when it is a whole event, dropped otherwise. Only the last line is read, found by
+   * looking back from the end a piece at a time: one event may be larger than any piece.
+   */
   private dropTornLastLine(): void {
     if (!existsSync(this.file)) return;
-    const text = readFileSync(this.file, 'utf8');
-    if (text === '' || text.endsWith('\n')) return;
-    const lastNewline = text.lastIndexOf('\n');
+    const fd = openSync(this.file, 'r+');
     try {
-      JSON.parse(text.slice(lastNewline + 1));
-      const fd = openSync(this.file, 'a');
-      writeSync(fd, '\n');
+      const size = fstatSync(fd).size;
+      if (size === 0) return;
+      const end = Buffer.alloc(1);
+      readSync(fd, end, 0, 1, size - 1);
+      if (end[0] === 0x0a) return;
+      let start = 0;
+      const piece = Buffer.alloc(1024 * 1024);
+      for (let to = size; to > 0;) {
+        const from = Math.max(0, to - piece.length);
+        const read = readSync(fd, piece, 0, to - from, from);
+        const newline = piece.subarray(0, read).lastIndexOf(0x0a);
+        if (newline >= 0) {
+          start = from + newline + 1;
+          break;
+        }
+        to = from;
+      }
+      const line = Buffer.alloc(size - start);
+      readSync(fd, line, 0, line.length, start);
+      try {
+        JSON.parse(line.toString('utf8'));
+        writeSync(fd, '\n', size);
+      } catch {
+        ftruncateSync(fd, start);
+      }
+    } finally {
       closeSync(fd);
-    } catch {
-      truncateSync(this.file, Buffer.byteLength(text.slice(0, lastNewline + 1)));
     }
   }
 

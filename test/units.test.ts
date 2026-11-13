@@ -32,6 +32,29 @@ describe('event store', () => {
     assert.equal(reopened.readAll().length, 2);
     assert.ok(readFileSync(file, 'utf8').endsWith('}\n'));
   });
+
+  it('reads a log larger than a piece, whose lines and characters cross the pieces', () => {
+    const file = join(tempDir('events'), 'events.jsonl');
+    const store = new EventStore(file);
+    // A reason of 700 kB, of two-byte characters: each event spans a piece's end, mid-line and mid-character.
+    const reason = 'é'.repeat(350_000);
+    for (let i = 0; i < 4; i++) store.append({ type: 'PIPELINE_PAUSED', payload: { reason: `${i}${reason}` } });
+    const events = new EventStore(file).readAll();
+    assert.deepEqual(events.map((e) => (e.payload as { reason: string }).reason.slice(0, 2)), ['0é', '1é', '2é', '3é']);
+    assert.ok(events.every((e) => (e.payload as { reason: string }).reason.length === 350_001));
+  });
+
+  it('drops a torn last line at the end of a large log, and keeps a whole one that only lacks its newline', () => {
+    const file = join(tempDir('events'), 'events.jsonl');
+    const store = new EventStore(file);
+    store.append({ type: 'PIPELINE_PAUSED', payload: { reason: 'x'.repeat(5 * 1024 * 1024) } });
+    appendFileSync(file, '{"v":1,"kind":"event","type":"PIPE');
+    assert.equal(new EventStore(file).readAll().length, 1);
+    appendFileSync(file, JSON.stringify({ ...store.readAll()[0], id: 'whole' }));
+    const reopened = new EventStore(file);
+    assert.equal(reopened.readAll().length, 2);
+    assert.ok(readFileSync(file, 'utf8').endsWith('}\n'));
+  });
 });
 
 describe('state projection', () => {
@@ -232,10 +255,18 @@ describe('agent tokens', () => {
     });
   });
 
-  it('ignores the agent-hours threshold an older log may hold', () => {
-    const event = (type: string, payload: object, ts: string) => ({ v: 1, id: `e-${type}`, ts, type, payload }) as unknown as HarnessEvent;
-    const state = project([event('AGENT_HOURS_SET', { hours: 40 }, '2026-11-01T00:00:00Z'), event('OWNER_HOURS_SET', { hours: 12 }, '2026-11-02T00:00:00Z')]);
-    assert.deepEqual(state.budgets, { ownerHours: 12, ownerHoursSetAt: '2026-11-02T00:00:00Z' });
+  it("keeps the owner's hours by module, and tells that module's Architect alone", () => {
+    const event = (id: string, type: string, payload: object, ts: string) => ({ v: 1, id, ts, type, payload }) as unknown as HarnessEvent;
+    const created = (module: string) => event(`e-${module}`, 'MODULE_CREATED', { module, title: module, sandbox: `arc-${module}`, sessionId: 's' }, '2026-11-01T00:00:00Z');
+    const state = project([
+      created('shop'), created('billing'),
+      event('e-1', 'OWNER_HOURS_SET', { module: 'shop', hours: 2 }, '2026-11-02T00:00:00Z'),
+      event('e-2', 'OWNER_HOURS_SET', { module: 'billing', hours: 6 }, '2026-11-03T00:00:00Z'),
+      event('e-3', 'OWNER_HOURS_SET', { module: 'billing', hours: null }, '2026-11-04T00:00:00Z'),
+    ]);
+    assert.deepEqual(state.ownerHours, { shop: { hours: 2, setAt: '2026-11-02T00:00:00Z' } });
+    assert.deepEqual(state.modules.shop!.notes.map((n) => n.text.slice(0, 62)), ['The owner set the hours of their time this module may take: 2 '.slice(0, 62)]);
+    assert.equal(state.modules.billing!.notes.length, 2);
   });
 
   it('names a model as people do: Fable 5.2, Sonnet 4.5, Opus 5.5 (1M), and anything else as it is', () => {
@@ -496,11 +527,38 @@ describe('sandbox policy', () => {
     assert.deepEqual(endpoints(['sts']).map((e) => e.host), ['sts.eu-west-1.amazonaws.com'], 'a list without all names only its services');
   });
 
-  it('rejects hosts OpenShell would reject', () => {
-    assert.throws(() => checkHost('**.com'));
-    assert.throws(() => checkHost('docs.**.example.com'));
-    assert.doesNotThrow(() => checkHost('**.github.io'));
+  it("signs DynamoDB's account endpoint, which SDKs and Terraform call by default, for all and for dynamodb", () => {
+    type Endpoint = { host: string; signing_service: string; credential_signing: string };
+    const endpoints = (services: string[]) => (buildPolicy({ bundles: ['core'], extraHosts: [], aws: { region: 'eu-west-1', provider: 'aws-view-shop', services } }) as {
+      network_policies: { aws_view: { endpoints: Endpoint[] } };
+    }).network_policies.aws_view.endpoints;
+    for (const services of [['all'], ['dynamodb']]) {
+      const account = endpoints(services).find((e) => e.host === '*.ddb.eu-west-1.amazonaws.com');
+      assert.deepEqual([account?.signing_service, account?.credential_signing], ['dynamodb', 'sigv4:body'], services.join());
+      assert.ok(endpoints(services).some((e) => e.host === 'dynamodb.eu-west-1.amazonaws.com'), services.join());
+    }
+  });
+
+  it('rejects hosts OpenShell would reject, and wildcards, addresses and ports wider than a host', () => {
+    for (const host of ['**.com', '*.com', 'docs.**.example.com', '**.*.*', '*.*.com', '1.2.3.4', '10.0.0.1', 'example.com:8080', 'Docs.example.com', 'localhost', '[::1]', 'docs..example.com', '-x.example.com']) {
+      assert.throws(() => checkHost(host), /not a host name/, host);
+    }
+    for (const host of ['**.github.io', '*.s3.eu-west-1.amazonaws.com', 'docs.example.com', 'xn--80ak6aa92e.com']) assert.doesNotThrow(() => checkHost(host), host);
     assert.throws(() => buildPolicy({ bundles: ['nope'], extraHosts: [] }));
+    const parse = (extraHosts: string[]) => ConfigSchema.safeParse({ harnessVersion: '0.4.1', project: { name: 'p' }, network: { extraHosts } }).success;
+    assert.equal(parse(['docs.example.com', '**.example.org']), true);
+    for (const host of ['**.*.*', '*.*.com', '1.2.3.4', 'example.com:443']) assert.equal(parse([host]), false, `${host} is refused when the design is read`);
+  });
+
+  it("allows a fetch's POST only to a repository's path, and never makes a git host an API", () => {
+    type Policy = { network_policies: { git_fetch: { endpoints: Array<{ host: string; rules: Array<{ allow: { method: string; path: string } }> }> } } };
+    const policy = buildPolicy({ bundles: ['core'], extraHosts: [] }) as Policy;
+    const posts = Object.fromEntries(policy.network_policies.git_fetch.endpoints.map((e) => [e.host, e.rules.filter((r) => r.allow.method === 'POST').map((r) => r.allow.path)]));
+    assert.deepEqual(posts, { 'github.com': ['/*/*/git-upload-pack'], 'gitlab.com': ['/**/*.git/git-upload-pack'] });
+    for (const host of ['github.com', 'gitlab.com']) {
+      assert.throws(() => buildPolicy({ bundles: ['core'], extraHosts: [], apis: [{ host }] }), /git host/, host);
+      assert.throws(() => buildPolicy({ bundles: ['all'], extraHosts: [], apis: [{ host, key: 'GIT_KEY' }] }), /git host/, host);
+    }
   });
 
   it('reads all as every bundle, and opens an API to every method, over a bundle\'s read-only rule', () => {

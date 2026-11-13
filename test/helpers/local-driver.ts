@@ -11,6 +11,12 @@ export class LocalDriver implements SandboxDriver {
   readonly created: SandboxSpec[] = [];
   /** The providers on this pretend gateway: a test adds an API's to store its key. */
   readonly providerNames: string[] = ['claude-sub'];
+  /** What a test makes the gateway say of a sandbox, in place of Ready: Stopped, as after a reboot, or another phase. */
+  readonly phases = new Map<string, SandboxStatus>();
+  /** The sandboxes the daemon started again. */
+  readonly started: string[] = [];
+  /** Set by a test: the gateway doesn't answer, as while it restarts. The sandboxes are still there. */
+  down = false;
   private readonly env = new Map<string, Record<string, string>>();
   private readonly labels = new Map<string, Record<string, string>>();
 
@@ -47,7 +53,10 @@ export class LocalDriver implements SandboxDriver {
 
   async exec(name: string, script: string, options: { input?: string } = {}): Promise<ExecResult> {
     const root = this.rootOf(name);
+    if (this.down) return { code: 1, stdout: '', stderr: 'Error: connect error: transport error' };
     if (!existsSync(root)) return { code: 1, stdout: '', stderr: `no sandbox ${name}` };
+    // A stopped sandbox runs nothing.
+    if (this.phases.get(name) === 'stopped') return { code: 1, stdout: '', stderr: `sandbox ${name} is not running` };
     return run('bash', ['-c', script], {
       cwd: root,
       env: { PATH: process.env.PATH, HOME: root, ...this.env.get(name) },
@@ -73,11 +82,31 @@ export class LocalDriver implements SandboxDriver {
   }
 
   async status(name: string): Promise<SandboxStatus> {
-    return existsSync(this.rootOf(name)) ? 'ready' : 'missing';
+    if (this.down) throw new Error(`openshell sandbox get ${name} failed: Error: connect error: transport error`);
+    if (!existsSync(this.rootOf(name))) return 'missing';
+    return this.phases.get(name) ?? 'ready';
+  }
+
+  async start(name: string): Promise<void> {
+    if (this.down) throw new Error('openshell sandbox start failed: Error: connect error: transport error');
+    this.started.push(name);
+    this.phases.delete(name);
   }
 
   /** Removing a container ends its processes: here, every agent whose pid file is in the sandbox. */
   async remove(name: string): Promise<void> {
+    this.endProcesses(name);
+    this.phases.delete(name);
+    rmSync(this.rootOf(name), { recursive: true, force: true });
+  }
+
+  /** What a reboot of the machine does to a sandbox: its processes end, and its files stay. */
+  stop(name: string): void {
+    this.endProcesses(name);
+    this.phases.set(name, 'stopped');
+  }
+
+  private endProcesses(name: string): void {
     const harness = join(this.rootOf(name), '.harness');
     const pidFiles = existsSync(harness)
       ? readdirSync(harness, { recursive: true, encoding: 'utf8' }).filter((f) => /(^|\/)[\w.]*pid$/.test(f)).map((f) => join(harness, f))
@@ -89,7 +118,6 @@ export class LocalDriver implements SandboxDriver {
         // Already gone.
       }
     }
-    rmSync(this.rootOf(name), { recursive: true, force: true });
   }
 
   async removeAll(): Promise<void> {
@@ -108,7 +136,7 @@ export class LocalDriver implements SandboxDriver {
   }
 
   async gateway(): Promise<GatewayStatus> {
-    return { status: 'connected', version: 'local' };
+    return this.down ? { status: 'unreachable', problem: 'connect error: transport error' } : { status: 'connected', version: 'local' };
   }
 
   async providers(): Promise<string[]> {

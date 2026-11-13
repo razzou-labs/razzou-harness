@@ -3,7 +3,7 @@ import { moduleOwnerTime, ownerTimeProblems } from '../design/owner-time.ts';
 import { checkScripts, definitionHash, featureDependency, loadDesign, scriptsOf, type Feature, type ModuleDesign } from '../design/schemas.ts';
 import { HARNESS } from '../git/repo.ts';
 import type { LockedChange, ModuleState } from '../state/state.ts';
-import { canonicalJson, clip } from '../util.ts';
+import { canonicalJson, clip, noMentions } from '../util.ts';
 import type { Orchestrator } from './orchestrator.ts';
 import { preMerge, sandboxName } from './refs.ts';
 
@@ -13,14 +13,30 @@ export const architectRef = (module: string) => `refs/architect/${module}`;
 /** Where it keeps the Architect's latest change to locked files (v5). */
 export const lockedRef = (module: string) => `refs/architect-locked/${module}`;
 
-/** A plan is built once it is past `active`: its features are locked (v5). */
-const isBuilt = (o: Orchestrator, module: string, plan: string): boolean => {
-  const status = o.state.plans[`${module}/${plan}`]?.status;
-  return status !== undefined && status !== 'active';
-};
+/**
+ * A plan is built once it is past its build: its features are locked (v5). A round that
+ * merges main into its branch, or makes its accepted work pass its checks again, belongs
+ * to the build, which goes on once the round lands: the design may still change then,
+ * and such a round may be what needs it to.
+ */
+export function isBuilt(o: Orchestrator, module: string, plan: string): boolean {
+  const state = o.state.plans[`${module}/${plan}`];
+  if (!state || state.status === 'active') return false;
+  if (state.status === 'fixing') return o.state.features[`${module}/${plan}/fix${state.fixes}`]?.fix?.resume !== 'active';
+  return true;
+}
+
+/**
+ * Why a branch with more than one merge base with main is refused. Its diff from "the"
+ * merge base, which the daemon, CI and the owner read, then shows only part of what
+ * merging it does: a commit whose parents are the two sides of a merge on main, with the
+ * tree of one side, lists a design file and takes the other side's merged work back out.
+ */
+const TWO_BASES = (branch: string) =>
+  `your branch has more than one merge base with main, so merging it would change more than its diff shows. Start it again from main (git switch -C ${branch} main), bring your files over (git checkout <your old commit> -- harness/), commit, and submit again`;
 
 export type DesignOutcome =
-  | { ok: true; head: string; suspect: string[]; pr: { number: number; url: string }; opened: boolean }
+  | { ok: true; head: string; suspect: string[]; settings: string[]; pr: { number: number; url: string }; opened: boolean }
   | { ok: false; problems: string[] };
 
 /**
@@ -31,6 +47,7 @@ export type DesignOutcome =
  */
 export async function submitDesign(o: Orchestrator, module: ModuleState, summary: string, head: string): Promise<DesignOutcome> {
   const main = (await o.repo.revParse('refs/heads/main'))!;
+  if ((await o.repo.mergeBases(main, head)).length > 1) return { ok: false, problems: [TWO_BASES(`arch/${module.module}`)] };
   const base = await o.repo.mergeBase(main, head);
   const tree = o.repo.treeReader(head);
   const changed = await o.repo.changedFiles(base, head);
@@ -55,13 +72,19 @@ export async function submitDesign(o: Orchestrator, module: ModuleState, summary
   // CHANGED_LOCKED_FILES PR, and new behavior comes in a new plan, whose feature supersedes it.
   const previous = await loadDesign(o.repo, base).catch(() => undefined);
   for (const plan of previous?.modules.find((m) => m.id === module.module)?.plans ?? []) {
-    const status = o.state.plans[`${module.module}/${plan.id}`]?.status;
-    if (status === undefined || status === 'active' || !mine) continue;
+    if (!isBuilt(o, module.module, plan.id) || !mine) continue;
+    const status = o.state.plans[`${module.module}/${plan.id}`]!.status.replaceAll('_', ' ');
     const now = mine.plans.find((p) => p.id === plan.id);
     for (const feature of plan.features) {
       const after = now?.features.find((f) => f.id === feature.id);
       if (!after || definitionHash(after) !== definitionHash(feature)) {
-        problems.push(`${plan.id}/${feature.id}: plan ${plan.id} is past its build (${status.replaceAll('_', ' ')}), so this feature is locked. Fix a wrong definition with submit_locked_change, a CHANGED_LOCKED_FILES PR of its own; for new behavior, add a plan whose feature supersedes ${plan.id}/${feature.id}`);
+        problems.push(`${plan.id}/${feature.id}: plan ${plan.id} is past its build (${status}), so this feature is locked. Fix a wrong definition with submit_locked_change, a CHANGED_LOCKED_FILES PR of its own; for new behavior, add a plan whose feature supersedes ${plan.id}/${feature.id}`);
+      }
+    }
+    // Nothing is built in a plan past its build: a feature added to it would be accepted with the design, and never built.
+    for (const feature of now?.features ?? []) {
+      if (!plan.features.some((f) => f.id === feature.id)) {
+        problems.push(`${plan.id}/${feature.id}: plan ${plan.id} is past its build (${status}), and nothing more is built in it: put this feature in a new plan`);
       }
     }
   }
@@ -91,15 +114,19 @@ export async function submitDesign(o: Orchestrator, module: ModuleState, summary
       }
     }
   }
-  // Once the owner budgets their time, every owner action is estimated, and the module fits what is available (v3 §4.1).
-  if (mine) problems.push(...ownerTimeProblems(await o.ownerTime(), moduleOwnerTime(mine, o.state)));
+  // Once the owner set the module's hours, every owner action is estimated, and the design fits them.
+  if (mine) problems.push(...ownerTimeProblems(moduleOwnerTime(o.design.config, mine, o.state)));
   if (problems.length > 0 || !mine) return { ok: false, problems };
 
   // The new checks, run once on the repository as it is: nothing is built yet, so they should fail.
   const known = new Set(previous?.modules.flatMap((m) => m.plans.flatMap((p) => p.features.map((f) => `${m.id}/${p.id}/${f.id}:${definitionHash(f)}`))) ?? []);
-  const fresh = mine.plans.flatMap((p) => p.features.filter((f) => !known.has(`${module.module}/${p.id}/${f.id}:${definitionHash(f)}`)).flatMap((f) => preMerge(f.checks)));
+  // Each gets two minutes at most here: a check of something that doesn't exist yet fails fast, and one that
+  // waits for it, such as for a server to answer, would hold the answer to the Architect for its whole timeout.
+  const fresh = mine.plans
+    .flatMap((p) => p.features.filter((f) => !known.has(`${module.module}/${p.id}/${f.id}:${definitionHash(f)}`)).flatMap((f) => preMerge(f.checks)))
+    .map((check) => ({ ...check, timeoutSec: Math.min(check.timeoutSec, 120) }));
   const results = fresh.length === 0 ? [] : await o.runChecksIn(
-    sandboxName('chk', o.design.config.project.name, module.module, 'design'),
+    sandboxName('chk', o.projectKey, module.module, 'design'),
     architectRef(module.module),
     o.moduleDir(module.module),
     fresh,
@@ -126,33 +153,72 @@ export async function submitDesign(o: Orchestrator, module: ModuleState, summary
   } catch (error) {
     return { ok: false, problems: [`the branch couldn't be pushed; build on the design already under review (${(error as Error).message.split('\n')[0]})`] };
   }
+  const settings = settingChanges(await o.repo.show(base, 'harness/config.json'), await o.repo.show(head, 'harness/config.json'));
 
   const existing = await o.forge.findPullRequest(branch, { open: true });
   const pr = existing ?? (await o.forge.openPullRequest({
     branch,
     // The module's first design, or a change to it once merged: the one that froze the module is told apart (v5).
-    title: `Arch: [${module.frozenCommit ? 'DESIGN_MODIFY' : 'DESIGN'}] [${module.module}] ${clip(summary.split('\n')[0]!, 70)}`,
-    body: await prBody(o, module, mine, summary, suspect, base, lock),
+    title: noMentions(`Arch: [${module.frozenCommit ? 'DESIGN_MODIFY' : 'DESIGN'}] [${module.module}] ${clip(summary.split('\n')[0]!.trim(), 70)}`),
+    body: noMentions(await prBody(o, module, mine, summary, suspect, base, head, lock)),
   }));
-  return { ok: true, head: branchHead, suspect, pr, opened: !existing };
+  return { ok: true, head: branchHead, suspect, settings, pr, opened: !existing };
 }
 
-async function prBody(o: Orchestrator, module: ModuleState, design: ModuleDesign, summary: string, suspect: string[], base: string, lock: Lock): Promise<string> {
+/**
+ * The settings of `harness/config.json` a design changes, one line each: the path, its value
+ * before and after. A setting decides what the daemon may do, such as what it merges or
+ * which hosts the sandboxes reach: the owner reads these before anything else.
+ */
+export function settingChanges(before: string | undefined, after: string | undefined): string[] {
+  const read = (text: string | undefined): unknown => {
+    try {
+      return text === undefined ? undefined : JSON.parse(text);
+    } catch {
+      return undefined;
+    }
+  };
+  const leaves = (value: unknown, path: string, out: Map<string, string>): Map<string, string> => {
+    if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+      for (const [key, inner] of Object.entries(value)) leaves(inner, path ? `${path}.${key}` : key, out);
+    } else if (path !== '') {
+      out.set(path, canonicalJson(value));
+    }
+    return out;
+  };
+  const was = leaves(read(before), '', new Map());
+  const now = leaves(read(after), '', new Map());
+  const shown = (value: string | undefined) => (value === undefined ? 'unset' : `\`${clip(value, 120)}\``);
+  return [...new Set([...was.keys(), ...now.keys()])]
+    .filter((path) => path !== 'harnessVersion' && was.get(path) !== now.get(path))
+    .sort()
+    .map((path) => `\`${path}\`: ${shown(was.get(path))} → ${shown(now.get(path))}`);
+}
+
+async function prBody(o: Orchestrator, module: ModuleState, design: ModuleDesign, summary: string, suspect: string[], base: string, head: string, lock: Lock): Promise<string> {
   const before = await computeLock(o.repo.treeReader(base));
   const key = (e: Lock['entries'][number]) => JSON.stringify(e);
   const old = new Set(before.entries.map(key));
   const changed = lock.entries.filter((e) => !old.has(key(e))).map((e) => e.path);
   const plans = design.plans.map((p) => `- **${p.id}** ${p.title}: ${p.features.map((f) => `${f.id} ${f.title}`).join('; ')}`);
   const actions = design.actions.map((a) => `- **${a.id}** (${a.kind}) ${a.title}`);
+  const settings = settingChanges(await o.repo.show(base, 'harness/config.json'), await o.repo.show(head, 'harness/config.json'));
+  // A check file that main already has may be run by built features' checks, through another script too.
+  const checkFiles: string[] = [];
+  for (const path of await o.repo.changedFiles(base, head)) {
+    if (/^harness\/modules\/[^/]+\/checks\//.test(path) && (await o.repo.show(base, path)) !== undefined) checkFiles.push(path);
+  }
   return [
     summary,
     '',
     `Proposal v${module.accepted ?? '?'}, accepted by the owner.`,
     '',
+    ...(settings.length > 0 ? ['## Settings it changes', '', 'What the daemon may do, and how: read these first.', '', ...settings.map((s) => `- ${s}`), ''] : []),
     '## Plans',
     '',
     ...plans,
     ...(actions.length ? ['', '## Owner actions', '', ...actions] : []),
+    ...(checkFiles.length > 0 ? ['', '## Check files it changes', '', 'These files were already on main: the checks of features built earlier may run them, and a weaker file can let a broken feature pass.', '', ...checkFiles.map((p) => `- \`${p}\``)] : []),
     '',
     '## Protected changes',
     '',
@@ -186,6 +252,7 @@ const SPEC_FIELDS = ['title', 'kind', 'description', 'expected', 'dependsOn', 's
 export async function submitLockedChange(o: Orchestrator, module: ModuleState, summary: string, submitted: string): Promise<LockedOutcome> {
   if (!module.frozenCommit) return { ok: false, problems: ['nothing is locked yet: the owner merges the first design before any feature is built'] };
   const main = (await o.repo.revParse('refs/heads/main'))!;
+  if ((await o.repo.mergeBases(main, submitted)).length > 1) return { ok: false, problems: [TWO_BASES('locked')] };
   // Judged on main as it is: the built work, which the checks run on, is there.
   let head = submitted;
   if (!(await o.repo.isAncestor(main, submitted))) {
@@ -248,7 +315,7 @@ export async function submitLockedChange(o: Orchestrator, module: ModuleState, s
   // Work already built: every changed feature's pre-merge checks pass on the change as it is.
   const checks = changes.flatMap((c) => preMerge(after.plans.find((p) => p.id === c.plan)!.features.find((f) => f.id === c.feature)!.checks));
   if (checks.length > 0) {
-    const results = await o.runChecksIn(sandboxName('chk', o.design.config.project.name, module.module, 'locked'), lockedRef(module.module), o.moduleDir(module.module), checks);
+    const results = await o.runChecksIn(sandboxName('chk', o.projectKey, module.module, 'locked'), lockedRef(module.module), o.moduleDir(module.module), checks);
     const failed = results.filter((r) => r.exit !== 0);
     if (failed.length > 0) {
       return { ok: false, problems: failed.map((r) => `${r.id} fails on the change, though its feature is built: it must pass\n${clip(r.output.trim(), 1500)}`) };
@@ -276,8 +343,8 @@ export async function submitLockedChange(o: Orchestrator, module: ModuleState, s
   const existing = await o.forge.findPullRequest(branch, { open: true });
   const pr = existing ?? (await o.forge.openPullRequest({
     branch,
-    title: `Arch: [CHANGED_LOCKED_FILES] [${module.module}] ${clip(summary.split('\n')[0]!, 70)}`,
-    body: await lockedBody(o, module, summary, changes, base, lock),
+    title: noMentions(`Arch: [CHANGED_LOCKED_FILES] [${module.module}] ${clip(summary.split('\n')[0]!.trim(), 70)}`),
+    body: noMentions(await lockedBody(o, module, summary, changes, base, lock)),
   }));
   return { ok: true, head: branchHead, pr, opened: !existing, changes };
 }

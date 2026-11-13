@@ -1,7 +1,7 @@
 import { join } from 'node:path';
 import type { Repo } from '../../src/git/repo.ts';
 import { GitHubError } from '../../src/github/app.ts';
-import type { BranchRules, CheckRun, CommitStatus, Forge, PullRequest, ReviewPost } from '../../src/github/forge.ts';
+import type { ArtifactOptions, BranchRules, CheckRun, CommitStatus, Forge, PullRequest, ReviewPost } from '../../src/github/forge.ts';
 import { run, runOk } from '../../src/util.ts';
 import { tempDir } from './toy-repo.ts';
 
@@ -14,12 +14,20 @@ interface FakePullRequest {
   body: string;
   state: 'open' | 'closed';
   mergeCommit?: string;
+  /** The head it was merged with: a closed one's head counts for `findPullRequest`'s `head`, and only a merged one's is known. */
+  mergedHead?: string;
 }
 
 /**
  * GitHub, for tests: a local bare repository is the remote, pull requests live in memory,
  * and `ci` decides how CI ends on each pushed commit (undefined keeps it running).
  */
+/** A job as a test declares it: a conclusion, or `in_progress` and `queued` for one still to end. */
+function settled(conclusion: string): Pick<CheckRun, 'status' | 'conclusion' | 'completedAt'> {
+  if (conclusion === 'in_progress' || conclusion === 'queued') return { status: conclusion, conclusion: null };
+  return { status: 'completed', conclusion, completedAt: new Date().toISOString() };
+}
+
 export class FakeForge implements Forge {
   readonly kind = 'github';
   readonly bot = FAKE_BOT;
@@ -78,8 +86,8 @@ export class FakeForge implements Forge {
     return { number: pr.number, url: `https://github.test/pull/${pr.number}` };
   }
 
-  async findPullRequest(branch: string, options: { open?: boolean } = {}): Promise<{ number: number; url: string } | undefined> {
-    const pr = this.prs.findLast((p) => p.branch === branch && (!options.open || p.state === 'open'));
+  async findPullRequest(branch: string, options: { open?: boolean; head?: string } = {}): Promise<{ number: number; url: string } | undefined> {
+    const pr = this.prs.findLast((p) => p.branch === branch && (p.state === 'open' || (!options.open && (options.head === undefined || p.mergedHead === options.head))));
     return pr ? { number: pr.number, url: `https://github.test/pull/${pr.number}` } : undefined;
   }
 
@@ -97,18 +105,35 @@ export class FakeForge implements Forge {
 
   async checkRuns(sha: string): Promise<CheckRun[]> {
     if (!this.runs.has(sha)) {
+      if (await this.unmergeable(sha)) return [];
       const decided = this.ci(sha);
       if (!decided) return [];
-      this.runs.set(sha, Object.entries(decided).map(([name, conclusion]) => ({ id: this.nextRun++, name, status: 'completed', conclusion })));
+      // One workflow run of the jobs, as GitHub has it: the daemon reads an artifact from its job's run.
+      const runId = 9000 + this.nextRun;
+      this.runs.set(sha, Object.entries(decided).map(([name, conclusion]) => ({ id: this.nextRun++, name, runId, ...settled(conclusion) })));
     }
     return this.runs.get(sha)!;
+  }
+
+  /**
+   * GitHub runs no workflow on a pull request it can't merge into its base, and it merges
+   * by git's own rules: two sides that both added lines to progress.txt conflict there.
+   */
+  private async unmergeable(sha: string): Promise<boolean> {
+    for (const pr of this.prs.filter((p) => p.state === 'open')) {
+      if ((await this.head(pr.branch).catch(() => undefined)) !== sha) continue;
+      const merged = await run('git', ['--git-dir', this.remote, 'merge-tree', '--write-tree', '--no-messages', await this.head('main'), sha]);
+      if (merged.code === 1) return true;
+    }
+    return false;
   }
 
   /** The owner runs CI again on GitHub: newer runs of the same jobs, which end as `conclusions` say. */
   async rerun(sha: string, conclusions: Record<string, string>): Promise<void> {
     await this.checkRuns(sha);
     const runs = this.runs.get(sha) ?? [];
-    runs.push(...Object.entries(conclusions).map(([name, conclusion]) => ({ id: this.nextRun++, name, status: 'completed', conclusion })));
+    const runId = 9000 + this.nextRun;
+    runs.push(...Object.entries(conclusions).map(([name, conclusion]) => ({ id: this.nextRun++, name, runId, ...settled(conclusion) })));
     this.runs.set(sha, runs);
   }
 
@@ -133,7 +158,7 @@ export class FakeForge implements Forge {
     this.statusesSet.push({ sha, ...status });
   }
 
-  async artifactFile(sha: string, artifact: string, file: string): Promise<string | undefined> {
+  async artifactFile(sha: string, artifact: string, file: string, _options?: ArtifactOptions): Promise<string | undefined> {
     return this.artifacts(sha)[artifact]?.[file];
   }
 
@@ -170,6 +195,7 @@ export class FakeForge implements Forge {
     const commit = (await runOk('git', ['--git-dir', this.remote, 'commit-tree', tree, '-p', main, '-p', head, '-m', `${pr.title} (#${number})`], { env })).trim();
     await runOk('git', ['--git-dir', this.remote, 'update-ref', 'refs/heads/main', commit, main]);
     pr.mergeCommit = commit;
+    pr.mergedHead = head;
     pr.state = 'closed';
     return commit;
   }

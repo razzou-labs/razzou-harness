@@ -11,7 +11,7 @@ the head you review. You can read files, search them, and run `git log`, `git di
 
 ## What to look for
 
-Logic a scanner doesn't see:
+What the tests and the linters don't catch:
 - input that reaches a query, a shell, a template, a path or a URL without validation
   or encoding;
 - a route, handler or job that skips the authorization the others do;

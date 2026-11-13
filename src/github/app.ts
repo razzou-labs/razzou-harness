@@ -1,11 +1,16 @@
 import { createPrivateKey, sign, type KeyObject } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 
-/** The App's identity, kept on the owner's machine: `app.json` and `app.pem` in this folder, mode 0600. */
+/**
+ * The App's identity, kept on the owner's machine: `app.json` and `app.pem` in this folder,
+ * mode 0600. XDG_CONFIG_HOME counts only as an absolute path, as its specification says: an
+ * empty or relative one would put the App's private key in whatever folder the command runs in.
+ */
 export function configDir(): string {
-  return join(process.env.XDG_CONFIG_HOME ?? join(homedir(), '.config'), 'harness');
+  const xdg = process.env.XDG_CONFIG_HOME;
+  return join(xdg && isAbsolute(xdg) ? xdg : join(homedir(), '.config'), 'harness');
 }
 
 export interface AppCredentials {
@@ -67,7 +72,15 @@ export class GitHubClient {
 
   /** A REST call as the App's installation on the repository. Paths may contain `{repo}`. */
   async request<T = any>(method: string, path: string, body?: unknown): Promise<T> {
-    return this.call<T>(method, path.replaceAll('{repo}', this.repo), `token ${await this.token()}`, body);
+    const send = async () => this.call<T>(method, path.replaceAll('{repo}', this.repo), `token ${await this.token()}`, body);
+    try {
+      return await send();
+    } catch (error) {
+      if (!(error instanceof GitHubError) || error.status !== 401) throw error;
+      // A token GitHub no longer takes, revoked or expired by its clock rather than ours: once more, with one minted anew.
+      this.cached = undefined;
+      return send();
+    }
   }
 
   /** A REST call as the App itself, for what happens before any installation token exists. */
@@ -86,10 +99,16 @@ export class GitHubClient {
   }
 
   private async raw(path: string): Promise<Response> {
-    const response = await this.fetch(`${API}${path.replaceAll('{repo}', this.repo)}`, {
+    const send = async () => this.fetch(`${API}${path.replaceAll('{repo}', this.repo)}`, {
       headers: { authorization: `token ${await this.token()}`, 'user-agent': 'razzou-harness', 'x-github-api-version': '2022-11-28' },
     });
-    if (!response.ok) throw new Error(`GET ${path}: ${response.status} ${(await response.text()).slice(0, 300)}`);
+    let response = await send();
+    if (response.status === 401) {
+      // As for `request`: once more, with a token minted anew.
+      this.cached = undefined;
+      response = await send();
+    }
+    if (!response.ok) throw new GitHubError(`GET ${path}: ${response.status} ${(await response.text()).slice(0, 300)}`, response.status);
     return response;
   }
 

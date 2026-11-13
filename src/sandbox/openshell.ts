@@ -27,6 +27,13 @@ export function splitLines(onLine: (line: string) => void, onDrop: () => void = 
   };
 }
 
+/**
+ * How long a call of the CLI may take before it is killed: a gateway that stopped
+ * answering must not hold the daemon's loop. A killed call rejects, like any that failed.
+ */
+const QUICK = { timeout: 30_000, killSignal: 'SIGKILL' } as const;
+const SLOW = { timeout: 600_000, killSignal: 'SIGKILL' } as const;
+
 /** The only code that calls the `openshell` CLI. OpenShell is young (0.1.x), so its surface stays in this file. */
 export class OpenShellDriver implements SandboxDriver {
   readonly bin: string;
@@ -49,7 +56,7 @@ export class OpenShellDriver implements SandboxDriver {
     if (spec.memory) args.push('--memory', spec.memory);
     if (spec.tty) args.push('--tty');
     if (spec.command) args.push('--', ...spec.command);
-    await runOk(this.bin, args);
+    await runOk(this.bin, args, SLOW);
   }
 
   exec(name: string, script: string, options: { input?: string; timeoutSec?: number } = {}): Promise<ExecResult> {
@@ -59,7 +66,12 @@ export class OpenShellDriver implements SandboxDriver {
     // answering gets as long again, 30 s more at most, and is then killed.
     const limitSec = options.timeoutSec ? options.timeoutSec + Math.min(options.timeoutSec, 30) : 0;
     return run(this.bin, [...args, '--', 'bash', '-c', script], { input: options.input, timeout: limitSec * 1000, killSignal: 'SIGKILL' }).catch(
-      (error: Error & { killed?: boolean }) => {
+      (error: Error & { killed?: boolean; code?: unknown }) => {
+        // A command that prints more than run() keeps is the command's failure, not the
+        // harness's: a check whose tests print 70 MB fails, and says why.
+        if (error.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') {
+          return { code: 1, stdout: '', stderr: 'the command printed more than 64 MB: its output went over the limit and was cut, so none of it is shown' };
+        }
         if (!error.killed) throw error;
         return { code: 124, stdout: '', stderr: `openshell sandbox exec did not end within ${limitSec} s, and was killed` };
       },
@@ -120,24 +132,39 @@ export class OpenShellDriver implements SandboxDriver {
    * without `--no-git-ignore` every upload stops. The trailing slash puts the file in the folder.
    */
   async upload(name: string, localFile: string, remoteDir: string): Promise<void> {
-    await runOk(this.bin, ['sandbox', 'upload', '--no-git-ignore', name, localFile, remoteDir.endsWith('/') ? remoteDir : `${remoteDir}/`]);
+    await runOk(this.bin, ['sandbox', 'upload', '--no-git-ignore', name, localFile, remoteDir.endsWith('/') ? remoteDir : `${remoteDir}/`], SLOW);
   }
 
   async download(name: string, remoteFile: string, localFile: string): Promise<void> {
-    await runOk(this.bin, ['sandbox', 'download', name, remoteFile, localFile]);
+    await runOk(this.bin, ['sandbox', 'download', name, remoteFile, localFile], SLOW);
   }
 
+  /**
+   * OpenShell 0.1.7 exits 1 both for a sandbox it doesn't have ("sandbox not found") and
+   * for a gateway it can't reach ("connect error: transport error"). Only the first says
+   * the sandbox is gone: the daemon deletes and makes again what is missing, and a gateway
+   * that restarts would cost every agent its sandbox, its conversation with it.
+   */
   async status(name: string): Promise<SandboxStatus> {
-    const result = await run(this.bin, ['sandbox', 'get', name, '--output', 'json']);
-    if (result.code !== 0) return 'missing';
+    const result = await run(this.bin, ['sandbox', 'get', name, '--output', 'json'], QUICK);
+    if (result.code !== 0) {
+      const problem = (result.stderr || result.stdout).trim();
+      if (/sandbox not found|requested entity was not found/i.test(problem)) return 'missing';
+      throw new Error(`openshell sandbox get ${name} failed: ${problem.slice(0, 300) || `exit code ${result.code}`}`);
+    }
     const phase = (JSON.parse(result.stdout) as { phase?: string }).phase;
     if (phase === 'Ready') return 'ready';
     if (phase === 'Stopped') return 'stopped';
     return 'other';
   }
 
+  async start(name: string): Promise<void> {
+    await runOk(this.bin, ['sandbox', 'start', name], SLOW);
+  }
+
+  /** Never throws: a delete that failed leaves a sandbox the daemon's sweep deletes later. */
   async remove(name: string): Promise<void> {
-    await run(this.bin, ['sandbox', 'delete', name]);
+    await run(this.bin, ['sandbox', 'delete', name], SLOW).catch(() => undefined);
   }
 
   async list(): Promise<SandboxInfo[]> {

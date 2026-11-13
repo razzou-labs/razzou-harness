@@ -3,7 +3,7 @@ import { defineComponent, onMounted, ref, watch, type PropType, type VNodeChild 
 import { getText, post, type DashboardState, type FeatureState } from '../api.ts';
 import { clock } from '../format.ts';
 import { list, listNeeds, needTitle, orderNeeds, waitText, type Need, type Ordered } from '../../../src/dashboard/needs.ts';
-import { Action, Command, Fold, GithubLink, Loading, Markdown, Reply, text } from '../ui.tsx';
+import { Action, Command, confirm, Fold, GithubLink, Loading, Markdown, Reply, text } from '../ui.tsx';
 import type { Go } from '../App.tsx';
 
 const key = (f: FeatureState) => `${f.module}/${f.plan}/${f.feature}`;
@@ -23,7 +23,7 @@ function content(need: Need, go: Go): { body: () => VNodeChild } {
                 Nothing new starts until {clock(paused.until)}, when the daemon looks again by itself, and goes on if it is over. You have nothing to do unless the reason is yours to fix.
               </p>
             )}
-            <Action label={paused.retry ? 'Look again now' : 'Resume'} run={() => post('/api/resume')} />
+            <Action label={paused.retry ? 'Look again now' : 'Resume'} run={() => post(paused.retry ? '/api/look-again' : '/api/resume')} />
           </>
         ),
       };
@@ -72,6 +72,12 @@ function content(need: Need, go: Go): { body: () => VNodeChild } {
               Comments go to the Architect, in its terminal.
               {module.frozenCommit && ' No new attempt starts in this module until you merge or close it.'}
             </p>
+            {(module.design?.settings?.length ?? 0) > 0 && (
+              <div class="text-caption text-warning">
+                It changes these settings of harness/config.json, which decide what the daemon may do:
+                <ul class="q-my-xs">{module.design!.settings!.map((setting) => <li key={setting}>{setting.replaceAll('`', '')}</li>)}</ul>
+              </div>
+            )}
             {(module.design?.suspect.length ?? 0) > 0 && (
               <p class="text-caption text-warning">These checks already pass before anything is built, so they may test nothing: {module.design?.suspect.join(', ')}</p>
             )}
@@ -154,13 +160,18 @@ function content(need: Need, go: Go): { body: () => VNodeChild } {
               : <p key={wait.plan} class="text-caption text-muted q-mb-xs">{waitText(wait)}</p>
             ))}
             <Markdown text={action.instructions} />
+            {action.estimatedMinutes !== undefined && <p class="text-caption text-muted q-mb-xs">About {action.estimatedMinutes} min of your time.</p>}
             {status?.status === 'verifying' && <p class="text-caption text-primary">Its check is running.</p>}
             {status?.status === 'refused' && <p class="text-caption text-negative">Its check failed: {status.reason}</p>}
             <Reply
               label={action.verify ? 'Done: run its check' : 'Mark done'}
               placeholder="A note (optional)"
               optional
-              send={(note) => post('/api/actions/done', { module: need.module, action: action.id, ...(note ? { note } : {}) })}
+              send={async (note) => {
+                // Work that builds on a plan not complete may start: the owner says so twice.
+                if (waits.length > 0 && !(await confirm(`${waits.map(waitText).join(' ')} Mark it done all the same?`, 'Mark done'))) return { done: false, error: 'left as it is' };
+                return post('/api/actions/done', { module: need.module, action: action.id, ...(note ? { note } : {}) });
+              }}
             />
           </>
         ),
@@ -313,7 +324,7 @@ const Order = defineComponent({
   },
 });
 
-/** One more attempt with guidance, the question to the Architect, or a pause (§14.2). */
+/** One more attempt with guidance, or a pause (§14.2): the card is only for a module without an Architect. */
 const Escalated = defineComponent({
   props: { feature: { type: Object as PropType<FeatureState>, required: true } },
   setup(props) {
@@ -323,18 +334,9 @@ const Escalated = defineComponent({
       return (
         <>
           <p>{feature.escalation}</p>
-          <QInput {...text(note)} type="textarea" autogrow outlined dense label="Guidance for one more attempt, or a note for the Architect" />
+          <QInput {...text(note)} type="textarea" autogrow outlined dense label="Guidance for one more attempt" />
           <div class="row items-center q-gutter-sm q-mt-sm">
             <Action label="One more attempt" run={() => post('/api/retry', { feature: key(feature), ...(note.value.trim() ? { note: note.value } : {}) })} />
-            <Action
-              label="Send it to the Architect"
-              run={() =>
-                post('/api/architect', {
-                  module: feature.module,
-                  text: `[owner] ${key(feature)} is escalated: ${feature.escalation ?? ''} ${note.value.trim() ? `My note: ${note.value.trim()}` : ''} Should the design change?`,
-                })
-              }
-            />
             <Action label="Pause the pipeline" run={() => post('/api/pause')} />
           </div>
         </>
@@ -348,9 +350,14 @@ export const Proposal = defineComponent({
   props: { module: { type: String, required: true }, version: { type: Number, required: true } },
   setup(props) {
     const content = ref<string>();
+    // Only the latest read lands: an older version's text never shows under a newer one.
+    let reads = 0;
     const load = () => {
+      const read = ++reads;
       content.value = undefined;
-      void getText(`/api/proposal?module=${encodeURIComponent(props.module)}&version=${props.version}`).then((t) => (content.value = t));
+      void getText(`/api/proposal?module=${encodeURIComponent(props.module)}&version=${props.version}`)
+        .catch((error: Error) => `(the daemon is not answering: ${error.message})`)
+        .then((t) => read === reads && (content.value = t));
     };
     onMounted(load);
     watch(() => [props.module, props.version], load);

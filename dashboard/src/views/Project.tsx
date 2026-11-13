@@ -1,8 +1,8 @@
 import { QBtn, QBtnToggle, QCard, QCardSection, QInput, QLinearProgress, QSeparator, QTable, QTd, QTr, type QTableProps } from 'quasar';
 import { defineComponent, onUnmounted, ref, watchEffect, type PropType, type Ref } from 'vue';
-import { post, type Attempt, type DashboardState, type FeatureState, type OwnerTime, type PlanState, type State, type SubscriptionUsage, type UsageLimit } from '../api.ts';
+import { post, type Attempt, type DashboardState, type FeatureState, type ModuleOwnerTime, type PlanState, type State, type SubscriptionUsage, type UsageLimit } from '../api.ts';
 import { Dependencies } from '../components/Dependencies.tsx';
-import { duration, modelName } from '../format.ts';
+import { clock, duration, modelName } from '../format.ts';
 import { Action, Badge, Fold, GithubLink, text } from '../ui.tsx';
 import { moduleCompleted } from '../../../src/dashboard/needs.ts';
 import { Proposal } from './NeedsYou.tsx';
@@ -17,7 +17,7 @@ export const Project = defineComponent({
       const moduleIds = [...new Set([...Object.keys(state.modules), ...design.modules.map((m) => m.id)])];
       return (
         <div class="column q-gutter-md">
-          <Budgets state={state} roles={design.roles} tokens={props.data.tokens} ceiling={design.swarm?.usageCeilingPercent ?? null} {...(props.data.ownerTime ? { ownerTime: props.data.ownerTime } : {})} {...(props.data.usage ? { usage: props.data.usage } : {})} />
+          <Budgets state={state} roles={design.roles} tokens={props.data.tokens} ceiling={design.swarm?.usageCeilingPercent ?? null} {...(props.data.usage ? { usage: props.data.usage } : {})} />
           <NewModule />
           {moduleIds.length === 0 && <p class="text-muted">No module yet.</p>}
           {moduleIds.map((id) => {
@@ -36,6 +36,7 @@ export const Project = defineComponent({
                     {moduleCompleted(designed, state) && <Badge status="completed" label="module completed" />}
                     {module?.design?.pr && <span class="text-subtitle2">· <GithubLink url={module.design.pr.url}>Arch PR #{module.design.pr.number}</GithubLink></span>}
                   </div>
+                  <OwnerHours module={id} {...(props.data.ownerTime.find((t) => t.module === id) ? { time: props.data.ownerTime.find((t) => t.module === id)! } : {})} />
                   {module && module.proposals.length > 0 && (
                     <div class="row items-center q-gutter-sm q-mt-sm">
                       <span class="text-muted">Proposals:</span>
@@ -132,14 +133,13 @@ const Meter = defineComponent({
 type Roles = DashboardState['design']['roles'];
 type RoleTokens = DashboardState['tokens'][number];
 
-/** The owner's hours for the whole project (v3 §4), set here and recorded by the daemon, and what the agents used. */
+/** What the agents used: their active hours, Claude's tokens and the subscription. The owner's own hours are each module's, on its card. */
 const Budgets = defineComponent({
   props: {
     state: { type: Object as PropType<State>, required: true },
     roles: { type: Object as PropType<Roles>, required: true },
     tokens: { type: Array as PropType<RoleTokens[]>, required: true },
     ceiling: { type: Number as PropType<number | null>, default: null },
-    ownerTime: Object as PropType<OwnerTime>,
     usage: Object as PropType<{ at: string; usage: SubscriptionUsage }>,
   },
   setup(props) {
@@ -148,37 +148,12 @@ const Budgets = defineComponent({
       Object.values(props.state.features).some((f) => f.attempts.some((a) => !a.endedAt)) ||
       Object.values(props.state.plans).some((p) => (p.reviews ?? []).some((r) => r.status === 'running')));
     return () => {
-      const { state, ownerTime } = props;
-      const budgets = state.budgets ?? {};
-      const overPlanned = ownerTime !== undefined && ownerTime.committedHours > ownerTime.plannableHours;
-      const overUsed = ownerTime !== undefined && ownerTime.usedHours > ownerTime.hours;
+      const { state } = props;
       return (
         <QCard flat bordered>
           <QCardSection>
             <div class="text-h6 q-mb-sm">Budgets</div>
             <div class="row q-col-gutter-md">
-              <Meter title="Your time">
-                <p>
-                  {budgets.ownerHours !== undefined
-                    ? <><b>{budgets.ownerHours} h</b> for the whole project{budgets.ownerHoursSetAt && <span class="text-muted">, set {new Date(budgets.ownerHoursSetAt).toLocaleDateString()}</span>}</>
-                    : <span class="text-muted">Not set: the Architect designs without a limit on your time.</span>}
-                </p>
-                {ownerTime && (
-                  <p>
-                    <b class={overUsed ? 'text-negative' : undefined}>{ownerTime.usedHours} h used</b>
-                    {' · '}
-                    <span class={overPlanned ? 'text-negative' : undefined}>{ownerTime.committedHours} h planned by the designs</span>
-                    {' · '}
-                    <span class="text-muted">{ownerTime.plannableHours} h plannable after the {ownerTime.reservePercent}% reserve</span>
-                  </p>
-                )}
-                <HoursForm value={budgets.ownerHours} />
-                <p class="text-caption text-muted q-mt-sm">
-                  {ownerTime
-                    ? "Planned: the estimates of the owner actions in submitted designs, gates and tasks. Used: the actions you marked done. What you read, proposals and pull requests, doesn't count."
-                    : 'Once set, the Architect must estimate every owner action and design within your hours; a design over them is refused.'}
-                </p>
-              </Meter>
               <ActiveMeter state={state} roles={props.roles} now={now.value} />
               <ClaudeMeter tokens={props.tokens} ceiling={props.ceiling} {...(props.usage ? { usage: props.usage } : {})} />
             </div>
@@ -330,7 +305,7 @@ const Subscription = defineComponent({
             );
           })}
           <p class="text-caption text-muted">
-            Reported by an agent's model call at {new Date(usage.at).toLocaleTimeString()}. In Swarm no attempt starts at or above {ceiling === null ? 'the ceiling, which is off' : `${ceiling}%`}; the pipeline waits for the window to reset.
+            Reported by an agent's model call at {clock(usage.at)}. In Swarm no attempt starts at or above {ceiling === null ? 'the ceiling, which is off' : `${ceiling}%`}; the pipeline waits for the window to reset.
           </p>
         </>
       );
@@ -365,29 +340,50 @@ function resetsIn(at: string, now: number): string {
   return new Date(at).toLocaleString(undefined, { weekday: 'short', hour: '2-digit', minute: '2-digit' });
 }
 
-/** The owner's hours for the whole project, to save, or clear: null clears them on the daemon. */
-const HoursForm = defineComponent({
+/**
+ * The hours of the owner's time that one module may take: what they set, what its design
+ * plans and has used of them, and the form that sets or clears them. They are the
+ * module's own: no other module draws on them, and one without hours has no limit.
+ */
+const OwnerHours = defineComponent({
   props: {
-    value: Number,
+    module: { type: String, required: true },
+    time: Object as PropType<ModuleOwnerTime>,
   },
   setup(props) {
     const hours = ref('');
+    const inHoursOf = (minutes: number) => Math.round(minutes / 6) / 10;
     return () => {
+      const time = props.time;
+      const planned = inHoursOf(time?.plannedMinutes ?? 0);
+      const over = time?.plannableHours !== undefined && inHoursOf(time.plannedMinutes + time.droppedMinutes) > time.plannableHours;
       const n = Number(hours.value);
       const valid = hours.value.trim() !== '' && Number.isFinite(n) && n > 0;
       return (
-        <div class="row items-center q-gutter-sm">
-          <QInput {...text(hours)} type="number" dense outlined label="hours" style="width: 120px" />
+        <div class="row items-center q-gutter-sm q-mt-sm">
+          <span class="text-muted">Your time:</span>
+          {time?.hours !== undefined
+            ? (
+              <span>
+                <b>{time.hours} h</b> for this module
+                {' · '}
+                <span class={over ? 'text-negative' : undefined}>{planned} h planned</span> of {time.plannableHours} h after the {time.reservePercent}% reserve
+                {' · '}
+                {inHoursOf(time.usedMinutes)} h used
+              </span>
+            )
+            : <span class="text-muted">no hours set, so its design has no limit{planned > 0 ? `; ${planned} h planned` : ''}</span>}
+          <QInput {...text(hours)} type="number" dense outlined label="hours" style="width: 110px" />
           <Action
-            label="Save"
+            label={time?.hours !== undefined ? 'Change' : 'Set'}
             run={async () => {
               if (!valid) return { done: false, error: 'a positive number of hours' };
-              const result = await post('/api/budgets', { ownerHours: n });
+              const result = await post('/api/owner-hours', { module: props.module, hours: n });
               if (result.done) hours.value = '';
               return result;
             }}
           />
-          {props.value !== undefined && <Action label="Clear" flat run={() => post('/api/budgets', { ownerHours: null })} />}
+          {time?.hours !== undefined && <Action label="Clear" flat run={() => post('/api/owner-hours', { module: props.module, hours: null })} />}
         </div>
       );
     };
@@ -398,13 +394,24 @@ const NewModule = defineComponent({
   setup() {
     const id = ref('');
     const title = ref('');
+    // The hours of the owner's time this module may take, set now or later on its card: empty sets none.
+    const hours = ref('');
     const error = ref<string>();
+    const busy = ref(false);
     const start = async () => {
-      const result = await post('/api/modules', { id: id.value.trim(), title: title.value });
+      const n = Number(hours.value.trim());
+      if (hours.value.trim() !== '' && !(Number.isFinite(n) && n > 0)) {
+        error.value = 'the hours are a positive number, or nothing';
+        return;
+      }
+      busy.value = true;
+      const result = await post('/api/modules', { id: id.value.trim(), title: title.value, ...(hours.value.trim() !== '' ? { ownerHours: n } : {}) })
+        .finally(() => (busy.value = false));
       error.value = result.done ? undefined : result.error;
       if (result.done) {
         id.value = '';
         title.value = '';
+        hours.value = '';
       }
     };
     return () => (
@@ -414,10 +421,11 @@ const NewModule = defineComponent({
           <div class="row items-center q-gutter-sm">
             <QInput {...text(id)} dense outlined label="id, like orders" style="width: 180px" />
             <QInput {...text(title)} dense outlined label="what it is for" class="col" style="min-width: 240px; max-width: 480px" />
-            <QBtn label="Start" color="primary" noCaps unelevated disable={!id.value.trim()} onClick={() => void start()} />
+            <QInput {...text(hours)} dense outlined label="hours of your time" hint="optional" style="width: 150px" />
+            <QBtn label="Start" color="primary" noCaps unelevated loading={busy.value} disable={!id.value.trim()} onClick={() => void start()} />
             {error.value && <span class="text-negative text-caption">{error.value}</span>}
           </div>
-          <p class="text-caption text-muted q-mt-sm">An Architect starts in its own sandbox; talk to it in the Agents view.</p>
+          <p class="text-caption text-muted q-mt-sm">An Architect starts in its own sandbox; talk to it in the Agents view. With hours, it designs your actions in this module within them; without, it has no limit until you set one on the module's card.</p>
         </QCardSection>
       </QCard>
     );

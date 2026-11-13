@@ -16,6 +16,14 @@ export type AgentRequest = z.infer<typeof RequestSchema>;
 
 const MAX_LINE = 64 * 1024;
 
+/**
+ * An agent can write request lines straight into its outbox, as fast and as many as it
+ * likes, and each one costs the daemon work and the event log a record. So a sandbox's
+ * requests are handled two at a time, and those over sixty a minute are refused.
+ */
+export const CONCURRENCY = 2;
+export const RATE_PER_MINUTE = 60;
+
 export interface ChannelOptions {
   driver: SandboxDriver;
   sandbox: string;
@@ -23,7 +31,8 @@ export interface ChannelOptions {
   inbox: string;
   /** On the host: ids of requests already answered. */
   repliedFile: string;
-  onRequest: (request: AgentRequest) => void;
+  /** Handles a request; the next one waits for the promise it returns, if any. */
+  onRequest: (request: AgentRequest) => void | Promise<unknown>;
   onInvalid: (reason: string) => void;
 }
 
@@ -41,6 +50,10 @@ export class AgentChannel {
   private readonly seen = new Set<string>();
   private follower?: Follower;
   private writes: Promise<void> = Promise.resolve();
+  /** When each of the last minute's accepted requests arrived. */
+  private readonly accepted: number[] = [];
+  private readonly queue: AgentRequest[] = [];
+  private running = 0;
 
   constructor(options: ChannelOptions) {
     this.options = options;
@@ -102,6 +115,32 @@ export class AgentChannel {
     const request = parsed.data;
     if (this.replied.has(request.id) || this.seen.has(request.id)) return;
     this.seen.add(request.id);
-    this.options.onRequest(request);
+    const now = Date.now();
+    while (this.accepted.length > 0 && this.accepted[0]! <= now - 60_000) this.accepted.shift();
+    if (this.accepted.length >= RATE_PER_MINUTE) {
+      void this.reply(request.id, false, `too many requests: at most ${RATE_PER_MINUTE} a minute from one sandbox. Wait a minute and call again.`).catch(() => {});
+      return this.options.onInvalid(`a request over the rate of ${RATE_PER_MINUTE} a minute`);
+    }
+    this.accepted.push(now);
+    this.queue.push(request);
+    this.next();
+  }
+
+  /** Hands queued requests over while fewer than CONCURRENCY are being handled. */
+  private next(): void {
+    while (this.running < CONCURRENCY && this.queue.length > 0) {
+      const request = this.queue.shift()!;
+      this.running++;
+      let handled: Promise<unknown>;
+      try {
+        handled = Promise.resolve(this.options.onRequest(request));
+      } catch (error) {
+        handled = Promise.reject(error);
+      }
+      void handled.catch(() => {}).finally(() => {
+        this.running--;
+        this.next();
+      });
+    }
   }
 }

@@ -43,8 +43,10 @@ export class Managers {
       await this.syncOnce();
       this.errors = 0;
     } catch (error) {
-      this.errors += 1;
       const message = (error as Error).message;
+      // A gateway that doesn't answer is no fault of the Manager's sandbox: nothing is counted, and nothing made again.
+      if (await this.o.gatewayDown()) return this.o.log(`manager: ${message}`);
+      this.errors += 1;
       this.o.log(`manager: ${message} (${this.errors}/${ERROR_LIMIT})`);
       if (this.errors >= ERROR_LIMIT) {
         this.errors = 0;
@@ -81,7 +83,7 @@ export class Managers {
         await this.start(scope);
       } else if (manager.status === 'starting') {
         await this.start(scope, manager);
-      } else if ((await o.driver.status(manager.sandbox)) === 'missing') {
+      } else if ((await this.sandboxThere(manager)) === false) {
         await this.start(scope);
       } else if (manager.status === 'running' && (await this.alive(manager))) {
         this.attach(manager);
@@ -110,12 +112,23 @@ export class Managers {
     return scopes;
   }
 
+  /**
+   * Whether the Manager's sandbox is still there, a stopped one started again first: what
+   * a reboot of the machine leaves keeps its files, and so the conversation, which the
+   * next launch resumes. Only a sandbox the gateway no longer has is made again.
+   */
+  private async sandboxThere(manager: ManagerState): Promise<boolean> {
+    const where = await this.o.driver.status(manager.sandbox);
+    if (where === 'stopped') await this.o.driver.start(manager.sandbox);
+    return where !== 'missing';
+  }
+
   /** A fresh sandbox and conversation. `existing` resumes a start that was cut short. */
   private async start(scope: ManagerScope, existing?: ManagerState): Promise<void> {
     const o = this.o;
     const key = managerKey(scope);
     if (!existing) {
-      const sandbox = sandboxName('mgr', o.design.config.project.name, key);
+      const sandbox = sandboxName('mgr', o.projectKey, key);
       o.record({ type: 'MANAGER_STARTING', payload: { ...identity(scope), sandbox, sessionId: randomUUID() } });
     }
     const manager = o.state.managers[key]!;
@@ -163,6 +176,8 @@ export class Managers {
     const probe = await o.exec(manager.sandbox, probeScript(run.exitFile, run.pidFile));
     const status = probe.stdout.trim();
     if (status === 'running') return true;
+    // The probe always prints an answer: none means it never ran, which says nothing of the Manager.
+    if (status === '') throw new Error(`${manager.sandbox} could not be asked how the Manager is doing: ${clip((probe.stderr || `exit code ${probe.code}`).trim(), 300)}`);
     const after = await o.exec(manager.sandbox,
       `{ { wc -c < ${sh(this.paths(manager).output)}; } 2>/dev/null || echo 0; }; tail -c 2000 ${sh(run.stderrFile)} 2>/dev/null`);
     const [bytes = '0', ...stderr] = after.stdout.split('\n');
@@ -219,6 +234,8 @@ export class Managers {
    */
   private async deliver(manager: ManagerState): Promise<void> {
     const o = this.o;
+    // Its last turn ended on the model's API failing: what waits is sent once that had time to pass.
+    if (manager.heldUntil && o.now() < Date.parse(manager.heldUntil)) return;
     for (const mail of [...manager.mail]) {
       await this.send(manager, mailText(o, manager, mail));
       o.record({ type: 'MANAGER_ITEM_SENT', payload: { ...identity(manager), key: mail.key, launch: manager.launch, reminder: false } });
@@ -237,7 +254,9 @@ export class Managers {
         if (item.show) await this.show(manager, item, pending);
         await this.send(manager, await item.text());
         o.record({ type: 'MANAGER_ITEM_SENT', payload: { ...identity(manager), key: item.key, launch: manager.launch, reminder: false } });
-      } else if (waitingForOthers) {
+      } else if (waitingForOthers || o.state.pipeline.paused) {
+        // While the pipeline is paused, as for a usage limit, the Manager may be unable to act: its silence says nothing,
+        // and a brake here would replace a pause that lifts itself with one only the owner can lift.
         continue;
       } else if (!sent.reminded && o.now() - Date.parse(sent.at) >= turnMs) {
         await this.send(manager, `[harness] REMINDER: ${item.title} is still waiting for you. ${item.ask}`);

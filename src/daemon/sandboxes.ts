@@ -1,6 +1,6 @@
 import type { Orchestrator } from './orchestrator.ts';
 import type { UsageReading } from '../sandbox/docker.ts';
-import { PROJECT_LABEL, type GatewayStatus, type SandboxInfo } from '../sandbox/driver.ts';
+import { CHECKOUT_LABEL, PROJECT_LABEL, type GatewayStatus, type SandboxInfo } from '../sandbox/driver.ts';
 import { LOG_LINES, parseDenials, type Denial } from '../sandbox/refusals.ts';
 import type { State } from '../state/state.ts';
 import { machineSize } from '../util.ts';
@@ -87,7 +87,7 @@ export async function sandboxRows(o: Orchestrator): Promise<SandboxRow[]> {
   const project = o.design.config.project.name;
   const order = { 'in use': 0, 'left over': 1, other: 2 };
   return listed
-    .map((sandbox) => row(sandbox, known.get(sandbox.name), project))
+    .map((sandbox) => row(sandbox, known.get(sandbox.name), project, o.checkout))
     .sort((a, b) => order[a.use] - order[b.use] || (a.createdAt ?? '').localeCompare(b.createdAt ?? '', 'en') || a.name.localeCompare(b.name, 'en'));
 }
 
@@ -146,16 +146,20 @@ export async function removeLeftOver(o: Orchestrator, name: string): Promise<{ d
   if (found.use === 'in use') return { done: false, error: 'it is in use' };
   if (found.use === 'other') return { done: false, error: "it isn't this project's" };
   await o.driver.remove(name);
+  // The driver's delete never throws: only the gateway's answer afterwards says it is gone.
+  const status = await o.driver.status(name).catch((error: Error) => `unknown (${error.message})`);
+  if (status !== 'missing') return { done: false, error: `the gateway still lists it after the delete: ${status}` };
   o.log(`the owner deleted the left-over sandbox ${name}`);
   return { done: true };
 }
 
-function row(sandbox: SandboxInfo, known: Known | undefined, project: string): SandboxRow {
+function row(sandbox: SandboxInfo, known: Known | undefined, project: string, checkout: string): SandboxRow {
   const base = { name: sandbox.name, phase: sandbox.phase, ...(sandbox.createdAt ? { createdAt: sandbox.createdAt } : {}) };
   if (known) return { ...base, role: known.role, title: known.title, ...(known.agent ? { agent: known.agent } : {}), use: known.live ? 'in use' : 'left over' };
   const label = sandbox.labels[PROJECT_LABEL];
-  // This project's, but the state no longer names it: what a crash or a failed delete leaves.
-  if (label === project) {
+  // This checkout's, but the state no longer names it: what a crash or a failed delete leaves. Another checkout
+  // of a project of the same name is another project's: its daemon knows which of its sandboxes it needs.
+  if (label === project && sandbox.labels[CHECKOUT_LABEL] === checkout) {
     const role = ROLES[sandbox.name.split('-')[0] ?? ''];
     return { ...base, ...(role ? { role } : {}), use: 'left over' };
   }

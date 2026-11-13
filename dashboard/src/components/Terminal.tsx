@@ -2,7 +2,7 @@ import { FitAddon } from '@xterm/addon-fit';
 import { Terminal as XTerm } from '@xterm/xterm';
 import '@xterm/xterm/css/xterm.css';
 import { defineComponent, onMounted, onUnmounted, ref } from 'vue';
-import { COPY_WINDOW_MS, copiedText, copiesSelection } from '../clipboard.ts';
+import { COPY_WINDOW_MS, copiedText, copiesSelection, inputSlices } from '../clipboard.ts';
 
 const MAC = /Mac|iPhone|iPad/.test(navigator.platform);
 
@@ -13,7 +13,12 @@ const MAC = /Mac|iPhone|iPad/.test(navigator.platform);
  * selects, or with Option on a Mac.
  */
 export const Terminal = defineComponent({
-  props: { module: String, sandbox: String },
+  props: {
+    module: String,
+    sandbox: String,
+    /** Whether it takes the keys as it opens: only when the owner clicked for it, never when the page showed it by itself. */
+    focus: Boolean,
+  },
   setup(props) {
     const element = ref<HTMLDivElement>();
     let cleanup = () => {};
@@ -61,11 +66,14 @@ export const Terminal = defineComponent({
       const socket = new WebSocket(`ws://${location.host}/api/terminal?${target}&cols=${term.cols}&rows=${term.rows}`);
       socket.onmessage = (message) => term.write(String(message.data));
       socket.onclose = (event) => term.write(`\r\n\x1b[2m[${event.reason || 'disconnected'}]\x1b[0m\r\n`);
-      const keys = term.onData((data) => socket.readyState === WebSocket.OPEN && socket.send(JSON.stringify({ i: data })));
+      // A paste arrives as one piece of data: it goes in slices, each well within the daemon's limit per message.
+      const keys = term.onData((data) => {
+        if (socket.readyState === WebSocket.OPEN) for (const slice of inputSlices(data)) socket.send(JSON.stringify({ i: slice }));
+      });
       const resized = term.onResize(({ cols, rows }) => socket.readyState === WebSocket.OPEN && socket.send(JSON.stringify({ cols, rows })));
       const observer = new ResizeObserver(() => fit.fit());
       observer.observe(box);
-      term.focus();
+      if (props.focus) term.focus();
       cleanup = () => {
         window.removeEventListener('mousedown', press, true);
         window.removeEventListener('mouseup', release, true);

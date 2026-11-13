@@ -1,42 +1,36 @@
 import type { State } from '../state/state.ts';
-import type { Config, Design, ModuleDesign } from './schemas.ts';
+import type { Config, ModuleDesign } from './schemas.ts';
 
 /**
- * The owner's time as a design constraint (proposal v3 §4.1). The owner sets the hours
- * the whole project may take of their time; the Architect estimates every owner action,
- * the gates and tasks of its design; a reserve stays out of what designs may plan; and
- * `submit_design` refuses a design that doesn't fit. Only owner actions count: what the
- * owner reads, proposals and pull requests, is their own and isn't measured.
+ * The owner's time as a design constraint. The owner sets, for a module, the hours it
+ * may take of their time; its Architect estimates every owner action of its design, the
+ * gates and tasks; a reserve stays out of what the design may plan; and `submit_design`
+ * refuses a design that doesn't fit. The hours are a module's own: what another module
+ * plans takes nothing from them, and a module without hours is designed without a limit.
+ * Only owner actions count: what the owner reads, proposals and pull requests, is their
+ * own and isn't measured.
  */
 export interface ModuleOwnerTime {
   module: string;
+  /** The hours the owner set for this module; undefined while they set none. */
+  hours?: number;
+  reservePercent: number;
+  /** What its design may plan: the hours minus the reserve. */
+  plannableHours?: number;
   /** The estimates of the module's owner actions, in minutes: what its design plans of the owner's time. */
   plannedMinutes: number;
   /** The actions without an estimate: a design needs one on every action once hours are set. */
   missing: string[];
-  /** The module's design is on main, submitted or frozen: its time is committed. */
-  committed: boolean;
   /** The estimates of the actions marked done, with those a redesign dropped since. */
   usedMinutes: number;
-}
-
-export interface OwnerTime {
-  hours: number;
-  reservePercent: number;
-  /** What designs may plan in all: the hours minus the reserve. */
-  plannableHours: number;
-  /** The planned time of every committed module. */
-  committedHours: number;
-  usedHours: number;
-  modules: ModuleOwnerTime[];
+  /** Of `usedMinutes`, the actions done and then dropped by a redesign: time spent, which counts against what may still be planned. */
+  droppedMinutes: number;
 }
 
 type Settings = Pick<Config, 'ownerTime'>;
 
-/** One module's owner time: the estimates of its owner actions. */
-export function moduleOwnerTime(module: ModuleDesign, state: State): ModuleOwnerTime {
-  const status = state.modules[module.id]?.status;
-  const committed = status === undefined || status === 'in_review' || status === 'frozen';
+/** One module's owner time: its hours, and the estimates of the owner actions of `module`, its design on main or one being submitted. */
+export function moduleOwnerTime(config: Settings, module: ModuleDesign, state: State): ModuleOwnerTime {
   let plannedMinutes = 0;
   let usedMinutes = 0;
   const missing: string[] = [];
@@ -50,49 +44,38 @@ export function moduleOwnerTime(module: ModuleDesign, state: State): ModuleOwner
   }
   // An action done, then dropped by a redesign, still took the owner's time: its estimate when it was done.
   const designed = new Set(module.actions.map((a) => `${module.id}/${a.id}`));
+  let droppedMinutes = 0;
   for (const [key, action] of Object.entries(state.actions)) {
-    if (key.startsWith(`${module.id}/`) && !designed.has(key) && action.status === 'done') usedMinutes += action.minutes ?? 0;
+    if (key.startsWith(`${module.id}/`) && !designed.has(key) && action.status === 'done') droppedMinutes += action.minutes ?? 0;
   }
-  return { module: module.id, plannedMinutes, missing, committed, usedMinutes };
-}
-
-/** The whole project's owner time, or undefined while the owner hasn't set their hours. */
-export function ownerTime(config: Settings, design: Design, state: State): OwnerTime | undefined {
-  const hours = state.budgets.ownerHours;
-  if (hours === undefined) return undefined;
-  const modules = design.modules.map((module) => moduleOwnerTime(module, state));
+  const hours = state.ownerHours[module.id]?.hours;
   const reservePercent = config.ownerTime.reservePercent;
   return {
-    hours,
+    module: module.id,
+    ...(hours === undefined ? {} : { hours, plannableHours: round(hours * (1 - reservePercent / 100)) }),
     reservePercent,
-    plannableHours: round(hours * (1 - reservePercent / 100)),
-    committedHours: round(modules.filter((m) => m.committed).reduce((sum, m) => sum + m.plannedMinutes, 0) / 60),
-    usedHours: round(modules.reduce((sum, m) => sum + m.usedMinutes, 0) / 60),
-    modules,
+    plannedMinutes,
+    missing,
+    usedMinutes: usedMinutes + droppedMinutes,
+    droppedMinutes,
   };
 }
 
-/** The hours a module may plan: what is plannable, minus what the other modules committed. */
-export function availableHours(time: OwnerTime, module: string): number {
-  const others = time.modules.filter((m) => m.committed && m.module !== module).reduce((sum, m) => sum + m.plannedMinutes, 0) / 60;
-  return round(time.plannableHours - others);
-}
-
 /**
- * Why a module's design doesn't fit the owner's time, as `submit_design` reports it, or
- * nothing. `candidate` is the design being submitted, in place of the module's current one.
+ * Why a module's design doesn't fit the hours the owner set for it, as `submit_design`
+ * reports it, or nothing: nothing is asked of a module without hours.
  */
-export function ownerTimeProblems(time: OwnerTime | undefined, candidate: ModuleOwnerTime): string[] {
-  if (!time) return [];
-  const problems = candidate.missing.map((id) => `owner-actions.json: ${id} needs estimatedMinutes, how long it takes the owner: their time is budgeted (get_owner_time)`);
+export function ownerTimeProblems(time: ModuleOwnerTime): string[] {
+  if (time.hours === undefined || time.plannableHours === undefined) return [];
+  const problems = time.missing.map((id) => `owner-actions.json: ${id} needs estimatedMinutes, how long it takes the owner: their time for this module is set (get_owner_time)`);
   if (problems.length > 0) return problems;
-  const available = availableHours(time, candidate.module);
-  const planned = round(candidate.plannedMinutes / 60);
-  // A design that asks nothing of the owner always fits, even once others took more than what is plannable.
-  if (planned > 0 && planned > available) {
+  const planned = round(time.plannedMinutes / 60);
+  const dropped = round(time.droppedMinutes / 60);
+  // A design that asks nothing more of the owner always fits.
+  if (planned > 0 && round(planned + dropped) > time.plannableHours) {
     problems.push(
-      `the design takes ${planned} h of the owner's time in owner actions, but ${available} h are available: ` +
-      `${time.hours} h for the project, minus the ${time.reservePercent}% reserve and what other modules committed. ` +
+      `the design takes ${planned} h of the owner's time in owner actions${dropped > 0 ? `, after ${dropped} h of actions already done that it drops` : ''}, but this module may plan ${time.plannableHours} h: ` +
+      `${time.hours} h set by the owner, minus the ${time.reservePercent}% reserve. ` +
       'Cut or shorten the owner actions: decide what you can, and ask only for what only the owner can do.',
     );
   }
@@ -100,15 +83,16 @@ export function ownerTimeProblems(time: OwnerTime | undefined, candidate: Module
 }
 
 /** What `get_owner_time` tells the Architect. */
-export function describeOwnerTime(time: OwnerTime | undefined, module: string): string {
-  if (!time) return "The owner hasn't set a time budget: estimatedMinutes on owner actions is welcome, not required.";
-  const mine = time.modules.find((m) => m.module === module);
-  const others = round(time.committedHours - (mine?.committed ? mine.plannedMinutes / 60 : 0));
+export function describeOwnerTime(time: ModuleOwnerTime): string {
+  if (time.hours === undefined || time.plannableHours === undefined) {
+    return `The owner set no hours for ${time.module}: estimatedMinutes on owner actions is welcome, not required.`;
+  }
+  const dropped = round(time.droppedMinutes / 60);
   return [
-    `The owner set ${time.hours} h for the whole project. A ${time.reservePercent}% reserve (${round(time.hours - time.plannableHours)} h) stays out of designs, for escalations, questions and merges.`,
-    `Other modules committed ${others} h. Available to ${module}: ${availableHours(time, module)} h.`,
-    'Only owner actions count: give every gate and task an estimatedMinutes, how long it takes the owner, and keep their sum within what is available, or submit_design refuses. What the owner reads, proposals and pull requests, doesn\'t count.',
-    `Used so far, project-wide: ${time.usedHours} h, the actions marked done.`,
+    `The owner set ${time.hours} h of their time for ${time.module}, this module alone: what other modules plan takes nothing from it. A ${time.reservePercent}% reserve (${round(time.hours - time.plannableHours)} h) stays out of the design, for escalations, questions and merges.`,
+    `Your design may plan ${round(time.plannableHours - dropped)} h in owner actions${dropped > 0 ? ` (${dropped} h went to actions done and since dropped)` : ''}; it plans ${round(time.plannedMinutes / 60)} h on main now.`,
+    'Only owner actions count: give every gate and task an estimatedMinutes, how long it takes the owner, and keep their sum within that, or submit_design refuses. What the owner reads, proposals and pull requests, doesn\'t count.',
+    `Used so far in this module: ${round(time.usedMinutes / 60)} h, the actions marked done.`,
   ].join('\n');
 }
 

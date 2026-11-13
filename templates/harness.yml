@@ -56,10 +56,14 @@ jobs:
           node base/.github/harness/harness-ci.ts verify --base base --head head
           --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" --author "$AUTHOR" --branch "$BRANCH" --title "$TITLE"
 
-  # Plans iac/ with the plan role (OIDC, pull requests only). The plan's JSON feeds the
-  # checks that assert on it. Without iac/, it does nothing and passes.
+  # Plans iac/ with the plan role (OIDC, pull requests only), once verify passed: the role
+  # never runs a pull request's Terraform that changes what it may not. The plan's JSON feeds
+  # the checks that assert on it. Without iac/, it does nothing and passes. It takes no state
+  # lock, as the harness's sandboxes don't: two plans, or a plan and main's apply, would
+  # collide on it, and a cancelled run could leave it taken.
   tf-plan:
     name: tf-plan
+    needs: [verify]
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -93,15 +97,16 @@ jobs:
           terraform fmt -check -recursive
           terraform init -input=false -backend-config=backend-configs/staging.hcl
           terraform validate
-          terraform plan -input=false -no-color -var-file=env/staging.tfvars -out=plan.bin | tee plan.txt
+          terraform plan -input=false -no-color -lock=false -var-file=env/staging.tfvars -out=plan.bin | tee plan.txt
           terraform show -json plan.bin > plan.json
           { echo '### Terraform plan'; echo '```'; tail -c 60000 plan.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      # The plan holds the state's values: kept for the checks of this run, and no longer.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: steps.iac.outputs.present == 'true'
         with:
           name: tfplan
           path: iac/plan.json
-          retention-days: 7
+          retention-days: 1
 
   # Estimates the monthly cost a pull request adds to iac/, with Infracost, for Swarm's merge
   # policy (razzou-harness v3 §5.3): an INFRA or MIXED_INFRA_AND_CODE plan merges itself only under the
@@ -167,16 +172,24 @@ jobs:
           path: cost.json
           retention-days: 7
 
-  # Runs init.sh, the project's checks and those of every accepted feature. No secrets.
+  # Runs init.sh, the project's checks and those of every accepted feature. No secrets. It
+  # always starts, and fails when tf-plan did: a skipped job would count as passed where
+  # checks is required and tf-plan isn't. A skipped tf-plan, on a push or after a failed
+  # verify, leaves the checks to run without a plan.
   checks:
     name: checks
     needs: [tf-plan]
-    if: ${{ !cancelled() && (needs.tf-plan.result == 'success' || needs.tf-plan.result == 'skipped') }}
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
       contents: read
     steps:
+      - name: The Terraform plan passed
+        if: needs.tf-plan.result == 'failure'
+        run: |
+          echo "::error::tf-plan failed, so the checks that assert on its plan can't run"
+          exit 1
       - name: Check out the code under test
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -245,4 +258,4 @@ jobs:
         working-directory: iac
         run: |
           terraform init -input=false -backend-config=backend-configs/staging.hcl
-          terraform apply -input=false -auto-approve -no-color -var-file=env/staging.tfvars
+          terraform apply -input=false -auto-approve -no-color -lock-timeout=10m -var-file=env/staging.tfvars

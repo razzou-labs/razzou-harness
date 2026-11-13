@@ -58,4 +58,25 @@ describe("the subscription's usage, as the agents report it", () => {
     assert.equal(usageFromEvent({ type: 'rate_limit_event', rate_limit_info: { status: 'allowed' } }), undefined);
     assert.equal(usageFromEvent(null), undefined);
   });
+  it('takes a window that refused a call as full, with or without its utilization', () => {
+    const soon = Math.floor(Date.now() / 1000) + 3600;
+    const usage = usageFromEvent({
+      type: 'rate_limit_event',
+      rate_limit_info: { unifiedWindows: { five_hour: { resetsAt: soon, status: 'rejected' }, seven_day: { utilization: 0.994, resetsAt: soon, status: 'rejected' } } },
+    })!;
+    assert.deepEqual(usage.limits.map((l) => [l.kind, l.percent, l.rejected]), [['session', 100, true], ['weekly_all', 99, true]]);
+    // The event's own window, named at its top, when it has no unifiedWindows.
+    const top = usageFromEvent({ type: 'rate_limit_event', rate_limit_info: { status: 'rejected', rateLimitType: 'seven_day', resetsAt: soon } })!;
+    assert.deepEqual(top.limits.map((l) => [l.kind, l.percent, l.rejected]), [['weekly_all', 100, true]]);
+  });
+
+  it('takes nothing that a real report could not hold: a stream is a file its sandbox writes', () => {
+    const soon = Math.floor(Date.now() / 1000) + 3600;
+    const window = (w: object) => usageFromEvent({ type: 'rate_limit_event', rate_limit_info: { unifiedWindows: { five_hour: w } } });
+    assert.equal(window({ utilization: 58.5, resetsAt: soon }), undefined, 'a percentage where a fraction belongs');
+    assert.equal(window({ utilization: 0.5, resetsAt: 9_999_999_999 }), undefined, 'a reset centuries away');
+    assert.equal(window({ utilization: 0.5, resetsAt: soon * 1000 }), undefined, 'milliseconds where seconds belong');
+    assert.equal(window({ utilization: '0.5', resetsAt: soon }), undefined);
+    assert.equal(window({ utilization: -1, resetsAt: soon }), undefined);
+  });
 });

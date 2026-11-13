@@ -64,11 +64,18 @@ export function bundleNames(names: readonly string[]): string[] {
   return names.includes(ALL_BUNDLES) ? Object.keys(BUNDLES) : [...names];
 }
 
-/** Throws on a host OpenShell would reject, so a bad entry fails at load time rather than at sandbox creation. */
+const LABEL = '[a-z0-9]([a-z0-9-]*[a-z0-9])?';
+
+/**
+ * A host a rule may name: lowercase labels, `*.` or `**.` as the first label only, then at
+ * least two literal labels, the last with a letter first, as every top-level domain has.
+ * So no address, no port, and no wildcard as wide as `*.com` or `**.*.*`.
+ */
+export const HOST_PATTERN = new RegExp(`^(\\*\\*?\\.)?${LABEL}(\\.${LABEL})*\\.[a-z]([a-z0-9-]*[a-z0-9])?$`);
+
+/** Throws on a host outside HOST_PATTERN. The design's schema checks `network.extraHosts` the same way, when it is read. */
 export function checkHost(host: string): void {
-  const labels = host.split('.');
-  const wildcard = host.includes('*');
-  if (labels.some((label) => label === '')) throw new Error(`host ${host}: empty label`);
-  if (wildcard && labels.length < 3) throw new Error(`host ${host}: a wildcard needs at least three labels`);
-  if (labels.slice(1).some((label) => label.includes('**'))) throw new Error(`host ${host}: ** may only be the whole first label`);
+  if (!HOST_PATTERN.test(host)) {
+    throw new Error(`host ${host}: not a host name like docs.example.com or **.example.com (a wildcard only as the first label, then two others; no address, no port)`);
+  }
 }

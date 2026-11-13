@@ -2,21 +2,21 @@ import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { claudeCode, mcpConfig, readResult, reportJsonSchema, type AgentAdapter, type AgentRun } from '../agents/claude-code.ts';
-import { usageFromEvent, windowName, type SubscriptionUsage, type UsageLimit } from '../anthropic/usage.ts';
-import { allPassed, initEnvironment, runChecks, type CheckResult, type RunOptions } from '../checks/runner.ts';
-import { protectedChanges } from '../ci/harness-ci.ts';
-import { ownerTime, type OwnerTime } from '../design/owner-time.ts';
+import { claudeCode, mcpConfig, readResult, reportJsonSchema, sessionTrouble, type AgentAdapter, type AgentRun } from '../agents/claude-code.ts';
+import { LONGEST_WINDOW_MS, usageFromEvent, windowName, type SubscriptionUsage, type UsageLimit } from '../anthropic/usage.ts';
+import { allPassed, initEnvironment, runChecks, runGuarded, type CheckResult, type RunOptions } from '../checks/runner.ts';
+import { lockfileProblems, protectedChanges, protectionRules } from '../ci/harness-ci.ts';
+import { moduleOwnerTime, type ModuleOwnerTime } from '../design/owner-time.ts';
 import {
   checksHash, definitionHash, featureDependency, KIND_TAGS, loadDesign, planDependencies, planKind, requiredChecks, REVIEWER_ROLES, statusContext,
-  type Check, type Config, type Design, type Feature, type ModuleDesign, type Plan, type ReviewerRole,
+  type Check, type Config, type Design, type Feature, type ModuleDesign, type Plan, type PlanKind, type ReviewerRole,
 } from '../design/schemas.ts';
 import { DEVELOPER, HARNESS, Repo } from '../git/repo.ts';
 import { GitHubClient, loadAppCredentials } from '../github/app.ts';
 import { GitHubForge, LocalForge, type CheckRun, type Forge, type PullRequest } from '../github/forge.ts';
 import { applyModeRules, rulesProblems } from '../github/setup.ts';
 import { toolsManifest, type Role } from '../roles.ts';
-import { PROJECT_LABEL, type ExecResult, type Follower, type SandboxDriver, type SandboxSpec } from '../sandbox/driver.ts';
+import { CHECKOUT_LABEL, PROJECT_LABEL, type ExecResult, type Follower, type SandboxDriver, type SandboxSpec } from '../sandbox/driver.ts';
 import { BUNDLES } from '../sandbox/allowlist.ts';
 import { apiProviderName, buildPolicy } from '../sandbox/policy.ts';
 import { Denials, LOG_LINES } from '../sandbox/refusals.ts';
@@ -26,17 +26,17 @@ import {
   activeAttempts, apply, countedAttempts, featureKey, interruptions, isActive, managerKey, managersOf, planKey, planMerged, project, writeSnapshot,
   type Attempt, type FeatureState, type FixMerge, type InfraMerge, type ManagerState, type Mode, type PlanState, type ReviewScope, type ReviewState, type State,
 } from '../state/state.ts';
-import { clip, machineSize, sh, sleep } from '../util.ts';
+import { clip, machineSize, noMentions, sh, sleep } from '../util.ts';
 import { Architects } from './architects.ts';
 import { AgentChannel, type AgentRequest } from './channel.ts';
-import { architectRef } from './design.ts';
+import { architectRef, isBuilt } from './design.ts';
 import { parseCostEstimate } from '../review/cost-estimate.ts';
 import { activeReview, pollRunningReviews, reviewStep, stepReview } from './review.ts';
 import { Managers } from './manager.ts';
 import { needsNow, orderManager, orderRequest } from './order.ts';
 import { sweepLeftOvers } from './sandboxes.ts';
 import { readTokens } from './tokens.ts';
-import { attemptRefName, preMerge, probeScript, refOf, sandboxName, waitForFile } from './refs.ts';
+import { attemptRefName, BUNDLE_BYTES, checkoutId, preMerge, probeScript, projectKey, refOf, sandboxName, waitForFile } from './refs.ts';
 import { handleRequest, type AgentIdentity, type Reply } from './requests.ts';
 import { buildTask } from './task.ts';
 import { webRead, type WebReadResult } from './web-read.ts';
@@ -81,6 +81,14 @@ const RESET_MARGIN_MS = 60_000;
 
 /** How long an order request waits for its answer before the owner can ask the same again: a Manager's turn takes about a minute. */
 const ORDER_WAIT_MS = 5 * 60_000;
+
+/**
+ * What the daemon reads whole of a text file an agent's sandbox wrote. A stream has no
+ * limit of its own and is read into memory here: past this, its end alone is taken,
+ * which holds the result, its last line.
+ */
+const AGENT_FILE_BYTES = 64 * 1024 * 1024;
+
 
 /** Where the Swarm setup stands, for the dashboard's note (v4 §6): read through the App, at most every five minutes. */
 export interface SetupStatus {
@@ -127,15 +135,29 @@ export class Orchestrator {
   private setup?: { at: number; mode: Mode; status: SetupStatus };
 
   private ticking?: Promise<void>;
+  /**
+   * The long steps under way, each by what it works on: an attempt's sandbox being made,
+   * its checks, its landing, a plan's check run, an owner action's check. They run beside
+   * the pass, which would otherwise stand still for minutes at each: no item would reach
+   * the Manager, no question be answered, no pull request be followed. Nothing else steps
+   * an attempt or a plan while its work runs.
+   */
+  private readonly work = new Map<string, Promise<void>>();
+  /** What must happen one at a time, by what it is about: the landings on a plan's branch, the use of a sandbox's name. */
+  private readonly turns = new Map<string, Promise<unknown>>();
+  /** Errors in a row of each attempt's step, by attempt and status. */
+  private readonly attemptErrors = new Map<string, number>();
   /** When each open PR may be polled again. */
   private readonly nextPoll = new Map<string, number>();
   private again = false;
   private stopping = false;
-  private stepErrors = { key: '', count: 0 };
+  private idleErrors = 0;
   /** When the left-over sandboxes are next deleted: at the first pass, then every hour. */
   private nextSweep = 0;
   /** When each long-lived agent's tokens were last read, by agent. */
   private readonly tokensReadAt = new Map<string, number>();
+  /** Whether the gateway answered when last asked (`gatewayDown`). */
+  private gatewayAsked = { at: -Infinity, down: false };
   /** The gateway's providers, read at most once a minute, for the keys of the project's APIs. */
   private providerNames?: { at: number; names: string[] };
   /** Errors in a row of each plan's step, and when it is tried again: one plan that keeps failing never stops the others. */
@@ -161,8 +183,10 @@ export class Orchestrator {
     this.store = new EventStore(join(options.harnessDir, 'events.jsonl'), this.now);
     this.usage = savedUsage(options.harnessDir);
     // The agents' streams carry the usage: each model call reports it (usage.ts). A replayed line's report is old.
-    this.events.on('transcript', ({ line, replay }: { line: string; replay?: boolean }) => {
-      if (!replay) this.noteUsage(line);
+    this.events.on('transcript', ({ agent, line, replay }: { agent: string; line: string; replay?: boolean }) => {
+      if (replay) return;
+      this.noteUsage(line);
+      if (agent.startsWith('manager:')) this.noteManagerTurn(agent.slice('manager:'.length), line);
     });
     this.state = project(this.store.readAll());
     this.managers = new Managers(this);
@@ -206,16 +230,20 @@ export class Orchestrator {
   }
 
   /**
-   * What `harness setup`, `harness budget` or `harness mode` left for the daemon while it
-   * was down (v4 §5), taken once: the owner's hours, which setup only offers, so they don't
-   * replace hours already set while budget's do, and the mode.
+   * What `harness budget` or `harness mode` left for the daemon while it was down (v4 §5),
+   * taken once: the hours of the owner's time for a module, by module, and the mode.
    */
   private takePendingSetup(): void {
     const file = join(this.options.harnessDir, 'setup.json');
     if (!existsSync(file)) return;
     try {
-      const { ownerHours, ownerHoursFrom, mode } = JSON.parse(readFileSync(file, 'utf8')) as { ownerHours?: unknown; ownerHoursFrom?: unknown; mode?: unknown };
-      if (typeof ownerHours === 'number' && ownerHours > 0 && (ownerHoursFrom === 'budget' || this.state.budgets.ownerHours === undefined)) this.setBudgets({ ownerHours });
+      const { ownerHours, mode } = JSON.parse(readFileSync(file, 'utf8')) as { ownerHours?: unknown; mode?: unknown };
+      if (ownerHours !== null && typeof ownerHours === 'object') {
+        for (const [module, hours] of Object.entries(ownerHours as Record<string, unknown>)) {
+          const problem = typeof hours === 'number' || hours === null ? this.setOwnerHours(module, hours) : 'a number of hours, or null';
+          if (problem) this.log(`setup.json: the hours of ${module} were not set: ${problem}`);
+        }
+      }
       if (mode === 'manual' || mode === 'swarm') this.setMode(mode);
     } catch (error) {
       this.log(`setup.json: ${(error as Error).message}`);
@@ -263,8 +291,58 @@ export class Orchestrator {
     this.stopFollowingReview();
     this.managers.detach();
     this.architects.detach();
-    if (this.ticking) await Promise.race([this.ticking, sleep(graceMs)]);
+    await Promise.race([this.settled(), sleep(graceMs)]);
     this.record({ type: 'DAEMON_STOPPED', payload: {} });
+  }
+
+  /** Resolves once no pass and no long step is under way: what the tests wait for before they look, or move the clock. */
+  async settled(): Promise<void> {
+    while (this.ticking || this.work.size > 0) await Promise.allSettled([this.ticking, ...this.work.values()]);
+  }
+
+  /**
+   * Starts a long step beside the pass, unless the one with this key still runs, and looks
+   * again when it ends. An error goes to `failed`, as one of a step of the pass would.
+   */
+  private beside(key: string, step: () => Promise<unknown>, failed: (error: Error) => Promise<unknown> | unknown): Step {
+    if (this.work.has(key)) return 'wait';
+    const run = step()
+      .then(() => undefined, async (error: Error) => {
+        if (!this.stopping) await failed(error);
+      })
+      .catch((error: Error) => this.log(`${key}: ${error.message}`))
+      .finally(() => {
+        this.work.delete(key);
+        if (!this.stopping) this.kick();
+      });
+    this.work.set(key, run);
+    return 'wait';
+  }
+
+  /** This checkout of the project, as its sandboxes are labelled. */
+  get checkout(): string {
+    return checkoutId(this.options.projectDir);
+  }
+
+  /** The project as its sandboxes and API providers are named: its name with this checkout (`projectKey`). */
+  get projectKey(): string {
+    return projectKey(this.options.projectDir, this.design.config.project.name);
+  }
+
+  /** A long step of another part of the daemon, such as an Architect's design being checked: beside the pass, its failure logged. */
+  runBeside(key: string, step: () => Promise<unknown>): void {
+    this.beside(key, step, (error) => this.log(`${key}: ${error.message}`));
+  }
+
+  /** Runs `step` once every earlier one with this key has ended: one at a time, in the order asked. */
+  private inTurn<T>(key: string, step: () => Promise<T>): Promise<T> {
+    const turn = (this.turns.get(key) ?? Promise.resolve()).then(step, step);
+    const settled = turn.catch(() => undefined);
+    this.turns.set(key, settled);
+    void settled.then(() => {
+      if (this.turns.get(key) === settled) this.turns.delete(key);
+    });
+    return turn;
   }
 
   /** One pass of the loop. If a pass is running, it runs once more when it ends. */
@@ -297,7 +375,7 @@ export class Orchestrator {
       }
       if (!this.stopping) await this.managers.sync();
       if (!this.stopping) await this.architects.sync();
-      if (!this.stopping) await this.verifyActions().catch((error: Error) => this.log(`owner action: ${error.message}`));
+      if (!this.stopping) this.verifyActions();
       if (!this.stopping && this.now() >= this.nextSweep) {
         this.nextSweep = this.now() + SWEEP_EVERY_MS;
         await sweepLeftOvers(this).catch((error: Error) => this.log(`left-over sandboxes: ${error.message}`));
@@ -331,8 +409,22 @@ export class Orchestrator {
    * is still so. The owner sees why under Needs you, and has nothing to lift: what a
    * resume of theirs sets off, such as fresh turns for the Managers, doesn't happen.
    */
-  private lookAgainLater(reason: string): void {
+  lookAgainLater(reason: string): void {
     this.pausePipeline(reason, new Date(this.now() + LOOK_AGAIN_MS).toISOString(), true);
+  }
+
+  /**
+   * Whether the OpenShell gateway doesn't answer, asked at most every ten seconds. What
+   * fails meanwhile says nothing of a sandbox or of its agent, which go on without the
+   * gateway: nothing is interrupted, deleted or counted, and the pipeline waits to look again.
+   */
+  async gatewayDown(): Promise<boolean> {
+    if (this.now() - this.gatewayAsked.at >= 10_000) {
+      const gateway = await this.driver.gateway().catch(() => ({ status: 'unreachable' }));
+      this.gatewayAsked = { at: this.now(), down: gateway.status === 'unreachable' };
+    }
+    if (this.gatewayAsked.down) this.lookAgainLater("the OpenShell gateway doesn't answer: the sandboxes are left as they are, and the daemon looks again by itself (`harness doctor` says more)");
+    return this.gatewayAsked.down;
   }
 
   /** The owner lifts a pause. An API key stored meanwhile counts at once. */
@@ -340,6 +432,17 @@ export class Orchestrator {
     if (!this.state.pipeline.paused) return false;
     this.providerNames = undefined;
     this.record({ type: 'PIPELINE_RESUMED', payload: {} });
+    this.kick();
+    return true;
+  }
+
+  /**
+   * The owner's "Look again now" on a pause that only waits to look again: lifted as the
+   * daemon lifts it at its end, so none of what a resume sets off happens.
+   */
+  lookAgain(): boolean {
+    if (!this.state.pipeline.paused?.retry) return false;
+    this.record({ type: 'PIPELINE_RESUMED', payload: { auto: true } });
     this.kick();
     return true;
   }
@@ -418,11 +521,15 @@ export class Orchestrator {
     return undefined;
   }
 
-  /** The owner sets their hours for the whole project (v3 §4); null clears them. */
-  setBudgets(budgets: { ownerHours?: number | null | undefined }): boolean {
-    if (budgets.ownerHours === undefined || budgets.ownerHours === (this.state.budgets.ownerHours ?? null)) return false;
-    this.record({ type: 'OWNER_HOURS_SET', payload: { hours: budgets.ownerHours } });
-    return true;
+  /**
+   * The owner sets the hours of their time that one module may take, or clears them with
+   * null: a module's own hours, which its design must fit. Returns why not, if not.
+   */
+  setOwnerHours(module: string, hours: number | null): string | undefined {
+    if (!Object.hasOwn(this.state.modules, module) && !this.design.modules.some((m) => m.id === module)) return `there is no module named ${module}`;
+    if (hours !== null && !(Number.isFinite(hours) && hours > 0 && hours <= 10_000)) return 'a positive number of hours';
+    if (hours !== (this.state.ownerHours[module]?.hours ?? null)) this.record({ type: 'OWNER_HOURS_SET', from: 'owner', payload: { module, hours } });
+    return undefined;
   }
 
   /**
@@ -441,7 +548,7 @@ export class Orchestrator {
 
   /** The owner grants one more attempt to an escalated feature (`module/plan/feature`). */
   retry(key: string, note?: string): boolean {
-    const feature = this.state.features[key];
+    const feature = Object.hasOwn(this.state.features, key) ? this.state.features[key] : undefined;
     if (feature?.status !== 'escalated') return false;
     this.record({ type: 'OWNER_RETRY', ref: { module: feature.module, plan: feature.plan, feature: feature.feature }, payload: note ? { note } : {} });
     this.kick();
@@ -450,7 +557,7 @@ export class Orchestrator {
 
   /** The owner writes to a Manager: the one named by its key, or else those of the module being built. */
   messageManager(text: string, manager?: string): boolean {
-    const named = manager ? this.state.managers[manager] : undefined;
+    const named = manager && Object.hasOwn(this.state.managers, manager) ? this.state.managers[manager] : undefined;
     const module = manager ? named?.module : this.currentModule();
     const targets: ManagerState[] = manager ? (named && named.status !== 'stopped' ? [named] : []) : module ? managersOf(this.state, module) : [];
     if (!module || targets.length === 0 || text.trim() === '') return false;
@@ -459,15 +566,22 @@ export class Orchestrator {
     return true;
   }
 
-  /** The owner starts a module: its Architect's sandbox and conversation (§7.1). Returns why not, if not. */
-  createModule(id: string, title: string): string | undefined {
+  /**
+   * The owner starts a module: its Architect's sandbox and conversation (§7.1), with the
+   * hours of their time it may take, if they give any. Returns why not, if not.
+   */
+  createModule(id: string, title: string, ownerHours?: number): string | undefined {
     if (!/^[A-Za-z0-9][A-Za-z0-9-]{0,39}$/.test(id)) return 'a module id uses letters, digits and dashes (at most 40)';
-    if (this.state.modules[id] || this.design.modules.some((m) => m.id === id)) return `a module named ${id} already exists`;
+    if (Object.hasOwn(this.state.modules, id) || this.design.modules.some((m) => m.id === id)) return `a module named ${id} already exists`;
+    if (ownerHours !== undefined && !(Number.isFinite(ownerHours) && ownerHours > 0 && ownerHours <= 10_000)) return 'a positive number of hours';
+    // A design lands through an Arch PR: without a repository on GitHub, the Architect could never submit one.
+    if (this.forge.kind !== 'github') return 'this project has no GitHub repository (project.repo), and an Architect\'s design lands through a pull request: run `harness setup` first';
     this.record({
       type: 'MODULE_CREATED',
       from: 'owner',
-      payload: { module: id, title: title.trim() || id, sandbox: sandboxName('arc', this.design.config.project.name, id), sessionId: randomUUID() },
+      payload: { module: id, title: title.trim() || id, sandbox: sandboxName('arc', this.projectKey, id), sessionId: randomUUID() },
     });
+    if (ownerHours !== undefined) this.record({ type: 'OWNER_HOURS_SET', from: 'owner', payload: { module: id, hours: ownerHours } });
     this.kick();
     return undefined;
   }
@@ -501,29 +615,34 @@ export class Orchestrator {
       .map((a) => a.id);
   }
 
-  private async verifyActions(): Promise<void> {
+  /** The checks of the owner actions the owner says are done, each beside the pass. */
+  private verifyActions(): void {
     for (const [key, action] of Object.entries(this.state.actions)) {
       if (action.status !== 'verifying') continue;
       const [module, id] = key.split('/') as [string, string];
       const definition = this.design.modules.find((m) => m.id === module)?.actions.find((a) => a.id === id);
       if (!definition) continue;
-      const results = definition.verify
-        ? await this.runChecksIn(sandboxName('chk', this.design.config.project.name, key, 'act'), 'refs/heads/main', this.moduleDir(module), [
-          { id: `${id}-verify`, run: definition.verify.run, phase: 'pre-merge', timeoutSec: definition.verify.timeoutSec, needs: definition.verify.needs },
-        ])
-        : [];
-      const failed = results.find((r) => r.exit !== 0);
-      if (failed) {
-        this.record({ type: 'OWNER_ACTION_REFUSED', payload: { module, action: id, reason: `its check failed: ${clip(failed.output.trim(), 800)}` } });
-      } else {
-        this.record({ type: 'OWNER_ACTION_DONE', payload: { module, action: id, title: definition.title, gate: definition.kind === 'gate', ...minutesOf(definition) } });
-      }
+      this.beside(`action:${key}`, async () => {
+        const results = definition.verify
+          ? await this.runChecksIn(sandboxName('chk', this.projectKey, key, 'act'), 'refs/heads/main', this.moduleDir(module), [
+            { id: `${id}-verify`, run: definition.verify.run, phase: 'pre-merge', timeoutSec: definition.verify.timeoutSec, needs: definition.verify.needs },
+          ])
+          : [];
+        if (this.state.actions[key]?.status !== 'verifying') return;
+        const failed = results.find((r) => r.exit !== 0);
+        if (failed) {
+          this.record({ type: 'OWNER_ACTION_REFUSED', payload: { module, action: id, reason: `its check failed: ${clip(failed.output.trim(), 800)}` } });
+        } else {
+          this.record({ type: 'OWNER_ACTION_DONE', payload: { module, action: id, title: definition.title, gate: definition.kind === 'gate', ...minutesOf(definition) } });
+        }
+      }, (error) => this.log(`owner action ${key}: ${error.message}`));
     }
   }
 
   /** The owner answers a Manager's `ask_owner`. */
   answerOwnerRequest(requestId: string, answer: string): boolean {
-    const request = this.state.ownerRequests[requestId];
+    // An id comes from the owner's side, a page or a command line: only a request the state really holds is answered.
+    const request = Object.hasOwn(this.state.ownerRequests, requestId) ? this.state.ownerRequests[requestId] : undefined;
     if (!request || request.answer !== undefined || answer.trim() === '') return false;
     this.record({ type: 'OWNER_ANSWER', from: 'owner', to: 'manager', payload: { module: request.module, requestId, answer: answer.trim() } });
     this.kick();
@@ -577,6 +696,11 @@ export class Orchestrator {
     // Paused, the reviewers already running are followed to their end too, as attempts are; none starts.
     if (paused) return (await pollRunningReviews(this)) ? 'progress' : 'wait';
     if (await this.apiKeysMissing()) return 'wait';
+    const added = this.addedToBuiltPlan();
+    if (added) {
+      this.pausePipeline(`${added} is in a plan that is already built, where nothing more is built: it would never be built. Move it to a new plan on main, then resume`);
+      return 'wait';
+    }
     // Manual builds one feature at a time, and looks at nothing else while it runs. Swarm starts
     // more while others run, up to its limit, and follows its other plans meanwhile (v3 §6.2).
     const swarm = this.state.mode === 'swarm';
@@ -602,28 +726,58 @@ export class Orchestrator {
         return false;
       }
     }
-    const project = this.design.config.project.name;
-    const missing = keyed.filter((api) => !this.providerNames!.names.includes(apiProviderName(project, api.host)));
+    const missing = keyed.filter((api) => !this.providerNames!.names.includes(apiProviderName(this.projectKey, api.host)));
     if (missing.length === 0) return false;
     this.pausePipeline(`no key stored on this machine for ${missing.map((api) => api.host).join(', ')}: run \`harness doctor\` in a terminal, which asks for it, then resume`);
     return true;
   }
 
+  /**
+   * A feature that main's design has in a plan past its build, and that was never built
+   * there. `submit_design` refuses one, so only a commit of the owner's own adds it; left
+   * alone, the module would count as complete without it.
+   */
+  private addedToBuiltPlan(): string | undefined {
+    for (const module of this.design.modules) {
+      for (const plan of module.plans) {
+        if (!isBuilt(this, module.id, plan.id)) continue;
+        const missing = plan.features.find((f) => this.state.features[`${module.id}/${plan.id}/${f.id}`]?.status !== 'accepted');
+        if (missing) return `${module.id}/${plan.id}/${missing.id}`;
+      }
+    }
+    return undefined;
+  }
+
   /** One attempt's next step. An error counts against this attempt alone, and interrupts it past the limit. */
   private async stepAttempt(feature: FeatureState, attempt: Attempt): Promise<Step> {
+    const key = attemptWork(feature, attempt);
+    if (this.work.has(key)) return 'wait';
+    const errors = `${key}:${attempt.status}`;
+    // A sandbox to make with its baseline, the checks, a landing that may check again: minutes each, beside the pass.
+    const beside = (step: () => Promise<Step>): Step =>
+      this.beside(key, async () => {
+        await step();
+        this.attemptErrors.delete(errors);
+      }, (error) => this.onAttemptError(feature, attempt, error));
     try {
+      let step: Step;
       switch (attempt.status) {
         case 'starting':
-          return await this.prepare(feature, attempt);
+          return beside(() => this.prepare(feature, attempt));
         case 'running':
-          return await this.poll(feature, attempt);
+          step = await this.poll(feature, attempt);
+          break;
         case 'collecting':
-          return await this.collect(feature, attempt);
+          step = await this.collect(feature, attempt);
+          break;
         case 'checking':
-          return await this.check(feature, attempt);
+          return beside(() => this.check(feature, attempt));
         default:
-          return await this.review(feature, attempt);
+          if (attempt.decision?.kind === 'accept') return beside(() => this.inTurn(`land:${planKey(feature)}`, () => this.review(feature, attempt)));
+          step = await this.review(feature, attempt);
       }
+      this.attemptErrors.delete(errors);
+      return step;
     } catch (error) {
       await this.onAttemptError(feature, attempt, error as Error);
       return 'wait';
@@ -651,7 +805,11 @@ export class Orchestrator {
     if (running >= limit) return 'wait';
     const module = this.design.modules.find((m) => m.id === current);
     if (!module) return 'wait';
-    const first = swarm ? undefined : module.plans.find((p) => this.state.plans[`${module.id}/${p.id}`]?.status !== 'completed');
+    // Manual builds one plan at a time: the one under way, whatever a design change put before it since, or else
+    // the first that isn't complete. Going by order alone, a plan added before the one being built stopped both.
+    const first = swarm
+      ? undefined
+      : module.plans.find((p) => inFlight.some((s) => s.plan === p.id)) ?? module.plans.find((p) => this.state.plans[`${module.id}/${p.id}`]?.status !== 'completed');
     const plans = first ? [first] : module.plans;
     for (const plan of plans) {
       const planState = this.state.plans[`${module.id}/${plan.id}`];
@@ -670,7 +828,9 @@ export class Orchestrator {
   /** A plan being built: main's changes reach its branch first (§6.3), then an attempt starts, or the full check run once every feature is accepted. */
   private async buildStep(module: ModuleDesign, plan: Plan, planState: PlanState, running: number, limit: number): Promise<Step> {
     const planRef = { module: module.id, plan: plan.id };
-    if (await this.mergeMain(planState)) return 'progress';
+    // The plan's check run under way: nothing new starts in it until it ended.
+    if (this.work.has(`plan:${planKey(planState)}`)) return 'wait';
+    if (await this.inTurn(`land:${planKey(planState)}`, () => this.mergeMain(planState))) return 'progress';
     // Main conflicts with the branch: what would start now would build without main, so the plan waits for its merge round.
     if (planState.mainConflict) return 'wait';
     // Accepted work fails its checks on the branch: what would start now would build on it, so the plan waits for its fix.
@@ -701,19 +861,26 @@ export class Orchestrator {
     if (errors && this.now() < errors.retryAt) return 'wait';
     try {
       const result = await step();
-      this.planErrors.delete(key);
+      // A step that only started work beside the pass has proved nothing yet: that work clears the count when it ends well.
+      if (!this.work.has(`plan:${key}`)) this.planErrors.delete(key);
       return result;
     } catch (error) {
-      const count = (errors?.count ?? 0) + 1;
-      const message = (error as Error).message;
-      this.log(`step of ${key} failed (${count}/${STEP_ERROR_LIMIT}): ${message}`);
-      if (count < STEP_ERROR_LIMIT) {
-        this.planErrors.set(key, { count, retryAt: this.now() + 30_000 });
-      } else {
-        this.planErrors.delete(key);
-        this.lookAgainLater(`${key} keeps failing: ${clip(message.replace(/\s+/g, ' '), 300)}`);
-      }
+      await this.planFailed(key, error as Error);
       return 'wait';
+    }
+  }
+
+  /** One more error in a row of a plan's step: tried again in half a minute, and past the limit the pipeline waits to look again. */
+  private async planFailed(key: string, error: Error): Promise<void> {
+    const message = error.message;
+    if (await this.gatewayDown()) return this.log(`step of ${key} failed while the gateway doesn't answer: ${message}`);
+    const count = (this.planErrors.get(key)?.count ?? 0) + 1;
+    this.log(`step of ${key} failed (${count}/${STEP_ERROR_LIMIT}): ${message}`);
+    if (count < STEP_ERROR_LIMIT) {
+      this.planErrors.set(key, { count, retryAt: this.now() + 30_000 });
+    } else {
+      this.planErrors.delete(key);
+      this.lookAgainLater(`${key} keeps failing: ${clip(message.replace(/\s+/g, ' '), 300)}`);
     }
   }
 
@@ -782,6 +949,8 @@ export class Orchestrator {
   private async abortStale(): Promise<boolean> {
     const current = this.currentModule();
     for (const { feature, attempt } of activeAttempts(this.state)) {
+      // One whose long step runs is looked at once that ended.
+      if (this.work.has(attemptWork(feature, attempt))) continue;
       const reason = this.whyStop(feature, attempt, current);
       if (!reason) continue;
       if (attempt.status === 'running') await this.killAgent(attempt.sandbox).catch(() => {});
@@ -882,12 +1051,45 @@ export class Orchestrator {
    */
   usageLimitUntil(message = ''): string {
     const now = this.now();
+    // The message is the agent's own, from a file its sandbox writes: a time is taken only if a real window could give it.
+    const real = (at: number) => Number.isFinite(at) && at + RESET_MARGIN_MS > now && at <= now + LONGEST_WINDOW_MS;
     const epoch = /\|(\d{10})\b/.exec(message)?.[1];
-    const resets = [
-      ...(epoch ? [Number(epoch) * 1000] : []),
-      ...(this.usage?.usage.limits ?? []).filter((limit) => limit.percent >= 100).map((limit) => Date.parse(limit.resetsAt)),
-    ].filter((at) => Number.isFinite(at) && at + RESET_MARGIN_MS > now);
+    const open = (this.usage?.usage.limits ?? []).filter((limit) => real(Date.parse(limit.resetsAt)));
+    // A window that refused a call, or reads 99% and more, is full. With none, the limit that was just hit is the fullest window's, when that one is nearly full.
+    let full = open.filter((limit) => limit.rejected || limit.percent >= 99);
+    if (full.length === 0) {
+      const top = open.reduce<UsageLimit | undefined>((most, limit) => (!most || limit.percent > most.percent ? limit : most), undefined);
+      if (top && top.percent >= 90) full = [top];
+    }
+    const resets = [...(epoch ? [Number(epoch) * 1000] : []), ...full.map((limit) => Date.parse(limit.resetsAt))].filter(real);
     return new Date(resets.length > 0 ? Math.max(...resets) + RESET_MARGIN_MS : now + 3_600_000).toISOString();
+  }
+
+  /**
+   * The end of one of a Manager's turns, from its stream: nothing else reads them. A turn
+   * that ends on the subscription's limit pauses the pipeline until the reset, as an
+   * attempt's does, and what the Manager was sent is sent again once the pause lifts. One
+   * that ends on the model's API failing has it all sent again in ten minutes.
+   */
+  private noteManagerTurn(key: string, line: string): void {
+    if (!line.includes('"type":"result"')) return;
+    const manager = this.state.managers[key];
+    if (!manager || manager.status === 'stopped') return;
+    let result: { type?: unknown; is_error?: unknown; result?: unknown };
+    try {
+      result = JSON.parse(line) as typeof result;
+    } catch {
+      return;
+    }
+    if (result?.type !== 'result') return;
+    const trouble = sessionTrouble(result);
+    if (trouble === 'usage_limit') this.pausePipeline('usage limit reached', this.usageLimitUntil(String(result.result)));
+    else if (trouble === 'api_error') {
+      this.record({
+        type: 'MANAGER_TURN_FAILED',
+        payload: { module: manager.module, ...(manager.plan ? { plan: manager.plan } : {}), reason: clip(String(result.result).replace(/\s+/g, ' '), 300), until: new Date(this.now() + LOOK_AGAIN_MS).toISOString() },
+      });
+    }
   }
 
   /** An agent's stream line: a `rate_limit_event` is the subscription's usage as of now, which the pages and the next restart get. */
@@ -953,7 +1155,7 @@ export class Orchestrator {
       type: 'ATTEMPT_STARTING',
       ref,
       payload: {
-        sandbox: sandboxName('dev', this.design.config.project.name, featureKey(ref), `a${ref.attempt}`),
+        sandbox: sandboxName('dev', this.projectKey, featureKey(ref), `a${ref.attempt}`),
         base: this.state.plans[planKey(ref)]!.head,
         sessionId: randomUUID(),
         deadline: new Date(this.now() + minutes * 60_000).toISOString(),
@@ -985,7 +1187,8 @@ export class Orchestrator {
     // A merge round (v3 §6.6) merges main at the commit that conflicted: its sandbox gets main with the plan branch.
     const merge = mergeOf(state);
     await this.repo.bundle(merge ? [`refs/heads/${branch}`, 'refs/heads/main'] : `refs/heads/${branch}`, join(dir, 'plan.bundle'));
-    const previous = state.attempts.filter((a) => a.n < attempt.n && a.status === 'failed').at(-1);
+    // A failure of an earlier definition says nothing of this one: its checks may be gone, and its report misleads.
+    const previous = state.attempts.filter((a) => a.n < attempt.n && a.status === 'failed' && a.definitionHash === attempt.definitionHash).at(-1);
     const progress = (await this.repo.show(`refs/heads/${branch}`, 'progress.txt')) ?? '';
     const mustKeep = await this.regressionChecks(attempt.base, ref);
     writeFileSync(join(dir, 'task.md'), buildTask({
@@ -996,6 +1199,8 @@ export class Orchestrator {
       progressTail: progress.split('\n').slice(-21).join('\n'),
       ...(merge ? { merge } : {}),
       ...(state.fix ? { fix: state.fix.kind } : {}),
+      rebuilding: state.attempts.some((a) => a.status === 'accepted'),
+      protect: await protectionRules(this.repo.treeReader(attempt.base)),
     }));
     copyFileSync(join(this.options.packageDir, 'roles', 'developer.md'), join(dir, 'developer.md'));
     writeFileSync(join(dir, 'report.schema.json'), reportJsonSchema());
@@ -1046,11 +1251,19 @@ export class Orchestrator {
   private async poll(state: FeatureState, attempt: Attempt): Promise<Step> {
     const ref = refOf(state, attempt);
     const p = this.paths(attempt.sandbox);
-    if ((await this.driver.status(attempt.sandbox)) === 'missing') return this.interrupt(state, attempt, 'the sandbox disappeared');
+    const where = await this.driver.status(attempt.sandbox);
+    if (where === 'missing') return this.interrupt(state, attempt, 'the sandbox disappeared');
+    // What a reboot of the machine leaves: started again, its files are as they were, and the next look finds that the agent is gone.
+    if (where === 'stopped') {
+      await this.driver.start(attempt.sandbox);
+      return 'wait';
+    }
     this.followAttempt(ref, attempt.sandbox);
 
     const probe = await this.exec(attempt.sandbox, probeScript(p.exit, p.pid));
     const status = probe.stdout.trim();
+    // The probe always prints an answer: none means it never ran, which says nothing of the agent.
+    if (status === '') throw new Error(`${attempt.sandbox} could not be asked how its agent is doing: ${clip((probe.stderr || `exit code ${probe.code}`).trim(), 300)}`);
     if (status === 'running') {
       if (attempt.abort) {
         await this.killAgent(attempt.sandbox);
@@ -1068,9 +1281,8 @@ export class Orchestrator {
     if (status === 'gone') return this.interrupt(state, attempt, 'the agent stopped without finishing');
 
     const dir = this.attemptDir(ref);
-    const fetch = (from: string, to: string) => this.driver.download(attempt.sandbox, from, join(dir, to)).then(() => readFileSync(join(dir, to), 'utf8'), () => '');
-    const stream = await fetch(p.stream, 'stream.jsonl');
-    const stderr = await fetch(p.stderr, 'stderr.log');
+    const stream = await this.readAgentFile(attempt.sandbox, p.stream, join(dir, 'stream.jsonl'));
+    const stderr = await this.readAgentFile(attempt.sandbox, p.stderr, join(dir, 'stderr.log'));
     if (stream.trim() === '' && status !== '0') return this.agentDidNotStart(state, attempt, stderr);
     const result = readResult(stream, Number(status), stderr);
     this.record({
@@ -1092,19 +1304,37 @@ export class Orchestrator {
     this.stopFollowing(attempt.sandbox);
     await this.keepRefusals(state, attempt);
     const ref = refOf(state, attempt);
-    if (attempt.outcome === 'usage_limit') {
+    if (attempt.outcome === 'usage_limit' || attempt.outcome === 'api_error') {
       // Not the Developer's doing, but the sandbox writes the stream it is read from: like any
       // interruption, it counts from the third one of the same definition, so it can't buy attempts.
       const counts = interruptions(state, attempt.definitionHash) >= 2;
-      this.record({ type: 'ATTEMPT_INTERRUPTED', ref, payload: { reason: 'the subscription usage limit was reached', counts } });
-      this.pausePipeline('usage limit reached', this.usageLimitUntil(attempt.summary));
+      if (attempt.outcome === 'usage_limit') {
+        this.record({ type: 'ATTEMPT_INTERRUPTED', ref, payload: { reason: 'the subscription usage limit was reached', counts } });
+        this.pausePipeline('usage limit reached', this.usageLimitUntil(attempt.summary));
+      } else {
+        // The model's API failed, as when it is overloaded: nothing starts for ten minutes, then the daemon looks again by itself.
+        const said = clip((attempt.summary ?? '').replace(/\s+/g, ' '), 200);
+        this.record({ type: 'ATTEMPT_INTERRUPTED', ref, payload: { reason: `the model's API failed: ${said}`, counts } });
+        this.lookAgainLater(`the model's API failed during an attempt (${said}): attempts start again once it answers`);
+      }
       await this.driver.remove(attempt.sandbox);
       return 'progress';
     }
     // Even a failed attempt's commits are kept, for the Manager and the owner to look at.
     const head = await this.takeCommits(ref, attempt);
+    if (head === TOO_LARGE) {
+      return this.fail(state, attempt, `its commits are more than ${BUNDLE_BYTES / 1024 / 1024} MB, which is no source code: what is generated or downloaded belongs in .gitignore`);
+    }
     if (attempt.outcome !== 'done') return this.fail(state, attempt, outcomeReason(attempt));
-    if (!head) return this.fail(state, attempt, 'the Developer reported done but committed nothing');
+    if (!head) {
+      // A feature built before, which a design change redefined: its code may meet the new definition as it is. The
+      // branch then goes to the checks and to the Manager unchanged, and lands as a line of progress.txt.
+      if (!state.attempts.some((a) => a.status === 'accepted')) return this.fail(state, attempt, 'the Developer reported done but committed nothing');
+      await this.repo.setRef(attemptRefName(ref), attempt.base);
+      this.record({ type: 'CHECKS_STARTED', ref, payload: { head: attempt.base, files: [] } });
+      await this.driver.remove(attempt.sandbox);
+      return 'progress';
+    }
 
     const files = await this.repo.changedFiles(attempt.base, head);
     const merge = mergeOf(state);
@@ -1114,6 +1344,8 @@ export class Orchestrator {
     } else {
       const touched = await protectedChanges(this.repo.treeReader(attempt.base), this.repo.treeReader(head), files, { progress: 'frozen' });
       if (touched.length > 0) return this.fail(state, attempt, `changed protected files: ${touched.join(', ')}`);
+      const packages = await lockfileProblems(this.repo.treeReader(attempt.base), this.repo.treeReader(head));
+      if (packages.length > 0) return this.fail(state, attempt, `package-lock.json: ${packages.join('; ')}: a package from outside the npm registry comes through the design, which the owner reviews`);
     }
     this.record({ type: 'CHECKS_STARTED', ref, payload: { head, files } });
     await this.driver.remove(attempt.sandbox);
@@ -1161,7 +1393,7 @@ export class Orchestrator {
     const checkRef = merged ? `${attemptRefName(ref)}-rebased` : attemptRefName(ref);
     if (merged) await this.repo.setRef(checkRef, merged.commit);
     const results = await this.runChecksIn(
-      sandboxName('chk', this.design.config.project.name, featureKey(ref), suffix),
+      sandboxName('chk', this.projectKey, featureKey(ref), suffix),
       checkRef,
       this.attemptDir(ref),
       [...(await this.regressionChecks(checkRef, ref)), ...preMerge(feature.checks)],
@@ -1242,10 +1474,7 @@ export class Orchestrator {
     const ref = { module: plan.module, plan: plan.plan };
     const validation = plan.validation;
     // A failed run is run once more. Failed twice, the plan is back in its build (`acceptedWorkFails`): its Manager has it fixed.
-    if (!validation || validation.status !== 'passed') {
-      await this.runPlanChecks(plan);
-      return 'progress';
-    }
+    if (!validation || validation.status !== 'passed') return this.besidePlan(plan, () => this.runPlanChecks(plan));
     if (plan.summary === undefined) return 'wait';
     if (this.forge.kind === 'local') {
       this.record({ type: 'PLAN_COMPLETED', ref, payload: { head: plan.head } });
@@ -1258,7 +1487,7 @@ export class Orchestrator {
   private async runPlanChecks(plan: PlanState): Promise<void> {
     const ref = { module: plan.module, plan: plan.plan };
     const results = await this.runChecksIn(
-      sandboxName('chk', this.design.config.project.name, planKey(ref), 'plan'),
+      sandboxName('chk', this.projectKey, planKey(ref), 'plan'),
       `refs/heads/${plan.branch}`,
       this.planDir(ref),
       await this.regressionChecks(`refs/heads/${plan.branch}`),
@@ -1278,8 +1507,15 @@ export class Orchestrator {
     const validation = plan.validation;
     if (validation?.status !== 'failed') return undefined;
     if (validation.head === plan.head && (validation.runs ?? 0) >= 2) return 'wait';
-    await this.runPlanChecks(plan);
-    return 'progress';
+    return this.besidePlan(plan, () => this.runPlanChecks(plan));
+  }
+
+  /** A plan's check run, beside the pass: its errors count for the plan, as those of its steps do. */
+  private besidePlan(plan: PlanState, step: () => Promise<unknown>): Step {
+    return this.beside(`plan:${planKey(plan)}`, async () => {
+      await step();
+      this.planErrors.delete(planKey(plan));
+    }, (error) => this.planFailed(planKey(plan), error));
   }
 
   // ── The pull request (§11.3, §11.7) ──────────────────────────────────────────
@@ -1293,8 +1529,8 @@ export class Orchestrator {
       await this.forge.push(this.repo, plan.branch);
       this.record({ type: 'PLAN_PUSHED', ref, payload: { head: plan.head } });
     }
-    const pr = (await this.forge.findPullRequest(plan.branch))
-      ?? (await this.forge.openPullRequest({ branch: plan.branch, title: this.prTitle(plan), body: this.prBody(plan) }));
+    const pr = (await this.forge.findPullRequest(plan.branch, { head: plan.head }))
+      ?? (await this.forge.openPullRequest({ branch: plan.branch, title: noMentions(this.prTitle(plan)), body: noMentions(this.prBody(plan)) }));
     this.record({ type: 'PR_OPENED', ref, payload: pr });
     this.nextPoll.delete(planKey(plan));
     return 'progress';
@@ -1390,7 +1626,9 @@ export class Orchestrator {
    * Whether main still merges into an open pull request's branch, tried once per main
    * and head. A conflict is recorded, and 'wait' is the answer while the plan's Manager
    * has it; undefined when there is none. A main that merges again, after one that
-   * didn't, is merged in at once, so the pull request gets a head CI can run on.
+   * didn't, is merged in at once, so the pull request gets a head CI can run on. So is a
+   * main that only the daemon's rule can merge: every plan adds lines to progress.txt,
+   * which git alone can't merge, and GitHub runs no CI on a pull request it can't merge.
    */
   private async conflictWithMain(plan: PlanState): Promise<Step | undefined> {
     const key = planKey(plan);
@@ -1405,7 +1643,7 @@ export class Orchestrator {
       this.record({ type: 'PLAN_MAIN_CONFLICT', ref, payload: { main, files } });
       return 'progress';
     }
-    if (plan.mainConflict) {
+    if (plan.mainConflict || (await this.repo.conflicts(plan.head, main)).length > 0) {
       const merged = await this.mergeMainInto(plan.head, plan.branch);
       if (!('conflicts' in merged)) {
         this.record({ type: 'PLAN_MAIN_MERGED', ref, payload: { main, head: merged.commit } });
@@ -1425,8 +1663,7 @@ export class Orchestrator {
   private async mergeUnderPolicy(plan: PlanState, pr: PullRequest): Promise<boolean> {
     const ref = { module: plan.module, plan: plan.plan };
     const policy = this.design.config.swarm;
-    const definition = this.definitionOf(plan);
-    const kind = definition ? planKind(definition) : 'MIXED';
+    const kind = await this.policyKind(plan, pr.head);
     const leave = (reason: string): false => {
       if (plan.leftToOwner?.head !== pr.head || plan.leftToOwner.reason !== reason) {
         this.record({ type: 'PR_LEFT_TO_OWNER', ref, payload: { number: pr.number, head: pr.head, reason } });
@@ -1435,18 +1672,26 @@ export class Orchestrator {
     };
     if (kind === 'CODE' && policy.merge.code !== 'daemon') return leave('CODE plans are the owner\'s to merge (swarm.merge.code)');
     if (kind !== 'CODE') {
+      // What the pull request is, when its plan alone doesn't say: a CODE plan's Fix PR that changes the Terraform folder.
+      const what = this.planKindOf(plan) === kind ? `${kind === 'INFRA' ? 'an' : 'a'} ${KIND_TAGS[kind]} plan` : 'a pull request that changes the Terraform folder';
       const ceiling = policy.merge.infraMonthlyUsdCeiling;
       // Only an estimate of this very head counts: a fix round's head may add what the earlier one didn't.
       const estimate = plan.costEstimate?.head === pr.head ? plan.costEstimate : undefined;
+      // The cost job isn't a required check, and may still run once CI passed: its estimate is waited for, rather
+      // than a merge made, or a pull request left to the owner, for want of a number that is minutes away.
+      if (estimate === undefined) {
+        const cost = (await this.forge.checkRuns(pr.head)).filter((r) => r.name === 'cost').sort((a, b) => b.id - a.id)[0];
+        if (cost && cost.status !== 'completed') return false;
+      }
       if (ceiling !== null && estimate !== undefined && estimate.monthlyUsd > ceiling) {
         return leave(`the PR adds an estimated ${estimate.monthlyUsd} USD a month, over the ceiling of ${ceiling} (swarm.merge.infraMonthlyUsdCeiling)`);
       }
       // Without the owner's button (v3 D36), an estimate under the ceiling is the only way in.
       if (this.state.infraMerge !== 'daemon') {
         const button = "under Config, the Infra merges switch lets the daemon merge infra once CI and the reviewers pass";
-        if (ceiling === null) return leave(`${KIND_TAGS[kind]} plans are the owner's to merge (swarm.merge.infraMonthlyUsdCeiling is null); ${button}`);
+        if (ceiling === null) return leave(`${what} is the owner's to merge (swarm.merge.infraMonthlyUsdCeiling is null); ${button}`);
         if (estimate === undefined) {
-          return leave(`${kind === 'INFRA' ? 'an' : 'a'} ${KIND_TAGS[kind]} plan merges itself only with the cost job's estimate of the monthly cost it adds, and none was produced: the cost job needs iac/ and the INFRACOST_API_KEY secret; ${button}`);
+          return leave(`${what} merges itself only with the cost job's estimate of the monthly cost it adds, and none was produced: the cost job needs iac/ and the INFRACOST_API_KEY secret; ${button}`);
         }
       }
     }
@@ -1487,15 +1732,16 @@ export class Orchestrator {
    * Without an estimate the policy leaves the PR to the owner, with the reason.
    */
   private async readCostEstimate(plan: PlanState, pr: PullRequest): Promise<boolean> {
-    const definition = this.definitionOf(plan);
-    if (!definition || planKind(definition) === 'CODE' || plan.costEstimate?.head === pr.head) return false;
+    if (plan.costEstimate?.head === pr.head || (await this.policyKind(plan, pr.head)) === 'CODE') return false;
     if (!plan.ci || this.now() - Date.parse(plan.ci.since) > 20 * 60_000) return false;
     // The artifact counts only once the cost job itself succeeded: other jobs of the run execute the PR's code.
     const job = (await this.forge.checkRuns(pr.head)).filter((r) => r.name === 'cost').sort((a, b) => b.id - a.id)[0];
     if (job?.status !== 'completed' || job.conclusion !== 'success') return false;
+    // The job's own run, and an artifact made before the job ended: a later job of the run executes the PR's code, and could upload its own.
+    if (job.runId === undefined || !job.completedAt) return false;
     let text: string | undefined;
     try {
-      text = await this.forge.artifactFile(pr.head, 'cost', 'cost.json');
+      text = await this.forge.artifactFile(pr.head, 'cost', 'cost.json', { runId: job.runId, notAfter: job.completedAt });
     } catch (error) {
       this.log(`the cost estimate of ${pr.head.slice(0, 8)} could not be read: ${(error as Error).message}`);
       return false;
@@ -1514,16 +1760,43 @@ export class Orchestrator {
     return this.design.modules.find((m) => m.id === plan.module)?.plans.find((p) => p.id === plan.plan);
   }
 
+  /** A plan's kind as its design says it; MIXED for a plan the design no longer has, which is held to every rule. */
+  private planKindOf(plan: PlanState): PlanKind {
+    const definition = this.definitionOf(plan);
+    return definition ? planKind(definition) : 'MIXED';
+  }
+
+  /**
+   * A pull request's kind for the merge policy: its plan's, and never CODE once its head
+   * changes the Terraform folder. CI keeps a CODE plan's own pull request off that folder,
+   * but not its Fix PR, which may have to change it: what such a head adds is estimated
+   * and held to the ceiling like any infrastructure.
+   */
+  private async policyKind(plan: PlanState, head: string): Promise<PlanKind> {
+    const kind = this.planKindOf(plan);
+    const terraform = this.design.config.terraform;
+    if (kind !== 'CODE' || !terraform) return kind;
+    const cached = this.policyKinds.get(head);
+    if (cached) return cached;
+    const main = (await this.repo.revParse('refs/heads/main'))!;
+    const files = await this.repo.changedFiles(await this.repo.mergeBase(main, head), head);
+    const found: PlanKind = files.some((file) => file.startsWith(`${terraform.dir}/`)) ? 'MIXED' : 'CODE';
+    this.policyKinds.set(head, found);
+    return found;
+  }
+
+  /** What `policyKind` found for a head: a diff per pass would be read for nothing. */
+  private readonly policyKinds = new Map<string, PlanKind>();
+
   /** After a merge: CI applies the infrastructure it changed, then the plan's post-deploy checks run (§12.6). */
   private async afterMerge(plan: PlanState, commit: string | undefined): Promise<'deploying' | 'verifying' | 'completed'> {
     const terraform = this.design.config.terraform;
     // Main as it is now, for the rest of the pass: the plans that wait for this merge start from it.
     await this.forge.fetchMain(this.repo);
-    let deploys = false;
-    if (terraform && commit) {
-      const parent = await this.repo.revParse(`${commit}^1`);
-      deploys = parent !== undefined && (await this.repo.changedFiles(parent, commit)).some((file) => file.startsWith(`${terraform.dir}/`));
-    }
+    // CI applies main after every merge once the Terraform folder is there, whatever the merge changed: code that
+    // Terraform packages deploys with it, and a fix after a failed apply may lie outside the folder. So the apply
+    // is waited for each time, and the post-deploy checks never run before it ended.
+    const deploys = terraform !== undefined && commit !== undefined && commit !== '' && (await this.repo.listFiles(commit, terraform.dir)).length > 0;
     if (deploys) return 'deploying';
     return this.postDeployChecks(plan).length > 0 ? 'verifying' : 'completed';
   }
@@ -1549,8 +1822,17 @@ export class Orchestrator {
       return 'progress';
     }
     if (apply?.status === 'completed' && apply.conclusion !== 'cancelled') {
-      const log = await this.forge.jobLog(apply).catch(() => '');
-      this.record({ type: 'DEPLOY_FAILED', ref, payload: { commit, jobs: [{ name, conclusion: apply.conclusion ?? 'unknown', ...(apply.url ? { url: apply.url } : {}), log }] } });
+      const jobs: CiJob[] = [];
+      if (apply.conclusion === 'skipped') {
+        // The apply waits for main's checks: skipped, it never started, and what failed is what it waited for.
+        for (const run of (await this.forge.checkRuns(commit)).filter((r) => r.name !== name && r.status === 'completed' && !['success', 'skipped', 'cancelled'].includes(r.conclusion ?? ''))) {
+          jobs.push({ name: run.name, conclusion: run.conclusion ?? 'unknown', ...(run.url ? { url: run.url } : {}), log: await this.forge.jobLog(run).catch(() => '') });
+        }
+        jobs.push({ name, conclusion: 'skipped', ...(apply.url ? { url: apply.url } : {}) });
+      } else {
+        jobs.push({ name, conclusion: apply.conclusion ?? 'unknown', ...(apply.url ? { url: apply.url } : {}), log: await this.forge.jobLog(apply).catch(() => '') });
+      }
+      this.record({ type: 'DEPLOY_FAILED', ref, payload: { commit, jobs } });
       this.pauseIfOutOfDeployRounds(plan);
       return 'progress';
     }
@@ -1564,22 +1846,24 @@ export class Orchestrator {
   }
 
   /** The plan's post-deploy checks, on main, with the view-only role (§12.6). */
-  private async verifyDeploy(plan: PlanState): Promise<Step> {
+  private verifyDeploy(plan: PlanState): Step {
     const ref = { module: plan.module, plan: plan.plan };
-    const results = await this.runChecksIn(
-      sandboxName('chk', this.design.config.project.name, planKey(plan), 'post'),
-      'refs/heads/main',
-      this.planDir(ref),
-      this.postDeployChecks(plan),
-    );
-    if (allPassed(results)) {
-      this.record({ type: 'PLAN_VERIFIED', ref, payload: { results } });
-      return 'progress';
-    }
-    const definition = this.postDeployDefinition(plan);
-    this.record({ type: 'POST_DEPLOY_CHECKS_FAILED', ref, payload: { results, ...(definition ? { checks: checksHash(definition, 'post-deploy') } : {}) } });
-    this.pauseIfOutOfDeployRounds(plan);
-    return 'progress';
+    return this.besidePlan(plan, async () => {
+      const results = await this.runChecksIn(
+        sandboxName('chk', this.projectKey, planKey(plan), 'post'),
+        'refs/heads/main',
+        this.planDir(ref),
+        this.postDeployChecks(plan),
+      );
+      if (plan.status !== 'verifying') return;
+      if (allPassed(results)) {
+        this.record({ type: 'PLAN_VERIFIED', ref, payload: { results } });
+        return;
+      }
+      const definition = this.postDeployDefinition(plan);
+      this.record({ type: 'POST_DEPLOY_CHECKS_FAILED', ref, payload: { results, ...(definition ? { checks: checksHash(definition, 'post-deploy') } : {}) } });
+      this.pauseIfOutOfDeployRounds(plan);
+    });
   }
 
   private pauseIfOutOfDeployRounds(plan: PlanState): void {
@@ -1719,7 +2003,11 @@ export class Orchestrator {
   private async refusePush(plan: PlanState): Promise<Step | undefined> {
     const base = await this.repo.mergeBase('refs/heads/main', plan.head);
     const changed = await this.repo.changedFiles(base, plan.head);
-    const problems = await protectedChanges(this.repo.treeReader(base), this.repo.treeReader(plan.head), changed, { progress: 'append' });
+    // As CI's verify judges it: main's rules, and fields compared with where the branch started.
+    const problems = [
+      ...(await protectedChanges(this.repo.treeReader('refs/heads/main'), this.repo.treeReader(plan.head), changed, { progress: 'append', before: this.repo.treeReader(base) })),
+      ...(await lockfileProblems(this.repo.treeReader(base), this.repo.treeReader(plan.head))).map((p) => `package-lock.json: ${p}`),
+    ];
     if (problems.length === 0) return undefined;
     this.pausePipeline(`refusing to push ${plan.branch}: it changes protected files: ${problems.join(', ')}`);
     return 'wait';
@@ -1734,7 +2022,8 @@ export class Orchestrator {
       return `Fix: [${plan.fixAfter === 'verify' ? 'VERIFY_FAILED' : 'DEPLOY_FAILED'}] [${planKey(plan)}] round ${plan.deployFixRounds} after the deploy`;
     }
     const definition = this.definitionOf(plan);
-    return `Plan: [${KIND_TAGS[definition ? planKind(definition) : 'MIXED']}] [${planKey(plan)}] ${definition?.title ?? plan.plan}`;
+    // One line GitHub takes: a title that starts with a space fails CI's rule, and one too long is refused.
+    return `Plan: [${KIND_TAGS[definition ? planKind(definition) : 'MIXED']}] [${planKey(plan)}] ${clip((definition?.title ?? plan.plan).replace(/\s+/g, ' ').trim(), 150)}`;
   }
 
   private prBody(plan: PlanState): string {
@@ -1778,7 +2067,12 @@ export class Orchestrator {
   }
 
   /** Runs checks on a commit of the daemon's repository, in a fresh sandbox with no agent and no credentials. */
-  async runChecksIn(name: string, gitRef: string, dir: string, checks: Check[]): Promise<CheckResult[]> {
+  runChecksIn(name: string, gitRef: string, dir: string, checks: Check[]): Promise<CheckResult[]> {
+    // A plan's check sandbox has one name, and two runs of it may be asked for at once: by the plan, and by an attempt whose own checks failed.
+    return this.inTurn(`sandbox:${name}`, () => this.checksIn(name, gitRef, dir, checks));
+  }
+
+  private async checksIn(name: string, gitRef: string, dir: string, checks: Check[]): Promise<CheckResult[]> {
     const p = this.paths(name);
     // In use from before its creation to after its removal, so the dashboard never offers to delete it.
     this.checking.set(name, gitRef.replace(/^refs\/(heads\/)?/, ''));
@@ -1800,9 +2094,9 @@ export class Orchestrator {
           'git checkout --quiet candidate',
         ].join(' && '));
         if (fetch.code !== 0) throw new Error(`could not check out the candidate: ${fetch.stderr.trim()}`);
-        const init = await initEnvironment(this.driver, name, p.work);
-        if (init && init.exit !== 0) return [init];
-        return await runChecks(this.driver, name, p.work, checks, this.checkOptions(name));
+        // init.sh, then the checks, under the tripwire: what they run, such as a `prepare` script, may not rewrite
+        // a protected file of the checkout, a check among them, to make the run pass.
+        return await runGuarded(this.driver, name, p.work, checks, { ...this.checkOptions(name), guard: this.repo.treeReader(gitRef) });
       } finally {
         await this.driver.remove(name);
       }
@@ -1920,17 +2214,19 @@ export class Orchestrator {
 
   /** An error outside any attempt: logged, and the loop goes on. */
   private async onStepError(error: Error): Promise<void> {
-    this.stepErrors = { key: 'idle', count: this.stepErrors.key === 'idle' ? this.stepErrors.count + 1 : 1 };
-    this.log(`step failed (idle, ${this.stepErrors.count}): ${error.message}`);
+    this.idleErrors += 1;
+    this.log(`step failed (idle, ${this.idleErrors}): ${error.message}`);
   }
 
   /** An error in one attempt's step: counted for that attempt and its status, and past the limit the attempt is interrupted. */
   private async onAttemptError(feature: FeatureState, attempt: Attempt, error: Error): Promise<void> {
-    const key = `${featureKey(refOf(feature, attempt))}#${attempt.n}:${attempt.status}`;
-    this.stepErrors = { key, count: this.stepErrors.key === key ? this.stepErrors.count + 1 : 1 };
-    this.log(`step failed (${key}, ${this.stepErrors.count}/${STEP_ERROR_LIMIT}): ${error.message}`);
-    if (this.stepErrors.count >= STEP_ERROR_LIMIT) {
-      this.stepErrors = { key: '', count: 0 };
+    if (await this.gatewayDown()) return this.log(`step of ${featureKey(refOf(feature, attempt))} failed while the gateway doesn't answer: ${error.message}`);
+    const key = `${attemptWork(feature, attempt)}:${attempt.status}`;
+    const count = (this.attemptErrors.get(key) ?? 0) + 1;
+    this.attemptErrors.set(key, count);
+    this.log(`step failed (${key}, ${count}/${STEP_ERROR_LIMIT}): ${error.message}`);
+    if (count >= STEP_ERROR_LIMIT) {
+      this.attemptErrors.delete(key);
       await this.interrupt(feature, attempt, `infrastructure error: ${error.message}`).catch(() => {});
     }
   }
@@ -1946,7 +2242,7 @@ export class Orchestrator {
       outbox: p.outbox,
       inbox: p.inbox,
       repliedFile,
-      onRequest: (request) => void this.onRequest(agent, channel, request),
+      onRequest: (request) => this.onRequest(agent, channel, request),
       onInvalid: (reason) => this.log(`${agent.sandbox} sent ${reason}`),
     });
     channel.start();
@@ -1998,7 +2294,10 @@ export class Orchestrator {
     const toBuild = (id: string) => this.design.modules.find((m) => m.id === id)?.plans.some((p) => this.state.plans[`${id}/${p.id}`]?.status !== 'completed') ?? false;
     const last = plans.at(-1)?.module;
     if (last !== undefined && toBuild(last)) return last;
-    return this.design.modules.find((m) => toBuild(m.id))?.id;
+    // In the order their designs were merged: the owner designs the next modules while one is built, and what they
+    // merged first is built first. A design written by hand has no such moment, and comes after those, by its name.
+    const mergedAt = (id: string) => this.state.modules[id]?.frozenAt ?? '\uffff';
+    return this.design.modules.filter((m) => toBuild(m.id)).sort((a, b) => (mergedAt(a.id) < mergedAt(b.id) ? -1 : mergedAt(a.id) > mergedAt(b.id) ? 1 : 0))[0]?.id;
   }
 
   /** A plan under way: not complete, and still in the design while it is built, since a design change may drop a plan before its build ends. */
@@ -2123,21 +2422,20 @@ export class Orchestrator {
   }
 
   /**
-   * The owner's time, planned and used, or undefined while the owner hasn't set their
-   * hours. A design in review counts as submitted: it is read from the Architect's ref,
-   * not from main, where it isn't yet.
+   * The owner's time in each module: its hours if the owner set any, and what its design
+   * plans and has used of them. A design in review counts as submitted: it is read from
+   * the commit under review, not from main, where it isn't yet, nor from a later
+   * submission that was refused.
    */
-  async ownerTime(): Promise<OwnerTime | undefined> {
-    if (this.state.budgets.ownerHours === undefined) return undefined;
-    const modules = [...this.design.modules];
-    for (const module of Object.values(this.state.modules).filter((m) => m.status === 'in_review')) {
-      const submitted = (await loadDesign(this.repo, architectRef(module.module)).catch(() => undefined))?.modules.find((m) => m.id === module.module);
-      if (!submitted) continue;
-      const current = modules.findIndex((m) => m.id === module.module);
-      if (current === -1) modules.push(submitted);
-      else modules[current] = submitted;
+  async ownerTimes(): Promise<ModuleOwnerTime[]> {
+    const designs = new Map(this.design.modules.map((m) => [m.id, m]));
+    for (const module of Object.values(this.state.modules)) {
+      const head = module.status === 'in_review' ? module.design?.head : undefined;
+      const submitted = head ? (await loadDesign(this.repo, head).catch(() => undefined))?.modules.find((m) => m.id === module.module) : undefined;
+      if (submitted) designs.set(module.module, submitted);
+      else if (!designs.has(module.module)) designs.set(module.module, { id: module.module, plans: [], actions: [] });
     }
-    return ownerTime(this.design.config, { config: this.design.config, modules }, this.state);
+    return [...designs.values()].map((design) => moduleOwnerTime(this.design.config, design, this.state));
   }
 
   /** The sandbox policy: the project's network bundles, or every bundle for the Architect (§13), and signed AWS endpoints. */
@@ -2160,15 +2458,14 @@ export class Orchestrator {
   access(options: { claude: boolean; aws: boolean; allBundles?: boolean }): Pick<SandboxSpec, 'providers' | 'env' | 'labels' | 'cpu' | 'memory'> & { policyFile: string } {
     const aws = options.aws ? this.design.config.aws : undefined;
     const limits = this.state.sandboxLimits;
-    const project = this.design.config.project.name;
     // The keys of the project's APIs, which OpenShell adds on requests to their hosts alone.
-    const apiKeys = this.design.config.network.apis.flatMap((api) => (api.key ? [apiProviderName(project, api.host)] : []));
+    const apiKeys = this.design.config.network.apis.flatMap((api) => (api.key ? [apiProviderName(this.projectKey, api.host)] : []));
     return {
       providers: [...(options.claude ? [this.design.config.sandbox.claudeProvider] : []), ...(aws ? [aws.provider] : []), ...apiKeys],
       policyFile: this.policyFile({ allBundles: options.allBundles ?? false, aws: aws !== undefined }),
       env: this.sandboxEnv(),
       // Every sandbox the daemon makes says whose it is: the dashboard tells them from other projects'.
-      labels: { [PROJECT_LABEL]: this.design.config.project.name },
+      labels: { [PROJECT_LABEL]: this.design.config.project.name, [CHECKOUT_LABEL]: this.checkout },
       // The owner's caps, so that agents and checks in parallel leave the machine usable.
       ...(limits?.cpu !== undefined ? { cpu: `${Math.round(limits.cpu * 1000)}m` } : {}),
       ...(limits?.memoryGiB !== undefined ? { memory: `${Math.round(limits.memoryGiB * 1024)}Mi` } : {}),
@@ -2196,6 +2493,8 @@ export class Orchestrator {
         AWS_REGION: this.design.config.aws.region,
         AWS_DEFAULT_REGION: this.design.config.aws.region,
         AWS_STS_REGIONAL_ENDPOINTS: 'regional',
+        // DynamoDB at its regional endpoint, which every policy lists: SDKs otherwise call one of the account's own.
+        AWS_ACCOUNT_ID_ENDPOINT_MODE: 'disabled',
         AWS_EC2_METADATA_DISABLED: 'true',
         AWS_PAGER: '',
       } : {}),
@@ -2204,7 +2503,9 @@ export class Orchestrator {
   }
 
   private async refreshDesign(): Promise<void> {
-    await this.forge.fetchMain(this.repo);
+    const main = await this.forge.fetchMain(this.repo);
+    // Read again only once main moved: a design is every plan file of every module.
+    if (main === this.designAt) return;
     try {
       this.design = await loadDesign(this.repo, 'refs/heads/main');
     } catch (error) {
@@ -2212,21 +2513,44 @@ export class Orchestrator {
       this.pausePipeline(`the design on main is invalid: ${clip((error as Error).message.replace(/\s+/g, ' '), 400)}`);
       throw error;
     }
+    this.designAt = main;
+    // The pages show the design: a merge on GitHub changes it with no event of the state's.
+    this.events.emit('design');
   }
 
-  /** Bundles the attempt's commits into `refs/attempts/...`. Undefined when it committed nothing. */
-  private async takeCommits(ref: Ref, attempt: Attempt): Promise<string | undefined> {
+  /** The commit of main `design` was read from. */
+  private designAt?: string;
+
+  /** Bundles the attempt's commits into `refs/attempts/...`. Undefined when it committed nothing, TOO_LARGE when they are no source code. */
+  private async takeCommits(ref: Ref, attempt: Attempt): Promise<string | undefined | typeof TOO_LARGE> {
     const p = this.paths(attempt.sandbox);
     const bundle = await this.exec(attempt.sandbox, [
       `cd ${sh(p.work)} || exit 1`,
       `[ "$(git rev-list --count ${sh(attempt.base)}..HEAD)" -gt 0 ] || exit 3`,
-      `mkdir -p ${sh(p.out)} && git bundle create --quiet ${sh(`${p.out}/result.bundle`)} ${sh(attempt.base)}..HEAD`,
+      `mkdir -p ${sh(p.out)} && git bundle create --quiet ${sh(`${p.out}/result.bundle`)} ${sh(attempt.base)}..HEAD || exit 1`,
+      `[ "$(wc -c < ${sh(`${p.out}/result.bundle`)})" -le ${BUNDLE_BYTES} ] || exit 5`,
     ].join('\n'));
     if (bundle.code === 3) return undefined;
+    if (bundle.code === 5) return TOO_LARGE;
     if (bundle.code !== 0) throw new Error(`could not bundle the attempt's commits: ${(bundle.stderr || bundle.stdout).trim()}`);
     const local = join(this.attemptDir(ref), 'result.bundle');
     await this.driver.download(attempt.sandbox, `${p.out}/result.bundle`, local);
     return this.fetchBundle(local, attemptRefName(ref));
+  }
+
+  /**
+   * A text file an agent wrote in its sandbox, its stream or its stderr, copied to `local`
+   * and read; empty when it has none. Past `AGENT_FILE_BYTES` its end is taken, from a
+   * whole line on: the copy keeps the file's name, in a folder of its own beside it.
+   */
+  async readAgentFile(sandbox: string, remote: string, local: string): Promise<string> {
+    const at = remote.lastIndexOf('/');
+    const end = `${remote.slice(0, at)}/end${remote.slice(at)}`;
+    const cut = await this.exec(sandbox, [
+      `[ -f ${sh(remote)} ] && [ "$(wc -c < ${sh(remote)})" -gt ${AGENT_FILE_BYTES} ] || exit 0`,
+      `mkdir -p ${sh(`${remote.slice(0, at)}/end`)} && tail -c ${AGENT_FILE_BYTES} ${sh(remote)} | tail -n +2 > ${sh(end)} && echo cut`,
+    ].join('\n'));
+    return this.driver.download(sandbox, cut.stdout.trim() === 'cut' ? end : remote, local).then(() => readFileSync(local, 'utf8'), () => '');
   }
 
   async killAgent(sandbox: string): Promise<void> {
@@ -2415,12 +2739,18 @@ function fixDefinition(id: string, plan: string, fix: NonNullable<FeatureState['
   };
 }
 
+/** The key of an attempt's long steps (`beside`). */
+const attemptWork = (feature: FeatureState, attempt: Attempt): string => `attempt:${featureKey(feature)}#${attempt.n}`;
+
 /** A merge round's main and the files that conflicted, when the work item is one. */
 function mergeOf(state: FeatureState): { main: string; files: string[] } | undefined {
   return state.fix?.kind === 'merge' && state.fix.main ? { main: state.fix.main, files: state.fix.files ?? [] } : undefined;
 }
 
 /** Checks, each once: what both sides of a merge must keep passing. */
+/** What `takeCommits` answers for commits too large to be source code. */
+const TOO_LARGE = Symbol('too large');
+
 function distinct(checks: Check[]): Check[] {
   return [...new Map(checks.map((check) => [check.id, check])).values()];
 }

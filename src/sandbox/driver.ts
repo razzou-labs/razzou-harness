@@ -18,6 +18,12 @@ export interface SandboxSpec {
 
 /** The label that tells which project a sandbox belongs to: names are hashes, and every project shares the gateway. */
 export const PROJECT_LABEL = 'harness.project';
+/**
+ * The label that tells which checkout of it: two folders of the same name, or two clones
+ * of one repository, each run a daemon, and neither may take the other's sandboxes for
+ * its own left-overs.
+ */
+export const CHECKOUT_LABEL = 'harness.checkout';
 
 /** A sandbox as the gateway lists it, whichever project made it. */
 export interface SandboxInfo {
@@ -62,7 +68,13 @@ export interface SandboxDriver {
   follow(name: string, file: string, from: number, onLine: (line: string) => void): Follower;
   upload(name: string, localFile: string, remoteDir: string): Promise<void>;
   download(name: string, remoteFile: string, localFile: string): Promise<void>;
+  /**
+   * Where a sandbox stands. `missing` only when the gateway says it has no such sandbox: a
+   * gateway that doesn't answer throws, since a sandbox nobody could ask about isn't gone.
+   */
   status(name: string): Promise<SandboxStatus>;
+  /** Starts a stopped sandbox again, its files as they were: what a reboot of the machine leaves. */
+  start(name: string): Promise<void>;
   remove(name: string): Promise<void>;
   /** Every sandbox on the gateway, this project's and any other's. */
   list(): Promise<SandboxInfo[]>;

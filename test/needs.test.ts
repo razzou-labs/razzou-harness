@@ -234,8 +234,39 @@ describe('needs you', () => {
   });
 });
 
+describe("a card's print", () => {
+  const gate = (p3: PlanState['status'], actions: State['actions'] = {}, design = teardown) =>
+    needPrint(listNeeds(data([design], { plans: plansOf(p3), actions: { 'web/G1': { status: 'done', at: '2026-11-09T21:00:00.000Z' }, ...actions } })).at(-1)!);
+
+  it("holds still while a gate's check runs, and while a plan it builds on makes its way", () => {
+    assert.equal(gate('pr_open'), gate('active'));
+    assert.equal(gate('deploying'), gate('active'));
+    assert.equal(gate('active', { 'web/G2': { status: 'verifying', at: '2026-11-11T10:00:00.000Z' } }), gate('active'));
+    assert.notEqual(gate('deploy_failed'), gate('active'));
+  });
+
+  it('changes with a gate rewritten on main', () => {
+    const rewritten = (more: Partial<ModuleDesign['actions'][number]>) => ({ ...teardown, actions: [teardown.actions[0]!, { ...teardown.actions[1]!, ...more }] });
+    assert.notEqual(gate('active', {}, rewritten({ instructions: 'Do it otherwise.' })), gate('active'));
+    assert.notEqual(gate('active', {}, rewritten({ when: 'anytime' })), gate('active'));
+    assert.notEqual(gate('active', {}, rewritten({ verify: true })), gate('active'));
+  });
+});
+
+describe('a pull request left to the owner', () => {
+  const left = (pushed: string) => listNeeds(data([teardown], {
+    plans: { 'web/P1': built('web', 'P1', 'pr_open', { pushed, pr: { number: 3, url: 'https://github.com/acme/toy/pull/3' }, leftToOwner: { head: 'c1', reason: 'an INFRA plan', at: '2026-11-10T09:00:00.000Z' } }) },
+    actions: { 'web/G1': { status: 'done', at: '2026-11-09T21:00:00.000Z' }, 'web/G2': { status: 'done', at: '2026-11-09T21:00:00.000Z' } },
+  })).map((need) => need.key);
+
+  it('is a card for the head it was left at only', () => {
+    assert.deepEqual(left('c1'), ['left:web/P1']);
+    assert.deepEqual(left('c2'), []);
+  });
+});
+
 describe('notifications', () => {
-  const paused = (reason: string): Need => ({ kind: 'paused', key: 'paused', paused: { reason, since: '2026-11-12T10:00:00.000Z' } });
+  const paused = (reason: string, retry = true): Need => ({ kind: 'paused', key: 'paused', paused: { reason, since: '2026-11-12T10:00:00.000Z', ...(retry ? { retry } : {}) } });
   const request = (id: string): Need => ({ kind: 'request', key: `request:${id}`, request: { requestId: id, module: 'web', question: 'Which region?', blocking: false, askedAt: '2026-11-12T10:00:00.000Z' } });
   const keys = (needs: Need[]) => needs.map((need) => need.key);
 
@@ -260,5 +291,28 @@ describe('notifications', () => {
     }
     assert.deepEqual(announced, [0, 60, 120]);
     assert.equal(QUIET_MS, 60 * 60_000);
+  });
+
+  it('announces a pause whose reason changed, and an untimed pause after one that waited, within the hour', () => {
+    let told = arrivals([], undefined, 0).told;
+    const retry = arrivals([paused('GitHub does not answer')], told, 0);
+    assert.equal(retry.fresh.length, 1);
+    told = arrivals([], retry.told, 60_000).told;
+    // 25 minutes later: CI still fails, and the pipeline waits for the owner.
+    const stuck = arrivals([paused('CI still fails after 2 fix rounds', false)], told, 25 * 60_000);
+    assert.equal(stuck.fresh.length, 1);
+    // The card changes in place, from a pause that waits to one that doesn't, without leaving.
+    const waiting = arrivals([paused('the API failed')], stuck.told, 26 * 60_000);
+    assert.equal(waiting.fresh.length, 1);
+    const untimed = arrivals([paused('the API failed', false)], waiting.told, 27 * 60_000);
+    assert.equal(untimed.fresh.length, 1);
+  });
+
+  it('starts the quiet hour only with a notification shown', () => {
+    let told = arrivals([], undefined, 0).told;
+    const unseen = arrivals([paused('GitHub does not answer')], told, 0, false);
+    assert.equal(unseen.fresh.length, 1);
+    told = arrivals([], unseen.told, 1_000, false).told;
+    assert.equal(arrivals([paused('GitHub does not answer')], told, 10 * 60_000).fresh.length, 1);
   });
 });
