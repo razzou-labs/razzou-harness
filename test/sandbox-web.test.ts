@@ -3,16 +3,17 @@ import { spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createServer, request, type Server } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import { connect, type AddressInfo } from 'node:net';
 import type { NetworkInterfaceInfo } from 'node:os';
 import { join } from 'node:path';
 import { after, describe, it } from 'node:test';
 import { gzipSync } from 'node:zlib';
+import { WebSocket } from 'ws';
 import { readResult, readReview } from '../src/agents/claude-code.ts';
 import { AgentChannel } from '../src/daemon/channel.ts';
 import type { Orchestrator } from '../src/daemon/orchestrator.ts';
 import { htmlToText, neverRead, onHostNetwork, webRead } from '../src/daemon/web-read.ts';
-import { runningSandboxes, startDashboard } from '../src/dashboard/server.ts';
+import { parseLine, runningSandboxes, startDashboard } from '../src/dashboard/server.ts';
 import { Terminals, type Pty } from '../src/dashboard/terminals.ts';
 import { MAX_FOLLOWED_LINE, OpenShellDriver, splitLines } from '../src/sandbox/openshell.ts';
 import { buildPolicy } from '../src/sandbox/policy.ts';
@@ -299,11 +300,13 @@ describe('the dashboard', () => {
   const token = 'ab'.repeat(16);
   const code = 'cd'.repeat(16);
 
-  async function dashboard(loginCode?: string) {
+  async function dashboard(loginCode?: string, extra: Record<string, unknown> = {}, terminals = new Terminals(undefined)) {
     const webRoot = tempDir('web');
     writeFileSync(join(webRoot, 'index.html'), '<!doctype html><title>harness</title>');
-    const orchestrator = { events: new EventEmitter() } as unknown as Orchestrator;
-    const server = await startDashboard({ orchestrator, port: 0, token, loginCode, webRoot, terminals: new Terminals(undefined) });
+    const logged: string[] = [];
+    const state = { modules: {}, managers: {}, features: {}, plans: {} };
+    const orchestrator = { events: new EventEmitter(), state, log: (line: string) => logged.push(line), ...extra } as unknown as Orchestrator;
+    const server = await startDashboard({ orchestrator, port: 0, token, loginCode, webRoot, terminals });
     servers.push(server);
     const port = (server.address() as AddressInfo).port;
     const get = (path: string, cookie?: string) =>
@@ -314,8 +317,75 @@ describe('the dashboard', () => {
           resolve({ status: res.statusCode ?? 0, cookie: String(res.headers['set-cookie'] ?? '') });
         }).on('error', reject).end();
       });
-    return { port, get };
+    const call = (method: string, path: string, body?: unknown) =>
+      new Promise<{ status: number; text: string }>((resolve, reject) => {
+        const headers = { host: `127.0.0.1:${port}`, origin: `http://127.0.0.1:${port}`, authorization: `Bearer ${token}`, 'content-type': 'application/json' };
+        const req = request({ host: '127.0.0.1', port, path, method, headers }, (res) => {
+          let text = '';
+          res.setEncoding('utf8');
+          res.on('data', (chunk: string) => (text += chunk));
+          res.on('end', () => resolve({ status: res.statusCode ?? 0, text }));
+        });
+        req.on('error', reject);
+        req.end(body === undefined ? undefined : JSON.stringify(body));
+      });
+    const post = async (path: string, body: unknown) => JSON.parse((await call('POST', path, body)).text) as { done: boolean; error?: string };
+    return { port, get, call, post, logged, orchestrator, state };
   }
+
+  /** Writes a raw request to the dashboard and gives back what came before the socket closed. */
+  const raw = (port: number, text: string) =>
+    new Promise<string>((resolve) => {
+      let answer = '';
+      const socket = connect(port, '127.0.0.1', () => socket.write(text));
+      socket.setEncoding('utf8');
+      socket.on('data', (chunk: string) => (answer += chunk));
+      socket.on('error', () => {});
+      // A daemon that died on the request never answers: the test fails rather than waits.
+      socket.setTimeout(2000, () => socket.destroy());
+      socket.on('close', () => resolve(answer));
+    });
+
+  it('lives through an upgrade whose path is no URL', async () => {
+    const { port, get } = await dashboard();
+    const host = `127.0.0.1:${port}`;
+    await raw(port, `GET // HTTP/1.1\r\nHost: ${host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n`);
+    assert.match(await raw(port, `GET /x HTTP/1.1\r\nHost: elsewhere\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n`), /^$|403/);
+    assert.equal((await get(`/?token=${token}`)).status, 303, 'the daemon still answers');
+  });
+
+  it("lives through a message over a terminal's limit, and takes a long paste", async () => {
+    const written: string[] = [];
+    const pty: Pty = { onData: () => {}, onExit: () => {}, write: (data) => written.push(data), resize: () => {}, kill: () => {} };
+    const { port, get, state } = await dashboard(undefined, {}, new Terminals(() => pty));
+    (state.modules as Record<string, unknown>).shop = { module: 'shop', architect: { sandbox: 'arc-1' } };
+    const open = () => {
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/api/terminal?module=shop`, { headers: { authorization: `Bearer ${token}` }, origin: `http://127.0.0.1:${port}` });
+      return new Promise<WebSocket>((resolve, reject) => ws.on('open', () => resolve(ws)).on('error', reject));
+    };
+    const paste = await open();
+    paste.send(JSON.stringify({ i: 'p'.repeat(600 * 1024) }));
+    await until(() => written.some((data) => data.length === 600 * 1024));
+    assert.ok(written.some((data) => data.length === 600 * 1024), 'the paste reached the terminal');
+    paste.close();
+    const big = await open();
+    const closed = new Promise<number>((resolve) => big.on('close', (code) => resolve(code)));
+    big.send('x'.repeat(2 * 1024 * 1024));
+    assert.equal(await Promise.race([closed, sleep(3000).then(() => 0)]), 1009);
+    assert.equal((await get(`/?token=${token}`)).status, 303, 'the daemon still answers');
+  });
+
+  it('keeps a transcript line nested deeper than its limit, and one too heavy, as markers', async () => {
+    const { orchestrator, call } = await dashboard();
+    const deep = `${'['.repeat(5000)}${']'.repeat(5000)}`;
+    orchestrator.events.emit('transcript', { agent: 'manager:shop', line: deep });
+    orchestrator.events.emit('transcript', { agent: 'manager:shop', line: JSON.stringify({ type: 'user', parts: Array.from({ length: 40 }, () => 'y'.repeat(3000)) }) });
+    const items = JSON.parse((await call('GET', '/api/transcript?agent=manager:shop')).text) as unknown[];
+    assert.equal(items.length, 2);
+    assert.match(JSON.stringify(items[0]), /nested too deep to show/);
+    assert.deepEqual(items[1], { type: 'clipped', text: `an item of ${JSON.stringify({ type: 'user', parts: Array.from({ length: 40 }, () => 'y'.repeat(3000)) }).length} characters, too large to show` });
+    assert.ok(JSON.stringify(parseLine(deep)).length < 200);
+  });
 
   it('names its cookie for its port, and logs in once with the code of the link it opened', async () => {
     const { port, get } = await dashboard(code);

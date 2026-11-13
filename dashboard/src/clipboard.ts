@@ -38,3 +38,23 @@ export function copiedText(data: string): string | undefined {
     return undefined;
   }
 }
+
+/** The most characters of input one WebSocket message carries: well under the daemon's 1 MiB per message, escapes and UTF-8 included. */
+export const INPUT_SLICE = 32 * 1024;
+
+/**
+ * A terminal's input cut into slices for the WebSocket, so that a long paste fits the
+ * daemon's limit per message. A slice never ends inside a surrogate pair, whose halves
+ * would each become a replacement character.
+ */
+export function inputSlices(data: string, size = INPUT_SLICE): string[] {
+  const slices: string[] = [];
+  for (let start = 0; start < data.length; ) {
+    let end = Math.min(start + size, data.length);
+    const last = data.charCodeAt(end - 1);
+    if (end < data.length && last >= 0xd800 && last <= 0xdbff) end--;
+    slices.push(data.slice(start, end));
+    start = end;
+  }
+  return slices;
+}

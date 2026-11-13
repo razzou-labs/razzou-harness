@@ -83,8 +83,13 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
   orchestrator.events.on('event', (event: HarnessEvent) => broadcast('event', event));
   // An agent reported the subscription's usage: the pages fetch the state again.
   orchestrator.events.on('usage', () => broadcast('usage', {}));
+  // It runs inside a follower's data handler, on lines an agent writes: nothing may throw out of it.
   orchestrator.events.on('transcript', ({ agent, line }: { agent: string; line: string }) => {
-    for (const item of transcripts.add(agent, line)) broadcast('transcript', { agent, item });
+    try {
+      for (const item of transcripts.add(agent, line)) broadcast('transcript', { agent, item });
+    } catch (error) {
+      orchestrator.log(`transcript of ${agent}: ${(error as Error).message}`);
+    }
   });
   orchestrator.events.on('architect-inbox', ({ sandbox }: { module: string; sandbox: string }) => {
     // At the terminal, the owner's own next prompt delivers it; typing there would mix with theirs.
@@ -241,14 +246,22 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
   });
 
   // Terminals: the same checks as any request, and a browser always sends its Origin.
-  const sockets = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
+  // A paste comes as one message: 1 MiB holds a long one, and the page sends it in slices anyway.
+  const sockets = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 });
   server.on('upgrade', (req, socket, head) => {
-    const url = new URL(req.url ?? '/', 'http://127.0.0.1');
-    if (!allowedHosts.has(req.headers.host ?? '') || !sameOrigin(req.headers.origin) || !authorized(req, url) || url.pathname !== '/api/terminal') {
-      socket.end('HTTP/1.1 403 Forbidden\r\n\r\n');
-      return;
+    // A client that hangs up while it is refused makes the socket emit an error, which would stop the daemon.
+    socket.on('error', () => {});
+    try {
+      if (!allowedHosts.has(req.headers.host ?? '')) throw new Error('wrong host');
+      const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+      if (!sameOrigin(req.headers.origin) || !authorized(req, url) || url.pathname !== '/api/terminal') {
+        socket.end('HTTP/1.1 403 Forbidden\r\n\r\n');
+        return;
+      }
+      sockets.handleUpgrade(req, socket, head, (ws) => openTerminal(ws, url, orchestrator.state, terminals));
+    } catch {
+      socket.destroy();
     }
-    sockets.handleUpgrade(req, socket, head, (ws) => openTerminal(ws, url, orchestrator.state, terminals));
   });
   server.on('close', () => {
     terminals.closeAll();
@@ -265,6 +278,8 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
       server.once('error', onError);
       server.listen(candidate, '127.0.0.1', () => {
         server.off('error', onError);
+        // Once it listens, a server error is only logged: nothing a client does may stop the daemon.
+        server.on('error', (error) => orchestrator.log(`dashboard: ${error.message}`));
         const actual = (server.address() as AddressInfo).port;
         allowedHosts = new Set([`127.0.0.1:${actual}`, `localhost:${actual}`]);
         cookie = `harness_token_${actual}`;
@@ -310,6 +325,8 @@ function openTerminal(ws: WebSocket, url: URL, state: State, terminals: Terminal
       // not ours: ignored
     }
   });
+  // A message over maxPayload, or a socket torn down, emits an error: without a listener, it would stop the daemon.
+  ws.on('error', () => {});
   ws.on('close', () => terminal.detach());
 }
 
@@ -419,11 +436,22 @@ class Transcripts {
   }
 }
 
-/** One stream-json line, with long strings cut: a tool's output can be megabytes. */
-function parseLine(line: string): unknown {
+/** The most a transcript item weighs once serialized: it bounds what the 1,000 items an agent keeps in memory can hold. */
+export const MAX_ITEM = 64 * 1024;
+/** How deep a transcript item goes: stream-json's own items stay well above it. */
+const MAX_DEPTH = 8;
+
+/**
+ * One stream-json line, with long strings cut, as a tool's output can be megabytes, what
+ * lies deeper than the limit replaced, and an item too heavy replaced as a whole. An agent
+ * writes these lines: nothing in one may make the dashboard throw.
+ */
+export function parseLine(line: string): unknown {
   if (!line.trim()) return undefined;
   try {
-    return clip(JSON.parse(line), 0);
+    const item = clip(JSON.parse(line), 0);
+    const size = JSON.stringify(item).length;
+    return size > MAX_ITEM ? { type: 'clipped', text: `an item of ${size} characters, too large to show` } : item;
   } catch {
     return undefined;
   }
@@ -431,7 +459,8 @@ function parseLine(line: string): unknown {
 
 function clip(value: unknown, depth: number): unknown {
   if (typeof value === 'string') return value.length > 4000 ? `${value.slice(0, 4000)}… (${value.length - 4000} more characters)` : value;
-  if (depth > 8 || value === null || typeof value !== 'object') return value;
+  if (value === null || typeof value !== 'object') return value;
+  if (depth >= MAX_DEPTH) return '… (nested too deep to show)';
   if (Array.isArray(value)) return value.map((v) => clip(v, depth + 1));
   return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, clip(v, depth + 1)]));
 }

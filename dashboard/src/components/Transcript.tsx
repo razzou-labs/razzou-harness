@@ -110,6 +110,9 @@ const Item = defineComponent({
             </>
           );
         }
+        case 'clipped':
+          // A line the daemon would not keep whole: it says so, in place of the line.
+          return <div class="t-meta">{String(item.text ?? 'an item too large to show')}</div>;
         case 'result':
           return (
             <div class={item.is_error ? 't-meta text-negative' : 't-meta'}>
