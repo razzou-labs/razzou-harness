@@ -496,6 +496,18 @@ describe('sandbox policy', () => {
     assert.deepEqual(endpoints(['sts']).map((e) => e.host), ['sts.eu-west-1.amazonaws.com'], 'a list without all names only its services');
   });
 
+  it("signs DynamoDB's account endpoint, which SDKs and Terraform call by default, for all and for dynamodb", () => {
+    type Endpoint = { host: string; signing_service: string; credential_signing: string };
+    const endpoints = (services: string[]) => (buildPolicy({ bundles: ['core'], extraHosts: [], aws: { region: 'eu-west-1', provider: 'aws-view-shop', services } }) as {
+      network_policies: { aws_view: { endpoints: Endpoint[] } };
+    }).network_policies.aws_view.endpoints;
+    for (const services of [['all'], ['dynamodb']]) {
+      const account = endpoints(services).find((e) => e.host === '*.ddb.eu-west-1.amazonaws.com');
+      assert.deepEqual([account?.signing_service, account?.credential_signing], ['dynamodb', 'sigv4:body'], services.join());
+      assert.ok(endpoints(services).some((e) => e.host === 'dynamodb.eu-west-1.amazonaws.com'), services.join());
+    }
+  });
+
   it('rejects hosts OpenShell would reject', () => {
     assert.throws(() => checkHost('**.com'));
     assert.throws(() => checkHost('docs.**.example.com'));

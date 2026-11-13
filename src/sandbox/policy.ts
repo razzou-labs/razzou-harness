@@ -22,6 +22,8 @@ const AWS_SERVICES: Record<string, { hosts: (region: string) => string[]; signin
   s3: { hosts: (region) => [`s3.${region}.amazonaws.com`, `*.s3.${region}.amazonaws.com`], signing: 's3' },
   cloudwatch: { hosts: (region) => [`monitoring.${region}.amazonaws.com`], signing: 'monitoring' },
   ecr: { hosts: (region) => [`api.ecr.${region}.amazonaws.com`], signing: 'ecr' },
+  // SDKs and Terraform's AWS provider call DynamoDB at the account's own endpoint by default.
+  dynamodb: { hosts: (region) => [`dynamodb.${region}.amazonaws.com`, `*.ddb.${region}.amazonaws.com`], signing: 'dynamodb' },
   cloudfront: { hosts: () => ['cloudfront.amazonaws.com'], signing: 'cloudfront', global: true },
   route53: { hosts: () => ['route53.amazonaws.com'], signing: 'route53', global: true },
 };
@@ -34,7 +36,8 @@ export const ALL_SERVICES = 'all';
  * role itself is what allows only reads (spike 2). OpenShell signs only for endpoints
  * named with their service, with no rule for every AWS host, so `all` names every one
  * the AWS SDK knows (aws-services.ts), with the hosts that carry a bucket's or an
- * account's name in front.
+ * account's name in front: S3's, S3 Control's and DynamoDB's (`<account>.ddb.<region>`),
+ * which botocore's endpoint data doesn't list.
  *
  * Every service but S3 is signed with `sigv4:body`: the hash of the request's body, an
  * empty one for a GET. OpenShell's automatic `sigv4` signs a request with neither a body
@@ -63,6 +66,7 @@ function awsEndpoints(aws: NonNullable<PolicyOptions['aws']>): object[] {
         ...REGIONAL_SERVICES.map(([prefix, service, template]) => signed((template ?? '{service}.{region}.{dnsSuffix}').replace('{service}', prefix).replace('{region}', aws.region).replace('{dnsSuffix}', 'amazonaws.com'), service)),
         signed(`*.s3.${aws.region}.amazonaws.com`, 's3'),
         signed(`*.s3-control.${aws.region}.amazonaws.com`, 's3'),
+        signed(`*.ddb.${aws.region}.amazonaws.com`, 'dynamodb'),
         ...GLOBAL_SERVICES.map(([, host, service, region]) => signed(host, service, region)),
       ]
     : [];

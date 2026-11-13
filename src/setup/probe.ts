@@ -32,7 +32,7 @@ interface ProbeOptions {
 export async function probe(options: ProbeOptions): Promise<ProbeResult[]> {
   const { driver, config } = options;
   const name = `prb-${randomUUID().slice(0, 8)}`;
-  const aws = config.aws ? { ...config.aws, services: [...new Set([...config.aws.services, 'sts', 's3', 'ec2', 'secretsmanager'])] } : undefined;
+  const aws = config.aws ? { ...config.aws, services: [...new Set([...config.aws.services, 'sts', 's3', 'ec2', 'secretsmanager', 'dynamodb'])] } : undefined;
   const policyFile = join(options.scratch, 'probe-policy.yaml');
   writeFileSync(policyFile, `${JSON.stringify(buildPolicy({ ...config.network, ...(aws ? { aws } : {}) }), null, 2)}\n`);
   await driver.create({
@@ -94,6 +94,9 @@ export async function probe(options: ProbeOptions): Promise<ProbeResult[]> {
         ok: identity.code === 0 && /:assumed-role\/harness-[^/]+-view\//.test(identity.out),
         detail: lastLine(identity.out),
       });
+      // SDKs and Terraform call DynamoDB at the account's endpoint: the probe makes the CLI use it too.
+      const tables = await run('AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)" AWS_ACCOUNT_ID_ENDPOINT_MODE=required aws dynamodb list-tables --max-items 1 --output text');
+      results.push({ name: "DynamoDB's account endpoint answers the view role", ok: tables.code === 0, detail: lastLine(tables.out) || 'no tables' });
       // A dry run asks only "may I?": EC2 answers UnauthorizedOperation, or DryRunOperation if it would allow it.
       await expectDenied(
         'AWS refuses a write (an EC2 tag, as a dry run)',
