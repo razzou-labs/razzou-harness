@@ -263,21 +263,36 @@ export async function protectedChanges(
 }
 
 /**
- * Packages in the head's package-lock.json that don't come from the public npm registry, and
- * links to a local folder that the base's doesn't have as they are: workspaces already on
- * the base keep working, and a new link comes through an Arch PR.
+ * Packages of the head that come from somewhere other than the public npm registry, and that
+ * the base doesn't have as they are: in package-lock.json, one resolved from elsewhere, a
+ * link to a folder, or a patched one; without a lockfile, a `file:` or `link:` dependency of
+ * package.json. What the base already has keeps working, a private registry or a workspace
+ * included, and a new one comes through an Arch PR.
  */
 export async function lockfileProblems(base: TreeReader, head: TreeReader): Promise<string[]> {
-  const packages = async (tree: TreeReader) =>
-    (parseJson(await tree.read('package-lock.json')) as { packages?: Record<string, { resolved?: string; link?: boolean }> } | undefined)?.packages ?? {};
-  const [before, after] = [await packages(base), await packages(head)];
+  type Entry = { resolved?: string; link?: boolean; patched?: unknown; integrity?: string };
+  const packages = async (tree: TreeReader) => (parseJson(await tree.read('package-lock.json')) as { packages?: Record<string, Entry> } | undefined)?.packages;
+  const after = await packages(head);
   const problems: string[] = [];
+  if (after === undefined) {
+    type Manifest = Record<string, Record<string, unknown> | undefined>;
+    const sections = ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'];
+    const [was, now] = [parseJson(await base.read('package.json')) as Manifest | undefined, parseJson(await head.read('package.json')) as Manifest | undefined];
+    for (const section of sections) {
+      for (const [name, spec] of Object.entries(now?.[section] ?? {})) {
+        if (typeof spec === 'string' && /^(?:file|link):/.test(spec) && was?.[section]?.[name] !== spec) problems.push(`${name} comes from ${spec}, which the base branch's package.json doesn't have`);
+      }
+    }
+    return problems;
+  }
+  const before = (await packages(base)) ?? {};
+  const pinned = (entry: Entry | undefined) => canonicalJson([entry?.resolved, entry?.link === true, entry?.patched, entry?.integrity]);
   for (const [name, entry] of Object.entries(after)) {
-    if (name === '') continue;
-    if (entry.link) {
-      if (before[name]?.link !== true || before[name].resolved !== entry.resolved) problems.push(`${name} links to ${entry.resolved}, which the base branch doesn't`);
-    } else if (entry.resolved !== undefined && !entry.resolved.startsWith('https://registry.npmjs.org/')) {
-      problems.push(`${name} resolves from ${entry.resolved}`);
+    if (name === '' || pinned(before[name]) === pinned(entry)) continue;
+    if (entry.link) problems.push(`${name} links to ${entry.resolved}, which the base branch doesn't`);
+    else if (entry.patched !== undefined) problems.push(`${name} is patched, which the base branch doesn't have`);
+    else if (entry.resolved !== undefined && !entry.resolved.startsWith('https://registry.npmjs.org/')) {
+      problems.push(`${name} resolves from ${entry.resolved}, which the base branch doesn't have`);
     }
   }
   return problems;

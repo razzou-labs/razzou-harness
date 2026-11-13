@@ -241,12 +241,40 @@ describe('protection rules', () => {
       }),
     }, base);
     assert.deepEqual(await lockfileProblems(pr.baseTree, pr.headTree), [
-      'node_modules/b resolves from git+ssh://git@example.com/b.git#abc', "node_modules/vitest links to tools/vitest, which the base branch doesn't",
+      "node_modules/b resolves from git+ssh://git@example.com/b.git#abc, which the base branch doesn't have", "node_modules/vitest links to tools/vitest, which the base branch doesn't",
     ]);
     const moved = await change({ 'package-lock.json': lock({ ...workspace, 'node_modules/c': { resolved: 'tools/c', link: true } }) }, base);
     assert.deepEqual(await lockfileProblems(moved.baseTree, moved.headTree), ["node_modules/c links to tools/c, which the base branch doesn't"]);
     const plan = { base: pr.baseTree, head: pr.headTree, changedPaths: pr.changed, author: BOT, branch: 'plan/shop/P1', title: 'Plan: [CODE] [shop/P1] T' };
     assert.ok((await verify(plan)).includes("package-lock.json: node_modules/vitest links to tools/vitest, which the base branch doesn't"));
+  });
+
+  it('let the packages the base already has come from where they do: a private registry, git, a patch', async () => {
+    const lock = (packages: Record<string, object>) => JSON.stringify({ packages: { '': { name: 'shop' }, ...packages } });
+    const own = {
+      'node_modules/@acme/ui': { resolved: 'https://npm.acme.example/@acme/ui/-/ui-1.0.0.tgz', integrity: 'sha512-a' },
+      'node_modules/b': { resolved: 'git+ssh://git@example.com/b.git#abc' },
+      'node_modules/d': { resolved: 'https://registry.npmjs.org/d/-/d-1.0.0.tgz', patched: true },
+    };
+    const base = { ...BASE, 'package-lock.json': lock(own) };
+    const pr = await change({ 'package-lock.json': lock({ ...own, 'node_modules/e': { resolved: 'https://registry.npmjs.org/e/-/e-1.0.0.tgz' } }) }, base);
+    assert.deepEqual(await lockfileProblems(pr.baseTree, pr.headTree), []);
+    const changed = await change({
+      'package-lock.json': lock({
+        ...own,
+        'node_modules/@acme/ui': { resolved: 'https://npm.acme.example/@acme/ui/-/ui-1.0.0.tgz', integrity: 'sha512-other' },
+        'node_modules/e': { resolved: 'https://registry.npmjs.org/e/-/e-1.0.0.tgz', patched: true },
+      }),
+    }, base);
+    assert.deepEqual(await lockfileProblems(changed.baseTree, changed.headTree), [
+      "node_modules/@acme/ui resolves from https://npm.acme.example/@acme/ui/-/ui-1.0.0.tgz, which the base branch doesn't have",
+      "node_modules/e is patched, which the base branch doesn't have",
+    ]);
+
+    // Without a lockfile, package.json says where a package comes from.
+    const manifest = (deps: Record<string, string>) => JSON.stringify({ name: 'shop', scripts: { lint: 'eslint .', test: 'node --test' }, devDependencies: deps });
+    const noLock = await change({ 'package.json': manifest({ old: 'file:../old', vitest: 'link:tools/vitest', left: '^1.0.0' }) }, { ...BASE, 'package.json': manifest({ old: 'file:../old' }) });
+    assert.deepEqual(await lockfileProblems(noLock.baseTree, noLock.headTree), ["vitest comes from link:tools/vitest, which the base branch's package.json doesn't have"]);
   });
 
   it('write a hash list that matches its tree until something protected changes', async () => {
