@@ -428,15 +428,21 @@ function swarmRuleset(ruleset: Ruleset, config: Config, repo: string): Check {
   return ok('probe (outside)', statuses.length > 0 ? `main needs no approval, and the App's statuses: ${statuses.join(', ')}` : 'main needs no approval, and the daemon merges on CI alone');
 }
 
-/** The daemon's mode, from its state snapshot (v3 §2.1); Manual when there is none. */
-function projectMode(projectDir: string): Mode {
-  const file = join(projectDir, '.harness', 'state.json');
-  if (!existsSync(file)) return 'manual';
-  try {
-    return (JSON.parse(readFileSync(file, 'utf8')) as { mode?: Mode }).mode ?? 'manual';
-  } catch {
-    return 'manual';
+/**
+ * The project's mode (v3 §2.1): the one `harness mode` recorded in .harness/setup.json for
+ * the daemon to switch to, or else the daemon's, from its state snapshot; Manual when there
+ * is neither. Main's rules are judged and applied for the mode the daemon will run in.
+ */
+export function projectMode(projectDir: string): Mode {
+  for (const file of ['setup.json', 'state.json']) {
+    try {
+      const mode = (JSON.parse(readFileSync(join(projectDir, '.harness', file), 'utf8')) as { mode?: unknown }).mode;
+      if (mode === 'manual' || mode === 'swarm') return mode;
+    } catch {
+      // No file, or one that can't be read: the next one says.
+    }
   }
+  return 'manual';
 }
 
 /**

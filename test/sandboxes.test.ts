@@ -5,7 +5,7 @@ import { describe, it } from 'node:test';
 import { bytes, readDockerUsage } from '../src/sandbox/docker.ts';
 import { OpenShellDriver } from '../src/sandbox/openshell.ts';
 import { Denials, parseDenials } from '../src/sandbox/refusals.ts';
-import { mainHolds, storeApiKey } from '../src/setup/doctor.ts';
+import { mainHolds, projectMode, storeApiKey } from '../src/setup/doctor.ts';
 import { buildCache, removeOldAgentImages } from '../src/setup/images.ts';
 import { runOk } from '../src/util.ts';
 import { tempDir } from './helpers/toy-repo.ts';
@@ -166,6 +166,19 @@ describe("the doctor's check of main", () => {
     assert.equal((await mainHolds(dir)).detail, "origin/main doesn't hold .github/workflows/harness.yml as it is here", 'committed, not pushed');
     writeFileSync(join(dir, 'harness', 'config.json'), '{"project":{"name":"shop2"}}\n');
     assert.equal((await mainHolds(dir)).detail, "main doesn't hold harness/config.json as it is here; origin/main doesn't hold harness/config.json, .github/workflows/harness.yml as they are here");
+  });
+});
+
+describe("the doctor's mode", () => {
+  it('is the one `harness mode` recorded for the daemon, before the daemon\'s own', () => {
+    const dir = tempDir('project');
+    mkdirSync(join(dir, '.harness'));
+    assert.equal(projectMode(dir), 'manual');
+    writeFileSync(join(dir, '.harness', 'state.json'), JSON.stringify({ mode: 'manual' }));
+    writeFileSync(join(dir, '.harness', 'setup.json'), JSON.stringify({ mode: 'swarm', ownerHours: { shop: 3 } }));
+    assert.equal(projectMode(dir), 'swarm', 'the rules are judged for the mode the daemon will run in');
+    writeFileSync(join(dir, '.harness', 'setup.json'), JSON.stringify({ ownerHours: { shop: 3 } }));
+    assert.equal(projectMode(dir), 'manual');
   });
 });
 

@@ -6,9 +6,8 @@ import { runningDaemon } from '../daemon/main.ts';
 import { ConfigSchema, requiredChecks, type Config } from '../design/schemas.ts';
 import { configDir, loadAppCredentials } from '../github/app.ts';
 import { applyRepositoryRules, checkApp, createApp, installCi, type RulesetOptions } from '../github/setup.ts';
-import type { Mode, State } from '../state/state.ts';
 import { run, sha256 } from '../util.ts';
-import { doctor, granted, repositorySecret, type Check } from './doctor.ts';
+import { doctor, granted, projectMode, repositorySecret, type Check } from './doctor.ts';
 import { appBot, checkedConfig, githubRepo, HARNESS_FILES, init, projectName } from './init.ts';
 import { scaffoldFiles, writeTerraformScaffold, type TerraformLayout, type TerraformScaffold } from './terraform.ts';
 
@@ -540,8 +539,7 @@ async function applyFix(options: SetupOptions, config: Config, fix: Fix, sleep: 
     }
     case 'apply-rules': {
       if (!repo) return false;
-      const stateFile = join(projectDir, '.harness', 'state.json');
-      const mode: Mode = existsSync(stateFile) ? ((JSON.parse(readFileSync(stateFile, 'utf8')) as State).mode ?? 'manual') : 'manual';
+      const mode = projectMode(projectDir);
       let ruleset: RulesetOptions = { mode };
       if (mode === 'swarm') {
         let appId: number | undefined;
