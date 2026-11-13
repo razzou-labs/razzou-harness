@@ -15,6 +15,7 @@ import type { Mode } from '../state/state.ts';
 import { run } from '../util.ts';
 import { buildCache, removeOldAgentImages } from './images.ts';
 import { MAIN_FILES } from './init.ts';
+import { terraformSource } from './terraform.ts';
 import { probe, stateLocation } from './probe.ts';
 
 /** The OpenShell release the harness is built and probed against (§17.4). */
@@ -225,7 +226,18 @@ async function project(options: DoctorOptions, config: Config, report: (c: Check
     for (const file of [tf.backendConfig, tf.varFile]) {
       report(existsSync(join(options.projectDir, tf.dir, file)) ? ok('Terraform', `${tf.dir}/${file}`) : fail('Terraform', `${tf.dir}/${file} is missing`, '`harness setup` writes the missing Terraform scaffold, or see the README\'s AWS section'));
     }
+    report(terraformBackend(options.projectDir, tf.dir));
   }
+}
+
+/**
+ * Without a `backend "s3"` block, CI's `terraform init -backend-config=...` only warns and
+ * keeps the state on the runner: what tf-apply creates would be forgotten with it.
+ */
+export function terraformBackend(projectDir: string, dir: string): Check {
+  return /^\s*backend\s+"s3"/m.test(terraformSource(join(projectDir, dir)))
+    ? ok('Terraform', `${dir}/ has a backend "s3" block`)
+    : fail('Terraform', `no .tf file in ${dir}/ has a backend "s3" block: CI would keep the state on its runner, and lose it`, 'add `terraform { backend "s3" {} }` in a .tf file of its own, or run `harness setup`, which writes it in backend.tf');
 }
 
 /**

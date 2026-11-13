@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { after, before, beforeEach, describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { computeLock, directoryReader } from '../src/ci/harness-ci.ts';
-import { granted, mainRuleset, repositorySecret, secretReader, type Check } from '../src/setup/doctor.ts';
+import { granted, mainRuleset, repositorySecret, secretReader, terraformBackend, type Check } from '../src/setup/doctor.ts';
 import { init } from '../src/setup/init.ts';
 import { recover } from '../src/setup/recover.ts';
 import { askSettings, awsProviderName, commitAndPush, fixFor, infracostKey, linkRepo, setup, type SetupOptions } from '../src/setup/setup.ts';
@@ -482,9 +482,11 @@ describe('the Terraform scaffold', () => {
   it("writes what the bootstrap expects, as terraform fmt writes it, with the bucket's own encryption", () => {
     const dir = tempDir('scaffold');
     const written = writeTerraformScaffold(dir, LAYOUT, { ...values, github: { repo: 'acme/shop', ownerId: '42', repoId: '4242' } });
-    assert.deepEqual(written, ['iac/versions.tf', 'iac/backend-configs/staging.hcl', 'iac/env/staging.tfvars', 'iac/variables.tf', 'iac/providers.tf']);
+    assert.deepEqual(written, ['iac/versions.tf', 'iac/backend.tf', 'iac/backend-configs/staging.hcl', 'iac/env/staging.tfvars', 'iac/variables.tf', 'iac/providers.tf']);
     const read = (path: string) => readFileSync(join(dir, 'iac', path), 'utf8');
-    assert.match(read('versions.tf'), /required_version = ">= 1\.10"[\s\S]*source  = "hashicorp\/aws"\n      version = "~> 6\.65"[\s\S]*\n  backend "s3" \{\}\n\}\n$/);
+    assert.match(read('versions.tf'), /required_version = ">= 1\.10"[\s\S]*source  = "hashicorp\/aws"\n      version = "~> 6\.65"\n    \}\n  \}\n\}\n$/);
+    assert.match(read('backend.tf'), /^terraform \{\n[\s\S]*\n  backend "s3" \{\}\n\}\n$/);
+    assert.equal(terraformBackend(dir, 'iac').status, 'ok');
     assert.equal(read('backend-configs/staging.hcl'), [
       'bucket = "tf-state-staging-123456789012"',
       'key    = "staging/shop/terraform.tfstate"',
@@ -515,9 +517,29 @@ describe('the Terraform scaffold', () => {
     mkdirSync(join(dir, 'iac', 'env'), { recursive: true });
     writeFileSync(join(dir, 'iac', 'main.tf'), 'terraform {\n  backend "s3" {}\n}\n');
     writeFileSync(join(dir, 'iac', 'env', 'staging.tfvars'), 'mine = true\n');
-    assert.deepEqual(writeTerraformScaffold(dir, LAYOUT, values), ['iac/backend-configs/staging.hcl']);
+    assert.deepEqual(writeTerraformScaffold(dir, LAYOUT, values), ['iac/versions.tf', 'iac/backend-configs/staging.hcl'], 'no second backend block');
     assert.equal(readFileSync(join(dir, 'iac', 'env', 'staging.tfvars'), 'utf8'), 'mine = true\n');
     assert.deepEqual(writeTerraformScaffold(dir, LAYOUT, values), [], 'a second run writes nothing');
+  });
+
+  it("writes a backend block of its own into a folder that has none, and nothing the project declares already", () => {
+    const dir = tempDir('scaffold-nobackend');
+    mkdirSync(join(dir, 'iac'), { recursive: true });
+    const versions = 'terraform {\n  required_providers {\n    aws = { source = "hashicorp/aws" }\n  }\n}\n';
+    writeFileSync(join(dir, 'iac', 'versions.tf'), versions);
+    writeFileSync(join(dir, 'iac', 'main.tf'), 'provider "aws" {\n  region = var.aws_region\n}\n\nvariable "aws_region" {\n  type = string\n}\n');
+    assert.equal(terraformBackend(dir, 'iac').status, 'fail', 'the doctor sees the state would stay on the runner');
+    const written = writeTerraformScaffold(dir, LAYOUT, values);
+    assert.deepEqual(written, ['iac/backend.tf', 'iac/backend-configs/staging.hcl', 'iac/env/staging.tfvars', 'iac/variables.tf']);
+    assert.equal(readFileSync(join(dir, 'iac', 'versions.tf'), 'utf8'), versions);
+    assert.deepEqual(readFileSync(join(dir, 'iac', 'variables.tf'), 'utf8').match(/^variable "\w+"/gm), ['variable "env"', 'variable "aws_account_id"'], 'no second aws_region');
+    assert.equal(terraformBackend(dir, 'iac').status, 'ok');
+  });
+
+  it('writes a value holding a template sequence as the text it is', () => {
+    const dir = tempDir('scaffold-escape');
+    writeTerraformScaffold(dir, LAYOUT, { ...values, key: 'staging/${var.x}/%{if}/terraform.tfstate' });
+    assert.match(readFileSync(join(dir, 'iac', 'backend-configs', 'staging.hcl'), 'utf8'), /^key {4}= "staging\/\$\$\{var\.x\}\/%%\{if\}\/terraform\.tfstate"$/m);
   });
 
   it('leaves the repository variables out for a local project', () => {
