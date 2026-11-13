@@ -1,4 +1,4 @@
-import { guardChanges, guardTargets, PARTS_KEY, partHashes, protectionRules, type ProtectionRules, type TreeReader } from '../ci/harness-ci.ts';
+import { guardChanges, guardTargets, INSTALLED, PARTS_KEY, partHashes, protectionRules, type ProtectionRules, type TreeReader } from '../ci/harness-ci.ts';
 import type { Check } from '../design/schemas.ts';
 import type { SandboxDriver } from '../sandbox/driver.ts';
 import { sh, tail } from '../util.ts';
@@ -96,10 +96,11 @@ export async function runGuarded(driver: SandboxDriver, sandbox: string, workDir
   return runEach(driver, sandbox, workDir, checks, options, tripwire);
 }
 
-/** Every file and symbolic link of the checkout but in .git and node_modules, found inside the sandbox: its git can't be trusted. */
+/** Every file and symbolic link of the checkout but in .git and what installing fills, found inside the sandbox: its git can't be trusted. */
 async function sandboxFiles(driver: SandboxDriver, sandbox: string, workDir: string): Promise<string[]> {
+  const pruned = ['.git', ...INSTALLED].map((name) => `-name ${sh(name)}`).join(' -o ');
   // In base64, so that NULs, which no path holds, cross any transport.
-  const script = `cd ${sh(workDir)} && find . \\( -name .git -o -name node_modules \\) -prune -o \\( -type f -o -type l \\) -print0 | base64 -w0`;
+  const script = `set -o pipefail; cd ${sh(workDir)} && find . \\( ${pruned} \\) -prune -o \\( -type f -o -type l \\) -print0 | base64 -w0`;
   const result = await driver.exec(sandbox, script, { timeoutSec: 300 });
   if (result.code !== 0) throw new Error(`could not list the checkout: ${result.stderr.trim()}`);
   return Buffer.from(result.stdout.trim(), 'base64').toString('utf8').split('\0').filter(Boolean).map((path) => path.replace(/^\.\//, ''));

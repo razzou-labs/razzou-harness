@@ -369,13 +369,17 @@ export async function computeLock(tree: TreeReader): Promise<Lock> {
  * What the tripwire of the checks watches in a checkout: the files protected whole that are
  * there now, and those protected by part as they were at the start (`parts`), since a
  * package.json that a build copies into dist/ is none the checks read. What installing
- * writes, in node_modules or a Python virtual environment, is a dependency's, not the project's.
+ * writes, in node_modules, Terraform's modules or a Python virtual environment, is a
+ * dependency's, not the project's.
  */
 export function guardTargets(rules: ProtectionRules, files: string[], parts?: string[]): { whole: string[]; parts: string[] } {
   const venvs = files.filter((file) => file.endsWith('/pyvenv.cfg')).map((file) => file.slice(0, -'pyvenv.cfg'.length));
-  const own = files.filter((file) => !file.split('/').includes('node_modules') && !venvs.some((venv) => file.startsWith(venv)));
+  const own = files.filter((file) => !file.split('/').some((name) => INSTALLED.includes(name)) && !venvs.some((venv) => file.startsWith(venv)));
   return { whole: wholeFiles(rules, own), parts: parts ?? partFiles(rules, own) };
 }
+
+/** The folders that installing fills, which the tripwire neither walks nor watches. */
+export const INSTALLED = ['node_modules', '.terraform'];
 
 /** The key of a file's protected parts in a checkout's state; NUL is in no path. */
 export const PARTS_KEY = '\0parts';
@@ -393,7 +397,7 @@ function walkFiles(root: string): string[] {
     for (const entry of readdirSync(join(root, folder), { withFileTypes: true })) {
       const path = folder ? `${folder}/${entry.name}` : entry.name;
       if (entry.isDirectory()) {
-        if (entry.name !== '.git' && entry.name !== 'node_modules') visit(path);
+        if (entry.name !== '.git' && !INSTALLED.includes(entry.name)) visit(path);
       } else if (entry.isFile() || entry.isSymbolicLink()) out.push(path);
     }
   };

@@ -77,7 +77,7 @@ describe('the tripwire of the checks', () => {
     const quiet = await sandbox('chk-quiet', {
       ...files,
       'init.sh': [
-        'mkdir -p node_modules/a dist .venv/lib',
+        'mkdir -p node_modules/a dist .venv/lib iac/.terraform/modules/vpc && touch iac/.terraform/modules/vpc/AGENTS.md',
         'echo "{}" > node_modules/a/package.json; echo "{}" > dist/package.json; touch .venv/pyvenv.cfg .venv/lib/conftest.py',
         // Another field of package.json, and another table of pyproject.toml.
         `printf '%s' '${JSON.stringify({ name: 'y', scripts: { prepare: 'node p.js' } })}' > package.json`,
