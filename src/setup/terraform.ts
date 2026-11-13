@@ -19,6 +19,11 @@ export interface TerraformScaffold {
   github?: { repo: string; ownerId: string; repoId: string } | undefined;
 }
 
+/** Every file the scaffold may write, from the project's root. */
+export function scaffoldFiles(layout: TerraformLayout): string[] {
+  return ['versions.tf', 'backend.tf', 'variables.tf', 'providers.tf', layout.backendConfig, layout.varFile].map((path) => `${layout.dir}/${path}`);
+}
+
 /**
  * Writes the Terraform scaffold the bootstrap expects in the layout's folder: a partial
  * `backend "s3"` block in `versions.tf`, the backend config and the variables file, and the

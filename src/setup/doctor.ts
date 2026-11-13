@@ -14,6 +14,7 @@ import { apiProfile, apiProviderName } from '../sandbox/policy.ts';
 import type { Mode } from '../state/state.ts';
 import { run } from '../util.ts';
 import { buildCache, removeOldAgentImages } from './images.ts';
+import { MAIN_FILES } from './init.ts';
 import { probe, stateLocation } from './probe.ts';
 
 /** The OpenShell release the harness is built and probed against (§17.4). */
@@ -170,6 +171,7 @@ export function granted(appCheck: string[], permission: string): string | undefi
 
 async function project(options: DoctorOptions, config: Config, report: (c: Check) => void): Promise<void> {
   report(ok('harness/config.json', `project ${config.project.name}`));
+  report(await mainHolds(options.projectDir));
   const repo = config.project.repo;
   const mode = projectMode(options.projectDir);
   if (!repo) {
@@ -224,6 +226,31 @@ async function project(options: DoctorOptions, config: Config, report: (c: Check
       report(existsSync(join(options.projectDir, tf.dir, file)) ? ok('Terraform', `${tf.dir}/${file}`) : fail('Terraform', `${tf.dir}/${file} is missing`, '`harness setup` writes the missing Terraform scaffold, or see the README\'s AWS section'));
     }
   }
+}
+
+/**
+ * main, and origin's main as of the last fetch or push, hold the config and the CI files as
+ * the working tree has them: the daemon reads the config from main, and CI runs the
+ * workflow that main has. Files the working tree hasn't are reported by their own checks.
+ */
+export async function mainHolds(projectDir: string): Promise<Check> {
+  const git = (args: string[]) => run('git', ['-C', projectDir, ...args]).catch(() => undefined);
+  const refs = ['main'];
+  const problems: string[] = [];
+  if ((await git(['rev-parse', '--verify', '--quiet', 'refs/remotes/origin/main']))?.code === 0) refs.push('origin/main');
+  else if ((await git(['remote', 'get-url', 'origin']))?.code === 0) problems.push("origin's main is unknown here: it was never pushed or fetched");
+  const files = MAIN_FILES.filter((file) => existsSync(join(projectDir, file)));
+  for (const ref of refs) {
+    const differ: string[] = [];
+    for (const file of files) {
+      const shown = await git(['show', `refs/${ref === 'main' ? 'heads' : 'remotes'}/${ref}:${file}`]);
+      if (shown?.code !== 0 || shown.stdout !== readFileSync(join(projectDir, file), 'utf8')) differ.push(file);
+    }
+    if (differ.length > 0) problems.push(`${ref} doesn't hold ${differ.join(', ')} as ${differ.length === 1 ? 'it is' : 'they are'} here`);
+  }
+  return problems.length === 0
+    ? ok('main', `holds ${files.join(', ')} as ${files.length === 1 ? 'it is' : 'they are'} here`)
+    : fail('main', problems.join('; '), 'commit them on main and push it: `harness setup` offers both. The daemon reads the config from main, and CI runs the workflow main has');
 }
 
 /** The project's third-party APIs: each key in an OpenShell provider, under the variable the config names. */

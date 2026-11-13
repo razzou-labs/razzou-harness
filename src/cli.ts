@@ -179,7 +179,7 @@ async function main(): Promise<void> {
     }
     case 'setup': {
       if (process.stdin.isTTY !== true) throw new Error('harness setup needs a terminal: it asks for what only you can give. `harness doctor` lists what is missing.');
-      return setup({
+      if (!(await setup({
         projectDir,
         packageDir: packageRoot,
         version,
@@ -194,7 +194,8 @@ async function main(): Promise<void> {
           await runDaemon(projectDir);
           process.exit(0);
         },
-      });
+      }))) process.exitCode = 1;
+      return;
     }
     case 'doctor':
       return runDoctor(projectDir, values);

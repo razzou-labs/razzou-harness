@@ -1,15 +1,16 @@
 import { basename, join, resolve } from 'node:path';
 import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
-import type { z } from 'zod';
+import { prettifyError, type z } from 'zod';
 import { computeLock, directoryReader } from '../ci/harness-ci.ts';
+import { runningDaemon } from '../daemon/main.ts';
 import { ConfigSchema, requiredChecks, type Config } from '../design/schemas.ts';
 import { configDir, loadAppCredentials } from '../github/app.ts';
 import { applyRepositoryRules, checkApp, createApp, installCi, type RulesetOptions } from '../github/setup.ts';
 import type { Mode, State } from '../state/state.ts';
 import { run, sha256 } from '../util.ts';
 import { doctor, granted, repositorySecret, type Check } from './doctor.ts';
-import { appBot, checkedConfig, githubRepo, init, projectName } from './init.ts';
-import { writeTerraformScaffold, type TerraformLayout, type TerraformScaffold } from './terraform.ts';
+import { appBot, checkedConfig, githubRepo, HARNESS_FILES, init, projectName } from './init.ts';
+import { scaffoldFiles, writeTerraformScaffold, type TerraformLayout, type TerraformScaffold } from './terraform.ts';
 
 /**
  * `harness setup` (proposal v4 §4): the doctor with hands. It walks the setup in order,
@@ -107,14 +108,15 @@ async function askValid(options: Pick<SetupOptions, 'ask' | 'say'>, question: st
   }
 }
 
-export async function setup(options: SetupOptions): Promise<void> {
+/** Runs the setup; false when it ends with problems left. */
+export async function setup(options: SetupOptions): Promise<boolean> {
   const { projectDir, say } = options;
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
 
   await ghLogin(options);
-  const scaffolded = await scaffold(options, sleep);
+  await scaffold(options, sleep);
   const settings = await askSettings(options);
-  await commitAndPush(options, [...scaffolded, ...settings.written]);
+  await commitAndPush(options);
 
   const config = loadConfig(projectDir);
   if (!config) throw new Error('harness/config.json is missing after init: run `harness setup` again');
@@ -145,13 +147,17 @@ export async function setup(options: SetupOptions): Promise<void> {
 
   say('\nThe probe: everything an agent must not do, tried.');
   const probe = await doctor({ projectDir, packageDir: options.packageDir, version: options.version, probe: true, buildImages: false, interactive: false, report: (c) => { if (c.name.startsWith('probe')) say(line(c)); } });
+  // A failed check, such as main without the config, would stop the daemon: it isn't offered then.
   const failed = probe.filter((c) => c.status === 'fail');
   if (failed.length > 0) {
     say(`\n${failed.length} problem${failed.length === 1 ? '' : 's'} left: ${failed.map((c) => c.name).join(', ')}. Fix them, then run \`harness setup\` again.`);
-    return;
+    return false;
   }
   say('\nAll good.');
-  if (!/^n/i.test(await options.ask('Start the daemon now? [Y/n] '))) await options.up();
+  const running = runningDaemon(join(projectDir, '.harness'));
+  if (running) say(`A daemon already runs for this project (pid ${running.pid}): \`harness down\`, then \`harness up\`, starts it on what the setup changed.`);
+  else if (!/^n/i.test(await options.ask('Start the daemon now? [Y/n] '))) await options.up();
+  return true;
 }
 
 /** gh must be logged in as an admin of the repository: it applies the rules and creates the repository. */
@@ -397,22 +403,32 @@ async function configureGitHubForAws(options: SetupOptions, repo: string, aws: {
 const SETUP_COMMIT = 'Set up razzou-harness';
 
 /**
- * The files the setup wrote, committed with the owner's git once they agree, and pushed
- * to main: before the ruleset, which would refuse the push. The commit holds those files
- * only, and only main is pushed. A setup commit on main that origin hasn't, after a push
- * refused or declined, is offered again.
+ * The harness's files, committed with the owner's git once they agree, and pushed to main:
+ * before the ruleset, which would refuse the push. Every run offers whichever of them git
+ * shows untracked or modified, whichever run wrote them: a commit declined or refused once
+ * is offered again. The commit holds those files only, and only main is pushed. A setup
+ * commit on main that origin hasn't, after a push refused or declined, is offered again.
  */
-export async function commitAndPush(options: Pick<SetupOptions, 'projectDir' | 'say' | 'ask'>, paths: string[]): Promise<void> {
+export async function commitAndPush(options: Pick<SetupOptions, 'projectDir' | 'say' | 'ask'>): Promise<void> {
   const { projectDir, say } = options;
   const git = (args: string[]) => run('git', ['-C', projectDir, ...args]);
-  const tracked = paths.filter((p) => !p.startsWith('.harness/'));
-  const status = tracked.length > 0 ? (await git(['status', '--porcelain', '--', ...tracked])).stdout : '';
-  const changed = status.split('\n').filter((l) => l.trim() !== '').map((l) => l.slice(3));
+  const status = (await git(['status', '--porcelain', '--untracked-files=all', '--', ...harnessFiles(projectDir)])).stdout;
+  const changed = status.split('\n').filter((l) => l.trim() !== '')
+    // init writes these only where they are missing: an edit to one is the owner's own.
+    .filter((l) => l.startsWith('??') || !OWNERS_ONCE_WRITTEN.includes(l.slice(3)))
+    .map((l) => l.slice(3));
+  const branch = (await git(['symbolic-ref', '--quiet', '--short', 'HEAD'])).stdout.trim() || 'a detached HEAD';
+  const pushing = changed.length > 0 ? branch === 'main' : await unpushedSetup(projectDir);
+  if (changed.length === 0 && !pushing) return;
+  // A config the schema refuses, once on main, stops every later run and the daemon at the same error.
+  const problem = configProblem(projectDir);
+  if (problem) throw new Error(`harness/config.json is not valid, so nothing was committed or pushed:\n${problem}\nFix it, then run \`harness setup\` again.`);
+  const others = pushing ? await unpushedCommits(projectDir) : 0;
+  const alsoSends = others > 0 ? ` The push also sends ${others} other commit${others === 1 ? '' : 's'} of main that origin doesn't have.` : '';
   if (changed.length > 0) {
-    const branch = (await git(['symbolic-ref', '--quiet', '--short', 'HEAD'])).stdout.trim() || 'a detached HEAD';
     const files = `${changed.length} file${changed.length === 1 ? '' : 's'}`;
     say(`\nTo commit on ${branch}: ${changed.join(', ')}`);
-    const question = branch === 'main' ? `Commit and push ${files} to main, as you? [Y/n] ` : `Commit ${files} on ${branch}, as you? The setup pushes only main. [Y/n] `;
+    const question = branch === 'main' ? `Commit and push ${files} to main, as you?${alsoSends} [Y/n] ` : `Commit ${files} on ${branch}, as you? The setup pushes only main. [Y/n] `;
     if (/^n/i.test(await options.ask(question))) return say('Commit them, and push them to main yourself before `harness up`.');
     const add = await git(['add', '--', ...changed]);
     if (add.code !== 0) throw new Error(`git add: ${add.stderr.trim()}`);
@@ -423,16 +439,53 @@ export async function commitAndPush(options: Pick<SetupOptions, 'projectDir' | '
       const sha = (await git(['rev-parse', '--short', 'HEAD'])).stdout.trim();
       return say(`committed on ${branch} (${sha}), not pushed: the setup pushes only main. Bring the commit to main (\`git switch main && git cherry-pick ${sha}\`, or \`git branch -m main\` if ${branch} is your main line), then run \`harness setup\` again: it offers the push.`);
     }
-  } else if (!(await unpushedSetup(projectDir))) {
-    return;
-  } else if (/^n/i.test(await options.ask("main has the setup's commit, and origin's main doesn't yet. Push main, as you? [Y/n] "))) {
+  } else if (/^n/i.test(await options.ask(`main has the setup's commit, and origin's main doesn't yet. Push main, as you?${others > 1 ? ` The push sends ${others} commits of main that origin doesn't have.` : ''} [Y/n] `))) {
     return say('Push main yourself before `harness up`.');
   }
   const committed = changed.length > 0;
   if ((await git(['remote', 'get-url', 'origin'])).code !== 0) return say('committed; no origin to push to.');
-  const push = await git(['push', '--quiet', '-u', 'origin', 'main']);
+  // An upstream the owner set stays as it is.
+  const upstream = (await git(['rev-parse', '--abbrev-ref', '--quiet', 'main@{upstream}'])).code === 0;
+  const push = await git(['push', '--quiet', ...(upstream ? [] : ['-u']), 'origin', 'main']);
   if (push.code !== 0) say(`${committed ? 'committed, but ' : ''}the push was refused: ${push.stderr.trim()}\nRun \`harness setup\` again to retry, or push main yourself.`);
   else say(committed ? 'committed and pushed to main.' : 'pushed to main.');
+}
+
+/** The files the setup offers to commit: the harness's own, and the Terraform scaffold of the config's layout. */
+function harnessFiles(projectDir: string): string[] {
+  const configFile = join(projectDir, 'harness', 'config.json');
+  let layout: TerraformLayout | undefined;
+  try {
+    layout = ConfigSchema.parse(JSON.parse(readFileSync(configFile, 'utf8'))).terraform;
+  } catch {
+    layout = undefined;
+  }
+  return [...HARNESS_FILES, ...OWNERS_ONCE_WRITTEN, ...(layout ? scaffoldFiles(layout) : [])];
+}
+
+/** The files init writes for the owner to make their own. */
+const OWNERS_ONCE_WRITTEN = ['README.md', 'ARCHITECTURE.md'];
+
+/** What the schema refuses in harness/config.json, if the file exists. */
+function configProblem(projectDir: string): string | undefined {
+  const file = join(projectDir, 'harness', 'config.json');
+  if (!existsSync(file)) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(file, 'utf8'));
+  } catch (error) {
+    return (error as Error).message;
+  }
+  const result = ConfigSchema.safeParse(parsed);
+  return result.success ? undefined : prettifyError(result.error);
+}
+
+/** How many commits of main origin's main hasn't, as of the last fetch or push: all of main, when origin's is unknown. */
+async function unpushedCommits(projectDir: string): Promise<number> {
+  const git = (args: string[]) => run('git', ['-C', projectDir, ...args]);
+  const known = (await git(['rev-parse', '--verify', '--quiet', 'refs/remotes/origin/main'])).code === 0;
+  const count = await git(['rev-list', '--count', 'refs/heads/main', ...(known ? ['^refs/remotes/origin/main'] : [])]);
+  return count.code === 0 ? Number(count.stdout.trim()) : 0;
 }
 
 /** Whether local main has a setup commit that origin's main hasn't, as of the last fetch or push. */

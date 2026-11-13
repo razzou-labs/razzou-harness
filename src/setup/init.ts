@@ -17,6 +17,16 @@ export interface InitOptions {
   owner?: string;
 }
 
+/**
+ * The files of the harness that main must hold as the working tree has them: the daemon
+ * reads the config from main, and CI runs the workflow on it. CODEOWNERS and the lock are
+ * the harness's too.
+ */
+export const MAIN_FILES = ['harness/config.json', '.github/workflows/harness.yml', '.github/harness/harness-ci.ts'];
+
+/** Every file the harness writes into a project, but the README and ARCHITECTURE.md, which become the owner's. */
+export const HARNESS_FILES = [...MAIN_FILES, 'harness/lock.json', '.github/CODEOWNERS', 'init.sh', '.gitignore'];
+
 /** The setup steps: `harness setup` does what it can (v4 §4), and `harness doctor` checks them (§17.3). */
 export const CHECKLIST = `Next: \`harness setup\` does these steps for you, and asks only for what is yours (a login,
 a token, a click on GitHub). \`harness doctor\` checks them at any time. The steps:

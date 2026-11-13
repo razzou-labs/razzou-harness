@@ -219,11 +219,11 @@ describe('the setup commits only its files, and pushes only main', () => {
   it('commits the files it wrote, and nothing the owner had staged, then pushes main', async () => {
     const { dir, remote } = await project();
     mkdirSync(join(dir, 'harness'), { recursive: true });
-    writeFileSync(join(dir, 'harness', 'config.json'), '{}\n');
+    writeFileSync(join(dir, 'harness', 'config.json'), `${JSON.stringify({ harnessVersion: '0.6.0', project: { name: 'shop' } })}\n`);
     writeFileSync(join(dir, 'notes.txt'), 'work in progress\n');
     await runOk('git', ['-C', dir, 'add', 'notes.txt']);
     const o = owner(dir, ['y']);
-    await commitAndPush(o.options, ['harness/config.json', '.harness/setup.json']);
+    await commitAndPush(o.options);
     assert.deepEqual((await runOk('git', ['-C', dir, 'show', '--name-only', '--format=%s', 'HEAD'])).trim().split('\n'), ['Set up razzou-harness', '', 'harness/config.json']);
     assert.equal((await runOk('git', ['-C', dir, 'diff', '--cached', '--name-only'])).trim(), 'notes.txt', 'still staged, not committed');
     assert.equal(await head(remote, 'main'), await head(dir));
@@ -237,7 +237,7 @@ describe('the setup commits only its files, and pushes only main', () => {
     await runOk('git', ['-C', dir, 'switch', '--quiet', '-c', 'feature']);
     writeFileSync(join(dir, 'init.sh'), '#!/usr/bin/env bash\n');
     const o = owner(dir, ['y']);
-    await commitAndPush(o.options, ['init.sh']);
+    await commitAndPush(o.options);
     assert.match(o.asked[0]!, /^Commit 1 file on feature, as you\? The setup pushes only main/);
     assert.equal(await head(remote, 'main'), before, 'nothing pushed');
     assert.equal((await run('git', ['-C', dir, 'rev-parse', '--abbrev-ref', 'feature@{upstream}'])).code === 0, false, 'no upstream for the branch');
@@ -249,21 +249,63 @@ describe('the setup commits only its files, and pushes only main', () => {
     await runOk('git', ['-C', dir, 'remote', 'add', 'origin', '/nonexistent/repo.git']);
     writeFileSync(join(dir, 'init.sh'), '#!/usr/bin/env bash\n');
     const first = owner(dir, ['y']);
-    await commitAndPush(first.options, ['init.sh']);
+    await commitAndPush(first.options);
     assert.match(first.said.at(-1)!, /^committed, but the push was refused/);
 
     await runOk('git', ['init', '--quiet', '--bare', '--initial-branch=main', remote]);
     await runOk('git', ['-C', dir, 'remote', 'set-url', 'origin', remote]);
     const declined = owner(dir, ['n']);
-    await commitAndPush(declined.options, []);
+    await commitAndPush(declined.options);
     assert.match(declined.asked[0]!, /^main has the setup's commit, and origin's main doesn't yet\. Push main/);
     const again = owner(dir, ['y']);
-    await commitAndPush(again.options, []);
+    await commitAndPush(again.options);
     assert.equal(again.asked.length, 1, 'offered again');
     assert.equal(await head(remote, 'main'), await head(dir));
     const done = owner(dir, []);
-    await commitAndPush(done.options, []);
+    await commitAndPush(done.options);
     assert.deepEqual(done.asked, [], 'pushed: nothing to offer');
+  });
+
+  it("offers again the harness's files an earlier run wrote and didn't commit, and not the owner's edits", async () => {
+    const { dir } = await project();
+    mkdirSync(join(dir, 'iac', 'env'), { recursive: true });
+    writeFileSync(join(dir, 'init.sh'), '#!/usr/bin/env bash\n');
+    writeFileSync(join(dir, 'README.md'), '# shop, edited\n');
+    mkdirSync(join(dir, 'harness'));
+    writeFileSync(join(dir, 'harness', 'config.json'), JSON.stringify({
+      harnessVersion: '0.6.0', project: { name: 'shop' }, aws: { region: 'eu-west-1', provider: 'aws-view-shop' }, terraform: { dir: 'iac' },
+    }));
+    writeFileSync(join(dir, 'iac', 'env', 'staging.tfvars'), 'env = "staging"\n');
+    writeFileSync(join(dir, 'iac', 'main.tf'), '# the owner\'s, in progress\n');
+    const declined = owner(dir, ['n']);
+    await commitAndPush(declined.options);
+    assert.equal(declined.said[0], '\nTo commit on main: harness/config.json, iac/env/staging.tfvars, init.sh');
+    const again = owner(dir, ['y']);
+    await commitAndPush(again.options);
+    assert.match(again.asked[0]!, /^Commit and push 3 files to main, as you\? \[Y\/n\] $/);
+    const left = (await runOk('git', ['-C', dir, 'status', '--porcelain'])).split('\n').filter(Boolean).sort();
+    assert.deepEqual(left, [' M README.md', '?? iac/main.tf'], "the owner's edit and work stay out");
+  });
+
+  it('says how many other commits the push sends, and keeps the upstream the owner set', async () => {
+    const { dir, remote } = await project();
+    await runOk('git', ['-C', dir, 'commit', '--quiet', '--allow-empty', '-m', 'mine']);
+    await runOk('git', ['-C', dir, 'branch', '--quiet', '--set-upstream-to', 'origin/main']);
+    writeFileSync(join(dir, 'init.sh'), '#!/usr/bin/env bash\n');
+    const o = owner(dir, ['y']);
+    await commitAndPush(o.options);
+    assert.match(o.asked[0]!, /^Commit and push 1 file to main, as you\? The push also sends 1 other commit of main that origin doesn't have\./);
+    assert.equal(await head(remote, 'main'), await head(dir));
+  });
+
+  it('commits and pushes nothing while harness/config.json is one the schema refuses', async () => {
+    const { dir, remote } = await project();
+    mkdirSync(join(dir, 'harness'));
+    writeFileSync(join(dir, 'harness', 'config.json'), JSON.stringify({ harnessVersion: '0.6.0', project: { name: 'shop', repo: 'shop', bot: 'shop-harness[bot]' } }));
+    const before = await head(dir);
+    await assert.rejects(commitAndPush(owner(dir, ['y']).options), /harness\/config\.json is not valid, so nothing was committed or pushed:\n.*owner\/name/s);
+    assert.equal(await head(dir), before);
+    assert.equal(await head(remote, 'main'), before);
   });
 });
 

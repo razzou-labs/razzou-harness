@@ -1,12 +1,13 @@
 import { strict as assert } from 'node:assert';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 import { bytes, readDockerUsage } from '../src/sandbox/docker.ts';
 import { OpenShellDriver } from '../src/sandbox/openshell.ts';
 import { Denials, parseDenials } from '../src/sandbox/refusals.ts';
-import { storeApiKey } from '../src/setup/doctor.ts';
+import { mainHolds, storeApiKey } from '../src/setup/doctor.ts';
 import { buildCache, removeOldAgentImages } from '../src/setup/images.ts';
+import { runOk } from '../src/util.ts';
 import { tempDir } from './helpers/toy-repo.ts';
 
 /** Lines of `openshell logs`, as OpenShell 0.1.2 wrote them for a sandbox whose policy refused two hosts. */
@@ -136,6 +137,35 @@ describe("the doctor's cleanup of the agents' images", () => {
     assert.deepEqual(await removeOldAgentImages('acme/agent:2', bin), { removed: [], kept: [] }, 'a project with its own image keeps every other');
     assert.deepEqual(await buildCache(bin), { size: '8.028GB', reclaimable: '4.102GB' });
     assert.equal(await buildCache(join(dir, 'missing')), undefined);
+  });
+});
+
+describe("the doctor's check of main", () => {
+  it("fails while main, or origin's main, lacks the config or the CI files as the working tree has them", async () => {
+    const dir = tempDir('project');
+    const remote = join(tempDir('remote'), 'repo.git');
+    const git = (...args: string[]) => runOk('git', ['-C', dir, '-c', 'user.name=owner', '-c', 'user.email=owner@test.invalid', ...args]);
+    await runOk('git', ['init', '--quiet', '--initial-branch=main', dir]);
+    await runOk('git', ['init', '--quiet', '--bare', '--initial-branch=main', remote]);
+    await git('remote', 'add', 'origin', remote);
+    mkdirSync(join(dir, 'harness'));
+    writeFileSync(join(dir, 'harness', 'config.json'), '{"project":{"name":"shop"}}\n');
+    await git('add', 'harness/config.json');
+    await git('commit', '--quiet', '-m', 'config');
+    assert.deepEqual(await mainHolds(dir), {
+      status: 'fail', name: 'main', detail: "origin's main is unknown here: it was never pushed or fetched",
+      fix: 'commit them on main and push it: `harness setup` offers both. The daemon reads the config from main, and CI runs the workflow main has',
+    });
+    await git('push', '--quiet', 'origin', 'main');
+    assert.deepEqual(await mainHolds(dir), { status: 'ok', name: 'main', detail: 'holds harness/config.json as it is here' });
+
+    mkdirSync(join(dir, '.github', 'workflows'), { recursive: true });
+    writeFileSync(join(dir, '.github', 'workflows', 'harness.yml'), 'name: harness\n');
+    await git('add', '.github');
+    await git('commit', '--quiet', '-m', 'ci');
+    assert.equal((await mainHolds(dir)).detail, "origin/main doesn't hold .github/workflows/harness.yml as it is here", 'committed, not pushed');
+    writeFileSync(join(dir, 'harness', 'config.json'), '{"project":{"name":"shop2"}}\n');
+    assert.equal((await mainHolds(dir)).detail, "main doesn't hold harness/config.json as it is here; origin/main doesn't hold harness/config.json, .github/workflows/harness.yml as they are here");
   });
 });
 
