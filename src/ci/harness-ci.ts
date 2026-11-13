@@ -9,7 +9,7 @@
 //   node harness-ci.ts lock --dir <dir>
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { appendFileSync, existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
+import { appendFileSync, existsSync, lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync, statSync } from 'node:fs';
 import { join, posix, relative } from 'node:path';
 import { parseArgs } from 'node:util';
 
@@ -309,6 +309,58 @@ export async function computeLock(tree: TreeReader): Promise<Lock> {
   return { version: 1, entries };
 }
 
+/**
+ * What the tripwire of the checks watches in a checkout: the files protected whole that are
+ * there now, and those protected by part as they were at the start (`parts`), since a
+ * package.json that a build copies into dist/ is none the checks read. What installing
+ * writes, in node_modules or a Python virtual environment, is a dependency's, not the project's.
+ */
+export function guardTargets(rules: ProtectionRules, files: string[], parts?: string[]): { whole: string[]; parts: string[] } {
+  const venvs = files.filter((file) => file.endsWith('/pyvenv.cfg')).map((file) => file.slice(0, -'pyvenv.cfg'.length));
+  const own = files.filter((file) => !file.split('/').includes('node_modules') && !venvs.some((venv) => file.startsWith(venv)));
+  return { whole: wholeFiles(rules, own), parts: parts ?? partFiles(rules, own) };
+}
+
+/** The key of a file's protected parts in a checkout's state; NUL is in no path. */
+export const PARTS_KEY = '\0parts';
+
+/** The paths whose entry differs between two states of a checkout: changed, appeared or gone. */
+export function guardChanges(before: Map<string, string>, after: Map<string, string>): string[] {
+  const keys = new Set([...before.keys(), ...after.keys()]);
+  return [...new Set([...keys].filter((key) => before.get(key) !== after.get(key)).map((key) => key.replace(PARTS_KEY, '')))].sort();
+}
+
+/** Every file and symbolic link of a checkout, as git would see them, but by walking it: the code under test controls git's view. */
+function walkFiles(root: string): string[] {
+  const out: string[] = [];
+  const visit = (folder: string) => {
+    for (const entry of readdirSync(join(root, folder), { withFileTypes: true })) {
+      const path = folder ? `${folder}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) {
+        if (entry.name !== '.git' && entry.name !== 'node_modules') visit(path);
+      } else if (entry.isFile() || entry.isSymbolicLink()) out.push(path);
+    }
+  };
+  visit('');
+  return out;
+}
+
+/** A checkout's protected files as they are on disk: each one's hash, or link, or its protected parts' hashes. */
+function checkoutState(root: string, rules: ProtectionRules, targets: { whole: string[]; parts: string[] }): Map<string, string> {
+  const entry = (path: string, part: boolean) => {
+    const file = join(root, path);
+    const stat = lstatSync(file, { throwIfNoEntry: false });
+    if (stat?.isSymbolicLink()) return `link:${readlinkSync(file)}`;
+    if (!stat?.isFile()) return 'absent';
+    const bytes = readFileSync(file);
+    return part ? JSON.stringify(partHashes(rules, path, bytes.toString('utf8'))) : createHash('sha256').update(bytes).digest('hex');
+  };
+  const state = new Map<string, string>();
+  for (const path of targets.whole) state.set(path, entry(path, false));
+  for (const path of targets.parts) state.set(`${path}${PARTS_KEY}`, entry(path, true));
+  return state;
+}
+
 /** Differences between a tree's `harness/lock.json` and the tree itself. */
 export async function lockMismatches(tree: TreeReader): Promise<string[]> {
   const written = parseJson(await tree.read('harness/lock.json')) as Lock | undefined;
@@ -561,7 +613,19 @@ export async function runCiChecks(definitions: TreeReader, dir: string, log: (li
     log(`${exit === 0 ? 'passed' : `FAILED (exit ${exit})`}: ${id}`);
     return exit;
   };
-  if (existsSync(join(dir, 'init.sh')) && run('init.sh', 'bash init.sh', 900) !== 0) return outcomes;
+  // A tripwire: what init.sh or a check runs, such as a `prepare` script, could rewrite a protected file in the checkout,
+  // which verify judged as committed, and make a check pass. Taken before anything runs, compared after each step.
+  const rules = await protectionRules(definitions);
+  const start = guardTargets(rules, walkFiles(dir));
+  const before = checkoutState(dir, rules, start);
+  const tripped = () => {
+    const changed = guardChanges(before, checkoutState(dir, rules, guardTargets(rules, walkFiles(dir), start.parts)));
+    if (changed.length === 0) return false;
+    log(`::error::the code under test changed protected files while the checks ran: ${changed.join(', ')}`);
+    outcomes.push({ id: 'protected-files', exit: 1, durationMs: 0 });
+    return true;
+  };
+  if (existsSync(join(dir, 'init.sh')) && (run('init.sh', 'bash init.sh', 900) !== 0 || tripped())) return outcomes;
   for (const check of checks) {
     const needs = check.needs ?? [];
     // Checks that need AWS run in the harness's own sandboxes, with the view-only role: CI has none.
@@ -574,6 +638,7 @@ export async function runCiChecks(definitions: TreeReader, dir: string, log: (li
       continue;
     }
     run(check.id, check.run, check.timeoutSec ?? 600);
+    if (tripped()) return outcomes;
   }
   return outcomes;
 }
@@ -609,7 +674,8 @@ export function tableHash(text: string | undefined, table: string): string {
     const key = (name === '' ? table : table.slice(name.length + 1)).split('.')[0]!;
     return block.split('\n').some((line) => bare(line).startsWith(`${key}.`) || bare(line).startsWith(`${key}=`));
   });
-  return picked.length === 0 ? 'absent' : sha256(picked.map((b) => b.text).join(''));
+  // Without the blank lines that end a block: a table added after it leaves it as it was.
+  return picked.length === 0 ? 'absent' : sha256(picked.map((b) => `${b.text.trimEnd()}\n`).join(''));
 }
 
 export function resolvePointer(value: unknown, pointer: string): unknown {

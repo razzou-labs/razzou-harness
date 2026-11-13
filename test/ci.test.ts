@@ -538,6 +538,50 @@ describe('verify', () => {
     assert.equal((await checks('', '')).code, 1, 'a push to main runs its own');
   });
 
+  it('fails the run once what it runs changes a protected file of the checkout, even through npm ci', async () => {
+    const dir = tempDir('tripwire');
+    const plan = (run: string) => JSON.stringify({
+      id: 'P1', module: 'm', title: 'T', goal: 'G',
+      features: [{ id: 'F01', title: 'A', description: 'd', expected: 'e', checks: [{ id: 'F01-test', run, phase: 'pre-merge' }] }],
+    });
+    write(dir, {
+      'harness/config.json': JSON.stringify({ harnessVersion: '0.1.0', project: { name: 'x' }, checks: [{ id: 'first', run: 'true', phase: 'pre-merge' }] }),
+      'harness/modules/m/plans/P1.json': plan('node harness/modules/m/checks/F01.test.mjs'),
+      'harness/modules/m/checks/F01.test.mjs': 'process.exit(1);\n',
+      'progress.txt': '2026-01-01T00:00:00Z feature.accepted m/P1/F01 attempt=1 "a"\n',
+      // A prepare script, which npm ci runs, rewrites the check to pass.
+      'package.json': JSON.stringify({ name: 'x', version: '1.0.0', scripts: { prepare: 'node tools/prepare.mjs' } }),
+      'package-lock.json': JSON.stringify({ name: 'x', version: '1.0.0', lockfileVersion: 3, requires: true, packages: { '': { name: 'x', version: '1.0.0' } } }),
+      'tools/prepare.mjs': "import { writeFileSync } from 'node:fs';\nwriteFileSync('harness/modules/m/checks/F01.test.mjs', 'process.exit(0);\\n');\n",
+      'init.sh': 'npm ci --no-audit --no-fund\n',
+    });
+    const env = { ...process.env, npm_config_offline: 'true', npm_config_cache: tempDir('npm-cache'), npm_config_update_notifier: 'false' };
+    const tripped = await run('node', [script, 'checks', '--definitions', dir, '--dir', dir], { env });
+    assert.equal(tripped.code, 1, tripped.stdout);
+    assert.match(tripped.stdout, /passed: init\.sh\n::error::the code under test changed protected files while the checks ran: harness\/modules\/m\/checks\/F01\.test\.mjs\n/);
+    assert.doesNotMatch(tripped.stdout, /F01-test|first/, 'no check runs once it tripped');
+
+    // A check that adds a conftest.py: the run stops after it. Installing, a build and a venv write what is no project's config.
+    write(dir, {
+      'harness/modules/m/checks/F01.test.mjs': 'process.exit(0);\n',
+      'harness/config.json': JSON.stringify({ harnessVersion: '0.1.0', project: { name: 'x' }, checks: [{ id: 'first', run: 'touch tests/conftest.py', phase: 'pre-merge' }] }),
+      'tools/prepare.mjs': [
+        "import { mkdirSync, writeFileSync } from 'node:fs';",
+        "for (const dir of ['dist', 'node_modules/a', '.venv/lib/site-packages/b', 'tests']) mkdirSync(dir, { recursive: true });",
+        "writeFileSync('dist/package.json', '{}');",
+        "writeFileSync('node_modules/a/package.json', '{}');",
+        "writeFileSync('node_modules/a/vitest.config.js', '');",
+        "writeFileSync('.venv/pyvenv.cfg', '');",
+        "writeFileSync('.venv/lib/site-packages/b/conftest.py', '');",
+        '',
+      ].join('\n'),
+    });
+    const later = await run('node', [script, 'checks', '--definitions', dir, '--dir', dir], { env });
+    assert.equal(later.code, 1, later.stdout);
+    assert.match(later.stdout, /passed: first\n::error::the code under test changed protected files while the checks ran: tests\/conftest\.py\n/);
+    assert.doesNotMatch(later.stdout, /F01-test/);
+  });
+
   it('leaves checks that need AWS to the harness, and runs plan assertions only with a plan', async () => {
     const dir = tempDir('checks');
     write(dir, {
