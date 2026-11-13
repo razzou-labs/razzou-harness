@@ -13,11 +13,18 @@ export const architectRef = (module: string) => `refs/architect/${module}`;
 /** Where it keeps the Architect's latest change to locked files (v5). */
 export const lockedRef = (module: string) => `refs/architect-locked/${module}`;
 
-/** A plan is built once it is past `active`: its features are locked (v5). */
-const isBuilt = (o: Orchestrator, module: string, plan: string): boolean => {
-  const status = o.state.plans[`${module}/${plan}`]?.status;
-  return status !== undefined && status !== 'active';
-};
+/**
+ * A plan is built once it is past its build: its features are locked (v5). A round that
+ * merges main into its branch, or makes its accepted work pass its checks again, belongs
+ * to the build, which goes on once the round lands: the design may still change then,
+ * and such a round may be what needs it to.
+ */
+export function isBuilt(o: Orchestrator, module: string, plan: string): boolean {
+  const state = o.state.plans[`${module}/${plan}`];
+  if (!state || state.status === 'active') return false;
+  if (state.status === 'fixing') return o.state.features[`${module}/${plan}/fix${state.fixes}`]?.fix?.resume !== 'active';
+  return true;
+}
 
 export type DesignOutcome =
   | { ok: true; head: string; suspect: string[]; pr: { number: number; url: string }; opened: boolean }
@@ -55,13 +62,19 @@ export async function submitDesign(o: Orchestrator, module: ModuleState, summary
   // CHANGED_LOCKED_FILES PR, and new behavior comes in a new plan, whose feature supersedes it.
   const previous = await loadDesign(o.repo, base).catch(() => undefined);
   for (const plan of previous?.modules.find((m) => m.id === module.module)?.plans ?? []) {
-    const status = o.state.plans[`${module.module}/${plan.id}`]?.status;
-    if (status === undefined || status === 'active' || !mine) continue;
+    if (!isBuilt(o, module.module, plan.id) || !mine) continue;
+    const status = o.state.plans[`${module.module}/${plan.id}`]!.status.replaceAll('_', ' ');
     const now = mine.plans.find((p) => p.id === plan.id);
     for (const feature of plan.features) {
       const after = now?.features.find((f) => f.id === feature.id);
       if (!after || definitionHash(after) !== definitionHash(feature)) {
-        problems.push(`${plan.id}/${feature.id}: plan ${plan.id} is past its build (${status.replaceAll('_', ' ')}), so this feature is locked. Fix a wrong definition with submit_locked_change, a CHANGED_LOCKED_FILES PR of its own; for new behavior, add a plan whose feature supersedes ${plan.id}/${feature.id}`);
+        problems.push(`${plan.id}/${feature.id}: plan ${plan.id} is past its build (${status}), so this feature is locked. Fix a wrong definition with submit_locked_change, a CHANGED_LOCKED_FILES PR of its own; for new behavior, add a plan whose feature supersedes ${plan.id}/${feature.id}`);
+      }
+    }
+    // Nothing is built in a plan past its build: a feature added to it would be accepted with the design, and never built.
+    for (const feature of now?.features ?? []) {
+      if (!plan.features.some((f) => f.id === feature.id)) {
+        problems.push(`${plan.id}/${feature.id}: plan ${plan.id} is past its build (${status}), and nothing more is built in it: put this feature in a new plan`);
       }
     }
   }

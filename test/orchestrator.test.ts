@@ -1155,8 +1155,11 @@ describe('pull requests', () => {
     });
     o.setMode('swarm');
     await until(o, () => plan(o)?.leftToOwner !== undefined);
-    assert.equal(plan(o)!.leftToOwner!.reason, 'the security reviewer still blocks PR #1 after 1 fix round(s): the owner decides');
-    assert.match(o.state.pipeline.paused!.reason, /still blocks PR #1 after 1 fix round/);
+    assert.match(plan(o)!.leftToOwner!.reason, /^the security reviewer still blocks PR #1 after 1 fix round\(s\): the owner decides\. Push a fix to its branch, or switch security reviews off under Config/);
+    // The pull request waits for the owner, with its card: nothing else stops for it, and no resume is undone.
+    for (let i = 0; i < 3; i++) await o.tick();
+    assert.equal(o.state.pipeline.paused, undefined);
+    assert.equal(o.store.readAll().some((e) => e.type === 'PIPELINE_PAUSED'), false);
     assert.deepEqual(plan(o)!.reviewFixRounds, { security: 1 });
     assert.equal(fake.prs[0]!.state, 'open');
   });
@@ -1245,13 +1248,12 @@ describe('pull requests', () => {
       github: true, review, config: { swarm: { securityFixRounds: 0, merge: { code: 'owner' } } },
     });
     o.setMode('swarm');
-    await until(o, () => o.state.pipeline.paused !== undefined);
-    assert.equal(plan(o)!.leftToOwner!.reason, 'the security reviewer still blocks PR #1 after 0 fix round(s): the owner decides');
+    const blocked = () => plan(o)?.leftToOwner?.reason.startsWith('the security reviewer still blocks PR #1 after 0 fix round(s): the owner decides') === true;
+    await until(o, blocked);
     const head = plan(o)!.pushed!;
 
     // Off: its status passes over its verdict, saying it isn't one, and the cost reviewer gets its turn.
     o.setReviews('security', 'off');
-    o.resume();
     await until(o, () => plan(o)?.leftToOwner?.reason === "CODE plans are the owner's to merge (swarm.merge.code)");
     assert.deepEqual(plan(o)!.unreviewed!.map((u) => [u.role, u.head === head, u.why]), [['security', true, 'off']]);
     assert.deepEqual(fake.statusesSet.map((s) => [s.context, s.state, s.description]), [
@@ -1263,13 +1265,11 @@ describe('pull requests', () => {
 
     // On again: the verdict it gave this head stands, its status says it again, and it blocks as before.
     o.setReviews('security', 'on');
-    await until(o, () => o.state.pipeline.paused !== undefined);
-    assert.match(o.state.pipeline.paused!.reason, /^the security reviewer still blocks PR #1 after 0 fix round/);
+    await until(o, blocked);
     assert.deepEqual(fake.statusesSet.slice(3).map((s) => [s.context, s.state, s.description]), [['harness/security', 'failure', '1 blocking finding']]);
     assert.equal(fake.reviews.length, 2, 'its review is on the pull request already: it is not posted twice');
     // Off once more: said again, over the verdict, though it was said for this head before.
     o.setReviews('security', 'off');
-    o.resume();
     await until(o, () => plan(o)!.unreviewed!.length === 2);
     assert.deepEqual(fake.statusesSet.slice(4).map((s) => [s.context, s.state]), [['harness/security', 'success']]);
     assert.equal(fake.prs[0]!.state, 'open');
@@ -3195,5 +3195,65 @@ describe('usage limits and a failing API', () => {
     assert.ok(within(o.usageLimitUntil("You've hit your limit"), hour - 60_000, hour + 60_000));
     // A time no window could give, in the agent's own message, isn't believed.
     assert.ok(within(o.usageLimitUntil('Claude AI usage limit reached|9999999999'), hour - 60_000, hour + 60_000));
+  });
+});
+
+describe('a build that must not stall', () => {
+  const check = (id: string, file: string) => ({ id, run: `test -f ${file}`, phase: 'pre-merge', timeoutSec: 30 });
+  const feat = (id: string, file: string, extra: object = {}) => ({ id, title: id, description: `${file} exists.`, expected: 'It exists.', checks: [check(`${id}-c`, file)], ...extra });
+  const planFile = (id: string) => `harness/modules/demo/plans/${id}.json`;
+  const planJson = (id: string, features: object[]) => JSON.stringify({ id, module: 'demo', title: id, goal: 'Files.', features }, null, 2);
+  /** A module whose plans are `plans`, in place of the toy plan: each feature writes the file named after it. */
+  const withPlans = (plans: Record<string, object[]>) => async (dir: string) => {
+    rmSync(join(dir, 'harness/modules/demo'), { recursive: true, force: true });
+    for (const [id, features] of Object.entries(plans)) {
+      mkdirSync(join(dir, 'harness/modules/demo/plans'), { recursive: true });
+      writeFileSync(join(dir, planFile(id)), planJson(id, features));
+    }
+    await runOk('git', ['-C', dir, 'add', '-A']);
+    await runOk('git', ['-C', dir, '-c', 'user.name=o', '-c', 'user.email=o@test.invalid', 'commit', '--quiet', '-m', 'plans']);
+  };
+  const writes = (f: string, extra: Partial<StubBehavior> = {}): StubBehavior => ({ files: { [`${f.toLowerCase()}.txt`]: `${f}\n` }, ...extra });
+  const projectOf = (o: Orchestrator) => o.options.projectDir;
+
+  it('in Manual, goes on with the plan under way when a design change adds a plan before it', async () => {
+    const { orchestrator: o } = await setup((f) => writes(f, { sleepSec: f === 'C1' ? 3 : 0 }), {
+      prepare: withPlans({ P1: [feat('A1', 'a1.txt')], P3: [feat('C1', 'c1.txt'), feat('C2', 'c2.txt')] }),
+    });
+    await until(o, () => o.state.features['demo/P3/C1']?.attempts[0]?.status === 'running');
+    await commitOnMain(projectOf(o), { [planFile('P2')]: planJson('P2', [feat('B1', 'b1.txt')]) }, 'add P2, which sorts before the plan under way');
+    await until(o, () => ['P1', 'P2', 'P3'].every((p) => o.state.plans[`demo/${p}`]?.status === 'completed'), 60_000);
+    const started = o.store.readAll().filter((e) => e.type === 'PLAN_STARTED').map((e) => e.ref!.plan);
+    assert.deepEqual(started, ['P1', 'P3', 'P2'], 'P3 was finished before P2 started');
+  });
+
+  it("pauses, and says why, when the owner's own commit adds a feature to a plan that is already built", async () => {
+    const { orchestrator: o } = await setup((f) => writes(f), { prepare: withPlans({ P1: [feat('A1', 'a1.txt')] }) });
+    await until(o, () => o.state.plans['demo/P1']?.status === 'completed');
+    await commitOnMain(projectOf(o), { [planFile('P1')]: planJson('P1', [feat('A1', 'a1.txt'), feat('A2', 'a2.txt')]) }, 'add A2 to the built P1');
+    await until(o, () => o.state.pipeline.paused !== undefined);
+    assert.equal(o.state.pipeline.paused!.reason, 'demo/P1/A2 is in a plan that is already built, where nothing more is built: it would never be built. Move it to a new plan on main, then resume');
+    // Moved to a plan of its own, it is built.
+    await commitOnMain(projectOf(o), { [planFile('P1')]: planJson('P1', [feat('A1', 'a1.txt')]), [planFile('P2')]: planJson('P2', [feat('A2', 'a2.txt')]) }, 'A2 in a plan of its own');
+    o.resume();
+    await until(o, () => o.state.plans['demo/P2']?.status === 'completed');
+  });
+
+  it('accepts a feature that a design change redefined when its code already fits: nothing to commit is no failure', async () => {
+    const { orchestrator: o } = await setup(
+      (f, attempt) => (f === 'A1' && attempt >= 2 ? { commit: false } : writes(f, { sleepSec: f === 'A2' ? 4 : 0 })),
+      { prepare: withPlans({ P1: [feat('A1', 'a1.txt'), feat('A2', 'a2.txt')] }) },
+    );
+    await until(o, () => o.state.features['demo/P1/A1']?.status === 'accepted' && o.state.features['demo/P1/A2']?.attempts[0]?.status === 'running');
+    const reworded = feat('A1', 'a1.txt', { description: 'a1.txt exists (reworded).' });
+    await commitOnMain(projectOf(o), { [planFile('P1')]: planJson('P1', [reworded, feat('A2', 'a2.txt')]) }, 'reword A1');
+    await until(o, () => o.state.plans['demo/P1']?.status === 'completed', 60_000);
+    const a1 = o.state.features['demo/P1/A1']!;
+    assert.deepEqual(a1.attempts.map((a) => a.status), ['accepted', 'accepted']);
+    assert.deepEqual(a1.attempts[1]!.files, []);
+    const task = readFileSync(join(o.options.harnessDir, 'modules/demo/attempts/P1-A1-a2/task.md'), 'utf8');
+    assert.match(task, /Each must exit 0\. Some may pass already\./);
+    assert.match(task, /if the code already meets it and every check passes, commit nothing and report done/);
+    assert.match((await o.repo.show(o.state.plans['demo/P1']!.head, 'progress.txt'))!, /feature\.accepted demo\/P1\/A1 attempt=1[^\n]*\n[\s\S]*feature\.accepted demo\/P1\/A1 attempt=2/);
   });
 });

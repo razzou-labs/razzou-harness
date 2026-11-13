@@ -16,6 +16,8 @@ export interface TaskInput {
   merge?: { main: string; files: string[] };
   /** Set for a fix round, with its kind: it starts whatever the checks say, since a failure is why it is there. */
   fix?: 'ci' | 'deploy' | 'review' | 'merge' | 'checks';
+  /** The feature was built and accepted before, and a design change redefined it since: its earlier work is on the branch. */
+  rebuilding?: boolean;
 }
 
 /** The Developer's task, given on stdin. Its role text is appended to the system prompt separately. */
@@ -65,10 +67,16 @@ function featureLines(input: TaskInput): string[] {
       '',
       '## How it is checked',
       '',
-      'After you finish, the harness runs these commands from the repository root, in a fresh sandbox. Each must exit 0. They fail now.',
+      `After you finish, the harness runs these commands from the repository root, in a fresh sandbox. Each must exit 0. ${input.rebuilding ? 'Some may pass already.' : 'They fail now.'}`,
       '',
       ...featureChecks.map((c) => `- \`${c.run}\` (${c.id})`),
     );
+    if (input.rebuilding) {
+      lines.push(
+        '',
+        'This feature was built and accepted before, and the design changed its definition since: its earlier work is on the branch. Read the definition above against the code. Change what no longer fits; if the code already meets it and every check passes, commit nothing and report done.',
+      );
+    }
   } else if (input.fix === 'checks') {
     // The work accepted on the branch fails its own checks: making them pass again is the whole task.
     lines.push(

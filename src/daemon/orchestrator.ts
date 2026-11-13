@@ -29,7 +29,7 @@ import {
 import { clip, machineSize, sh, sleep } from '../util.ts';
 import { Architects } from './architects.ts';
 import { AgentChannel, type AgentRequest } from './channel.ts';
-import { architectRef } from './design.ts';
+import { architectRef, isBuilt } from './design.ts';
 import { parseCostEstimate } from '../review/cost-estimate.ts';
 import { activeReview, pollRunningReviews, reviewStep, stepReview } from './review.ts';
 import { Managers } from './manager.ts';
@@ -606,6 +606,11 @@ export class Orchestrator {
     // Paused, the reviewers already running are followed to their end too, as attempts are; none starts.
     if (paused) return (await pollRunningReviews(this)) ? 'progress' : 'wait';
     if (await this.apiKeysMissing()) return 'wait';
+    const added = this.addedToBuiltPlan();
+    if (added) {
+      this.pausePipeline(`${added} is in a plan that is already built, where nothing more is built: it would never be built. Move it to a new plan on main, then resume`);
+      return 'wait';
+    }
     // Manual builds one feature at a time, and looks at nothing else while it runs. Swarm starts
     // more while others run, up to its limit, and follows its other plans meanwhile (v3 §6.2).
     const swarm = this.state.mode === 'swarm';
@@ -636,6 +641,22 @@ export class Orchestrator {
     if (missing.length === 0) return false;
     this.pausePipeline(`no key stored on this machine for ${missing.map((api) => api.host).join(', ')}: run \`harness doctor\` in a terminal, which asks for it, then resume`);
     return true;
+  }
+
+  /**
+   * A feature that main's design has in a plan past its build, and that was never built
+   * there. `submit_design` refuses one, so only a commit of the owner's own adds it; left
+   * alone, the module would count as complete without it.
+   */
+  private addedToBuiltPlan(): string | undefined {
+    for (const module of this.design.modules) {
+      for (const plan of module.plans) {
+        if (!isBuilt(this, module.id, plan.id)) continue;
+        const missing = plan.features.find((f) => this.state.features[`${module.id}/${plan.id}/${f.id}`]?.status !== 'accepted');
+        if (missing) return `${module.id}/${plan.id}/${missing.id}`;
+      }
+    }
+    return undefined;
   }
 
   /** One attempt's next step. An error counts against this attempt alone, and interrupts it past the limit. */
@@ -680,7 +701,11 @@ export class Orchestrator {
     if (running >= limit) return 'wait';
     const module = this.design.modules.find((m) => m.id === current);
     if (!module) return 'wait';
-    const first = swarm ? undefined : module.plans.find((p) => this.state.plans[`${module.id}/${p.id}`]?.status !== 'completed');
+    // Manual builds one plan at a time: the one under way, whatever a design change put before it since, or else
+    // the first that isn't complete. Going by order alone, a plan added before the one being built stopped both.
+    const first = swarm
+      ? undefined
+      : module.plans.find((p) => inFlight.some((s) => s.plan === p.id)) ?? module.plans.find((p) => this.state.plans[`${module.id}/${p.id}`]?.status !== 'completed');
     const plans = first ? [first] : module.plans;
     for (const plan of plans) {
       const planState = this.state.plans[`${module.id}/${plan.id}`];
@@ -1062,6 +1087,7 @@ export class Orchestrator {
       progressTail: progress.split('\n').slice(-21).join('\n'),
       ...(merge ? { merge } : {}),
       ...(state.fix ? { fix: state.fix.kind } : {}),
+      rebuilding: state.attempts.some((a) => a.status === 'accepted'),
     }));
     copyFileSync(join(this.options.packageDir, 'roles', 'developer.md'), join(dir, 'developer.md'));
     writeFileSync(join(dir, 'report.schema.json'), reportJsonSchema());
@@ -1185,7 +1211,15 @@ export class Orchestrator {
     // Even a failed attempt's commits are kept, for the Manager and the owner to look at.
     const head = await this.takeCommits(ref, attempt);
     if (attempt.outcome !== 'done') return this.fail(state, attempt, outcomeReason(attempt));
-    if (!head) return this.fail(state, attempt, 'the Developer reported done but committed nothing');
+    if (!head) {
+      // A feature built before, which a design change redefined: its code may meet the new definition as it is. The
+      // branch then goes to the checks and to the Manager unchanged, and lands as a line of progress.txt.
+      if (!state.attempts.some((a) => a.status === 'accepted')) return this.fail(state, attempt, 'the Developer reported done but committed nothing');
+      await this.repo.setRef(attemptRefName(ref), attempt.base);
+      this.record({ type: 'CHECKS_STARTED', ref, payload: { head: attempt.base, files: [] } });
+      await this.driver.remove(attempt.sandbox);
+      return 'progress';
+    }
 
     const files = await this.repo.changedFiles(attempt.base, head);
     const merge = mergeOf(state);

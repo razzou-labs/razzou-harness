@@ -71,6 +71,7 @@ export class Architects {
     // GitHub first: what the owner merged or closed is seen whatever state the Architect's sandbox is in.
     // A change to locked files has its own PR, which doesn't hold the build (v5).
     if (module.status === 'in_review' && module.design?.pr) await this.followPullRequest(module);
+    else if (!module.design && module.closedDesign?.pr) await this.followClosed(module);
     if (module.locked?.pr) await this.followLocked(module);
     if (module.architect.status !== 'starting') {
       const where = await o.driver.status(module.architect.sandbox);
@@ -185,7 +186,9 @@ export class Architects {
       if (result.code !== 0) throw new Error(`could not write to the Architect's inbox: ${result.stderr.trim()}`);
       o.record({ type: 'ARCHITECT_NOTE_SENT', payload: { module: module.module, key: note.key } });
     }
-    if (unsent.length > 0) o.events.emit('architect-inbox', { module: module.module, sandbox: module.architect.sandbox });
+    // A digest line tells what happened to a plan, and asks for nothing: it waits in the inbox for the next prompt.
+    // Announcing each would cost a turn of the Architect's model on its whole conversation, several times a plan.
+    if (unsent.some((n) => !n.text.startsWith('[digest]'))) o.events.emit('architect-inbox', { module: module.module, sandbox: module.architect.sandbox });
   }
 
   private async process(module: ModuleState): Promise<void> {
@@ -203,7 +206,10 @@ export class Architects {
         return;
       }
       o.record({ type: 'DESIGN_SUBMITTED', payload: { module: module.module, head: outcome.head, suspect: outcome.suspect } });
-      if (outcome.opened) o.record({ type: 'ARCH_PR_OPENED', payload: { module: module.module, number: outcome.pr.number, url: outcome.pr.url } });
+      // Also a pull request found open that the state no longer knew, as one the owner closed and opened again: without it nothing follows the design.
+      if (outcome.opened || module.design?.pr?.number !== outcome.pr.number) {
+        o.record({ type: 'ARCH_PR_OPENED', payload: { module: module.module, number: outcome.pr.number, url: outcome.pr.url } });
+      }
       await this.syncBranch(module);
       const checks = outcome.suspect.length
         ? `These checks already pass on the unbuilt repository, so they may be too weak: ${outcome.suspect.join(', ')}. The PR lists them for the owner.`
@@ -230,7 +236,9 @@ export class Architects {
         return;
       }
       o.record({ type: 'LOCKED_CHANGE_SUBMITTED', payload: { module: module.module, head: outcome.head, changes: outcome.changes } });
-      if (outcome.opened) o.record({ type: 'ARCH_PR_OPENED', payload: { module: module.module, number: outcome.pr.number, url: outcome.pr.url, locked: true } });
+      if (outcome.opened || module.locked?.pr?.number !== outcome.pr.number) {
+        o.record({ type: 'ARCH_PR_OPENED', payload: { module: module.module, number: outcome.pr.number, url: outcome.pr.url, locked: true } });
+      }
       await this.syncBranch(module, `locked/${module.module}`);
       await this.reply(
         module.module,
@@ -367,6 +375,25 @@ export class Architects {
       jobs.push({ name: run.name, conclusion, ...(conclusion === 'success' ? {} : { log: await o.forge.jobLog(run) }) });
     }
     o.record({ type: 'ARCH_CI_DONE', payload: { module: module.module, sha: pr.head, jobs } });
+  }
+
+  /**
+   * A pull request the owner closed may be opened again, and merged after that: looked at
+   * every five minutes, it is taken up as the design under review again. Without this the
+   * module stayed where the close left it, and a merge was never seen.
+   */
+  private async followClosed(module: ModuleState): Promise<void> {
+    const o = this.o;
+    const key = `${module.module}:closed`;
+    if (o.now() < (this.nextPoll.get(key) ?? 0)) return;
+    this.nextPoll.set(key, o.now() + 5 * 60_000);
+    const closed = module.closedDesign!;
+    const pr = await o.forge.pullRequest(closed.pr!.number);
+    if (pr.state !== 'open' && !pr.merged) return;
+    o.record({ type: 'DESIGN_SUBMITTED', payload: { module: module.module, head: closed.head, suspect: closed.suspect, summary: closed.summary } });
+    o.record({ type: 'ARCH_PR_OPENED', payload: { module: module.module, number: closed.pr!.number, url: closed.pr!.url } });
+    this.nextPoll.delete(module.module);
+    o.kick();
   }
 
   /** After the merge: the Architect's clone gets the new main, and its branch starts from it. */

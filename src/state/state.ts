@@ -264,6 +264,8 @@ export interface ModuleState {
   submission?: { requestId: string; summary: string; head: string; at: string };
   /** The design under review: its branch head with the hash list, and its PR. */
   design?: { head: string; suspect: string[]; summary: string; pr?: { number: number; url: string }; ciNoted?: string };
+  /** The design of a pull request the owner closed: they may open it again, and it is then the design under review again. */
+  closedDesign?: { head: string; suspect: string[]; summary: string; pr?: { number: number; url: string } };
   /** A CHANGED_LOCKED_FILES change the daemon is checking before it opens its PR (v5). */
   lockedSubmission?: { requestId: string; summary: string; head: string; at: string };
   /** A CHANGED_LOCKED_FILES change under review: what it changes in each built feature, and its PR (v5). */
@@ -975,8 +977,12 @@ export function apply(state: State, event: HarnessEvent): State {
     }
     case 'DESIGN_SUBMITTED': {
       const module = state.modules[event.payload.module]!;
-      module.design = { head: event.payload.head, suspect: event.payload.suspect, summary: module.submission?.summary ?? '', ...(module.design?.pr ? { pr: module.design.pr } : {}) };
+      module.design = {
+        head: event.payload.head, suspect: event.payload.suspect, summary: event.payload.summary ?? module.submission?.summary ?? '',
+        ...(module.design?.pr ? { pr: module.design.pr } : {}),
+      };
       delete module.submission;
+      delete module.closedDesign;
       module.status = 'in_review';
       break;
     }
@@ -1035,6 +1041,7 @@ export function apply(state: State, event: HarnessEvent): State {
       const module = state.modules[event.payload.module]!;
       // A design change that was closed leaves the merged design as it was.
       module.status = module.frozenCommit ? 'frozen' : 'decomposing';
+      if (module.design?.pr) module.closedDesign = { head: module.design.head, suspect: module.design.suspect, summary: module.design.summary, pr: module.design.pr };
       delete module.design;
       module.notes.push({ key: `note:${event.id}`, text: 'The owner closed your Arch PR without merging it. Ask them why before you submit again.' });
       break;

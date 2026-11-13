@@ -6,6 +6,7 @@ import { INPUTS, TOOLS, type Role, type ToolInput, type ToolName } from '../role
 import { activeAttempts, attemptInSandbox, featureKey, managerKey, planKey, type Attempt, type FeatureState } from '../state/state.ts';
 import { clip, sh, sha256, tail } from '../util.ts';
 import type { AgentRequest } from './channel.ts';
+import { isBuilt } from './design.ts';
 import { attemptsLeft, checksFail, checksReport, ciReport, conflictReport, CONFLICT_STATUSES, deployReport, fixPrMerge, grantFor, outOfAttempts } from './items.ts';
 import type { Orchestrator } from './orchestrator.ts';
 import { refOf } from './refs.ts';
@@ -400,7 +401,7 @@ function architectState(o: Orchestrator, id: string): string {
     plan: planKey(p),
     status: p.status,
     // Past its build, a plan's features are locked: submit_locked_change, or a new plan that supersedes them (v5).
-    locked: p.status !== 'active',
+    locked: isBuilt(o, id, p.plan),
     features: Object.values(o.state.features).filter((f) => f.module === id && f.plan === p.plan).map((f) => ({
       feature: f.feature, status: f.status, attempts: f.attempts.length, ...(f.escalation ? { escalation: f.escalation } : {}),
     })),

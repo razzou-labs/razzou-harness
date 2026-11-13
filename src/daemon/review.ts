@@ -351,9 +351,8 @@ function requestFix(o: Orchestrator, plan: PlanState, pr: PullRequest, review: R
   const limit = review.role === 'security' ? o.design.config.swarm.securityFixRounds : o.design.config.swarm.costFixRounds;
   const rounds = plan.reviewFixRounds?.[review.role] ?? 0;
   if (rounds >= limit) {
-    const reason = `the ${review.role} reviewer still blocks PR #${pr.number} after ${limit} fix round(s): the owner decides`;
-    leaveToOwner(o, plan, pr, reason);
-    o.pausePipeline(`${reason} (${planKey(plan)})`);
+    // The pull request waits for the owner, with its card under Needs you; the module's other plans go on.
+    leaveToOwner(o, plan, pr, `the ${review.role} reviewer still blocks PR #${pr.number} after ${limit} fix round(s): the owner decides. Push a fix to its branch, or switch ${review.role} reviews off under Config to let it merge on what is left`);
     return 'owner';
   }
   const blocking = (review.findings ?? []).filter((f) => f.severity === 'blocking');

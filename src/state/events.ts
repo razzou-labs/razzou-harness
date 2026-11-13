@@ -131,7 +131,8 @@ interface Payloads {
   ARCHITECT_LAUNCHED: { module: string };
   ARCHITECTURE_ACCEPTED: { module: string; version: number };
   DESIGN_REFUSED: { module: string; requestId: string; problems: string[] };
-  DESIGN_SUBMITTED: { module: string; head: string; suspect: string[] };
+  /** `summary`: for a design taken up again from a pull request the owner closed, then opened again. */
+  DESIGN_SUBMITTED: { module: string; head: string; suspect: string[]; summary?: string };
   /** `locked`: the PR of a CHANGED_LOCKED_FILES change, not of a design (v5). */
   ARCH_PR_OPENED: { module: string; number: number; url: string; locked?: boolean };
   ARCH_PR_CLOSED: { module: string; locked?: boolean };
