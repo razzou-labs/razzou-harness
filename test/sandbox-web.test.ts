@@ -304,7 +304,7 @@ describe('the dashboard', () => {
     const webRoot = tempDir('web');
     writeFileSync(join(webRoot, 'index.html'), '<!doctype html><title>harness</title>');
     const logged: string[] = [];
-    const state = { modules: {}, managers: {}, features: {}, plans: {} };
+    const state = { modules: {}, managers: {}, features: {}, plans: {}, ownerRequests: {}, actions: {} };
     const orchestrator = { events: new EventEmitter(), state, log: (line: string) => logged.push(line), ...extra } as unknown as Orchestrator;
     const server = await startDashboard({ orchestrator, port: 0, token, loginCode, webRoot, terminals });
     servers.push(server);
@@ -445,6 +445,62 @@ describe('the dashboard', () => {
     const reviews = [['rev-old', 'reported'], ['rev-now', 'running'], ['rev-next', 'starting'], ['rev-bad', 'failed']].map(([sandbox, status]) => ({ sandbox, status }));
     const state = { modules: {}, managers: {}, features: {}, plans: { 'shop/P1': { reviews }, 'shop/P2': {} } } as unknown as State;
     assert.deepEqual(runningSandboxes(state), ['rev-now', 'rev-next']);
+  });
+
+  it('lifts a pause that only waits to look again, and nothing else, with "Look again now"', async () => {
+    let lifted = 0;
+    let resumed = 0;
+    const { post } = await dashboard(undefined, { lookAgain: () => ++lifted === 1, resume: () => ++resumed > 0 });
+    assert.deepEqual(await post('/api/look-again', {}), { done: true });
+    assert.deepEqual(await post('/api/look-again', {}), { done: false, error: 'no pause waits to look again' });
+    assert.equal(resumed, 0);
+  });
+
+  it("looks up the ids a request names as the state's own: `__proto__` is no question", async () => {
+    let answered = 0;
+    const { post } = await dashboard(undefined, { answerOwnerRequest: () => ++answered > 0 });
+    for (const id of ['__proto__', 'constructor', 'toString']) assert.deepEqual(await post('/api/answer', { id, text: 'yes' }), { done: false, error: 'no such question' }, id);
+    assert.equal((await post('/api/retry', { feature: '__proto__' })).error, 'no such feature');
+    assert.equal(answered, 0);
+  });
+
+  it('gives at least one line of the log, whatever the limit', async () => {
+    const lines = Array.from({ length: 10 }, (_, i) => ({ id: i }));
+    const { call } = await dashboard(undefined, { store: { readAll: () => lines } });
+    for (const limit of ['-3', '0.2', '2']) {
+      const answer = JSON.parse((await call('GET', `/api/log?limit=${limit}`)).text) as unknown[];
+      assert.deepEqual(answer, limit === '2' ? lines.slice(-2) : lines.slice(-1), limit);
+    }
+  });
+
+  it('refuses a body too large, and still answers', async () => {
+    const { call, post } = await dashboard(undefined, { messageManager: () => true });
+    const answer = await call('POST', '/api/message', { text: 'x'.repeat(200 * 1024) });
+    assert.equal(answer.status, 500);
+    assert.equal(answer.text, 'body too large');
+    assert.deepEqual(await post('/api/message', { text: 'hello' }), { done: true });
+  });
+
+  it('says a left-over sandbox is deleted only once the gateway no longer lists it', async () => {
+    let status = 'ready';
+    const removed: string[] = [];
+    const driver = {
+      list: async () => [{ name: 'dev-old', phase: 'Ready', labels: { 'harness.project': 'toy' } }],
+      remove: async (name: string) => void removed.push(name),
+      status: async () => status,
+    };
+    const { post } = await dashboard(undefined, { driver, checking: new Map(), design: { config: { project: { name: 'toy' } } } });
+    assert.deepEqual(await post('/api/sandboxes/remove', { name: 'dev-old' }), { done: false, error: 'the gateway still lists it after the delete: ready' });
+    status = 'missing';
+    assert.deepEqual(await post('/api/sandboxes/remove', { name: 'dev-old' }), { done: true });
+    assert.deepEqual(removed, ['dev-old', 'dev-old']);
+  });
+
+  it('logs when the login code is used, and when another try comes', async () => {
+    const { get, logged } = await dashboard(code);
+    await get(`/?code=${code}`);
+    await get(`/?code=${code}`);
+    assert.deepEqual(logged, ['dashboard: the login code of the opened link was used', 'dashboard: a login with a code was refused (the code was used already)']);
   });
 
   it("opens no shell in an attempt's sandbox once its checks started, as the daemon deleted it", () => {

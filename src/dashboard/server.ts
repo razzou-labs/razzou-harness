@@ -119,9 +119,14 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
       if (!allowedHosts.has(req.headers.host ?? '')) return send(res, 421, 'wrong host');
       if (req.method === 'POST' && req.headers.origin && !sameOrigin(req.headers.origin)) return send(res, 403, 'wrong origin');
       const url = new URL(req.url ?? '/', 'http://127.0.0.1');
-      if (req.method === 'GET' && url.pathname === '/' && code !== undefined && Date.now() - started < 120_000 && matches(url.searchParams.get('code'), code)) {
-        code = undefined;
-        return login(res);
+      if (req.method === 'GET' && url.pathname === '/' && url.searchParams.has('code')) {
+        // The code sits on a command line other users can read: the log says when it is used, and when another try comes.
+        if (code !== undefined && Date.now() - started < 120_000 && matches(url.searchParams.get('code'), code)) {
+          code = undefined;
+          orchestrator.log('dashboard: the login code of the opened link was used');
+          return login(res);
+        }
+        orchestrator.log(`dashboard: a login with a code was refused (${code === undefined ? 'the code was used already' : Date.now() - started >= 120_000 ? 'the code expired' : 'not the code'})`);
       }
       if (!authorized(req, url)) return send(res, 401, 'open the URL the daemon printed, with its token');
 
@@ -149,7 +154,8 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
           req.on('close', () => clients.delete(res));
           return;
         case 'GET /api/log': {
-          const limit = Math.min(Number(url.searchParams.get('limit')) || 300, 5000);
+          // At least one line: slice(-0) and a negative limit would give the whole log.
+          const limit = clamp(Number(url.searchParams.get('limit')) || 300, 1, 5000);
           return sendJson(res, orchestrator.store.readAll().slice(-limit));
         }
         case 'GET /api/transcript': {
@@ -166,14 +172,20 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
         }
         case 'GET /api/proposal': {
           // Only files the state names: a module that exists, and one of its versions.
-          const module = orchestrator.state.modules[url.searchParams.get('module') ?? ''];
+          const module = own(orchestrator.state.modules, url.searchParams.get('module'));
           const version = Number(url.searchParams.get('version'));
           if (!module || !module.proposals.some((p) => p.version === version)) return send(res, 404, 'no such proposal');
           const file = join(orchestrator.options.harnessDir, 'modules', module.module, 'proposals', `v${version}.md`);
           return send(res, existsSync(file) ? 200 : 404, existsSync(file) ? readFileSync(file, 'utf8') : 'not found');
         }
-        case 'POST /api/sandboxes/remove':
-          return sendJson(res, typeof body.name === 'string' ? await removeLeftOver(orchestrator, body.name) : { done: false, error: 'which sandbox?' });
+        case 'POST /api/sandboxes/remove': {
+          if (typeof body.name !== 'string') return sendJson(res, { done: false, error: 'which sandbox?' });
+          const removed = await removeLeftOver(orchestrator, body.name);
+          if (!removed.done) return sendJson(res, removed);
+          // The driver's delete never throws: only the gateway's answer afterwards says it is gone.
+          const status = await orchestrator.driver.status(body.name).catch((error: Error) => `unknown (${error.message})`);
+          return sendJson(res, status === 'missing' ? { done: true } : { done: false, error: `the gateway still lists it after the delete: ${status}` });
+        }
         case 'POST /api/sandboxes/limits': {
           // A number caps, null lifts the cap.
           const cap = (key: string) => (body[key] === null ? null : typeof body[key] === 'number' ? body[key] : undefined);
@@ -184,14 +196,17 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
           return sendJson(res, error ? { done: false, error } : { done: true });
         }
         case 'POST /api/pause':
-          return sendJson(res, { done: orchestrator.pause() });
+          return sendJson(res, orchestrator.pause() ? { done: true } : { done: false, error: 'the pipeline is paused already' });
         case 'POST /api/resume':
-          return sendJson(res, { done: orchestrator.resume() });
+          return sendJson(res, orchestrator.resume() ? { done: true } : { done: false, error: 'the pipeline is not paused' });
+        case 'POST /api/look-again':
+          // A pause that only waits to look again is lifted as the daemon lifts it: none of what a resume sets off happens.
+          return sendJson(res, orchestrator.lookAgain() ? { done: true } : { done: false, error: 'no pause waits to look again' });
         case 'POST /api/infra-merge':
-          return sendJson(res, body.by === 'daemon' || body.by === 'ceiling' ? { done: orchestrator.setInfraMerge(body.by) } : { done: false, error: 'by is daemon or ceiling' });
+          return sendJson(res, body.by === 'daemon' || body.by === 'ceiling' ? (orchestrator.setInfraMerge(body.by) ? { done: true } : { done: false, error: 'it is so already' }) : { done: false, error: 'by is daemon or ceiling' });
         case 'POST /api/fix-merge':
           // Who merges a Fix PR in Swarm: the daemon, under the plans' policy, or the owner.
-          return sendJson(res, body.by === 'daemon' || body.by === 'owner' ? { done: orchestrator.setFixMerge(body.by) } : { done: false, error: 'by is daemon or owner' });
+          return sendJson(res, body.by === 'daemon' || body.by === 'owner' ? (orchestrator.setFixMerge(body.by) ? { done: true } : { done: false, error: 'it is so already' }) : { done: false, error: 'by is daemon or owner' });
         case 'POST /api/reviews': {
           // A reviewer's switch: every plan's pull request, infrastructure plans' only (the cost reviewer's), or none.
           const { role, scope } = body;
@@ -216,16 +231,18 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
           const error = orchestrator.requestOrder();
           return sendJson(res, error ? { done: false, error } : { done: true });
         }
-        case 'POST /api/retry':
-          return sendJson(res, { done: typeof body.feature === 'string' && orchestrator.retry(body.feature, text('note')) });
-        case 'POST /api/message':
-          return sendJson(res, { done: text('text') !== undefined && orchestrator.messageManager(text('text')!, text('manager')) });
-        case 'POST /api/architect': {
-          // The owner writes to an Architect from the dashboard: typed into its terminal, as they would.
-          const module = orchestrator.state.modules[typeof body.module === 'string' ? body.module : ''];
-          if (!module || !text('text') || !terminals.available) return sendJson(res, { done: false });
-          await terminals.prompt(module.architect.sandbox, text('text')!.replace(/\s*\n\s*/g, ' '));
-          return sendJson(res, { done: true });
+        // The ids a request names are looked up as the state's own keys only: `__proto__` is none.
+        case 'POST /api/retry': {
+          const feature = own(orchestrator.state.features, body.feature);
+          if (!feature) return sendJson(res, { done: false, error: 'no such feature' });
+          if (feature.status !== 'escalated') return sendJson(res, { done: false, error: 'the feature is not escalated' });
+          return sendJson(res, orchestrator.retry(body.feature as string, text('note')) ? { done: true } : { done: false, error: 'refused: the state changed meanwhile' });
+        }
+        case 'POST /api/message': {
+          if (text('text') === undefined) return sendJson(res, { done: false, error: 'the message is empty' });
+          const manager = text('manager');
+          if (manager !== undefined && !own(orchestrator.state.managers, manager)) return sendJson(res, { done: false, error: 'no such Manager' });
+          return sendJson(res, orchestrator.messageManager(text('text')!, manager) ? { done: true } : { done: false, error: 'no Manager is running to read it' });
         }
         case 'POST /api/attach': {
           // `harness attach` reports that it opened, or left, the Architect's terminal: a nudge then waits for a quiet moment.
@@ -240,12 +257,24 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
           const error = orchestrator.createModule(body.id, typeof body.title === 'string' ? body.title : '');
           return sendJson(res, error ? { done: false, error } : { done: true });
         }
-        case 'POST /api/accept':
-          return sendJson(res, { done: typeof body.module === 'string' && typeof body.version === 'number' && orchestrator.acceptProposal(body.module, body.version) });
-        case 'POST /api/actions/done':
-          return sendJson(res, { done: typeof body.module === 'string' && typeof body.action === 'string' && orchestrator.claimAction(body.module, body.action, text('note')) });
-        case 'POST /api/answer':
-          return sendJson(res, { done: typeof body.id === 'string' && text('text') !== undefined && orchestrator.answerOwnerRequest(body.id, text('text')!) });
+        case 'POST /api/accept': {
+          const module = own(orchestrator.state.modules, body.module);
+          if (!module || typeof body.version !== 'number') return sendJson(res, { done: false, error: 'no such module, or no version' });
+          return sendJson(res, orchestrator.acceptProposal(module.module, body.version) ? { done: true } : { done: false, error: `v${body.version} of ${module.module} can't be accepted now: the module is ${module.status.replace(/_/g, ' ')}` });
+        }
+        case 'POST /api/actions/done': {
+          if (typeof body.module !== 'string' || typeof body.action !== 'string') return sendJson(res, { done: false, error: 'which action?' });
+          const status = own(orchestrator.state.actions, `${body.module}/${body.action}`)?.status;
+          if (status === 'done' || status === 'verifying') return sendJson(res, { done: false, error: status === 'done' ? 'it is done already' : 'its check is running' });
+          return sendJson(res, orchestrator.claimAction(body.module, body.action, text('note')) ? { done: true } : { done: false, error: 'the design on main has no such action' });
+        }
+        case 'POST /api/answer': {
+          const request = own(orchestrator.state.ownerRequests, body.id);
+          if (!request) return sendJson(res, { done: false, error: 'no such question' });
+          if (request.answer !== undefined) return sendJson(res, { done: false, error: 'it was answered already' });
+          if (text('text') === undefined) return sendJson(res, { done: false, error: 'the answer is empty' });
+          return sendJson(res, orchestrator.answerOwnerRequest(request.requestId, text('text')!) ? { done: true } : { done: false, error: 'refused: the state changed meanwhile' });
+        }
       }
       send(res, 404, 'not found');
     } catch (error) {
@@ -515,10 +544,16 @@ function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     let body = '';
     req.setEncoding('utf8');
-    req.on('data', (chunk: string) => {
+    const read = (chunk: string) => {
       body += chunk;
-      if (body.length > 64 * 1024) reject(new Error('body too large'));
-    });
+      if (body.length <= 64 * 1024) return;
+      // Refused: the rest is read and dropped, never kept, so the answer can still be sent.
+      req.off('data', read);
+      body = '';
+      req.resume();
+      reject(new Error('body too large'));
+    };
+    req.on('data', read);
     req.on('end', () => resolve(body || '{}'));
     req.on('error', reject);
   });
