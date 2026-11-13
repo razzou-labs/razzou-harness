@@ -65,12 +65,27 @@ const HANDLERS: Handlers = {
   },
 
   async web_read({ o, agent }, { url }) {
-    const result = await o.webRead(url);
-    o.record({
-      type: 'WEB_READ',
-      payload: { role: agent.role, sandbox: agent.sandbox, url, finalUrl: result.finalUrl, status: result.status, bytes: result.bytes, ok: result.ok },
-    });
-    return { ok: result.ok, text: result.text };
+    // Recorded however the read ends, a failure included. The URLs are clipped: every call
+    // is a line of the event log, which the daemon reads whole when it starts.
+    const recorded = 300;
+    let result: Awaited<ReturnType<Orchestrator['webRead']>> | undefined;
+    try {
+      result = await o.webRead(url);
+      return { ok: result.ok, text: result.text };
+    } finally {
+      o.record({
+        type: 'WEB_READ',
+        payload: {
+          role: agent.role,
+          sandbox: agent.sandbox,
+          url: clip(url, recorded),
+          finalUrl: result?.finalUrl === undefined ? undefined : clip(result.finalUrl, recorded),
+          status: result?.status,
+          bytes: result?.bytes ?? 0,
+          ok: result?.ok ?? false,
+        },
+      });
+    }
   },
 
   async answer_developer({ o, agent }, { question_id, answer }) {

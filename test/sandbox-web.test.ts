@@ -11,6 +11,7 @@ import { gzipSync } from 'node:zlib';
 import { readResult, readReview } from '../src/agents/claude-code.ts';
 import { AgentChannel } from '../src/daemon/channel.ts';
 import type { Orchestrator } from '../src/daemon/orchestrator.ts';
+import { handleRequest } from '../src/daemon/requests.ts';
 import { htmlToText, neverRead, onHostNetwork, webRead } from '../src/daemon/web-read.ts';
 import { runningSandboxes, startDashboard } from '../src/dashboard/server.ts';
 import { Terminals, type Pty } from '../src/dashboard/terminals.ts';
@@ -42,6 +43,29 @@ describe('web_read', () => {
       assert.equal(onHostNetwork(ip, interfaces), true, ip);
     }
     for (const ip of ['192.0.3.1', '2001:db8:1:3::1', '198.51.100.8', '127.0.0.2', 'not an ip']) assert.equal(onHostNetwork(ip, interfaces), false, ip);
+  });
+
+  it('refuses a URL over 2,000 characters, and records every read with its URLs clipped, a failed one too', async () => {
+    const recorded: Array<{ type: string; payload: { url: string; finalUrl?: string; ok: boolean; bytes: number } }> = [];
+    let fails = false;
+    const o = {
+      webRead: async (url: string) => {
+        if (fails) throw new Error('the socket broke');
+        return { ok: true, text: 'page', finalUrl: `${url}/final`, status: 200, bytes: 4 };
+      },
+      record: (event: (typeof recorded)[number]) => recorded.push(event),
+    } as unknown as Orchestrator;
+    const agent = { role: 'developer' as const, sandbox: 'dev-x' };
+    const call = (url: string) => handleRequest(o, agent, { v: 1, id: 'r-1', tool: 'web_read', args: { url } });
+    const long = `https://example.com/${'x'.repeat(2000)}`;
+    assert.match((await call(long))!.text, /Invalid arguments/);
+    assert.equal(recorded.length, 0, 'a refused URL is not fetched, nor recorded');
+    const url = `https://example.com/${'x'.repeat(1900)}`;
+    assert.deepEqual(await call(url), { ok: true, text: 'page' });
+    assert.ok(recorded[0]!.payload.url.length <= 300 && recorded[0]!.payload.finalUrl!.length <= 300);
+    fails = true;
+    await assert.rejects(call(url), /the socket broke/);
+    assert.deepEqual([recorded.length, recorded[1]!.type, recorded[1]!.payload.ok, recorded[1]!.payload.bytes], [2, 'WEB_READ', false, 0]);
   });
 
   it('never reads chat apps', () => {
@@ -153,6 +177,44 @@ describe('the agent channel', () => {
     assert.deepEqual(replies.map((r) => [r.replyTo, r.ok]), [['big-1', false]]);
     assert.match(replies[0]!.text, /^the request is too large: \d+ characters, where the limit is 65536$/);
     assert.equal(invalid.length, 2);
+    await driver.removeAll();
+  });
+
+  it("handles a sandbox's requests two at a time, and refuses those over sixty a minute", async () => {
+    const driver = new LocalDriver(tempDir('channel-rate'));
+    await driver.create({ name: 'dev-rate', image: 'x', providers: [], env: {} });
+    const harness = join(driver.rootOf('dev-rate'), '.harness');
+    const outbox = join(harness, 'outbox.jsonl');
+    const inbox = join(harness, 'inbox.jsonl');
+    const handled: string[] = [];
+    const pending: Array<() => void> = [];
+    let running = 0;
+    let most = 0;
+    const channel = new AgentChannel({
+      driver, sandbox: 'dev-rate', outbox, inbox, repliedFile: join(tempDir('replied-rate'), 'replied.txt'),
+      onRequest: (request) => {
+        handled.push(request.id);
+        most = Math.max(most, ++running);
+        return new Promise<void>((resolve) => pending.push(() => { running--; resolve(); }));
+      },
+      onInvalid: () => {},
+    });
+    channel.start();
+    const lines = Array.from({ length: 62 }, (_, i) => `${JSON.stringify({ v: 1, id: `r-${i}`, tool: 'web_read', args: { url: 'https://example.com/' } })}\n`);
+    appendFileSync(outbox, lines.join(''));
+    await until(() => existsSync(inbox) && readFileSync(inbox, 'utf8').trim().split('\n').length === 2);
+    assert.deepEqual(handled, ['r-0', 'r-1'], 'two at a time');
+    for (let done = 0; done < 60; done++) {
+      await until(() => pending.length > 0);
+      pending.shift()!();
+    }
+    await until(() => handled.length === 60);
+    channel.stop();
+    assert.equal(handled.length, 60);
+    assert.equal(most, 2);
+    const replies = readFileSync(inbox, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { replyTo: string; ok: boolean; text: string });
+    assert.deepEqual(replies.map((r) => [r.replyTo, r.ok]), [['r-60', false], ['r-61', false]]);
+    assert.match(replies[0]!.text, /^too many requests: at most 60 a minute/);
     await driver.removeAll();
   });
 });

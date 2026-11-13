@@ -14,7 +14,8 @@ const Guidance = z.string().trim().min(20, 'say in at least a sentence what the 
 /** The arguments of every harness tool. The daemon validates each call against these. */
 export const INPUTS = {
   ask_manager: z.object({ question: z.string().trim().min(1).max(4000) }),
-  web_read: z.object({ url: z.url({ protocol: /^https?$/ }) }),
+  // A page's address, not a payload: a long URL is refused before anything is fetched or recorded.
+  web_read: z.object({ url: z.url({ protocol: /^https?$/ }).max(2000) }),
   answer_developer: z.object({ question_id: z.string().min(1), answer: z.string().trim().min(1).max(8000) }),
   accept_feature: z.object({ feature: FeatureKey, attempt: AttemptNumber, note: z.string().max(2000).optional() }),
   reject_feature: z.object({ feature: FeatureKey, attempt: AttemptNumber, guidance: Guidance }),
