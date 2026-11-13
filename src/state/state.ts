@@ -220,6 +220,8 @@ export interface ManagerState {
   lastExit?: { code: number | null; stderr: string; started: boolean };
   /** Items that need a decision, by key: when they were sent in the current launch, and reminded. */
   sent: Record<string, { launch: number; at: string; reminded?: string }>;
+  /** After a turn that ended on the model's API failing: nothing is sent to it before then. */
+  heldUntil?: string;
   /** Things to deliver once: the owner's messages and answers, the Architect's decisions, and the welcome. */
   mail: Array<{ key: string; kind: 'welcome' | 'owner_message' | 'owner_answer' | 'decision' | 'order_request'; text: string; requestId?: string }>;
 }
@@ -890,6 +892,12 @@ export function apply(state: State, event: HarnessEvent): State {
     case 'MANAGER_STOPPED':
       state.managers[managerKey(event.payload)]!.status = 'stopped';
       break;
+    case 'MANAGER_TURN_FAILED': {
+      const manager = state.managers[managerKey(event.payload)];
+      // Whatever it was sent may be what the failed turn was about: all of it is sent again, later.
+      if (manager) Object.assign(manager, { sent: {}, heldUntil: event.payload.until });
+      break;
+    }
     case 'PIPELINE_PAUSED':
       state.pipeline.paused = { reason: event.payload.reason, since: event.ts, until: event.payload.until, ...(event.payload.retry ? { retry: true } : {}) };
       break;

@@ -770,6 +770,37 @@ describe('parallel plans', () => {
     assert.deepEqual(reviews.map((r) => [r.key, r.plan]).sort(), [['review:demo/P1/F01#1', undefined], ['review:demo/P2/F02#1', undefined]]);
   });
 
+  it("in Swarm, merges main into an open pull request that conflicts with it only in progress.txt, which GitHub can't merge", async () => {
+    let skew = 0;
+    let hold = true;
+    const { orchestrator: o, fake } = await setup((f) => ({ files: files(f) }), {
+      github: true, prepare: split({ dependsOn: [] }), config: { swarm: { requiredStatuses: [] } }, now: () => Date.now() + skew,
+    });
+    // P2's CI stays under way until P1 is merged: its pull request is then open on a head that lacks main.
+    fake.ci = (sha) => (hold && sha === o.state.plans['demo/P2']?.pushed ? undefined : { verify: 'success', checks: 'success', cost: 'success' });
+    o.setMode('swarm');
+    const fast = async (done: () => boolean) => {
+      const deadline = Date.now() + 90_000;
+      while (!done()) {
+        if (Date.now() > deadline) throw new Error(`timed out; last events: ${o.store.readAll().slice(-8).map((e) => e.type).join(', ')}`);
+        await o.tick();
+        await sleep(100);
+        skew += 5_000;
+      }
+      await o.tick();
+    };
+    await fast(() => o.state.plans['demo/P1']?.status === 'completed' && o.state.plans['demo/P2']?.pr !== undefined);
+    hold = false;
+    await fast(allComplete(o, ['P1', 'P2']));
+
+    const events = o.store.readAll();
+    const opened = events.findIndex((e) => e.type === 'PR_OPENED' && e.ref?.plan === 'P2');
+    assert.ok(events.findIndex((e, i) => i > opened && e.type === 'PLAN_MAIN_MERGED' && e.ref?.plan === 'P2') > opened, 'main was merged into P2 once its pull request was open');
+    assert.equal(events.some((e) => e.type === 'PIPELINE_PAUSED' || e.type === 'PLAN_MAIN_CONFLICT'), false);
+    const progress = await runOk('git', ['--git-dir', fake.remote, 'show', 'main:progress.txt']);
+    assert.match(progress, /feature\.accepted demo\/P1\/F01[^\n]*\n[^\n]*feature\.accepted demo\/P2\/F02/);
+  });
+
   it("in Swarm, a plan that completes doesn't make the Manager forget what waits for it in the module's other plans", async () => {
     // The Manager leaves every review waiting, and the test accepts P2's in its place: P2 completes while P1's review still waits.
     const { orchestrator: o } = await setup((f) => ({ files: files(f) }), { prepare: split({ dependsOn: [] }), manager: { ignore: ['REVIEW', 'REMINDER'] } });
@@ -3081,5 +3112,88 @@ describe('the gateway and the sandboxes', () => {
     const types = o.store.readAll().map((e) => e.type).filter((t) => t.startsWith('ARCHITECT_') && t !== 'ARCHITECT_NOTE_SENT');
     assert.deepEqual(types, ['ARCHITECT_LAUNCHED', 'ARCHITECT_STARTING', 'ARCHITECT_LAUNCHED']);
     assert.deepEqual([o.state.modules.shop!.architect.sandbox, o.state.modules.shop!.architect.sessionId, o.state.modules.shop!.architect.status], [sandbox, sessionId, 'running']);
+  });
+});
+
+describe('usage limits and a failing API', () => {
+  const reviewKey = 'review:demo/P1/F01#1';
+  const sentReviews = (o: Orchestrator) => o.store.readAll().filter((e) => e.type === 'MANAGER_ITEM_SENT' && (e.payload as { key: string }).key === reviewKey).map((e) => (e.payload as { reminder: boolean }).reminder);
+  const managerOutput = (o: Orchestrator, driver: LocalDriver) => join(driver.rootOf(o.state.managers.demo!.sandbox), '.harness', 'manager', 'out.jsonl');
+  const turnEnded = (text: string) => `${JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true, result: text })}\n`;
+
+  it("a pause that lifts itself stays one: the Manager's silence during it sets off neither a reminder nor the brake", async () => {
+    let skew = 0;
+    const { orchestrator: o } = await setup((f) => solved(f), { manager: { ignore: ['REVIEW', 'REMINDER'] }, now: () => Date.now() + skew });
+    await until(o, () => o.state.managers.demo?.sent[reviewKey] !== undefined);
+    // An agent hit the subscription's limit: four hours until the reset, and the Manager can't act either.
+    const reset = new Date(Date.now() + 4 * 3_600_000).toISOString();
+    assert.equal(o.pausePipeline('usage limit reached', reset), true);
+    skew = 182 * 60_000;
+    for (let i = 0; i < 5; i++) await o.tick();
+    assert.deepEqual([o.state.pipeline.paused?.reason, o.state.pipeline.paused?.until], ['usage limit reached', reset]);
+    assert.deepEqual(sentReviews(o), [false]);
+
+    // Past the reset the pause lifts by itself, and what waited for the Manager is sent again.
+    skew = 4 * 3_600_000 + 120_000;
+    await until(o, () => sentReviews(o).length === 2);
+    assert.equal(o.state.pipeline.paused, undefined);
+    assert.deepEqual(sentReviews(o), [false, false]);
+  });
+
+  it("a Manager's turn that ends on the usage limit pauses the pipeline until the reset, like an attempt's", async () => {
+    let skew = 0;
+    const { orchestrator: o, driver } = await setup((f) => solved(f), { manager: { ignore: ['REVIEW', 'REMINDER'] }, now: () => Date.now() + skew });
+    await until(o, () => o.state.managers.demo?.sent[reviewKey] !== undefined);
+    const epoch = Math.floor(Date.now() / 1000) + 2 * 3600;
+    appendFileSync(managerOutput(o, driver), turnEnded(`Claude AI usage limit reached|${epoch}`));
+    await until(o, () => o.state.pipeline.paused !== undefined);
+    assert.deepEqual([o.state.pipeline.paused!.reason, o.state.pipeline.paused!.until], ['usage limit reached', new Date(epoch * 1000 + 60_000).toISOString()]);
+    skew = 2 * 3_600_000 + 120_000;
+    await until(o, () => sentReviews(o).length === 2);
+    assert.equal(o.state.pipeline.paused, undefined);
+  });
+
+  it("a Manager's turn that ends on the API failing has its items sent again ten minutes later, and pauses nothing", async () => {
+    let skew = 0;
+    const { orchestrator: o, driver } = await setup((f) => solved(f), { manager: { ignore: ['REVIEW', 'REMINDER'] }, now: () => Date.now() + skew });
+    await until(o, () => o.state.managers.demo?.sent[reviewKey] !== undefined);
+    appendFileSync(managerOutput(o, driver), turnEnded('API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}'));
+    await until(o, () => o.store.readAll().some((e) => e.type === 'MANAGER_TURN_FAILED'));
+    for (let i = 0; i < 3; i++) await o.tick();
+    assert.deepEqual(sentReviews(o), [false], 'nothing is sent again at once');
+    assert.equal(o.state.pipeline.paused, undefined);
+    skew = 11 * 60_000;
+    await until(o, () => sentReviews(o).length === 2);
+  });
+
+  it("an attempt that ends on the API failing is interrupted, not failed, and the next one starts once the daemon looked again", async () => {
+    const { orchestrator: o } = await setup((f) => solved(f), { agent: usageLimitOn('F01', [1], 'API Error: 500 {"type":"error","error":{"type":"api_error","message":"Internal server error"}}') });
+    await until(o, () => o.state.pipeline.paused !== undefined);
+    const first = feature(o, 'F01')!.attempts[0]!;
+    assert.deepEqual([first.status, first.outcome, first.counts], ['interrupted', 'api_error', false]);
+    assert.match(o.state.pipeline.paused!.reason, /^the model's API failed during an attempt \(API Error: 500/);
+    assert.equal(o.state.pipeline.paused!.retry, true);
+    assert.equal(o.lookAgain(), true);
+    await until(o, completed(o));
+    assert.equal(feature(o, 'F01')!.attempts.length, 2);
+    assert.equal(o.store.readAll().some((e) => e.type === 'ATTEMPT_FAILED'), false);
+  });
+
+  it('reads the reset of the window that is full, and takes no time a real window could not give', async () => {
+    const { orchestrator: o } = await setup((f) => solved(f));
+    const at = (ms: number) => new Date(Date.now() + ms).toISOString();
+    const hour = 3_600_000;
+    const within = (iso: string, from: number, to: number) => Date.parse(iso) - Date.now() > from && Date.parse(iso) - Date.now() < to;
+    // 99% is a full window whose number was rounded down.
+    o.usage = { at: at(0), usage: { percent: 99, resetsAt: at(3 * hour), limits: [{ kind: 'weekly_all', percent: 99, resetsAt: at(3 * hour) }] } };
+    assert.ok(within(o.usageLimitUntil("You've hit your limit"), 3 * hour, 3 * hour + 2 * 60_000));
+    // A window that refused a call is full, whatever its percentage.
+    o.usage = { at: at(0), usage: { percent: 40, resetsAt: at(5 * hour), limits: [{ kind: 'session', percent: 40, resetsAt: at(5 * hour), rejected: true }] } };
+    assert.ok(within(o.usageLimitUntil("You've hit your limit"), 5 * hour, 5 * hour + 2 * 60_000));
+    // No window near full: an hour.
+    o.usage = { at: at(0), usage: { percent: 40, resetsAt: at(5 * hour), limits: [{ kind: 'session', percent: 40, resetsAt: at(5 * hour) }] } };
+    assert.ok(within(o.usageLimitUntil("You've hit your limit"), hour - 60_000, hour + 60_000));
+    // A time no window could give, in the agent's own message, isn't believed.
+    assert.ok(within(o.usageLimitUntil('Claude AI usage limit reached|9999999999'), hour - 60_000, hour + 60_000));
   });
 });

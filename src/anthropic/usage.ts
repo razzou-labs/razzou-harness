@@ -16,6 +16,8 @@ export interface UsageLimit {
   resetsAt: string;
   /** The model a scoped limit counts, when a window names one. */
   model?: string;
+  /** The window refused a call: it is full, whatever its percentage was rounded to. */
+  rejected?: boolean;
 }
 
 export interface SubscriptionUsage {
@@ -36,7 +38,10 @@ export function windowName(kind: string): string {
   return `the ${kind.replace(/_/g, ' ')} window`;
 }
 
-type Window = { utilization?: unknown; resetsAt?: unknown };
+type Window = { utilization?: unknown; resetsAt?: unknown; status?: unknown };
+
+/** No real window is longer than a week: a reset further away than this is not one. */
+export const LONGEST_WINDOW_MS = 8 * 24 * 3_600_000;
 
 /**
  * The windows one `rate_limit_event` reports, from a parsed stream-json line; undefined
@@ -51,8 +56,15 @@ export function usageFromEvent(item: unknown): SubscriptionUsage | undefined {
   const windows = info.unifiedWindows ?? (typeof info.rateLimitType === 'string' ? { [info.rateLimitType]: info } : {});
   const limits: UsageLimit[] = [];
   for (const [name, window] of Object.entries(windows)) {
-    if (!window || typeof window.utilization !== 'number' || typeof window.resetsAt !== 'number') continue;
-    limits.push({ kind: KINDS[name] ?? name, percent: Math.round(window.utilization * 100), resetsAt: new Date(window.resetsAt * 1000).toISOString() });
+    if (!window || typeof window.resetsAt !== 'number' || !Number.isFinite(window.resetsAt)) continue;
+    const rejected = window.status === 'rejected';
+    // A window that refused a call may come without its utilization: it is full.
+    const fraction = typeof window.utilization === 'number' && Number.isFinite(window.utilization) ? window.utilization : rejected ? 1 : undefined;
+    if (fraction === undefined || fraction < 0) continue;
+    // Claude Code reports a fraction and Unix seconds. A stream is a file its sandbox writes: anything else is not a report.
+    const resetsAt = window.resetsAt * 1000;
+    if (fraction > 2 || resetsAt > Date.now() + LONGEST_WINDOW_MS) continue;
+    limits.push({ kind: KINDS[name] ?? name, percent: Math.round(fraction * 100), resetsAt: new Date(resetsAt).toISOString(), ...(rejected ? { rejected: true } : {}) });
   }
   if (limits.length === 0) return undefined;
   const binding = limits.reduce((top, limit) => (limit.percent > top.percent ? limit : top));

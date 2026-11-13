@@ -2,8 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { claudeCode, mcpConfig, readResult, reportJsonSchema, type AgentAdapter, type AgentRun } from '../agents/claude-code.ts';
-import { usageFromEvent, windowName, type SubscriptionUsage, type UsageLimit } from '../anthropic/usage.ts';
+import { claudeCode, mcpConfig, readResult, reportJsonSchema, sessionTrouble, type AgentAdapter, type AgentRun } from '../agents/claude-code.ts';
+import { LONGEST_WINDOW_MS, usageFromEvent, windowName, type SubscriptionUsage, type UsageLimit } from '../anthropic/usage.ts';
 import { allPassed, initEnvironment, runChecks, type CheckResult, type RunOptions } from '../checks/runner.ts';
 import { protectedChanges } from '../ci/harness-ci.ts';
 import { ownerTime, type OwnerTime } from '../design/owner-time.ts';
@@ -163,8 +163,10 @@ export class Orchestrator {
     this.store = new EventStore(join(options.harnessDir, 'events.jsonl'), this.now);
     this.usage = savedUsage(options.harnessDir);
     // The agents' streams carry the usage: each model call reports it (usage.ts). A replayed line's report is old.
-    this.events.on('transcript', ({ line, replay }: { line: string; replay?: boolean }) => {
-      if (!replay) this.noteUsage(line);
+    this.events.on('transcript', ({ agent, line, replay }: { agent: string; line: string; replay?: boolean }) => {
+      if (replay) return;
+      this.noteUsage(line);
+      if (agent.startsWith('manager:')) this.noteManagerTurn(agent.slice('manager:'.length), line);
     });
     this.state = project(this.store.readAll());
     this.managers = new Managers(this);
@@ -913,12 +915,45 @@ export class Orchestrator {
    */
   usageLimitUntil(message = ''): string {
     const now = this.now();
+    // The message is the agent's own, from a file its sandbox writes: a time is taken only if a real window could give it.
+    const real = (at: number) => Number.isFinite(at) && at + RESET_MARGIN_MS > now && at <= now + LONGEST_WINDOW_MS;
     const epoch = /\|(\d{10})\b/.exec(message)?.[1];
-    const resets = [
-      ...(epoch ? [Number(epoch) * 1000] : []),
-      ...(this.usage?.usage.limits ?? []).filter((limit) => limit.percent >= 100).map((limit) => Date.parse(limit.resetsAt)),
-    ].filter((at) => Number.isFinite(at) && at + RESET_MARGIN_MS > now);
+    const open = (this.usage?.usage.limits ?? []).filter((limit) => real(Date.parse(limit.resetsAt)));
+    // A window that refused a call, or reads 99% and more, is full. With none, the limit that was just hit is the fullest window's, when that one is nearly full.
+    let full = open.filter((limit) => limit.rejected || limit.percent >= 99);
+    if (full.length === 0) {
+      const top = open.reduce<UsageLimit | undefined>((most, limit) => (!most || limit.percent > most.percent ? limit : most), undefined);
+      if (top && top.percent >= 90) full = [top];
+    }
+    const resets = [...(epoch ? [Number(epoch) * 1000] : []), ...full.map((limit) => Date.parse(limit.resetsAt))].filter(real);
     return new Date(resets.length > 0 ? Math.max(...resets) + RESET_MARGIN_MS : now + 3_600_000).toISOString();
+  }
+
+  /**
+   * The end of one of a Manager's turns, from its stream: nothing else reads them. A turn
+   * that ends on the subscription's limit pauses the pipeline until the reset, as an
+   * attempt's does, and what the Manager was sent is sent again once the pause lifts. One
+   * that ends on the model's API failing has it all sent again in ten minutes.
+   */
+  private noteManagerTurn(key: string, line: string): void {
+    if (!line.includes('"type":"result"')) return;
+    const manager = this.state.managers[key];
+    if (!manager || manager.status === 'stopped') return;
+    let result: { type?: unknown; is_error?: unknown; result?: unknown };
+    try {
+      result = JSON.parse(line) as typeof result;
+    } catch {
+      return;
+    }
+    if (result?.type !== 'result') return;
+    const trouble = sessionTrouble(result);
+    if (trouble === 'usage_limit') this.pausePipeline('usage limit reached', this.usageLimitUntil(String(result.result)));
+    else if (trouble === 'api_error') {
+      this.record({
+        type: 'MANAGER_TURN_FAILED',
+        payload: { module: manager.module, ...(manager.plan ? { plan: manager.plan } : {}), reason: clip(String(result.result).replace(/\s+/g, ' '), 300), until: new Date(this.now() + LOOK_AGAIN_MS).toISOString() },
+      });
+    }
   }
 
   /** An agent's stream line: a `rate_limit_event` is the subscription's usage as of now, which the pages and the next restart get. */
@@ -1131,12 +1166,19 @@ export class Orchestrator {
     this.stopFollowing(attempt.sandbox);
     await this.keepRefusals(state, attempt);
     const ref = refOf(state, attempt);
-    if (attempt.outcome === 'usage_limit') {
+    if (attempt.outcome === 'usage_limit' || attempt.outcome === 'api_error') {
       // Not the Developer's doing, but the sandbox writes the stream it is read from: like any
       // interruption, it counts from the third one of the same definition, so it can't buy attempts.
       const counts = interruptions(state, attempt.definitionHash) >= 2;
-      this.record({ type: 'ATTEMPT_INTERRUPTED', ref, payload: { reason: 'the subscription usage limit was reached', counts } });
-      this.pausePipeline('usage limit reached', this.usageLimitUntil(attempt.summary));
+      if (attempt.outcome === 'usage_limit') {
+        this.record({ type: 'ATTEMPT_INTERRUPTED', ref, payload: { reason: 'the subscription usage limit was reached', counts } });
+        this.pausePipeline('usage limit reached', this.usageLimitUntil(attempt.summary));
+      } else {
+        // The model's API failed, as when it is overloaded: nothing starts for ten minutes, then the daemon looks again by itself.
+        const said = clip((attempt.summary ?? '').replace(/\s+/g, ' '), 200);
+        this.record({ type: 'ATTEMPT_INTERRUPTED', ref, payload: { reason: `the model's API failed: ${said}`, counts } });
+        this.lookAgainLater(`the model's API failed during an attempt (${said}): attempts start again once it answers`);
+      }
       await this.driver.remove(attempt.sandbox);
       return 'progress';
     }
@@ -1429,7 +1471,9 @@ export class Orchestrator {
    * Whether main still merges into an open pull request's branch, tried once per main
    * and head. A conflict is recorded, and 'wait' is the answer while the plan's Manager
    * has it; undefined when there is none. A main that merges again, after one that
-   * didn't, is merged in at once, so the pull request gets a head CI can run on.
+   * didn't, is merged in at once, so the pull request gets a head CI can run on. So is a
+   * main that only the daemon's rule can merge: every plan adds lines to progress.txt,
+   * which git alone can't merge, and GitHub runs no CI on a pull request it can't merge.
    */
   private async conflictWithMain(plan: PlanState): Promise<Step | undefined> {
     const key = planKey(plan);
@@ -1444,7 +1488,7 @@ export class Orchestrator {
       this.record({ type: 'PLAN_MAIN_CONFLICT', ref, payload: { main, files } });
       return 'progress';
     }
-    if (plan.mainConflict) {
+    if (plan.mainConflict || (await this.repo.conflicts(plan.head, main)).length > 0) {
       const merged = await this.mergeMainInto(plan.head, plan.branch);
       if (!('conflicts' in merged)) {
         this.record({ type: 'PLAN_MAIN_MERGED', ref, payload: { main, head: merged.commit } });

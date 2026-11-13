@@ -105,8 +105,8 @@ export async function reviewStep(o: Orchestrator, plan: PlanState, pr: PullReque
       o.record({ type: 'REVIEW_SKIPPED', ref, payload: { role, head: pr.head, why } });
       return 'progress';
     }
-    // Neither a usage limit nor the owner's switch is the reviewer's failure: the session runs again once it may.
-    const failures = reviews.filter((r) => r.status === 'failed' && r.outcome !== 'usage_limit' && r.outcome !== 'aborted').length;
+    // Neither a usage limit, nor the model's API failing, nor the owner's switch is the reviewer's failure: the session runs again once it may.
+    const failures = reviews.filter((r) => r.status === 'failed' && r.outcome !== 'usage_limit' && r.outcome !== 'api_error' && r.outcome !== 'aborted').length;
     if (!review || (review.status === 'failed' && failures < 2)) {
       const minutes = o.design.config.swarm.reviewTimeoutMinutes;
       o.record({
@@ -262,9 +262,10 @@ async function poll(o: Orchestrator, plan: PlanState, review: ReviewState): Prom
   const result = readReview(stream, Number(status), stderr);
   o.stopFollowingReview(review.sandbox);
   await o.driver.remove(review.sandbox);
-  if (result.outcome === 'usage_limit') {
-    o.record({ type: 'REVIEW_ENDED', ref, payload: { role: review.role, head: review.head, outcome: 'usage_limit', reason: result.detail ?? 'usage limit', ...(result.usage ? { usage: result.usage } : {}) } });
-    o.pausePipeline('usage limit reached', o.usageLimitUntil(result.detail));
+  if (result.outcome === 'usage_limit' || result.outcome === 'api_error') {
+    o.record({ type: 'REVIEW_ENDED', ref, payload: { role: review.role, head: review.head, outcome: result.outcome, reason: result.detail ?? result.outcome, ...(result.usage ? { usage: result.usage } : {}) } });
+    if (result.outcome === 'usage_limit') o.pausePipeline('usage limit reached', o.usageLimitUntil(result.detail));
+    else o.lookAgainLater(`the model's API failed during a review (${clip((result.detail ?? '').replace(/\s+/g, ' '), 200)}): it is read again once the API answers`);
     return 'progress';
   }
   if (result.outcome !== 'done' || !result.report) {

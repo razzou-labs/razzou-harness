@@ -97,11 +97,25 @@ export class FakeForge implements Forge {
 
   async checkRuns(sha: string): Promise<CheckRun[]> {
     if (!this.runs.has(sha)) {
+      if (await this.unmergeable(sha)) return [];
       const decided = this.ci(sha);
       if (!decided) return [];
       this.runs.set(sha, Object.entries(decided).map(([name, conclusion]) => ({ id: this.nextRun++, name, status: 'completed', conclusion })));
     }
     return this.runs.get(sha)!;
+  }
+
+  /**
+   * GitHub runs no workflow on a pull request it can't merge into its base, and it merges
+   * by git's own rules: two sides that both added lines to progress.txt conflict there.
+   */
+  private async unmergeable(sha: string): Promise<boolean> {
+    for (const pr of this.prs.filter((p) => p.state === 'open')) {
+      if ((await this.head(pr.branch).catch(() => undefined)) !== sha) continue;
+      const merged = await run('git', ['--git-dir', this.remote, 'merge-tree', '--write-tree', '--no-messages', await this.head('main'), sha]);
+      if (merged.code === 1) return true;
+    }
+    return false;
   }
 
   /** The owner runs CI again on GitHub: newer runs of the same jobs, which end as `conclusions` say. */

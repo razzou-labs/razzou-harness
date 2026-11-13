@@ -234,6 +234,8 @@ export class Managers {
    */
   private async deliver(manager: ManagerState): Promise<void> {
     const o = this.o;
+    // Its last turn ended on the model's API failing: what waits is sent once that had time to pass.
+    if (manager.heldUntil && o.now() < Date.parse(manager.heldUntil)) return;
     for (const mail of [...manager.mail]) {
       await this.send(manager, mailText(o, manager, mail));
       o.record({ type: 'MANAGER_ITEM_SENT', payload: { ...identity(manager), key: mail.key, launch: manager.launch, reminder: false } });
@@ -252,7 +254,9 @@ export class Managers {
         if (item.show) await this.show(manager, item, pending);
         await this.send(manager, await item.text());
         o.record({ type: 'MANAGER_ITEM_SENT', payload: { ...identity(manager), key: item.key, launch: manager.launch, reminder: false } });
-      } else if (waitingForOthers) {
+      } else if (waitingForOthers || o.state.pipeline.paused) {
+        // While the pipeline is paused, as for a usage limit, the Manager may be unable to act: its silence says nothing,
+        // and a brake here would replace a pause that lifts itself with one only the owner can lift.
         continue;
       } else if (!sent.reminded && o.now() - Date.parse(sent.at) >= turnMs) {
         await this.send(manager, `[harness] REMINDER: ${item.title} is still waiting for you. ${item.ask}`);

@@ -274,6 +274,20 @@ export function reviewJsonSchema(): string {
  */
 const USAGE_LIMIT = /usage limit|limit reached|rate.?limit|you['’]ve (?:hit|reached) your|you['’]re out of (?:usage credits|extra usage)|your org is out of usage/i;
 
+/**
+ * How a session's error result says the model's API failed: overloaded, a server error,
+ * a connection that broke. Like a usage limit, it is nobody's failure: the work is taken
+ * up again later, and doesn't count.
+ */
+const API_FAILURE = /API Error:? ?\(?(?:5\d\d|408)|overloaded|internal server error|service unavailable|bad gateway|gateway timeout|connection error|connection (?:was )?(?:reset|refused|closed)|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|socket hang up|fetch failed|request timed out/i;
+
+/** What stopped a session short of its work, as its error result says: the subscription's limit, or the API failing. */
+export function sessionTrouble(result: { is_error?: unknown; result?: unknown }): 'usage_limit' | 'api_error' | undefined {
+  if (result.is_error !== true || typeof result.result !== 'string') return undefined;
+  if (USAGE_LIMIT.test(result.result)) return 'usage_limit';
+  return API_FAILURE.test(result.result) ? 'api_error' : undefined;
+}
+
 export interface ReviewResult {
   outcome: AttemptOutcome;
   report?: ReviewReport;
@@ -290,7 +304,8 @@ export function readReview(stream: string, exitCode: number, stderr = ''): Revie
   }
   const usage = toUsage(result.usage, result.total_cost_usd);
   const text = typeof result.result === 'string' ? result.result : '';
-  if (result.is_error === true && USAGE_LIMIT.test(text)) return { outcome: 'usage_limit', detail: text.slice(0, 500), usage };
+  const trouble = sessionTrouble(result);
+  if (trouble) return { outcome: trouble, detail: text.slice(0, 500), usage };
   const report = ReviewReportSchema.safeParse(result.structured_output);
   if (!report.success) return { outcome: result.is_error === true ? 'error' : 'no_report', detail: text.slice(0, 500), usage };
   return { outcome: 'done', report: report.data, usage };
@@ -309,9 +324,8 @@ export function readResult(stream: string, exitCode: number, stderr = ''): Agent
 
   const usage = toUsage(result.usage, result.total_cost_usd);
   const text = typeof result.result === 'string' ? result.result : '';
-  if (result.is_error === true && USAGE_LIMIT.test(text)) {
-    return { outcome: 'usage_limit', detail: text.slice(0, 500), usage };
-  }
+  const trouble = sessionTrouble(result);
+  if (trouble) return { outcome: trouble, detail: text.slice(0, 500), usage };
   const report = ReportSchema.safeParse(result.structured_output);
   if (!report.success) return { outcome: result.is_error === true ? 'error' : 'no_report', detail: text.slice(0, 500), usage };
   return { outcome: report.data.outcome, summary: report.data.summary, finding: report.data.finding, notes: report.data.notes, usage };
@@ -334,12 +348,14 @@ function lastResult(stream: string): Record<string, unknown> | undefined {
 
 function toUsage(usage: unknown, cost: unknown): Usage | undefined {
   if (!usage || typeof usage !== 'object') return undefined;
-  const u = usage as Record<string, number | undefined>;
+  // A stream is a file its sandbox writes: a count is a number, or nothing.
+  const count = (value: unknown): number => (typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0);
+  const u = usage as Record<string, unknown>;
   return {
-    inputTokens: (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0),
-    outputTokens: u.output_tokens ?? 0,
-    cacheReadTokens: u.cache_read_input_tokens ?? 0,
-    ...(typeof cost === 'number' ? { costUsd: cost } : {}),
+    inputTokens: count(u.input_tokens) + count(u.cache_creation_input_tokens) + count(u.cache_read_input_tokens),
+    outputTokens: count(u.output_tokens),
+    cacheReadTokens: count(u.cache_read_input_tokens),
+    ...(typeof cost === 'number' && Number.isFinite(cost) ? { costUsd: cost } : {}),
   };
 }
 

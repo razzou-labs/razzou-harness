@@ -35,7 +35,8 @@ export interface Finding {
   needs?: string;
 }
 
-export type AttemptOutcome = 'done' | 'blocked' | 'timed_out' | 'no_report' | 'error' | 'usage_limit' | 'aborted';
+/** `usage_limit` and `api_error` are nobody's failure: the subscription's limit was reached, or the model's API failed. */
+export type AttemptOutcome = 'done' | 'blocked' | 'timed_out' | 'no_report' | 'error' | 'usage_limit' | 'api_error' | 'aborted';
 
 /** One required CI job, as the daemon saw it. */
 export interface CiJob {
@@ -104,6 +105,11 @@ interface Payloads {
   MANAGER_EXITED: { module: string; plan?: string; launch: number; code: number | null; stderr: string; started: boolean };
   MANAGER_ITEM_SENT: { module: string; plan?: string; key: string; launch: number; reminder: boolean };
   MANAGER_STOPPED: { module: string; plan?: string; reason: string };
+  /**
+   * A turn of the Manager ended on the model's API failing: what it was sent is sent
+   * again, once `until` has passed, since a failing API is tried no faster than that.
+   */
+  MANAGER_TURN_FAILED: { module: string; plan?: string; reason: string; until: string };
   WEB_READ: { role: Role; sandbox: string; url: string; finalUrl?: string; status?: number; bytes: number; ok: boolean };
   PLAN_PUSHED: { head: string };
   PR_OPENED: { number: number; url: string };
