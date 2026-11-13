@@ -14,7 +14,7 @@ import { AgentChannel } from '../src/daemon/channel.ts';
 import type { Orchestrator } from '../src/daemon/orchestrator.ts';
 import { htmlToText, neverRead, onHostNetwork, webRead } from '../src/daemon/web-read.ts';
 import { parseLine, runningSandboxes, startDashboard } from '../src/dashboard/server.ts';
-import { Terminals, type Pty } from '../src/dashboard/terminals.ts';
+import { ARCHITECT_NUDGE, QUIET_MS, Terminals, type Pty } from '../src/dashboard/terminals.ts';
 import { MAX_FOLLOWED_LINE, OpenShellDriver, splitLines } from '../src/sandbox/openshell.ts';
 import { buildPolicy } from '../src/sandbox/policy.ts';
 import type { State } from '../src/state/state.ts';
@@ -429,10 +429,42 @@ describe('the dashboard', () => {
     assert.equal((await get(`/?code=${code}`)).status, 401);
   });
 
+  it('hears `harness attach` come and go, for a module of the project only', async () => {
+    const terminals = new Terminals(undefined);
+    const { post, state } = await dashboard(undefined, {}, terminals);
+    (state.modules as Record<string, unknown>).shop = { module: 'shop', architect: { sandbox: 'arc-1' } };
+    assert.deepEqual(await post('/api/attach', { module: 'shop', attached: true }), { done: true });
+    assert.equal(terminals.watched('arc-1'), true);
+    assert.deepEqual(await post('/api/attach', { module: 'shop', attached: false }), { done: true });
+    assert.equal(terminals.watched('arc-1'), false);
+    assert.equal((await post('/api/attach', { module: '__proto__', attached: true })).done, false);
+    assert.equal((await post('/api/attach', { module: 'shop' })).done, false);
+  });
+
   it("opens a shell in a reviewer's sandbox while its review runs", () => {
     const reviews = [['rev-old', 'reported'], ['rev-now', 'running'], ['rev-next', 'starting'], ['rev-bad', 'failed']].map(([sandbox, status]) => ({ sandbox, status }));
     const state = { modules: {}, managers: {}, features: {}, plans: { 'shop/P1': { reviews }, 'shop/P2': {} } } as unknown as State;
     assert.deepEqual(runningSandboxes(state), ['rev-now', 'rev-next']);
+  });
+
+  it("opens no shell in an attempt's sandbox once its checks started, as the daemon deleted it", () => {
+    const attempts = ['running', 'collecting', 'checking', 'reviewing'].map((status) => ({ sandbox: `dev-${status}`, status }));
+    const state = { modules: {}, managers: {}, features: { 'shop/P1/F1': { attempts } }, plans: {} } as unknown as State;
+    assert.deepEqual(runningSandboxes(state), ['dev-running', 'dev-collecting']);
+  });
+
+  it("serves a finished reviewer's transcript from its review's folder", async () => {
+    const harnessDir = tempDir('harness');
+    const { call, state } = await dashboard(undefined, { options: { harnessDir } });
+    const head = '0123456789abcdef';
+    (state.plans as Record<string, unknown>)['shop/P1'] = { module: 'shop', plan: 'P1', reviews: [{ role: 'security', head, status: 'reported' }] };
+    const dir = join(harnessDir, 'modules', 'shop', 'reviews', 'P1-security-01234567');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'brief.md'), '# Review P1');
+    writeFileSync(join(dir, 'stream.jsonl'), `${JSON.stringify({ type: 'result', subtype: 'success' })}\n`);
+    const answer = await call('GET', '/api/transcript?agent=security:01234567');
+    assert.equal(answer.status, 200, answer.text);
+    assert.deepEqual(JSON.parse(answer.text), [{ type: 'prompt', text: '# Review P1' }, { type: 'result', subtype: 'success' }]);
   });
 });
 
@@ -452,5 +484,62 @@ describe('terminals', () => {
     // The resize after 100 ms, from a timer, too.
     await sleep(150);
     view.detach();
+  });
+
+  describe("an Architect's nudge", () => {
+    /** Terminals whose connections answer at once, and what was typed into them; `failing` connections fail to start. */
+    const recording = () => {
+      const typed: string[] = [];
+      const control = { failing: false };
+      const terminals = new Terminals(() => {
+        if (control.failing) throw new Error('openshell did not start');
+        let output = (_data: string) => {};
+        setTimeout(() => output('$ '), 1);
+        return { onData: (listener) => (output = listener), onExit: () => {}, write: (data) => typed.push(data), resize: () => {}, kill: () => {} };
+      });
+      const nudges = () => typed.filter((data) => data === ARCHITECT_NUDGE).length;
+      return { terminals, typed, control, nudges };
+    };
+    const viewer = { send: () => {}, close: () => {} };
+
+    it('is typed at once when nobody is at the terminal, and once only', async () => {
+      const { terminals, nudges } = recording();
+      await terminals.announce('arc-1');
+      await terminals.announceDue();
+      assert.equal(nudges(), 1);
+    });
+
+    it('waits, while a viewer is there, until nobody typed for five minutes', async () => {
+      const { terminals, nudges } = recording();
+      const view = terminals.attach('arc-1', viewer, { cols: 80, rows: 24 });
+      view.input('ls');
+      await terminals.announce('arc-1');
+      await terminals.announceDue(Date.now() + QUIET_MS - 10_000);
+      assert.equal(nudges(), 0, 'the owner typed four minutes ago');
+      await terminals.announceDue(Date.now() + QUIET_MS + 1000);
+      assert.equal(nudges(), 1);
+      view.detach();
+    });
+
+    it("counts `harness attach` as somebody at the terminal, until it leaves", async () => {
+      const { terminals, nudges } = recording();
+      terminals.attachOutside('arc-1', true);
+      assert.equal(terminals.watched('arc-1'), true);
+      await terminals.announce('arc-1');
+      assert.equal(nudges(), 0);
+      terminals.attachOutside('arc-1', false);
+      assert.equal(terminals.watched('arc-1'), false);
+      await terminals.announceDue();
+      assert.equal(nudges(), 1);
+    });
+
+    it('stays due when typing it fails, and is typed on the next try', async () => {
+      const { terminals, control, nudges } = recording();
+      control.failing = true;
+      await assert.rejects(terminals.announce('arc-1'), /arc-1: openshell did not start/);
+      control.failing = false;
+      await terminals.announceDue();
+      assert.equal(nudges(), 1);
+    });
   });
 });

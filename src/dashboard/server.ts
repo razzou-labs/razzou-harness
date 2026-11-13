@@ -50,9 +50,6 @@ export interface DashboardState {
   tokens: RoleTokens[];
 }
 
-/** What the daemon types into an Architect's terminal so that its hook delivers the inbox. */
-export const ARCHITECT_NUDGE = '[harness] New messages for you.';
-
 const TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
@@ -93,12 +90,14 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
       orchestrator.log(`transcript of ${agent}: ${(error as Error).message}`);
     }
   });
+  // A note for an Architect stays unannounced until the nudge is typed in its terminal: at
+  // once when nobody is there, after five quiet minutes when somebody is, tried each minute.
+  // Without node-pty nothing can be typed: the owner's next prompt there delivers it.
+  const announce = (attempt: Promise<void>) => attempt.catch((error: Error) => orchestrator.log(`architect prompt: ${error.message}`));
   orchestrator.events.on('architect-inbox', ({ sandbox }: { module: string; sandbox: string }) => {
-    // At the terminal, the owner's own next prompt delivers it; typing there would mix with theirs.
-    if (terminals.available && !terminals.watched(sandbox)) {
-      terminals.prompt(sandbox, ARCHITECT_NUDGE).catch((error: Error) => orchestrator.log(`architect prompt: ${error.message}`));
-    }
+    if (terminals.available) void announce(terminals.announce(sandbox));
   });
+  setInterval(() => terminals.available && void announce(terminals.announceDue()), 60_000).unref();
   setInterval(() => clients.forEach((client) => client.write(': keepalive\n\n')), 20_000).unref();
 
   const authorized = (req: IncomingMessage, url: URL) =>
@@ -228,6 +227,14 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
           await terminals.prompt(module.architect.sandbox, text('text')!.replace(/\s*\n\s*/g, ' '));
           return sendJson(res, { done: true });
         }
+        case 'POST /api/attach': {
+          // `harness attach` reports that it opened, or left, the Architect's terminal: a nudge then waits for a quiet moment.
+          const module = own(orchestrator.state.modules, body.module);
+          if (!module || typeof body.attached !== 'boolean') return sendJson(res, { done: false, error: 'module: a module of this project; attached: true or false' });
+          terminals.attachOutside(module.architect.sandbox, body.attached);
+          if (!body.attached && terminals.available) void announce(terminals.announceDue());
+          return sendJson(res, { done: true });
+        }
         case 'POST /api/modules': {
           if (typeof body.id !== 'string') return sendJson(res, { done: false, error: 'a module needs an id' });
           const error = orchestrator.createModule(body.id, typeof body.title === 'string' ? body.title : '');
@@ -332,9 +339,13 @@ function openTerminal(ws: WebSocket, url: URL, state: State, terminals: Terminal
   ws.on('close', () => terminal.detach());
 }
 
-/** The sandboxes the owner may open a shell in: the agents' that are still there. */
+/**
+ * The sandboxes the owner may open a shell in: the agents' that are still there. An
+ * attempt's goes as its checks start, which run in a sandbox of their own; the page's
+ * Agents view offers a shell for the same statuses.
+ */
 export function runningSandboxes(state: State): string[] {
-  const live = ['starting', 'running', 'collecting', 'checking', 'reviewing'];
+  const live = ['starting', 'running', 'collecting'];
   return [
     ...Object.values(state.modules).map((m) => m.architect.sandbox),
     ...Object.values(state.managers).filter((m) => m.status !== 'stopped').map((m) => m.sandbox),
@@ -403,10 +414,13 @@ class Transcripts {
     return clip({ type: 'prompt', text: readFileSync(file, 'utf8') }, 0);
   }
 
-  /** Only files the state names: the attempt of a known feature, or a module's Manager. */
+  /** Only files the state names: the attempt of a known feature, a known review, or a module's Manager. */
   private file(agent: string): string | undefined {
     const attempt = this.attemptDir(agent);
     if (attempt) return join(attempt, 'stream.jsonl');
+    // A review's stream is saved in its folder as its session ends.
+    const review = this.reviewDir(agent);
+    if (review) return join(review, 'stream.jsonl');
     // A module's Manager, or a plan's (v3 §6.4): each keeps its transcripts in its own folder.
     const manager = /^manager:([^/]+)(?:\/([^/]+))?$/.exec(agent);
     if (!manager) return undefined;
@@ -431,7 +445,7 @@ class Transcripts {
   /** The folder of a review the state knows, for "<role>:<first 8 characters of the head>". */
   private reviewDir(agent: string): string | undefined {
     for (const plan of Object.values(this.orchestrator.state.plans)) {
-      const review = plan.reviews?.find((r) => `${r.role}:${r.head.slice(0, 8)}` === agent);
+      const review = plan.reviews?.findLast((r) => `${r.role}:${r.head.slice(0, 8)}` === agent);
       if (review) return join(this.orchestrator.options.harnessDir, 'modules', plan.module, 'reviews', `${plan.plan}-${review.role}-${review.head.slice(0, 8)}`);
     }
     return undefined;
@@ -508,6 +522,11 @@ function readBody(req: IncomingMessage): Promise<string> {
     req.on('end', () => resolve(body || '{}'));
     req.on('error', reject);
   });
+}
+
+/** A record's own entry for a key a request gave, never one of Object.prototype's (`__proto__`, `constructor`). */
+function own<T>(record: Record<string, T>, key: unknown): T | undefined {
+  return typeof key === 'string' && Object.hasOwn(record, key) ? record[key] : undefined;
 }
 
 const clamp = (n: number, min: number, max: number) => Math.min(max, Math.max(min, Math.round(n)));

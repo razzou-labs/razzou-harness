@@ -33,6 +33,11 @@ export async function loadPty(): Promise<SpawnPty | undefined> {
   }
 }
 
+/** What the daemon types into an Architect's terminal so that its hook delivers the inbox. */
+export const ARCHITECT_NUDGE = '[harness] New messages for you.';
+/** How long nobody must have typed in an Architect's terminal that someone is at before the daemon types there. */
+export const QUIET_MS = 5 * 60_000;
+
 /** Detaching from `openshell sandbox connect` leaves the sandbox's own terminal running. */
 const DETACH = '\x10\x11';
 /** Enough of the screen to show a newcomer, until the program redraws it. */
@@ -54,6 +59,14 @@ export class Terminals {
   private readonly shared = new Map<string, Shared>();
   private readonly shells = new Set<Pty>();
   private readonly spawn: SpawnPty | undefined;
+  /** The Architects' sandboxes with notes their Architect wasn't told about yet. */
+  private readonly unannounced = new Set<string>();
+  /** Those the daemon is typing the nudge into right now. */
+  private readonly typing = new Set<string>();
+  /** When somebody last typed in an Architect's terminal, or attached to it. */
+  private readonly typed = new Map<string, number>();
+  /** How many `harness attach` are at each Architect's terminal, as the CLI reports them. */
+  private readonly outside = new Map<string, number>();
 
   constructor(spawn: SpawnPty | undefined) {
     this.spawn = spawn;
@@ -67,12 +80,16 @@ export class Terminals {
   attach(sandbox: string, viewer: Viewer, size: Size): { input: (data: string) => void; resize: (size: Size) => void; detach: () => void } {
     const session = this.connect(sandbox, size);
     session.viewers.add(viewer);
+    this.typed.set(sandbox, Date.now());
     if (session.output) viewer.send(session.output);
     // A full-screen program redraws on a size change: nudge it, so the newcomer sees a whole screen.
     resize(session.pty, size.cols, Math.max(2, size.rows - 1));
     setTimeout(() => resize(session.pty, size.cols, size.rows), 100);
     return {
-      input: (data) => session.pty.write(data),
+      input: (data) => {
+        this.typed.set(sandbox, Date.now());
+        session.pty.write(data);
+      },
       resize: ({ cols, rows }) => resize(session.pty, cols, rows),
       detach: () => {
         session.viewers.delete(viewer);
@@ -81,9 +98,49 @@ export class Terminals {
     };
   }
 
-  /** Whether the owner is looking at the Architect's terminal. */
+  /** Whether somebody is at the Architect's terminal: a dashboard viewer, or `harness attach`. */
   watched(sandbox: string): boolean {
-    return (this.shared.get(sandbox)?.viewers.size ?? 0) > 0;
+    return (this.shared.get(sandbox)?.viewers.size ?? 0) > 0 || (this.outside.get(sandbox) ?? 0) > 0;
+  }
+
+  /**
+   * `harness attach` opened, or left, the Architect's terminal. Its keys never pass through
+   * the daemon: the attach itself counts as typing, so a nudge waits five minutes after it.
+   */
+  attachOutside(sandbox: string, attached: boolean): void {
+    const count = Math.max(0, (this.outside.get(sandbox) ?? 0) + (attached ? 1 : -1));
+    if (count === 0) this.outside.delete(sandbox);
+    else this.outside.set(sandbox, count);
+    this.typed.set(sandbox, Date.now());
+  }
+
+  /** The Architect has notes it wasn't told about: it is told now if it may be, or by a later `announceDue`. */
+  announce(sandbox: string): Promise<void> {
+    this.unannounced.add(sandbox);
+    return this.announceDue();
+  }
+
+  /**
+   * Types the nudge for each Architect with notes it wasn't told about: at once when
+   * nobody is at its terminal, otherwise once nobody has typed there for five minutes, so
+   * that it never mixes with the owner's own prompt. A nudge that fails stays due.
+   */
+  async announceDue(now = Date.now()): Promise<void> {
+    const failures: string[] = [];
+    for (const sandbox of [...this.unannounced]) {
+      if (this.typing.has(sandbox)) continue;
+      if (this.watched(sandbox) && now - (this.typed.get(sandbox) ?? 0) < QUIET_MS) continue;
+      this.typing.add(sandbox);
+      try {
+        await this.prompt(sandbox, ARCHITECT_NUDGE);
+        this.unannounced.delete(sandbox);
+      } catch (error) {
+        failures.push(`${sandbox}: ${(error as Error).message}`);
+      } finally {
+        this.typing.delete(sandbox);
+      }
+    }
+    if (failures.length > 0) throw new Error(failures.join('; '));
   }
 
   /**
