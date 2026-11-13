@@ -922,6 +922,18 @@ export function apply(state: State, event: HarnessEvent): State {
       };
       break;
     }
+    case 'ARCHITECT_STARTING': {
+      const module = state.modules[event.payload.module]!;
+      module.architect.status = 'starting';
+      // What the old sandbox was told is gone with it: a question still waiting for a decision is asked again.
+      for (const escalation of module.escalations.filter((e) => e.decision === undefined)) {
+        module.notes.push({
+          key: `note:${event.id}:${escalation.id}`,
+          text: `The Manager asks (escalation ${escalation.id}${escalation.feature ? `, about ${escalation.feature}` : ''}):\n${escalation.question}\nDecide with the owner if needed, then call reply_to_manager.`,
+        });
+      }
+      break;
+    }
     case 'ARCHITECT_LAUNCHED':
       state.modules[event.payload.module]!.architect.status = 'running';
       break;

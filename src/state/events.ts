@@ -120,6 +120,8 @@ interface Payloads {
   POST_DEPLOY_RECHECK: { reason: string };
   PR_CLOSED: Record<string, never>;
   MODULE_CREATED: { module: string; title: string; sandbox: string; sessionId: string };
+  /** The Architect's sandbox is gone, and is made again: a new conversation, which starts from what the state knows. */
+  ARCHITECT_STARTING: { module: string };
   ARCHITECT_LAUNCHED: { module: string };
   ARCHITECTURE_ACCEPTED: { module: string; version: number };
   DESIGN_REFUSED: { module: string; requestId: string; problems: string[] };

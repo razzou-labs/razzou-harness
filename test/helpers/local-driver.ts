@@ -95,6 +95,18 @@ export class LocalDriver implements SandboxDriver {
 
   /** Removing a container ends its processes: here, every agent whose pid file is in the sandbox. */
   async remove(name: string): Promise<void> {
+    this.endProcesses(name);
+    this.phases.delete(name);
+    rmSync(this.rootOf(name), { recursive: true, force: true });
+  }
+
+  /** What a reboot of the machine does to a sandbox: its processes end, and its files stay. */
+  stop(name: string): void {
+    this.endProcesses(name);
+    this.phases.set(name, 'stopped');
+  }
+
+  private endProcesses(name: string): void {
     const harness = join(this.rootOf(name), '.harness');
     const pidFiles = existsSync(harness)
       ? readdirSync(harness, { recursive: true, encoding: 'utf8' }).filter((f) => /(^|\/)[\w.]*pid$/.test(f)).map((f) => join(harness, f))
@@ -106,7 +118,6 @@ export class LocalDriver implements SandboxDriver {
         // Already gone.
       }
     }
-    rmSync(this.rootOf(name), { recursive: true, force: true });
   }
 
   async removeAll(): Promise<void> {

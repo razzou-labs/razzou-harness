@@ -239,10 +239,16 @@ async function poll(o: Orchestrator, plan: PlanState, review: ReviewState): Prom
     await o.driver.remove(review.sandbox);
     return 'progress' as const;
   };
-  if ((await o.driver.status(review.sandbox)) === 'missing') return end('error', 'the sandbox disappeared');
+  const where = await o.driver.status(review.sandbox);
+  if (where === 'missing') return end('error', 'the sandbox disappeared');
+  if (where === 'stopped') {
+    await o.driver.start(review.sandbox);
+    return 'wait';
+  }
   o.followReview(review);
   const probe = await o.exec(review.sandbox, probeScript(p.exit, p.pid));
   const status = probe.stdout.trim();
+  if (status === '') throw new Error(`${review.sandbox} could not be asked how the reviewer is doing: ${clip((probe.stderr || `exit code ${probe.code}`).trim(), 300)}`);
   if (status === 'running') {
     if (o.now() < Date.parse(review.deadline)) return 'wait';
     await o.killAgent(review.sandbox);

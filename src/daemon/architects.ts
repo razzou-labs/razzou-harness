@@ -68,7 +68,18 @@ export class Architects {
 
   private async syncModule(module: ModuleState): Promise<void> {
     const o = this.o;
-    if (module.architect.status === 'starting' || (await o.driver.status(module.architect.sandbox)) === 'missing') {
+    // GitHub first: what the owner merged or closed is seen whatever state the Architect's sandbox is in.
+    // A change to locked files has its own PR, which doesn't hold the build (v5).
+    if (module.status === 'in_review' && module.design?.pr) await this.followPullRequest(module);
+    if (module.locked?.pr) await this.followLocked(module);
+    if (module.architect.status !== 'starting') {
+      const where = await o.driver.status(module.architect.sandbox);
+      // Gone, so made again with a new conversation. Recorded first: a start cut short is taken up again.
+      if (where === 'missing') o.record({ type: 'ARCHITECT_STARTING', payload: { module: module.module } });
+      // What a reboot of the machine leaves: started again, its launcher resumes the conversation.
+      else if (where === 'stopped') await o.driver.start(module.architect.sandbox);
+    }
+    if (module.architect.status === 'starting') {
       await this.start(module);
       return;
     }
@@ -77,10 +88,7 @@ export class Architects {
     await o.noteTokens(`architect:${module.module}`, module.architect.sandbox);
     await this.refreshMainIfMoved(module);
     if (module.submission && !this.busy.has(module.module)) await this.process(module);
-    if (module.status === 'in_review' && module.design?.pr) await this.followPullRequest(module);
-    // A change to locked files has its own PR, which doesn't hold the build (v5).
     if (module.lockedSubmission && !this.busy.has(`${module.module}:locked`)) await this.processLocked(module);
-    if (module.locked?.pr) await this.followLocked(module);
   }
 
   /** A sandbox whose main command waits for the launcher; the launcher, uploaded last, starts Claude. */
@@ -252,7 +260,8 @@ export class Architects {
         return feature ? [{ feature: `${module.module}/${c.plan}/${c.feature}`, definitionHash: definitionHash(feature) }] : [];
       });
       o.record({ type: 'LOCKED_CHANGE_MERGED', payload: { module: module.module, commit, rehash } });
-      await this.refreshMain(module);
+      // The Architect's clone gets the new main whenever its sandbox answers (`refreshMainIfMoved`).
+      this.mainSent.delete(module.module);
       o.kick();
       return;
     }
@@ -334,7 +343,8 @@ export class Architects {
     const pr = await o.forge.pullRequest(module.design!.pr!.number);
     if (pr.merged) {
       o.record({ type: 'DESIGN_FROZEN', payload: { module: module.module, commit: pr.mergeCommit ?? '' } });
-      await this.refreshClone(module);
+      // The merge is recorded whatever the sandbox does: a clone that can't be refreshed now only keeps its old branch.
+      await this.refreshClone(module).catch((error: Error) => o.log(`architect of ${module.module}: its clone was not refreshed after the merge: ${error.message}`));
       o.kick();
       return;
     }

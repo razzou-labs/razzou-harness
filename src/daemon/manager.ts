@@ -43,8 +43,10 @@ export class Managers {
       await this.syncOnce();
       this.errors = 0;
     } catch (error) {
-      this.errors += 1;
       const message = (error as Error).message;
+      // A gateway that doesn't answer is no fault of the Manager's sandbox: nothing is counted, and nothing made again.
+      if (await this.o.gatewayDown()) return this.o.log(`manager: ${message}`);
+      this.errors += 1;
       this.o.log(`manager: ${message} (${this.errors}/${ERROR_LIMIT})`);
       if (this.errors >= ERROR_LIMIT) {
         this.errors = 0;
@@ -81,7 +83,7 @@ export class Managers {
         await this.start(scope);
       } else if (manager.status === 'starting') {
         await this.start(scope, manager);
-      } else if ((await o.driver.status(manager.sandbox)) === 'missing') {
+      } else if ((await this.sandboxThere(manager)) === false) {
         await this.start(scope);
       } else if (manager.status === 'running' && (await this.alive(manager))) {
         this.attach(manager);
@@ -108,6 +110,17 @@ export class Managers {
     const scopes: ManagerScope[] = own.map((p) => ({ module, plan: p.plan }));
     if (own.length === 0 || own.length < inFlight.length) scopes.push({ module });
     return scopes;
+  }
+
+  /**
+   * Whether the Manager's sandbox is still there, a stopped one started again first: what
+   * a reboot of the machine leaves keeps its files, and so the conversation, which the
+   * next launch resumes. Only a sandbox the gateway no longer has is made again.
+   */
+  private async sandboxThere(manager: ManagerState): Promise<boolean> {
+    const where = await this.o.driver.status(manager.sandbox);
+    if (where === 'stopped') await this.o.driver.start(manager.sandbox);
+    return where !== 'missing';
   }
 
   /** A fresh sandbox and conversation. `existing` resumes a start that was cut short. */
@@ -163,6 +176,8 @@ export class Managers {
     const probe = await o.exec(manager.sandbox, probeScript(run.exitFile, run.pidFile));
     const status = probe.stdout.trim();
     if (status === 'running') return true;
+    // The probe always prints an answer: none means it never ran, which says nothing of the Manager.
+    if (status === '') throw new Error(`${manager.sandbox} could not be asked how the Manager is doing: ${clip((probe.stderr || `exit code ${probe.code}`).trim(), 300)}`);
     const after = await o.exec(manager.sandbox,
       `{ { wc -c < ${sh(this.paths(manager).output)}; } 2>/dev/null || echo 0; }; tail -c 2000 ${sh(run.stderrFile)} 2>/dev/null`);
     const [bytes = '0', ...stderr] = after.stdout.split('\n');

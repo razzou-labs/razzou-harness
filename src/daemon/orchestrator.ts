@@ -136,6 +136,8 @@ export class Orchestrator {
   private nextSweep = 0;
   /** When each long-lived agent's tokens were last read, by agent. */
   private readonly tokensReadAt = new Map<string, number>();
+  /** Whether the gateway answered when last asked (`gatewayDown`). */
+  private gatewayAsked = { at: -Infinity, down: false };
   /** The gateway's providers, read at most once a minute, for the keys of the project's APIs. */
   private providerNames?: { at: number; names: string[] };
   /** Errors in a row of each plan's step, and when it is tried again: one plan that keeps failing never stops the others. */
@@ -331,8 +333,22 @@ export class Orchestrator {
    * is still so. The owner sees why under Needs you, and has nothing to lift: what a
    * resume of theirs sets off, such as fresh turns for the Managers, doesn't happen.
    */
-  private lookAgainLater(reason: string): void {
+  lookAgainLater(reason: string): void {
     this.pausePipeline(reason, new Date(this.now() + LOOK_AGAIN_MS).toISOString(), true);
+  }
+
+  /**
+   * Whether the OpenShell gateway doesn't answer, asked at most every ten seconds. What
+   * fails meanwhile says nothing of a sandbox or of its agent, which go on without the
+   * gateway: nothing is interrupted, deleted or counted, and the pipeline waits to look again.
+   */
+  async gatewayDown(): Promise<boolean> {
+    if (this.now() - this.gatewayAsked.at >= 10_000) {
+      const gateway = await this.driver.gateway().catch(() => ({ status: 'unreachable' }));
+      this.gatewayAsked = { at: this.now(), down: gateway.status === 'unreachable' };
+    }
+    if (this.gatewayAsked.down) this.lookAgainLater("the OpenShell gateway doesn't answer: the sandboxes are left as they are, and the daemon looks again by itself (`harness doctor` says more)");
+    return this.gatewayAsked.down;
   }
 
   /** The owner lifts a pause. An API key stored meanwhile counts at once. */
@@ -715,8 +731,12 @@ export class Orchestrator {
       this.planErrors.delete(key);
       return result;
     } catch (error) {
-      const count = (errors?.count ?? 0) + 1;
       const message = (error as Error).message;
+      if (await this.gatewayDown()) {
+        this.log(`step of ${key} failed while the gateway doesn't answer: ${message}`);
+        return 'wait';
+      }
+      const count = (errors?.count ?? 0) + 1;
       this.log(`step of ${key} failed (${count}/${STEP_ERROR_LIMIT}): ${message}`);
       if (count < STEP_ERROR_LIMIT) {
         this.planErrors.set(key, { count, retryAt: this.now() + 30_000 });
@@ -1057,11 +1077,19 @@ export class Orchestrator {
   private async poll(state: FeatureState, attempt: Attempt): Promise<Step> {
     const ref = refOf(state, attempt);
     const p = this.paths(attempt.sandbox);
-    if ((await this.driver.status(attempt.sandbox)) === 'missing') return this.interrupt(state, attempt, 'the sandbox disappeared');
+    const where = await this.driver.status(attempt.sandbox);
+    if (where === 'missing') return this.interrupt(state, attempt, 'the sandbox disappeared');
+    // What a reboot of the machine leaves: started again, its files are as they were, and the next look finds that the agent is gone.
+    if (where === 'stopped') {
+      await this.driver.start(attempt.sandbox);
+      return 'wait';
+    }
     this.followAttempt(ref, attempt.sandbox);
 
     const probe = await this.exec(attempt.sandbox, probeScript(p.exit, p.pid));
     const status = probe.stdout.trim();
+    // The probe always prints an answer: none means it never ran, which says nothing of the agent.
+    if (status === '') throw new Error(`${attempt.sandbox} could not be asked how its agent is doing: ${clip((probe.stderr || `exit code ${probe.code}`).trim(), 300)}`);
     if (status === 'running') {
       if (attempt.abort) {
         await this.killAgent(attempt.sandbox);
@@ -1937,6 +1965,7 @@ export class Orchestrator {
 
   /** An error in one attempt's step: counted for that attempt and its status, and past the limit the attempt is interrupted. */
   private async onAttemptError(feature: FeatureState, attempt: Attempt, error: Error): Promise<void> {
+    if (await this.gatewayDown()) return this.log(`step of ${featureKey(refOf(feature, attempt))} failed while the gateway doesn't answer: ${error.message}`);
     const key = `${featureKey(refOf(feature, attempt))}#${attempt.n}:${attempt.status}`;
     this.stepErrors = { key, count: this.stepErrors.key === key ? this.stepErrors.count + 1 : 1 };
     this.log(`step failed (${key}, ${this.stepErrors.count}/${STEP_ERROR_LIMIT}): ${error.message}`);

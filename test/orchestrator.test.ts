@@ -3019,3 +3019,67 @@ describe('problems of the build', () => {
     assert.equal(o.store.readAll().some((e) => e.type === 'OWNER_RETRY' || e.type === 'PIPELINE_PAUSED'), false);
   });
 });
+
+describe('the gateway and the sandboxes', () => {
+  const shop: ArchitectBehavior = { module: 'shop', design: toyDesign('shop'), summary: 'Greeting and adding' };
+
+  it('leaves agents and sandboxes as they are while the gateway does not answer, and goes on once it does', async () => {
+    const { orchestrator: o, driver } = await setup((f) => ({ ...solved(f), sleepSec: f === 'F01' ? 3 : 0 }));
+    await until(o, () => feature(o, 'F01')?.attempts[0]?.status === 'running' && o.state.managers.demo?.status === 'running');
+    const { sandbox, sessionId } = o.state.managers.demo!;
+    driver.down = true;
+    // More passes than the limit of errors in a row, which interrupts an attempt.
+    for (let i = 0; i < 8; i++) {
+      await o.tick();
+      await sleep(50);
+    }
+    assert.equal(feature(o, 'F01')!.attempts[0]!.status, 'running');
+    assert.deepEqual([o.state.managers.demo!.sandbox, o.state.managers.demo!.sessionId, o.state.managers.demo!.status], [sandbox, sessionId, 'running']);
+    assert.match(o.state.pipeline.paused!.reason, /^the OpenShell gateway doesn't answer: the sandboxes are left as they are/);
+    assert.equal(o.state.pipeline.paused!.retry, true);
+
+    driver.down = false;
+    assert.equal(o.lookAgain(), true);
+    await until(o, completed(o));
+    assert.equal(feature(o, 'F01')!.attempts.length, 1);
+    assert.equal(o.store.readAll().filter((e) => e.type === 'MANAGER_STARTING').length, 1);
+    assert.equal(o.store.readAll().some((e) => e.type === 'ATTEMPT_INTERRUPTED'), false);
+  });
+
+  it("starts a stopped sandbox again instead of making a new one, so a Manager keeps its conversation across a reboot", async () => {
+    const { orchestrator: o, driver } = await setup((f) => solved(f), { manager: { ignore: ['REVIEW'] } });
+    await until(o, () => o.state.managers.demo?.sent['review:demo/P1/F01#1'] !== undefined);
+    const { sandbox, sessionId, launch } = o.state.managers.demo!;
+    driver.stop(sandbox);
+    await until(o, () => o.state.managers.demo!.launch === launch + 1 && o.state.managers.demo!.status === 'running');
+    assert.deepEqual(driver.started, [sandbox]);
+    assert.deepEqual([o.state.managers.demo!.sandbox, o.state.managers.demo!.sessionId], [sandbox, sessionId]);
+    assert.equal(o.store.readAll().filter((e) => e.type === 'MANAGER_STARTING').length, 1);
+  });
+
+  it("sees the merge of an Arch PR while the Architect's sandbox can't be reached", async () => {
+    let skew = 0;
+    const { orchestrator: o, fake, driver } = await setup((f) => solved(f), { github: true, design: false, architect: shop, now: () => Date.now() + skew });
+    o.createModule('shop', 'A tiny shop');
+    await until(o, () => o.state.modules.shop?.status === 'proposed');
+    o.acceptProposal('shop', 1);
+    await until(o, () => o.state.modules.shop?.status === 'in_review' && o.state.modules.shop.design?.pr !== undefined);
+    driver.down = true;
+    await fake.merge(1);
+    skew += 120_000;
+    await until(o, () => o.state.modules.shop?.status === 'frozen');
+    assert.equal(o.store.readAll().some((e) => e.type === 'ARCHITECT_STARTING'), false);
+  });
+
+  it("makes an Architect's sandbox again once the gateway says it is gone, and records it before it starts", async () => {
+    const { orchestrator: o, driver } = await setup((f) => solved(f), { github: true, design: false, architect: shop });
+    o.createModule('shop', 'A tiny shop');
+    await until(o, () => o.state.modules.shop?.architect.status === 'running');
+    const { sandbox, sessionId } = o.state.modules.shop!.architect;
+    await driver.remove(sandbox);
+    await until(o, () => o.store.readAll().filter((e) => e.type === 'ARCHITECT_LAUNCHED').length === 2);
+    const types = o.store.readAll().map((e) => e.type).filter((t) => t.startsWith('ARCHITECT_') && t !== 'ARCHITECT_NOTE_SENT');
+    assert.deepEqual(types, ['ARCHITECT_LAUNCHED', 'ARCHITECT_STARTING', 'ARCHITECT_LAUNCHED']);
+    assert.deepEqual([o.state.modules.shop!.architect.sandbox, o.state.modules.shop!.architect.sessionId, o.state.modules.shop!.architect.status], [sandbox, sessionId, 'running']);
+  });
+});
