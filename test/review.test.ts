@@ -61,6 +61,32 @@ describe('the paid-call inventory', () => {
     assert.equal(describePaidCalls(diff), '+ Bedrock: InvokeModelCommand at src/a.ts:2\n+ SES: SendEmailCommand at src/c.ts:1\n- Polly: synthesize_speech at src/b.py:1');
     assert.match(describePaidCalls({ added: [], removed: [] }), /^None found by pattern/);
   });
+
+  it('scans a long line in linear time, and names what it skipped for its length instead of finding nothing', async () => {
+    // One megabyte on one line, Kendra's commands in it: the lookahead the pattern once had took 25 s.
+    const minified = `${'QueryCommand '.repeat(76_000)}kendra`;
+    const started = performance.now();
+    assert.deepEqual(paidCalls(minified, 'src/bundle.js'), []);
+    assert.ok(performance.now() - started < 1000, `took ${Math.round(performance.now() - started)} ms`);
+    const kendra = `import { QueryCommand } from '@aws-sdk/client-kendra'; ${'x'.repeat(1500)}`;
+    assert.deepEqual(paidCalls(kendra, 'src/k.ts').map((c) => c.call), ['QueryCommand', 'kendra']);
+
+    const read: string[] = [];
+    const files: Record<string, string> = {
+      'src/bundle.js': `const a = 1;\n${'x'.repeat(3000)}\nawait ses.send(new SendEmailCommand(m));\n`,
+      'src/huge.ts': `${'a\n'.repeat(600_000)}`,
+      'package-lock.json': '{}',
+    };
+    const diff = await paidCallDiff(Object.keys(files), async () => undefined, async (file) => (read.push(file), files[file]));
+    assert.deepEqual(read, ['src/bundle.js', 'src/huge.ts'], 'what the skip list names is never read');
+    assert.equal(describePaidCalls(diff), [
+      '+ SES: SendEmailCommand at src/bundle.js:3',
+      'Not scanned, too long: src/bundle.js, line 2 (over 2,000 characters). Read it yourself.',
+      'Not scanned, too long: src/huge.ts (over 1 MB). Read it yourself.',
+    ].join('\n'));
+    const none = await paidCallDiff(['src/huge.ts'], async () => undefined, async (file) => files[file]);
+    assert.match(describePaidCalls(none), /^None found by pattern\. .*\nNot scanned, too long: src\/huge\.ts/);
+  });
 });
 
 describe('a reviewer\'s report', () => {

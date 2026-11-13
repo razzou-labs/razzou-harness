@@ -29,7 +29,8 @@ function servicePattern(operations: string[], classes: string[], ids: string[], 
   return new RegExp(sources.join('|'), 'g');
 }
 
-const TABLE: ReadonlyArray<{ service: string; pattern: RegExp }> = [
+/** A service's pattern; with `line`, it counts only on a line that matches that too, tested once per line. */
+const TABLE: ReadonlyArray<{ service: string; pattern: RegExp; line?: RegExp }> = [
   // Converse is also a word: only as a command, or called (`.converse(`).
   {
     service: 'Bedrock',
@@ -52,45 +53,67 @@ const TABLE: ReadonlyArray<{ service: string; pattern: RegExp }> = [
   { service: 'Step Functions', pattern: servicePattern(['StartExecution', 'StartSyncExecution'], ['SFNClient', 'AWS.StepFunctions'], ['sfn', 'stepfunctions']) },
   { service: 'Location', pattern: servicePattern(['SearchPlaceIndexForText', 'SearchPlaceIndexForPosition', 'CalculateRoute', 'CalculateRouteMatrix'], ['LocationClient', 'AWS.Location'], ['location']) },
   // Query and Retrieve are also words, and other services' commands: only with Kendra on the line, or called on its client.
-  { service: 'Kendra', pattern: servicePattern([], ['KendraClient', 'AWS.Kendra'], ['kendra'], /\b(?:QueryCommand|RetrieveCommand)\b(?=.*[Kk]endra)|(?<=[Kk]endra\w*\.)(?:query|retrieve|Query|Retrieve)(?=\s*\()/) },
+  { service: 'Kendra', pattern: servicePattern([], ['KendraClient', 'AWS.Kendra'], ['kendra'], /(?<=[Kk]endra\w*\.)(?:query|retrieve|Query|Retrieve)(?=\s*\()/) },
+  { service: 'Kendra', pattern: /\b(?:QueryCommand|RetrieveCommand)\b/g, line: /kendra/i },
 ];
 
-/** Files that aren't code the project runs, or are too long to be worth a scan. */
+/** Files that aren't code the project runs. */
 const SKIPPED = /(^|\/)(node_modules|vendor|dist|build|\.terraform)\/|(^|\/)package-lock\.json$|\.lock$|\.min\.(js|css)$|\.(png|jpg|jpeg|gif|svg|ico|pdf|zip|gz|woff2?|ttf|map)$/;
+/** A file, and a line, too long to be worth a scan: minified or generated, and slow for the patterns on the daemon's one thread. */
 const MAX_BYTES = 1_000_000;
+const MAX_LINE = 2_000;
 
-/** The paid calls in one file, by line. */
-export function paidCalls(text: string, file: string): PaidCall[] {
-  if (SKIPPED.test(file) || text.length > MAX_BYTES) return [];
-  const found: PaidCall[] = [];
-  const lines = text.split('\n');
-  lines.forEach((content, i) => {
-    for (const { service, pattern } of TABLE) {
+/** The paid calls in one file, by line, and what wasn't scanned: the file when too long, or its lines too long. */
+function scan(text: string, file: string): { calls: PaidCall[]; unscanned?: string } {
+  if (text.length > MAX_BYTES) return { calls: [], unscanned: `${file} (over ${MAX_BYTES / 1_000_000} MB)` };
+  const calls: PaidCall[] = [];
+  const long: number[] = [];
+  text.split('\n').forEach((content, i) => {
+    if (content.length > MAX_LINE) {
+      long.push(i + 1);
+      return;
+    }
+    const found: Array<PaidCall & { at: number }> = [];
+    for (const { service, pattern, line } of TABLE) {
+      if (line && !line.test(content)) continue;
       pattern.lastIndex = 0;
       for (let match = pattern.exec(content); match; match = pattern.exec(content)) {
-        found.push({ service, call: match[0], file, line: i + 1 });
+        found.push({ service, call: match[0], file, line: i + 1, at: match.index });
         if (match[0].length === 0) pattern.lastIndex++;
       }
     }
+    // In the order they are on the line, whichever pattern found them.
+    calls.push(...found.sort((a, b) => a.at - b.at).map(({ at: _at, ...call }) => call));
   });
-  return found;
+  const lines = long.length > 3 ? `${long.slice(0, 3).join(', ')} and ${long.length - 3} more` : long.join(', ');
+  return { calls, ...(long.length > 0 ? { unscanned: `${file}, line${long.length === 1 ? '' : 's'} ${lines} (over ${MAX_LINE.toLocaleString('en')} characters)` } : {}) };
+}
+
+/** The paid calls in one file, by line. */
+export function paidCalls(text: string, file: string): PaidCall[] {
+  return SKIPPED.test(file) ? [] : scan(text, file).calls;
 }
 
 export interface PaidCallDiff {
   added: PaidCall[];
   removed: PaidCall[];
+  /** The code the patterns didn't scan, too long: a call there goes unseen. */
+  unscanned?: string[];
 }
 
 /**
  * What a change adds and removes, per file: a call counts as added when the head has
- * more of it than the base, with the head's lines; as removed in the opposite case.
+ * more of it than the base, with the head's lines; as removed in the opposite case. A
+ * file the skip list names isn't read at all.
  */
 export async function paidCallDiff(files: string[], base: (file: string) => Promise<string | undefined>, head: (file: string) => Promise<string | undefined>): Promise<PaidCallDiff> {
   const added: PaidCall[] = [];
   const removed: PaidCall[] = [];
-  for (const file of files) {
-    const before = paidCalls((await base(file)) ?? '', file);
-    const after = paidCalls((await head(file)) ?? '', file);
+  const unscanned: string[] = [];
+  for (const file of files.filter((f) => !SKIPPED.test(f))) {
+    const { calls: before } = scan((await base(file)) ?? '', file);
+    const { calls: after, unscanned: missed } = scan((await head(file)) ?? '', file);
+    if (missed) unscanned.push(missed);
     const key = (c: PaidCall) => `${c.service}\t${c.call}`;
     const counts = new Map<string, number>();
     for (const call of before) counts.set(key(call), (counts.get(key(call)) ?? 0) - 1);
@@ -100,12 +123,15 @@ export async function paidCallDiff(files: string[], base: (file: string) => Prom
       if (delta < 0) removed.push(...before.filter((c) => key(c) === k).slice(0, -delta));
     }
   }
-  return { added, removed };
+  return { added, removed, ...(unscanned.length > 0 ? { unscanned } : {}) };
 }
 
-/** The difference as the reviewer reads it. */
+/** The difference as the reviewer reads it, and the code it couldn't scan, which the reviewer reads itself. */
 export function describePaidCalls(diff: PaidCallDiff): string {
-  if (diff.added.length === 0 && diff.removed.length === 0) return 'None found by pattern. Look for what patterns miss: a client built by name, a call behind a wrapper.';
+  const unscanned = (diff.unscanned ?? []).map((what) => `Not scanned, too long: ${what}. Read it yourself.`);
+  if (diff.added.length === 0 && diff.removed.length === 0) {
+    return ['None found by pattern. Look for what patterns miss: a client built by name, a call behind a wrapper.', ...unscanned].join('\n');
+  }
   const line = (sign: string, c: PaidCall) => `${sign} ${c.service}: ${c.call} at ${c.file}:${c.line}`;
-  return [...diff.added.map((c) => line('+', c)), ...diff.removed.map((c) => line('-', c))].join('\n');
+  return [...diff.added.map((c) => line('+', c)), ...diff.removed.map((c) => line('-', c)), ...unscanned].join('\n');
 }
