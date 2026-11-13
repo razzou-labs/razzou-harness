@@ -13,11 +13,11 @@ import { createToyRepo, tempDir } from './helpers/toy-repo.ts';
 const CLI = fileURLToPath(new URL('../src/cli.ts', import.meta.url));
 const source = (path: string) => JSON.stringify(new URL(path, import.meta.url).href);
 
-/** A script run as a process of its own: signals sent to it don't reach the test runner. */
-function script(body: string): ChildProcess & { out: () => string } {
+/** A script run as a process of its own: signals sent to it don't reach the test runner. Values reach it in `env`, not in its code. */
+function script(body: string, env: Record<string, string> = {}): ChildProcess & { out: () => string } {
   const file = join(tempDir('script'), 'script.ts');
   writeFileSync(file, body);
-  const child = spawn(process.execPath, [file], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, [file], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, ...env } });
   let out = '';
   child.stdout!.on('data', (chunk: Buffer) => (out += String(chunk)));
   child.stderr!.on('data', (chunk: Buffer) => (out += String(chunk)));
@@ -85,13 +85,15 @@ describe('the daemon\'s lifecycle', () => {
     const port = await freePort();
     await createToyRepo(dir, { project: { name: 'toy', repo: 'acme/toy', bot: FAKE_BOT }, dashboard: { port } }, { design: false });
     const child = script(`
+      import { join } from 'node:path';
       import { runDaemon } from ${source('../src/daemon/main.ts')};
       import { FakeForge } from ${source('./helpers/fake-forge.ts')};
       import { LocalDriver } from ${source('./helpers/local-driver.ts')};
-      const forge = await FakeForge.create(${JSON.stringify(dir)});
-      await runDaemon(${JSON.stringify(dir)}, { forge: () => forge, driver: new LocalDriver(${JSON.stringify(join(dir, '.sandboxes'))}), tickMs: 60_000 });
+      const dir = process.env.TEST_PROJECT_DIR;
+      const forge = await FakeForge.create(dir);
+      await runDaemon(dir, { forge: () => forge, driver: new LocalDriver(join(dir, '.sandboxes')), tickMs: 60_000 });
       process.exit(0);
-    `);
+    `, { TEST_PROJECT_DIR: dir });
     const harnessDir = join(dir, '.harness');
     try {
       await until(() => existsSync(join(harnessDir, 'daemon.json')), 'daemon.json');

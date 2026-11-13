@@ -30,7 +30,7 @@ describe('the probe', () => {
       if (script.includes('https://github.com/)')) return { stdout: '200' };
       if (script.includes('id -u')) return { stdout: '1500 agent\n' };
       if (script.includes('169.254.169.254')) return { stdout: metadata };
-      if (script.includes('example.org')) return { code: 6, stdout: '000' };
+      if (/ https:\/\/example\.org\//.test(script)) return { code: 6, stdout: '000' };
       if (script.includes('-X POST') || script.includes('-X PUT')) return { stdout: '403' };
       if (script.startsWith('ls ')) return { stdout: 'No such file or directory' };
       if (script.includes('get-caller-identity --query Arn')) return { stdout: 'arn:aws:sts::000000000000:assumed-role/harness-shop-view/probe\n' };

@@ -95,9 +95,10 @@ export async function probe(options: ProbeOptions): Promise<ProbeResult[]> {
       : { name: 'the cloud metadata address is unreachable', ok: exit !== '0' || code === '403', detail: `HTTP ${code}, curl exit ${exit}` });
     await expectDenied('an unlisted host is unreachable', 'curl -s -m 8 -o /dev/null -w "%{http_code}" https://example.org/', notConnected);
     await expectDenied("a POST to github.com outside a repository's fetch is refused", 'curl -s -m 8 -o /dev/null -w "%{http_code}" -X POST https://github.com/login', forbidden);
-    const plain = readOnly.find((host) => !host.includes('*') && !host.endsWith('github.com'));
+    // A host a bundle reads only: not a wildcard, and not GitHub, whose fetch paths take a POST.
+    const plain = readOnly.find((host) => !host.includes('*') && host !== 'github.com' && !host.endsWith('.github.com'));
     if (plain) await expectDenied(`a POST to a read-only host (${plain}) is refused`, `curl -s -m 8 -o /dev/null -w "%{http_code}" -X POST https://${plain}/`, forbidden);
-    if (readOnly.includes('registry.npmjs.org')) {
+    if (readOnly.some((host) => host === 'registry.npmjs.org')) {
       await expectDenied(
         'a PUT to the npm registry (a publish) is refused',
         'curl -s -m 8 -o /dev/null -w "%{http_code}" -X PUT -H "content-type: application/json" -d "{}" https://registry.npmjs.org/harness-probe-does-not-exist',
