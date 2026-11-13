@@ -4,7 +4,7 @@ import type { HarnessEvent } from '../../src/state/events.ts';
 
 export type { DashboardState, HarnessEvent };
 export type { Attempt, FeatureState, ManagerState, ModuleState, PlanState, State } from '../../src/state/state.ts';
-export type { OwnerTime } from '../../src/design/owner-time.ts';
+export type { ModuleOwnerTime } from '../../src/design/owner-time.ts';
 export type { SubscriptionUsage, UsageLimit } from '../../src/anthropic/usage.ts';
 export type { Denial, SandboxOverview, SandboxRow, UsageReading } from '../../src/daemon/sandboxes.ts';
 export type { SandboxUsage } from '../../src/sandbox/docker.ts';

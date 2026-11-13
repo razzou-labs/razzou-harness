@@ -196,7 +196,8 @@ export interface ReviewState {
   usage?: Usage;
   /** Why there is no report. */
   reason?: string;
-  posted?: { status: 'success' | 'failure' | 'error'; comments: number; at: string; problem?: string };
+  /** `tries`: how many times the post was made; one that failed for a reason that may pass (`retry`) is made again. */
+  posted?: { status: 'success' | 'failure' | 'error'; comments: number; at: string; problem?: string; tries?: number; retry?: boolean };
   /** A fix round was opened for this review's blocking findings. */
   fixRequested?: boolean;
 }
@@ -336,11 +337,11 @@ export interface State {
   /** The owner's switch for each reviewer; one never switched is `on`. */
   reviews?: Partial<Record<ReviewerRole, ReviewScope>>;
   /**
-   * What the owner set in the dashboard (v3 §4): their hours for the whole project. An
-   * older log may hold AGENT_HOURS_SET, the agent-hours threshold before 0.4.22: nothing
-   * reads it any more.
+   * The hours of the owner's time that each module may take, by module, as the owner set
+   * them: a module's own, which no other module draws on. A module without an entry is
+   * designed without a limit.
    */
-  budgets: { ownerHours?: number; ownerHoursSetAt?: string };
+  ownerHours: Record<string, { hours: number; setAt: string }>;
   /**
    * The tokens and active time of the Managers and Architects, by agent (`manager:<key>`,
    * `architect:<module>`): the total so far, and the last reading of their sandbox. A
@@ -376,7 +377,7 @@ export function managersOf(state: State, module: string, plan?: string): Manager
 export const planMerged = (plan: PlanState | undefined): boolean => plan !== undefined && (plan.mergeCommit !== undefined || plan.status === 'completed');
 
 export function initialState(): State {
-  return { v: 1, pipeline: { consecutiveFailures: 0 }, mode: 'manual', infraMerge: 'ceiling', budgets: {}, plans: {}, features: {}, managers: {}, ownerRequests: {}, modules: {}, actions: {}, pendingProgress: [] };
+  return { v: 1, pipeline: { consecutiveFailures: 0 }, mode: 'manual', infraMerge: 'ceiling', ownerHours: {}, plans: {}, features: {}, managers: {}, ownerRequests: {}, modules: {}, actions: {}, pendingProgress: [] };
 }
 
 export function project(events: HarnessEvent[]): State {
@@ -480,24 +481,19 @@ export function apply(state: State, event: HarnessEvent): State {
       (state.plans[planKey(ref!)]!.unreviewed ??= []).push({ role, head, why, at: event.ts });
       break;
     }
-    case 'OWNER_HOURS_SET':
-      if (event.payload.hours === null) {
-        delete state.budgets.ownerHours;
-        delete state.budgets.ownerHoursSetAt;
-      } else {
-        state.budgets.ownerHours = event.payload.hours;
-        state.budgets.ownerHoursSetAt = event.ts;
-      }
-      // Every Architect learns of it: the budget bounds the owner actions it may design (v3 §4.1).
-      for (const module of Object.values(state.modules)) {
-        module.notes.push({
-          key: `note:${event.id}`,
-          text: event.payload.hours === null
-            ? 'The owner cleared their time budget: estimatedMinutes on owner actions is welcome, not required.'
-            : `The owner set their time budget: ${event.payload.hours} hours for the whole project. Call get_owner_time for what this module may plan; every owner action needs estimatedMinutes, and submit_design refuses a design over the budget.`,
-        });
-      }
+    case 'OWNER_HOURS_SET': {
+      const { module, hours } = event.payload;
+      if (hours === null) delete state.ownerHours[module];
+      else state.ownerHours[module] = { hours, setAt: event.ts };
+      // The module's Architect learns of it: the hours bound the owner actions it may design.
+      state.modules[module]?.notes.push({
+        key: `note:${event.id}`,
+        text: hours === null
+          ? 'The owner cleared the hours of their time for this module: estimatedMinutes on owner actions is welcome, not required.'
+          : `The owner set the hours of their time this module may take: ${hours} h, for this module alone. Call get_owner_time for what your design may plan; every owner action needs estimatedMinutes, and submit_design refuses a design over it.`,
+      });
       break;
+    }
     case 'AGENT_TOKENS': {
       const { agent, reading } = event.payload;
       const tokens = (state.agentTokens ??= {});
@@ -616,6 +612,10 @@ export function apply(state: State, event: HarnessEvent): State {
         delete plan.pr;
         delete plan.pushed;
         delete plan.ci;
+        // A new pull request: the reviewers' rounds, and what the earlier one left to the owner, start afresh.
+        delete plan.reviewFixRounds;
+        delete plan.leftToOwner;
+        delete plan.mergedBy;
       } else {
         round = (plan.fixRounds ?? 0) + 1;
         plan.fixRounds = round;
@@ -640,9 +640,12 @@ export function apply(state: State, event: HarnessEvent): State {
       (plan.reviews ??= []).push({ role, head, status: 'starting', sandbox, sessionId, startedAt: event.ts, deadline });
       break;
     }
-    case 'REVIEW_STARTED':
-      reviewOf(state, ref!, event.payload).status = 'running';
+    case 'REVIEW_STARTED': {
+      const review = reviewOf(state, ref!, event.payload);
+      review.status = 'running';
+      if (event.payload.deadline) review.deadline = event.payload.deadline;
       break;
+    }
     case 'REVIEW_ENDED': {
       const review = reviewOf(state, ref!, event.payload);
       const { outcome, verdict, summary, findings, usage, reason } = event.payload;
@@ -655,8 +658,8 @@ export function apply(state: State, event: HarnessEvent): State {
     }
     case 'REVIEW_POSTED': {
       const review = reviewOf(state, ref!, event.payload);
-      const { status, comments, problem } = event.payload;
-      review.posted = { status, comments, at: event.ts, ...(problem ? { problem } : {}) };
+      const { status, comments, problem, retry } = event.payload;
+      review.posted = { status, comments, at: event.ts, ...(problem ? { problem } : {}), ...(retry ? { retry } : {}), tries: (review.posted?.tries ?? 0) + 1 };
       if (review.verdict === 'block') {
         const blocking = (review.findings ?? []).filter((f) => f.severity === 'blocking').map((f) => f.title).join('; ');
         digest(state, event.id, ref!, `The ${review.role} reviewer blocked plan ${ref!.plan}'s pull request at ${review.head.slice(0, 8)}: ${blocking}`);

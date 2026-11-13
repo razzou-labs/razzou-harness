@@ -396,7 +396,11 @@ function failureItem(o: Orchestrator, feature: FeatureState, attempt: Attempt): 
 /** What went wrong after a merge: the apply job's log, or the post-deploy checks' output. */
 export function deployReport(plan: PlanState): string {
   if (plan.deploy?.status === 'failed') {
-    return (plan.deploy.jobs ?? []).map((job) => [`- ${job.name}: ${job.conclusion}${job.url ? ` (${job.url})` : ''}`, '```', tail((job.log ?? '').trim(), 3000), '```'].join('\n')).join('\n');
+    const jobs = plan.deploy.jobs ?? [];
+    const lines = jobs.map((job) => [`- ${job.name}: ${job.conclusion}${job.url ? ` (${job.url})` : ''}`, ...(job.log?.trim() ? ['```', tail(job.log.trim(), 3000), '```'] : [])].join('\n'));
+    // A skipped apply never started: the jobs it waits for on main failed, and their logs say why.
+    const skipped = jobs.some((job) => job.conclusion === 'skipped');
+    return [...(skipped ? ['The apply did not start: it runs once the other jobs pass on main, and one of them failed there.'] : []), ...lines].join('\n');
   }
   if (plan.postDeploy?.status === 'failed') {
     return ['The post-deploy checks, run with the view-only role:', ...checkLines(plan.postDeploy.results, true)].join('\n');

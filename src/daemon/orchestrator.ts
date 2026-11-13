@@ -6,7 +6,7 @@ import { claudeCode, mcpConfig, readResult, reportJsonSchema, sessionTrouble, ty
 import { LONGEST_WINDOW_MS, usageFromEvent, windowName, type SubscriptionUsage, type UsageLimit } from '../anthropic/usage.ts';
 import { allPassed, initEnvironment, runChecks, type CheckResult, type RunOptions } from '../checks/runner.ts';
 import { protectedChanges } from '../ci/harness-ci.ts';
-import { ownerTime, type OwnerTime } from '../design/owner-time.ts';
+import { moduleOwnerTime, type ModuleOwnerTime } from '../design/owner-time.ts';
 import {
   checksHash, definitionHash, featureDependency, KIND_TAGS, loadDesign, planDependencies, planKind, requiredChecks, REVIEWER_ROLES, statusContext,
   type Check, type Config, type Design, type Feature, type ModuleDesign, type Plan, type ReviewerRole,
@@ -210,16 +210,20 @@ export class Orchestrator {
   }
 
   /**
-   * What `harness setup`, `harness budget` or `harness mode` left for the daemon while it
-   * was down (v4 §5), taken once: the owner's hours, which setup only offers, so they don't
-   * replace hours already set while budget's do, and the mode.
+   * What `harness budget` or `harness mode` left for the daemon while it was down (v4 §5),
+   * taken once: the hours of the owner's time for a module, by module, and the mode.
    */
   private takePendingSetup(): void {
     const file = join(this.options.harnessDir, 'setup.json');
     if (!existsSync(file)) return;
     try {
-      const { ownerHours, ownerHoursFrom, mode } = JSON.parse(readFileSync(file, 'utf8')) as { ownerHours?: unknown; ownerHoursFrom?: unknown; mode?: unknown };
-      if (typeof ownerHours === 'number' && ownerHours > 0 && (ownerHoursFrom === 'budget' || this.state.budgets.ownerHours === undefined)) this.setBudgets({ ownerHours });
+      const { ownerHours, mode } = JSON.parse(readFileSync(file, 'utf8')) as { ownerHours?: unknown; mode?: unknown };
+      if (ownerHours !== null && typeof ownerHours === 'object') {
+        for (const [module, hours] of Object.entries(ownerHours as Record<string, unknown>)) {
+          const problem = typeof hours === 'number' || hours === null ? this.setOwnerHours(module, hours) : 'a number of hours, or null';
+          if (problem) this.log(`setup.json: the hours of ${module} were not set: ${problem}`);
+        }
+      }
       if (mode === 'manual' || mode === 'swarm') this.setMode(mode);
     } catch (error) {
       this.log(`setup.json: ${(error as Error).message}`);
@@ -447,11 +451,15 @@ export class Orchestrator {
     return undefined;
   }
 
-  /** The owner sets their hours for the whole project (v3 §4); null clears them. */
-  setBudgets(budgets: { ownerHours?: number | null | undefined }): boolean {
-    if (budgets.ownerHours === undefined || budgets.ownerHours === (this.state.budgets.ownerHours ?? null)) return false;
-    this.record({ type: 'OWNER_HOURS_SET', payload: { hours: budgets.ownerHours } });
-    return true;
+  /**
+   * The owner sets the hours of their time that one module may take, or clears them with
+   * null: a module's own hours, which its design must fit. Returns why not, if not.
+   */
+  setOwnerHours(module: string, hours: number | null): string | undefined {
+    if (!Object.hasOwn(this.state.modules, module) && !this.design.modules.some((m) => m.id === module)) return `there is no module named ${module}`;
+    if (hours !== null && !(Number.isFinite(hours) && hours > 0 && hours <= 10_000)) return 'a positive number of hours';
+    if (hours !== (this.state.ownerHours[module]?.hours ?? null)) this.record({ type: 'OWNER_HOURS_SET', from: 'owner', payload: { module, hours } });
+    return undefined;
   }
 
   /**
@@ -488,15 +496,22 @@ export class Orchestrator {
     return true;
   }
 
-  /** The owner starts a module: its Architect's sandbox and conversation (§7.1). Returns why not, if not. */
-  createModule(id: string, title: string): string | undefined {
+  /**
+   * The owner starts a module: its Architect's sandbox and conversation (§7.1), with the
+   * hours of their time it may take, if they give any. Returns why not, if not.
+   */
+  createModule(id: string, title: string, ownerHours?: number): string | undefined {
     if (!/^[A-Za-z0-9][A-Za-z0-9-]{0,39}$/.test(id)) return 'a module id uses letters, digits and dashes (at most 40)';
-    if (this.state.modules[id] || this.design.modules.some((m) => m.id === id)) return `a module named ${id} already exists`;
+    if (Object.hasOwn(this.state.modules, id) || this.design.modules.some((m) => m.id === id)) return `a module named ${id} already exists`;
+    if (ownerHours !== undefined && !(Number.isFinite(ownerHours) && ownerHours > 0 && ownerHours <= 10_000)) return 'a positive number of hours';
+    // A design lands through an Arch PR: without a repository on GitHub, the Architect could never submit one.
+    if (this.forge.kind !== 'github') return 'this project has no GitHub repository (project.repo), and an Architect\'s design lands through a pull request: run `harness setup` first';
     this.record({
       type: 'MODULE_CREATED',
       from: 'owner',
       payload: { module: id, title: title.trim() || id, sandbox: sandboxName('arc', this.design.config.project.name, id), sessionId: randomUUID() },
     });
+    if (ownerHours !== undefined) this.record({ type: 'OWNER_HOURS_SET', from: 'owner', payload: { module: id, hours: ownerHours } });
     this.kick();
     return undefined;
   }
@@ -1636,11 +1651,10 @@ export class Orchestrator {
     const terraform = this.design.config.terraform;
     // Main as it is now, for the rest of the pass: the plans that wait for this merge start from it.
     await this.forge.fetchMain(this.repo);
-    let deploys = false;
-    if (terraform && commit) {
-      const parent = await this.repo.revParse(`${commit}^1`);
-      deploys = parent !== undefined && (await this.repo.changedFiles(parent, commit)).some((file) => file.startsWith(`${terraform.dir}/`));
-    }
+    // CI applies main after every merge once the Terraform folder is there, whatever the merge changed: code that
+    // Terraform packages deploys with it, and a fix after a failed apply may lie outside the folder. So the apply
+    // is waited for each time, and the post-deploy checks never run before it ended.
+    const deploys = terraform !== undefined && commit !== undefined && commit !== '' && (await this.repo.listFiles(commit, terraform.dir)).length > 0;
     if (deploys) return 'deploying';
     return this.postDeployChecks(plan).length > 0 ? 'verifying' : 'completed';
   }
@@ -1666,8 +1680,17 @@ export class Orchestrator {
       return 'progress';
     }
     if (apply?.status === 'completed' && apply.conclusion !== 'cancelled') {
-      const log = await this.forge.jobLog(apply).catch(() => '');
-      this.record({ type: 'DEPLOY_FAILED', ref, payload: { commit, jobs: [{ name, conclusion: apply.conclusion ?? 'unknown', ...(apply.url ? { url: apply.url } : {}), log }] } });
+      const jobs: CiJob[] = [];
+      if (apply.conclusion === 'skipped') {
+        // The apply waits for main's checks: skipped, it never started, and what failed is what it waited for.
+        for (const run of (await this.forge.checkRuns(commit)).filter((r) => r.name !== name && r.status === 'completed' && !['success', 'skipped', 'cancelled'].includes(r.conclusion ?? ''))) {
+          jobs.push({ name: run.name, conclusion: run.conclusion ?? 'unknown', ...(run.url ? { url: run.url } : {}), log: await this.forge.jobLog(run).catch(() => '') });
+        }
+        jobs.push({ name, conclusion: 'skipped', ...(apply.url ? { url: apply.url } : {}) });
+      } else {
+        jobs.push({ name, conclusion: apply.conclusion ?? 'unknown', ...(apply.url ? { url: apply.url } : {}), log: await this.forge.jobLog(apply).catch(() => '') });
+      }
+      this.record({ type: 'DEPLOY_FAILED', ref, payload: { commit, jobs } });
       this.pauseIfOutOfDeployRounds(plan);
       return 'progress';
     }
@@ -2241,21 +2264,20 @@ export class Orchestrator {
   }
 
   /**
-   * The owner's time, planned and used, or undefined while the owner hasn't set their
-   * hours. A design in review counts as submitted: it is read from the Architect's ref,
-   * not from main, where it isn't yet.
+   * The owner's time in each module: its hours if the owner set any, and what its design
+   * plans and has used of them. A design in review counts as submitted: it is read from
+   * the commit under review, not from main, where it isn't yet, nor from a later
+   * submission that was refused.
    */
-  async ownerTime(): Promise<OwnerTime | undefined> {
-    if (this.state.budgets.ownerHours === undefined) return undefined;
-    const modules = [...this.design.modules];
-    for (const module of Object.values(this.state.modules).filter((m) => m.status === 'in_review')) {
-      const submitted = (await loadDesign(this.repo, architectRef(module.module)).catch(() => undefined))?.modules.find((m) => m.id === module.module);
-      if (!submitted) continue;
-      const current = modules.findIndex((m) => m.id === module.module);
-      if (current === -1) modules.push(submitted);
-      else modules[current] = submitted;
+  async ownerTimes(): Promise<ModuleOwnerTime[]> {
+    const designs = new Map(this.design.modules.map((m) => [m.id, m]));
+    for (const module of Object.values(this.state.modules)) {
+      const head = module.status === 'in_review' ? module.design?.head : undefined;
+      const submitted = head ? (await loadDesign(this.repo, head).catch(() => undefined))?.modules.find((m) => m.id === module.module) : undefined;
+      if (submitted) designs.set(module.module, submitted);
+      else if (!designs.has(module.module)) designs.set(module.module, { id: module.module, plans: [], actions: [] });
     }
-    return ownerTime(this.design.config, { config: this.design.config, modules }, this.state);
+    return [...designs.values()].map((design) => moduleOwnerTime(this.design.config, design, this.state));
   }
 
   /** The sandbox policy: the project's network bundles, or every bundle for the Architect (§13), and signed AWS endpoints. */

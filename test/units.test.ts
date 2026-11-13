@@ -232,10 +232,18 @@ describe('agent tokens', () => {
     });
   });
 
-  it('ignores the agent-hours threshold an older log may hold', () => {
-    const event = (type: string, payload: object, ts: string) => ({ v: 1, id: `e-${type}`, ts, type, payload }) as unknown as HarnessEvent;
-    const state = project([event('AGENT_HOURS_SET', { hours: 40 }, '2026-11-01T00:00:00Z'), event('OWNER_HOURS_SET', { hours: 12 }, '2026-11-02T00:00:00Z')]);
-    assert.deepEqual(state.budgets, { ownerHours: 12, ownerHoursSetAt: '2026-11-02T00:00:00Z' });
+  it("keeps the owner's hours by module, and tells that module's Architect alone", () => {
+    const event = (id: string, type: string, payload: object, ts: string) => ({ v: 1, id, ts, type, payload }) as unknown as HarnessEvent;
+    const created = (module: string) => event(`e-${module}`, 'MODULE_CREATED', { module, title: module, sandbox: `arc-${module}`, sessionId: 's' }, '2026-11-01T00:00:00Z');
+    const state = project([
+      created('shop'), created('billing'),
+      event('e-1', 'OWNER_HOURS_SET', { module: 'shop', hours: 2 }, '2026-11-02T00:00:00Z'),
+      event('e-2', 'OWNER_HOURS_SET', { module: 'billing', hours: 6 }, '2026-11-03T00:00:00Z'),
+      event('e-3', 'OWNER_HOURS_SET', { module: 'billing', hours: null }, '2026-11-04T00:00:00Z'),
+    ]);
+    assert.deepEqual(state.ownerHours, { shop: { hours: 2, setAt: '2026-11-02T00:00:00Z' } });
+    assert.deepEqual(state.modules.shop!.notes.map((n) => n.text.slice(0, 62)), ['The owner set the hours of their time this module may take: 2 '.slice(0, 62)]);
+    assert.equal(state.modules.billing!.notes.length, 2);
   });
 
   it('names a model as people do: Fable 5.2, Sonnet 4.5, Opus 5.5 (1M), and anything else as it is', () => {

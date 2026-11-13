@@ -7,7 +7,7 @@ import { WebSocketServer, type WebSocket } from 'ws';
 import type { Orchestrator, SetupStatus } from '../daemon/orchestrator.ts';
 import type { HarnessEvent } from '../state/events.ts';
 import type { SubscriptionUsage } from '../anthropic/usage.ts';
-import type { OwnerTime } from '../design/owner-time.ts';
+import type { ModuleOwnerTime } from '../design/owner-time.ts';
 import type { State } from '../state/state.ts';
 import { readDockerUsage, type UsageReading } from '../sandbox/docker.ts';
 import { removeLeftOver, sandboxDenials, sandboxOverview, sharedReading } from '../daemon/sandboxes.ts';
@@ -37,8 +37,8 @@ export interface DashboardOptions {
 export interface DashboardState {
   state: State;
   design: DesignView;
-  /** The owner's time, planned and used, once they set their hours (v3 §4.1). */
-  ownerTime?: OwnerTime;
+  /** The owner's time in each module: its hours, if they set any, and what its design plans and used of them. */
+  ownerTime: ModuleOwnerTime[];
   /** The subscription's usage, as an agent's model call last reported it: for the meters, and the Swarm ceiling (v3 §4.3). */
   usage?: { at: string; usage: SubscriptionUsage };
   /** In Swarm, where its setup stands, for the note that lists what is left to do (v4 §6). */
@@ -129,7 +129,7 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
           return sendJson(res, {
             state: orchestrator.state,
             design: designView(orchestrator.design),
-            ...(orchestrator.state.budgets.ownerHours !== undefined ? { ownerTime: await orchestrator.ownerTime() } : {}),
+            ownerTime: await orchestrator.ownerTimes(),
             ...(orchestrator.usage ? { usage: orchestrator.usage } : {}),
             ...(orchestrator.state.mode === 'swarm' ? { setup: await orchestrator.setupStatus() } : {}),
             progress: await progressTail(orchestrator),
@@ -200,10 +200,11 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
           return sendJson(res, body.mode === 'manual' || body.mode === 'swarm' ? await orchestrator.switchMode(body.mode) : { done: false, error: 'the mode is manual or swarm' });
         case 'GET /api/config':
           return sendJson(res, await configView(orchestrator));
-        case 'POST /api/budgets': {
-          // A positive number sets the owner's hours, null clears them, anything else leaves them alone.
-          const hours = body.ownerHours === null ? null : typeof body.ownerHours === 'number' && Number.isFinite(body.ownerHours) && body.ownerHours > 0 ? body.ownerHours : undefined;
-          return sendJson(res, { done: orchestrator.setBudgets({ ownerHours: hours }) });
+        case 'POST /api/owner-hours': {
+          // The hours of the owner's time for one module: a positive number sets them, null clears them.
+          if (typeof body.module !== 'string' || !(body.hours === null || typeof body.hours === 'number')) return sendJson(res, { done: false, error: 'a module, and its hours or null' });
+          const error = orchestrator.setOwnerHours(body.module, body.hours);
+          return sendJson(res, error ? { done: false, error } : { done: true });
         }
         case 'POST /api/order': {
           // The owner asks a Manager in which order to handle the cards of Needs you.
@@ -223,7 +224,8 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
         }
         case 'POST /api/modules': {
           if (typeof body.id !== 'string') return sendJson(res, { done: false, error: 'a module needs an id' });
-          const error = orchestrator.createModule(body.id, typeof body.title === 'string' ? body.title : '');
+          if (!(body.ownerHours === undefined || typeof body.ownerHours === 'number')) return sendJson(res, { done: false, error: 'the hours are a number' });
+          const error = orchestrator.createModule(body.id, typeof body.title === 'string' ? body.title : '', body.ownerHours);
           return sendJson(res, error ? { done: false, error } : { done: true });
         }
         case 'POST /api/accept':

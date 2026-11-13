@@ -7,7 +7,8 @@ import { after, describe, it } from 'node:test';
 import { WebSocket } from 'ws';
 import { detach, type AgentAdapter, type AgentRun } from '../src/agents/claude-code.ts';
 import type { SubscriptionUsage } from '../src/anthropic/usage.ts';
-import { submitLockedChange } from '../src/daemon/design.ts';
+import { submitDesign, submitLockedChange } from '../src/daemon/design.ts';
+import { deployReport } from '../src/daemon/items.ts';
 import { Orchestrator } from '../src/daemon/orchestrator.ts';
 import { needsNow } from '../src/daemon/order.ts';
 import { handleRequest } from '../src/daemon/requests.ts';
@@ -20,6 +21,7 @@ import { recover } from '../src/setup/recover.ts';
 import type { Config } from '../src/design/schemas.ts';
 import { activeAttempts, type Mode } from '../src/state/state.ts';
 import { HARNESS } from '../src/git/repo.ts';
+import { GitHubError } from '../src/github/app.ts';
 import { runOk, sh, sleep } from '../src/util.ts';
 import { FAKE_BOT, FakeForge } from './helpers/fake-forge.ts';
 import { LocalDriver } from './helpers/local-driver.ts';
@@ -186,22 +188,21 @@ function sentTo(o: Orchestrator, agent: string): string[] {
 }
 
 describe('orchestrator', () => {
-  it('takes the owner hours left for it by harness budget when it starts, once', async () => {
+  it("takes a module's hours left for it by harness budget when it starts, once, and sets hours for a module only", async () => {
     const pending = async (dir: string) => {
       mkdirSync(join(dir, '.harness'), { recursive: true });
-      writeFileSync(join(dir, '.harness', 'setup.json'), JSON.stringify({ ownerHours: 12 }));
+      writeFileSync(join(dir, '.harness', 'setup.json'), JSON.stringify({ ownerHours: { demo: 12, nowhere: 3 } }));
     };
-    const { orchestrator: o, harnessDir, make } = await setup((f) => solved(f), { prepare: pending });
-    assert.equal(o.state.budgets.ownerHours, 12);
+    const { orchestrator: o, harnessDir } = await setup((f) => solved(f), { prepare: pending });
+    assert.deepEqual(Object.entries(o.state.ownerHours).map(([module, set]) => [module, set.hours]), [['demo', 12]], 'a module the project has gets its hours; one it has not gets none');
     assert.equal(existsSync(join(harnessDir, 'setup.json')), false);
-    // Set again by hand later, the file left behind doesn't override the owner.
-    o.setBudgets({ ownerHours: 20 });
-    writeFileSync(join(harnessDir, 'setup.json'), JSON.stringify({ ownerHours: 5 }));
-    await o.stop(0);
-    const again = make();
-    await again.start();
-    assert.equal(again.state.budgets.ownerHours, 20);
-    assert.equal(existsSync(join(harnessDir, 'setup.json')), false);
+    // The owner's hours are a module's: set, changed and cleared by its name.
+    assert.equal(o.setOwnerHours('nowhere', 5), 'there is no module named nowhere');
+    assert.equal(o.setOwnerHours('demo', -1), 'a positive number of hours');
+    assert.equal(o.setOwnerHours('demo', 20), undefined);
+    assert.equal(o.state.ownerHours.demo!.hours, 20);
+    assert.equal(o.setOwnerHours('demo', null), undefined);
+    assert.deepEqual(o.state.ownerHours, {});
   });
 
   it('lands each accepted feature as one commit with its progress line', async () => {
@@ -1312,6 +1313,30 @@ describe('pull requests', () => {
     assert.deepEqual(fake.statusesSet.map((s) => [s.context, s.state]), [['harness/cost', 'success']]);
   });
 
+  it("in Swarm, posts a reviewer's status again when GitHub failed for a moment, and the plan merges", async () => {
+    let skew = 0;
+    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true, now: () => Date.now() + skew });
+    const set = fake.setCommitStatus.bind(fake);
+    let failed = 0;
+    // GitHub answers 502 to the first status: nothing is wrong with the App.
+    fake.setCommitStatus = async (sha, status) => {
+      if (failed++ === 0) throw new GitHubError('Bad Gateway', 502);
+      return set(sha, status);
+    };
+    o.setMode('swarm');
+    const deadline = Date.now() + 60_000;
+    while (plan(o)?.status !== 'completed') {
+      if (Date.now() > deadline) throw new Error(`timed out; last events: ${o.store.readAll().slice(-8).map((e) => e.type).join(', ')}`);
+      await o.tick();
+      await sleep(100);
+      skew += 10_000;
+    }
+    const posts = o.store.readAll().filter((e) => e.type === 'REVIEW_POSTED').map((e) => e.payload as { role: string; status: string; retry?: boolean });
+    assert.deepEqual(posts.map((p) => [p.role, p.status, p.retry]), [['security', 'error', true], ['security', 'success', undefined], ['cost', 'success', undefined]]);
+    assert.equal(fake.reviews.filter((r) => r.body.startsWith('## Security review')).length, 1, 'the findings are posted once');
+    assert.equal(plan(o)!.mergedBy, 'daemon');
+  });
+
   it('in Swarm, a status the App cannot set leaves the PR to the owner with the reason', async () => {
     const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true });
     o.setMode('swarm');
@@ -1606,32 +1631,32 @@ describe('architect', () => {
     });
     o.createModule('shop', 'A tiny shop');
     await until(o, () => module(o)?.status === 'proposed');
-    // Set once the Architect exists: it hears of the budget in its inbox (a new Architect hears of it in its welcome).
-    assert.equal(o.setBudgets({ ownerHours: 10 }), true);
+    // Set once the Architect exists: it hears of its module's hours in its inbox (a new Architect hears of them in its welcome).
+    assert.equal(o.setOwnerHours('shop', 10), undefined);
     o.acceptProposal('shop', 1);
     await until(o, () => o.store.readAll().filter((e) => e.type === 'DESIGN_REFUSED').length === 2);
     const problems = o.store.readAll().flatMap((e) => (e.type === 'DESIGN_REFUSED' ? e.payload.problems : []));
-    assert.equal(problems[0], 'owner-actions.json: T1 needs estimatedMinutes, how long it takes the owner: their time is budgeted (get_owner_time)');
-    assert.match(problems[1]!, /^the design takes 10 h of the owner's time in owner actions, but 8 h are available/);
+    assert.equal(problems[0], 'owner-actions.json: T1 needs estimatedMinutes, how long it takes the owner: their time for this module is set (get_owner_time)');
+    assert.match(problems[1]!, /^the design takes 10 h of the owner's time in owner actions, but this module may plan 8 h/);
     assert.equal(module(o)!.status, 'decomposing');
-    assert.ok(module(o)!.notes.some((n) => n.text.startsWith('The owner set their time budget: 10 hours')));
+    assert.ok(module(o)!.notes.some((n) => n.text.startsWith('The owner set the hours of their time this module may take: 10 h, for this module alone.')));
 
     // Within the budget: the design is submitted, and the numbers are the Architect's to read.
     const { orchestrator: p, fake } = await setup((f) => solved(f), {
       github: true, design: false, architect: shop({ design: { ...toyDesign('shop'), ...actions(60) } }),
     });
-    p.setBudgets({ ownerHours: 10 });
-    p.createModule('shop', 'A tiny shop');
+    // The hours given as the module starts are its own from its first prompt.
+    assert.equal(p.createModule('shop', 'A tiny shop', 10), undefined);
     await until(p, () => p.state.modules.shop?.status === 'proposed');
     p.acceptProposal('shop', 1);
     await until(p, () => p.state.modules.shop?.status === 'in_review');
     assert.equal(fake.prs.length, 1);
-    const time = (await p.ownerTime())!;
-    assert.equal(time.plannableHours, 8);
-    assert.ok(time.committedHours >= 1 && time.committedHours < 1.1, `committed ${time.committedHours}`);
+    // The design under review counts as planned, read from its commit: it isn't on main yet.
+    const time = (await p.ownerTimes()).find((t) => t.module === 'shop')!;
+    assert.deepEqual([time.hours, time.plannableHours, time.plannedMinutes], [10, 8, 60]);
     const told = await handleRequest(p, { role: 'architect', sandbox: p.state.modules.shop!.architect.sandbox, module: 'shop' }, { v: 1, id: 'r-time', tool: 'get_owner_time', args: {} });
-    assert.match(told!.text, /^The owner set 10 h for the whole project\. A 20% reserve \(2 h\) stays out of designs/);
-    assert.match(told!.text, /Available to shop: 8 h\./);
+    assert.match(told!.text, /^The owner set 10 h of their time for shop, this module alone: what other modules plan takes nothing from it\. A 20% reserve \(2 h\) stays out of the design/);
+    assert.match(told!.text, /Your design may plan 8 h in owner actions/);
   });
 
   it('refuses a design whose checks run a missing script, and takes the fix', async () => {
@@ -1809,14 +1834,17 @@ describe('dashboard', () => {
     assert.equal(o.state.fixMerge, 'daemon');
   });
 
-  it('sets and clears only the hours of your time: the agent-hours threshold is gone', async () => {
+  it('sets and clears the hours of your time for one module, from the page', async () => {
     const { o, port, bearer } = await dashboard();
-    const post = async (body: object) => JSON.parse((await callWith(port, '/api/budgets', bearer, body)).body) as { done: boolean };
-    assert.equal((await post({ agentHours: 40 })).done, false);
-    assert.equal((await post({ ownerHours: 12, agentHours: 40 })).done, true);
-    assert.deepEqual(Object.keys(o.state.budgets).sort(), ['ownerHours', 'ownerHoursSetAt']);
-    assert.equal((await post({ ownerHours: null })).done, true);
-    assert.deepEqual(o.state.budgets, {});
+    const post = async (body: object) => JSON.parse((await callWith(port, '/api/owner-hours', bearer, body)).body) as { done: boolean; error?: string };
+    assert.deepEqual(await post({ hours: 12 }), { done: false, error: 'a module, and its hours or null' });
+    assert.deepEqual(await post({ module: 'nowhere', hours: 12 }), { done: false, error: 'there is no module named nowhere' });
+    assert.equal((await post({ module: 'demo', hours: 12 })).done, true);
+    assert.equal(o.state.ownerHours.demo!.hours, 12);
+    const state = JSON.parse((await call(port, '/api/state', bearer)).body) as DashboardState;
+    assert.deepEqual(state.ownerTime.map((t) => [t.module, t.hours, t.plannableHours]), [['demo', 12, 9.6]]);
+    assert.equal((await post({ module: 'demo', hours: null })).done, true);
+    assert.deepEqual(o.state.ownerHours, {});
   });
 
   it("lists the gateway's sandboxes, labels its own, shows what a policy refused, and deletes only a left-over one", async () => {
@@ -2219,12 +2247,12 @@ describe('pauses', () => {
 
   it('takes the hours harness budget left while it was down over earlier ones, and the mode harness mode left', async () => {
     const { orchestrator: o, harnessDir, make } = await setup((f) => solved(f));
-    o.setBudgets({ ownerHours: 20 });
+    o.setOwnerHours('demo', 20);
     await o.stop(0);
-    writeFileSync(join(harnessDir, 'setup.json'), JSON.stringify({ ownerHours: 40, ownerHoursFrom: 'budget', mode: 'swarm' }));
+    writeFileSync(join(harnessDir, 'setup.json'), JSON.stringify({ ownerHours: { demo: 40 }, mode: 'swarm' }));
     const again = make();
     await again.start();
-    assert.equal(again.state.budgets.ownerHours, 40);
+    assert.equal(again.state.ownerHours.demo!.hours, 40);
     assert.equal(again.state.mode, 'swarm');
     assert.equal(existsSync(join(harnessDir, 'setup.json')), false);
   });
@@ -3255,5 +3283,103 @@ describe('a build that must not stall', () => {
     assert.match(task, /Each must exit 0\. Some may pass already\./);
     assert.match(task, /if the code already meets it and every check passes, commit nothing and report done/);
     assert.match((await o.repo.show(o.state.plans['demo/P1']!.head, 'progress.txt'))!, /feature\.accepted demo\/P1\/A1 attempt=1[^\n]*\n[\s\S]*feature\.accepted demo\/P1\/A1 attempt=2/);
+  });
+});
+
+describe('what a pull request can and cannot do to its own judgment', () => {
+  const infra = (f: string): StubBehavior => (f === 'F02' ? { files: { ...SOLUTIONS.F02, 'iac/main.tf': '# a bucket\n' } } : f.startsWith('fix') ? { files: { 'src/fix.txt': `${f}: outside iac/\n` } } : solved(f));
+  const green = { verify: 'success', 'tf-plan': 'success', checks: 'success' };
+  /** Ticks with the daemon's clock running fast, so that pull requests looked at once a minute don't hold the test. */
+  const fast = async (o: Orchestrator, advance: (ms: number) => void, done: () => boolean, timeoutMs = 120_000) => {
+    const deadline = Date.now() + timeoutMs;
+    while (!done()) {
+      if (Date.now() > deadline) throw new Error(`timed out; last events: ${o.store.readAll().slice(-10).map((e) => e.type).join(', ')}`);
+      await o.tick();
+      await sleep(100);
+      advance(5_000);
+    }
+    await o.tick();
+  };
+
+  it("gives a reviewer CI's Terraform plan for the head, and runs nothing of the pull request in its sandbox", async () => {
+    let skew = 0;
+    const { orchestrator: o, fake, driver, harnessDir } = await setup(infra, {
+      github: true, config: { terraform: {}, aws: { region: 'eu-west-1', provider: 'aws-view-toy' }, swarm: { merge: { infraMonthlyUsdCeiling: null } } }, now: () => Date.now() + skew,
+    });
+    fake.ci = () => ({ ...green, 'tf-apply': 'success' });
+    fake.artifacts = () => ({ tfplan: { 'plan.json': '{"resource_changes":[{"address":"aws_s3_bucket.a"}]}' } });
+    o.setMode('swarm');
+    await fast(o, (ms) => (skew += ms), () => (o.state.plans['demo/P1']?.reviews ?? []).filter((r) => r.status === 'reported').length === 2);
+    const security = o.state.plans['demo/P1']!.reviews!.find((r) => r.role === 'security')!;
+    const dir = join(harnessDir, 'modules/demo/reviews', `P1-security-${security.head.slice(0, 8)}`);
+    assert.match(readFileSync(join(dir, 'brief.md'), 'utf8'), /The plan's JSON, as CI's tf-plan job made it for this head against the real state, is at .*\/work\/\.harness\/tfplan\.json\. It comes from running the pull request's own Terraform/);
+    assert.equal(readFileSync(join(dir, 'tfplan.json'), 'utf8'), '{"resource_changes":[{"address":"aws_s3_bucket.a"}]}');
+    // No AWS role in a reviewer's sandbox any more: it plans nothing there.
+    const made = driver.created.filter((spec) => spec.name === security.sandbox);
+    assert.deepEqual(made.map((spec) => spec.providers), [['claude-sub']]);
+    // Its clock started with its session, not when its sandbox was asked for.
+    assert.ok(Date.parse(security.deadline) - Date.parse(security.startedAt) >= 30 * 60_000);
+  });
+
+  it('after a failed apply, a Fix PR that changes nothing under iac/ still waits for the apply, and fails with it', async () => {
+    let skew = 0;
+    const { orchestrator: o, fake } = await setup(infra, { github: true, config: { terraform: {} }, now: () => Date.now() + skew });
+    // The apply fails on every commit of main, the fix's merge included.
+    fake.ci = () => ({ ...green, 'tf-apply': 'failure' });
+    const plan = () => o.state.plans['demo/P1'];
+    const failures = () => o.store.readAll().filter((e) => e.type === 'DEPLOY_FAILED').length;
+    await fast(o, (ms) => (skew += ms), () => plan()?.status === 'ready_to_merge');
+    await fake.merge(1);
+    await fast(o, (ms) => (skew += ms), () => plan()?.status === 'ready_to_merge' && plan()?.pr?.number === 2);
+    assert.equal(fake.prs[1]!.title, 'Fix: [DEPLOY_FAILED] [demo/P1] round 1 after the deploy');
+    await fake.merge(2);
+    await fast(o, (ms) => (skew += ms), () => failures() === 2);
+    assert.notEqual(plan()!.status, 'completed');
+    assert.equal(o.store.readAll().some((e) => e.type === 'PLAN_COMPLETED' || e.type === 'DEPLOYED'), false);
+  });
+
+  it('says that the apply never started when the checks failed on main, with their log', async () => {
+    let skew = 0;
+    const { orchestrator: o, fake } = await setup(infra, { github: true, config: { terraform: {} }, now: () => Date.now() + skew, manager: { ignore: ['DEPLOY'] } });
+    let merged: string | undefined;
+    // On the merge commit the checks fail, so the apply, which needs them, is skipped.
+    fake.ci = (sha) => (sha === merged ? { checks: 'failure', 'tf-apply': 'skipped' } : { ...green, 'tf-apply': 'success' });
+    await fast(o, (ms) => (skew += ms), () => o.state.plans['demo/P1']?.status === 'ready_to_merge');
+    merged = await fake.merge(1);
+    await fast(o, (ms) => (skew += ms), () => o.state.plans['demo/P1']?.status === 'deploy_failed');
+    const jobs = o.state.plans['demo/P1']!.deploy!.jobs!;
+    assert.deepEqual(jobs.map((j) => [j.name, j.conclusion, j.log !== undefined]), [['checks', 'failure', true], ['tf-apply', 'skipped', false]]);
+    assert.match(deployReport(o.state.plans['demo/P1']!), /^The apply did not start: it runs once the other jobs pass on main, and one of them failed there\.\n- checks: failure\n```\nthe checks job failed/);
+  });
+
+  it('refuses a design whose history has two merge bases with main: merging it would undo merged work its diff does not show', async () => {
+    let skew = 0;
+    const shop: ArchitectBehavior = { module: 'shop', design: toyDesign('shop'), summary: 'Greeting and adding' };
+    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true, design: false, architect: shop, now: () => Date.now() + skew });
+    o.createModule('shop', 'A tiny shop');
+    await until(o, () => o.state.modules.shop?.status === 'proposed');
+    o.acceptProposal('shop', 1);
+    await until(o, () => o.state.modules.shop?.status === 'in_review' && o.state.modules.shop.design?.pr !== undefined);
+    // The owner commits on main before merging, so the merge has two sides that aren't each other's ancestor.
+    await ownerCommit(fake.remote, 'main', 'NOTES.md', 'a note\n');
+    await fake.merge(1);
+    skew += 120_000;
+    await until(o, () => o.state.modules.shop?.status === 'frozen');
+    // A commit whose parents are the two sides of that merge, with the first side's tree and one more design file.
+    const git = (args: string[], env: NodeJS.ProcessEnv = {}, input?: string) => runOk('git', ['--git-dir', o.repo.dir, ...args], { env: { ...process.env, ...env }, ...(input === undefined ? {} : { input }) });
+    const main = (await git(['rev-parse', 'refs/heads/main'])).trim();
+    const [side1, side2] = (await git(['rev-list', '--parents', '-n', '1', main])).trim().split(' ').slice(1) as [string, string];
+    const index = { GIT_INDEX_FILE: join(tempDir('index'), 'index') };
+    await git(['read-tree', side1], index);
+    const blob = (await git(['hash-object', '-w', '--stdin'], {}, '{"id":"P9"}\n')).trim();
+    await git(['update-index', '--add', '--cacheinfo', `100644,${blob},harness/modules/shop/notes.json`], index);
+    const tree = (await git(['write-tree'], index)).trim();
+    const who = { GIT_AUTHOR_NAME: 'a', GIT_AUTHOR_EMAIL: 'a@test.invalid', GIT_COMMITTER_NAME: 'a', GIT_COMMITTER_EMAIL: 'a@test.invalid' };
+    const crafted = (await git(['commit-tree', tree, '-p', side1, '-p', side2, '-m', 'design: a note'], who)).trim();
+    assert.deepEqual(await o.repo.changedFiles(await o.repo.mergeBase(main, crafted), crafted), ['harness/modules/shop/notes.json'], 'its diff shows the design file alone');
+
+    const outcome = await submitDesign(o, o.state.modules.shop!, 'A note', crafted);
+    assert.equal(outcome.ok, false);
+    assert.match((outcome as { problems: string[] }).problems[0]!, /^your branch has more than one merge base with main, so merging it would change more than its diff shows\. Start it again from main \(git switch -C arch\/shop main\)/);
   });
 });

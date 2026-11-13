@@ -2,8 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { managerSettings, readReview, reviewJsonSchema, type AgentRun } from '../agents/claude-code.ts';
-import { runChecks } from '../checks/runner.ts';
 import { KIND_TAGS, planKind, REVIEWER_ROLES, statusContext, type Plan, type ReviewerRole, type ReviewFinding } from '../design/schemas.ts';
+import { GitHubError } from '../github/app.ts';
 import type { PullRequest, ReviewPost } from '../github/forge.ts';
 import { describePaidCalls, paidCallDiff } from '../review/paid-calls.ts';
 import { planKey, type PlanState, type ReviewState } from '../state/state.ts';
@@ -132,6 +132,14 @@ export async function reviewStep(o: Orchestrator, plan: PlanState, pr: PullReque
       await post(o, plan, pr, review);
       return 'progress';
     }
+    // GitHub may have failed once: a post that didn't go through for a reason that may pass is tried again, twice, a minute apart.
+    if (review.posted.status === 'error' && review.posted.retry && (review.posted.tries ?? 1) < 3) {
+      if (o.now() - Date.parse(review.posted.at) < 60_000) return 'busy';
+      // The findings are posted once: only what failed is done again.
+      if (review.posted.problem?.includes('could not post the review')) await post(o, plan, pr, review);
+      else await restate(o, plan, review);
+      return 'progress';
+    }
     // Switched on again after its status said "not reviewed" over its verdict on this head: the verdict stands, and its status says it again.
     if (said && said.at > review.posted.at && o.state.mode === 'swarm') {
       await restate(o, plan, review);
@@ -145,7 +153,16 @@ export async function reviewStep(o: Orchestrator, plan: PlanState, pr: PullReque
   return 'ready';
 }
 
-/** The sandbox: a clone at the head, the brief, the schema, the prompt, and the Terraform plan when the project has one. */
+/** The largest plan JSON handed to a reviewer: past it, the brief says the plan was too large to bring. */
+const PLAN_LIMIT = 20 * 1024 * 1024;
+
+/**
+ * The sandbox: a clone at the head, the brief, the schema, the prompt, and the Terraform
+ * plan when CI made one. Nothing of the pull request runs here: a reviewer's verdict is
+ * read from files of its own sandbox, which any process started there could write. So the
+ * plan's JSON comes from CI's `tfplan` artifact for that head, not from a `terraform
+ * plan` made in this sandbox, whose providers and data sources are the pull request's.
+ */
 async function prepare(o: Orchestrator, plan: PlanState, review: ReviewState): Promise<'progress' | 'wait'> {
   const ref = { module: plan.module, plan: plan.plan };
   const sandbox = review.sandbox;
@@ -161,7 +178,7 @@ async function prepare(o: Orchestrator, plan: PlanState, review: ReviewState): P
   await o.driver.create({
     name: sandbox,
     image: o.design.config.sandbox.image,
-    ...o.access({ claude: true, aws: terraform !== undefined }),
+    ...o.access({ claude: true, aws: false }),
     command: ['sleep', 'infinity'],
   });
   await o.repo.bundle(`refs/heads/${plan.branch}`, join(dir, 'plan.bundle'));
@@ -176,17 +193,25 @@ async function prepare(o: Orchestrator, plan: PlanState, review: ReviewState): P
     return fail(`could not clone the plan branch: ${clip(clone.stderr.trim(), 300)}`);
   }
 
-  // The Terraform plan's JSON, made the way a check that needs it gets it (§12.4). It goes in the
-  // clone's .harness/, which projects ignore: --restricted keeps the reviewer's file tools in the clone.
+  // The Terraform plan's JSON, as CI's tf-plan job made it for this head. It goes in the clone's
+  // .harness/, which projects ignore: --restricted keeps the reviewer's file tools in the clone.
   let plannedAt: string | undefined;
   let planProblem: string | undefined;
   if (terraform) {
-    const planFile = `${p.work}/.harness/tfplan.json`;
-    const [result] = await runChecks(o.driver, sandbox, p.work, [
-      { id: 'tfplan', run: `mkdir -p ${sh(`${p.work}/.harness`)} && cp "$HARNESS_PLAN_JSON" ${sh(planFile)}`, phase: 'pre-merge', timeoutSec: 900, needs: ['tfplan'] },
-    ], o.checkOptions(sandbox));
-    if (result && result.exit === 0) plannedAt = planFile;
-    else planProblem = clip((result?.output ?? 'no output').trim(), 1500);
+    try {
+      const json = await o.forge.artifactFile(review.head, 'tfplan', 'plan.json');
+      if (json === undefined) planProblem = "CI's tf-plan job uploaded no plan for this head";
+      else if (json.length > PLAN_LIMIT) planProblem = `CI's plan is ${Math.round(json.length / 1024 / 1024)} MB of JSON, too large to bring here`;
+      else {
+        writeFileSync(join(dir, 'tfplan.json'), json);
+        const made = await o.exec(sandbox, `mkdir -p ${sh(`${p.work}/.harness`)}`);
+        if (made.code !== 0) throw new Error(made.stderr.trim());
+        await o.driver.upload(sandbox, join(dir, 'tfplan.json'), `${p.work}/.harness`);
+        plannedAt = `${p.work}/.harness/tfplan.json`;
+      }
+    } catch (error) {
+      planProblem = `CI's plan could not be read: ${clip((error as Error).message, 300)}`;
+    }
   }
 
   const base = await o.repo.mergeBase('refs/heads/main', review.head);
@@ -225,7 +250,9 @@ async function prepare(o: Orchestrator, plan: PlanState, review: ReviewState): P
     await o.driver.remove(sandbox);
     return fail(`could not start the reviewer: ${clip(launch.stderr.trim(), 300)}`);
   }
-  o.record({ type: 'REVIEW_STARTED', ref, payload: { role: review.role, head: review.head } });
+  // Its clock starts now: the time its sandbox took, or a pause before it, isn't the reviewer's.
+  const deadline = new Date(o.now() + o.design.config.swarm.reviewTimeoutMinutes * 60_000).toISOString();
+  o.record({ type: 'REVIEW_STARTED', ref, payload: { role: review.role, head: review.head, deadline } });
   return 'progress';
 }
 
@@ -305,19 +332,27 @@ async function post(o: Orchestrator, plan: PlanState, pr: PullRequest, review: R
   ].join('\n');
   const posting: ReviewPost = { head: review.head, body, comments: inline.map((f) => ({ path: f.file!, line: f.line!, body: `${title(f)}\n\n${f.detail}` })) };
   const { state, description } = verdictStatus(review);
-  let comments = 0;
+  let comments = review.posted?.comments ?? 0;
   let problem: string | undefined;
+  let retry = false;
   try {
     ({ comments } = await o.forge.createReview(pr.number, posting));
   } catch (error) {
     problem = `could not post the review: ${clip((error as Error).message, 300)}`;
+    retry = mayPass(error);
   }
   try {
     await o.forge.setCommitStatus(review.head, { context: statusContext(review.role), state, description });
   } catch (error) {
     problem = `${problem ? `${problem}; ` : ''}could not set ${statusContext(review.role)}: ${clip((error as Error).message, 300)}`;
+    retry ||= mayPass(error);
   }
-  o.record({ type: 'REVIEW_POSTED', ref, payload: { role: review.role, head: review.head, status: problem ? 'error' : state, comments, ...(problem ? { problem } : {}) } });
+  o.record({ type: 'REVIEW_POSTED', ref, payload: { role: review.role, head: review.head, status: problem ? 'error' : state, comments, ...(problem ? { problem } : {}), ...(retry ? { retry } : {}) } });
+}
+
+/** Whether a failed call to GitHub may go through later: a server error, a rate limit, or no answer at all; never a refusal, like a missing permission. */
+function mayPass(error: unknown): boolean {
+  return !(error instanceof GitHubError) || error.status >= 500 || error.status === 429;
 }
 
 /** A verdict as the reviewer's commit status. */
@@ -333,15 +368,17 @@ function verdictStatus(review: ReviewState): { state: 'success' | 'failure'; des
 async function restate(o: Orchestrator, plan: PlanState, review: ReviewState): Promise<void> {
   const { state, description } = verdictStatus(review);
   let problem: string | undefined;
+  let retry = false;
   try {
     await o.forge.setCommitStatus(review.head, { context: statusContext(review.role), state, description });
   } catch (error) {
     problem = `could not set ${statusContext(review.role)}: ${clip((error as Error).message, 300)}`;
+    retry = mayPass(error);
   }
   o.record({
     type: 'REVIEW_POSTED',
     ref: { module: plan.module, plan: plan.plan },
-    payload: { role: review.role, head: review.head, status: problem ? 'error' : state, comments: review.posted?.comments ?? 0, ...(problem ? { problem } : {}) },
+    payload: { role: review.role, head: review.head, status: problem ? 'error' : state, comments: review.posted?.comments ?? 0, ...(problem ? { problem } : {}), ...(retry ? { retry } : {}) },
   });
 }
 
@@ -430,9 +467,9 @@ function brief(o: Orchestrator, plan: PlanState, review: ReviewState, inputs: Br
     '## Terraform',
     '',
     inputs.plannedAt
-      ? `The plan's JSON, made against the real state with the view-only role, is at ${inputs.plannedAt}.`
+      ? `The plan's JSON, as CI's tf-plan job made it for this head against the real state, is at ${inputs.plannedAt}. It comes from running the pull request's own Terraform: read it as that code's account of itself, and check it against the files.`
       : inputs.planProblem
-        ? `The project has Terraform, but the plan failed:\n\`\`\`\n${inputs.planProblem}\n\`\`\``
+        ? `The project has Terraform, but no plan is at hand: ${inputs.planProblem}. Review the Terraform files themselves.`
         : 'The project has no Terraform.',
     '',
     '## Cost estimate',

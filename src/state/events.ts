@@ -156,8 +156,8 @@ interface Payloads {
   FIX_MERGE_SET: { by: FixMerge };
   /** The owner switched a reviewer: every plan's pull request, those of infrastructure plans only, or none. */
   REVIEWS_SET: { role: ReviewerRole; scope: ReviewScope };
-  /** The owner set, or cleared with null, the hours the whole project may take of their time (v3 §4.1). */
-  OWNER_HOURS_SET: { hours: number | null };
+  /** The owner set, or cleared with null, the hours a module may take of their time: each module has its own. */
+  OWNER_HOURS_SET: { module: string; hours: number | null };
   /**
    * What a long-lived agent, a Manager or an Architect, has used of Claude, read from the
    * conversations saved in its sandbox: a running count, which a new sandbox starts again.
@@ -173,7 +173,8 @@ interface Payloads {
   PR_MERGED_BY_DAEMON: { number: number; head: string; commit: string };
   /** A reviewer's session on a PR head (v3 §5): starting, started, and ended with its report or why there is none. */
   REVIEW_STARTING: { role: ReviewerRole; head: string; sandbox: string; sessionId: string; deadline: string };
-  REVIEW_STARTED: { role: ReviewerRole; head: string };
+  /** `deadline`: its clock starts once its session does. */
+  REVIEW_STARTED: { role: ReviewerRole; head: string; deadline?: string };
   REVIEW_ENDED: {
     role: ReviewerRole; head: string; outcome: AttemptOutcome;
     verdict?: 'pass' | 'block'; summary?: string; findings?: ReviewFinding[]; usage?: Usage; reason?: string;
@@ -181,7 +182,8 @@ interface Payloads {
   /** A reviewer the owner switched off, or away from CODE plans, didn't read this head: in Swarm its status is set as passed, saying so. */
   REVIEW_SKIPPED: { role: ReviewerRole; head: string; why: 'off' | 'code' };
   /** The review posted on the PR as comments, and the commit status set, or what went wrong. */
-  REVIEW_POSTED: { role: ReviewerRole; head: string; status: 'success' | 'failure' | 'error'; comments: number; problem?: string };
+  /** `retry`: what went wrong may pass, as a server error does, so the post is made again. */
+  REVIEW_POSTED: { role: ReviewerRole; head: string; status: 'success' | 'failure' | 'error'; comments: number; problem?: string; retry?: boolean };
 
   // Messages.
   QUESTION: { requestId: string; question: string };

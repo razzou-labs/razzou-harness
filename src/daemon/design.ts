@@ -26,6 +26,15 @@ export function isBuilt(o: Orchestrator, module: string, plan: string): boolean 
   return true;
 }
 
+/**
+ * Why a branch with more than one merge base with main is refused. Its diff from "the"
+ * merge base, which the daemon, CI and the owner read, then shows only part of what
+ * merging it does: a commit whose parents are the two sides of a merge on main, with the
+ * tree of one side, lists a design file and takes the other side's merged work back out.
+ */
+const TWO_BASES = (branch: string) =>
+  `your branch has more than one merge base with main, so merging it would change more than its diff shows. Start it again from main (git switch -C ${branch} main), bring your files over (git checkout <your old commit> -- harness/), commit, and submit again`;
+
 export type DesignOutcome =
   | { ok: true; head: string; suspect: string[]; pr: { number: number; url: string }; opened: boolean }
   | { ok: false; problems: string[] };
@@ -38,6 +47,7 @@ export type DesignOutcome =
  */
 export async function submitDesign(o: Orchestrator, module: ModuleState, summary: string, head: string): Promise<DesignOutcome> {
   const main = (await o.repo.revParse('refs/heads/main'))!;
+  if ((await o.repo.mergeBases(main, head)).length > 1) return { ok: false, problems: [TWO_BASES(`arch/${module.module}`)] };
   const base = await o.repo.mergeBase(main, head);
   const tree = o.repo.treeReader(head);
   const changed = await o.repo.changedFiles(base, head);
@@ -104,8 +114,8 @@ export async function submitDesign(o: Orchestrator, module: ModuleState, summary
       }
     }
   }
-  // Once the owner budgets their time, every owner action is estimated, and the module fits what is available (v3 §4.1).
-  if (mine) problems.push(...ownerTimeProblems(await o.ownerTime(), moduleOwnerTime(mine, o.state)));
+  // Once the owner set the module's hours, every owner action is estimated, and the design fits them.
+  if (mine) problems.push(...ownerTimeProblems(moduleOwnerTime(o.design.config, mine, o.state)));
   if (problems.length > 0 || !mine) return { ok: false, problems };
 
   // The new checks, run once on the repository as it is: nothing is built yet, so they should fail.
@@ -199,6 +209,7 @@ const SPEC_FIELDS = ['title', 'kind', 'description', 'expected', 'dependsOn', 's
 export async function submitLockedChange(o: Orchestrator, module: ModuleState, summary: string, submitted: string): Promise<LockedOutcome> {
   if (!module.frozenCommit) return { ok: false, problems: ['nothing is locked yet: the owner merges the first design before any feature is built'] };
   const main = (await o.repo.revParse('refs/heads/main'))!;
+  if ((await o.repo.mergeBases(main, submitted)).length > 1) return { ok: false, problems: [TWO_BASES('locked')] };
   // Judged on main as it is: the built work, which the checks run on, is there.
   let head = submitted;
   if (!(await o.repo.isAncestor(main, submitted))) {

@@ -137,7 +137,7 @@ export class Architects {
       return folder;
     };
     copyFileSync(join(o.options.packageDir, 'roles', 'architect.md'), join(staging('harness'), 'architect.md'));
-    writeFileSync(join(staging('harness'), 'welcome.md'), welcome(module, o.state.budgets.ownerHours !== undefined));
+    writeFileSync(join(staging('harness'), 'welcome.md'), welcome(module, o.state.ownerHours[module.module] !== undefined));
     for (const file of ['architect.md', 'welcome.md']) await o.driver.upload(sandbox, join(staging('harness'), file), p.harness);
     await o.uploadAgentFiles(sandbox, 'architect', dir);
     writeFileSync(join(staging('home'), '.claude.json'), claudeJson(p.work));
@@ -422,7 +422,7 @@ export class Architects {
 function welcome(module: ModuleState, budgeted: boolean): string {
   const latest = module.proposals.at(-1);
   // The owner's time is budgeted: the Architect designs owner actions within it (v3 §4.1).
-  const budget = budgeted ? ['The owner budgets their time: call get_owner_time before you propose, and estimate every owner action.'] : [];
+  const budget = budgeted ? ['The owner set the hours of their time this module may take: call get_owner_time before you propose, and estimate every owner action.'] : [];
   if (!latest) {
     return clip([
       `[harness] You are the Architect of the new module "${module.module}": ${module.title}.`,

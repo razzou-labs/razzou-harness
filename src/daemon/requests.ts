@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
-import { describeOwnerTime } from '../design/owner-time.ts';
+import { describeOwnerTime, moduleOwnerTime } from '../design/owner-time.ts';
 import { INPUTS, TOOLS, type Role, type ToolInput, type ToolName } from '../roles.ts';
 import { activeAttempts, attemptInSandbox, featureKey, managerKey, planKey, type Attempt, type FeatureState } from '../state/state.ts';
 import { clip, sh, sha256, tail } from '../util.ts';
@@ -315,8 +315,9 @@ const HANDLERS: Handlers = {
     return ok(module.notes.slice(-20).map((n) => n.text).join('\n\n---\n\n'));
   },
 
-  async get_owner_time({ o, agent }) {
-    return ok(describeOwnerTime(await o.ownerTime(), agent.module!));
+  get_owner_time({ o, agent }) {
+    const design = o.design.modules.find((m) => m.id === agent.module) ?? { id: agent.module!, plans: [], actions: [] };
+    return ok(describeOwnerTime(moduleOwnerTime(o.design.config, design, o.state)));
   },
 
   reply_to_manager({ o, agent, requestId }, { escalation_id, decision }) {

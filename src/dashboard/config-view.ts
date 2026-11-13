@@ -53,7 +53,7 @@ function daemonFacts(o: Orchestrator): ConfigFact[] {
   const { state } = o;
   const paused = state.pipeline.paused;
   return [
-    { name: 'Your hours', value: state.budgets.ownerHours !== undefined ? `${state.budgets.ownerHours} h for the whole project` : 'not set' },
+    { name: 'Your hours', value: Object.entries(state.ownerHours).map(([module, set]) => `${module}: ${set.hours} h`).join(', ') || 'set for no module' },
     { name: 'Pipeline', value: paused ? `paused: ${paused.reason}${paused.until ? `, until ${paused.until}` : ''}` : 'running' },
     { name: 'Daemon', value: state.daemon ? `razzou-harness ${state.daemon.version}, pid ${state.daemon.pid}` : 'stopped' },
     { name: 'Project folder', value: o.options.projectDir },

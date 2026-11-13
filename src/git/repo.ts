@@ -177,6 +177,14 @@ export class Repo {
     return (await this.git(['merge-base', a, b])).trim();
   }
 
+  /**
+   * Every best common ancestor of two commits. More than one means that a diff from "the"
+   * merge base shows only part of what a merge would do: the rest comes from the other.
+   */
+  async mergeBases(a: string, b: string): Promise<string[]> {
+    return lines(await this.git(['merge-base', '--all', a, b]));
+  }
+
   /** The paths that differ, NUL-separated: git quotes unusual ones otherwise, and a quoted path matches no protection rule (§8.7). */
   async changedFiles(base: string, head: string): Promise<string[]> {
     return nulSeparated(await this.git(['diff', '-z', '--name-only', '--no-renames', base, head]));

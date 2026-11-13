@@ -199,11 +199,16 @@ export const ConfigSchema = z.object({
   /** Where the project's Terraform lives, and how a plan is made against the real state (§12.4). */
   terraform: z
     .object({
-      /** A folder from the repository root, written `iac`, `./iac` or `iac/` alike, as CI's path rules read it. */
+      /**
+       * The folder `iac`, written `iac`, `./iac` or `iac/` alike, with its backend config and
+       * variables file: the three paths the CI workflow plans and applies with. They are
+       * settings only in name: another value would be planned in the sandboxes and never
+       * applied, while the daemon recorded a deploy.
+       */
       dir: z.string().transform((dir) => dir.replace(/^(?:\.?\/)+/, '').replace(/\/+$/, ''))
-        .refine((dir) => dir !== '' && dir !== '.' && !dir.split('/').includes('..'), 'a folder inside the repository, like iac: the CI workflow plans and applies iac/').default('iac'),
-      backendConfig: z.string().default('backend-configs/staging.hcl'),
-      varFile: z.string().default('env/staging.tfvars'),
+        .refine((dir) => dir === 'iac', 'the CI workflow plans and applies the folder iac/: keep "iac"').default('iac'),
+      backendConfig: z.string().refine((path) => path === 'backend-configs/staging.hcl', 'the CI workflow uses backend-configs/staging.hcl: keep it').default('backend-configs/staging.hcl'),
+      varFile: z.string().refine((path) => path === 'env/staging.tfvars', 'the CI workflow uses env/staging.tfvars: keep it').default('env/staging.tfvars'),
     })
     .optional(),
   brakes: z
