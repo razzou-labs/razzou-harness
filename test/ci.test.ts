@@ -1,9 +1,9 @@
 import { strict as assert } from 'node:assert';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
 import {
-  computeLock, directoryReader, lockfileProblems, lockMismatches, matches, npmScripts, parseJson, planKindOf, prKind, protectedChanges, protectionRules, verify,
+  commitReader, computeLock, directoryReader, lockfileProblems, lockMismatches, matches, npmScripts, parseJson, planKindOf, prKind, protectedChanges, protectionRules, verify,
 } from '../src/ci/harness-ci.ts';
 import { run, runOk } from '../src/util.ts';
 import { tempDir } from './helpers/toy-repo.ts';
@@ -311,6 +311,29 @@ describe('protection rules', () => {
     assert.deepEqual(await lockMismatches(directoryReader(checkout)), []);
   });
 
+  it('read a checkout as git committed it, so the lock the daemon writes from blobs matches: a symlink as its link, line endings as committed', async () => {
+    const dir = tempDir('lock-blobs');
+    write(dir, { ...BASE, 'CLAUDE.md': '# Rules\nline two\n', '.gitattributes': '*.md text eol=crlf\n' });
+    symlinkSync('CLAUDE.md', join(dir, 'AGENTS.md'));
+    const git = (...args: string[]) => runOk('git', ['-C', dir, '-c', 'user.name=t', '-c', 'user.email=t@test.invalid', ...args]);
+    await runOk('git', ['init', '--quiet', '--initial-branch=main', dir]);
+    await git('add', '-A');
+    await git('commit', '--quiet', '-m', 'base');
+    // The daemon's lock, from the commit's blobs.
+    write(dir, { 'harness/lock.json': JSON.stringify(await computeLock(commitReader(dir, 'HEAD'))) });
+    await git('add', '-A');
+    await git('commit', '--quiet', '-m', 'lock');
+    const checkout = tempDir('checkout');
+    await runOk('git', ['clone', '--quiet', dir, checkout]);
+    assert.match(readFileSync(join(checkout, 'CLAUDE.md'), 'utf8'), /\r\n/, 'the checkout has CRLF');
+    assert.deepEqual(await lockMismatches(directoryReader(checkout)), []);
+    assert.ok((await directoryReader(checkout).list('')).includes('AGENTS.md'));
+    assert.equal(await directoryReader(checkout).read('AGENTS.md'), 'CLAUDE.md');
+    // A change not committed yet is read as it is on disk.
+    writeFileSync(join(checkout, 'init.sh'), 'npm ci\n');
+    assert.equal(await directoryReader(checkout).read('init.sh'), 'npm ci\n');
+  });
+
   it('hash the same whatever the machine\'s locale', async () => {
     const dir = tempDir('locale');
     write(dir, {
@@ -479,6 +502,70 @@ describe('verify', () => {
     const pr = await change({ 'harness/modules/shop/checks/F01.sh': '[ "$x" -eq 0 ]\n' }, base);
     assert.match((await verify({ base: pr.baseTree, head: pr.headTree, changedPaths: pr.changed, author: BOT, branch: 'locked/shop', title: 'Arch: [DESIGN_MODIFY] [shop] T' })).join('\n'),
       /a Arch PR's title is "Arch: \[CHANGED_LOCKED_FILES\] \[shop\] <title>"/);
+  });
+
+  /** A repository of BASE on main, for history drawn by hand; `commit` returns the new commit's sha. */
+  async function history() {
+    const dir = tempDir('history');
+    write(dir, BASE);
+    const git = (...args: string[]) => runOk('git', ['-C', dir, '-c', 'user.name=t', '-c', 'user.email=t@test.invalid', ...args]);
+    await runOk('git', ['init', '--quiet', '--initial-branch=main', dir]);
+    const commit = async (files: Record<string, string>, message: string) => {
+      write(dir, files);
+      await git('add', '-A');
+      await git('commit', '--quiet', '--allow-empty', '-m', message);
+      return (await git('rev-parse', 'HEAD')).trim();
+    };
+    return { dir, git, commit, root: await commit({}, 'base') };
+  }
+  /** `verify` on the command line, as the workflow runs it, with the base checked out at `base`. */
+  async function verifyCli(dir: string, base: string, head: string, branch: string, title: string) {
+    const baseDir = tempDir('base');
+    await runOk('git', ['clone', '--quiet', dir, baseDir]);
+    await runOk('git', ['-C', baseDir, 'checkout', '--quiet', base]);
+    const headDir = tempDir('head');
+    await runOk('git', ['clone', '--quiet', dir, headDir]);
+    await runOk('git', ['-C', headDir, 'checkout', '--quiet', head]);
+    return run('node', [script, 'verify', '--base', baseDir, '--head', headDir, '--base-sha', base, '--head-sha', head, '--author', BOT, '--branch', branch, '--title', title]);
+  }
+
+  it("compares a protected field with where the change started, not with what main changed since", async () => {
+    const { git, commit, dir, root } = await history();
+    const pkg = (scripts: Record<string, string>, extra: object = {}) => JSON.stringify({ name: 'shop', scripts: { test: 'node --test', build: 'tsc', ...scripts }, ...extra }, null, 2);
+    await git('checkout', '--quiet', '-b', 'plan/shop/P1');
+    const head = await commit({ 'package.json': pkg({ lint: 'eslint .' }, { dependencies: { a: '^1.0.0' } }) }, 'plan');
+    await git('checkout', '--quiet', 'main');
+    const main = await commit({ 'package.json': pkg({ lint: 'eslint --max-warnings 0 .' }) }, 'main tightens lint');
+    assert.notEqual(root, main);
+    const verified = await verifyCli(dir, main, head, 'plan/shop/P1', 'Plan: [CODE] [shop/P1] T');
+    assert.equal(verified.code, 0, verified.stdout);
+    // The plan itself loosening lint still fails.
+    await git('checkout', '--quiet', 'plan/shop/P1');
+    const loose = await commit({ 'package.json': pkg({ lint: 'true' }, { dependencies: { a: '^1.0.0' } }) }, 'plan loosens lint');
+    const failed = await verifyCli(dir, main, loose, 'plan/shop/P1', 'Plan: [CODE] [shop/P1] T');
+    assert.equal(failed.code, 1);
+    assert.match(failed.stdout, /::error::changes a protected file: package\.json \/scripts\/lint/);
+  });
+
+  it("fails the App's pull request whose head has two merge bases with main: merging it would undo what its diff doesn't show", async () => {
+    const { git, commit, dir } = await history();
+    await git('checkout', '--quiet', '-b', 'plan/shop/P1');
+    const plan = await commit({ 'src/feature.js': 'export const f = 1;\n' }, 'the plan');
+    await git('checkout', '--quiet', 'main');
+    const before = await commit({ 'src/other.js': 'export const o = 1;\n' }, 'another merge');
+    await git('merge', '--quiet', '--no-ff', '-m', 'merge the plan', 'plan/shop/P1');
+    const main = (await git('rev-parse', 'HEAD')).trim();
+    // Main before the last merge, and the merged plan's head: a design on top of the first, which drops the plan.
+    await git('checkout', '--quiet', '-b', 'arch/shop', before);
+    write(dir, { 'harness/modules/shop/plans/P2.json': JSON.stringify({ id: 'P2', module: 'shop', title: 'T', goal: 'G', features: [] }) });
+    await git('add', '-A');
+    const tree = (await git('write-tree')).trim();
+    const design = (await git('commit-tree', tree, '-p', before, '-p', plan, '-m', 'design')).trim();
+    const changed = (await git('diff', '--name-only', `${main}...${design}`)).trim();
+    assert.equal(changed, 'harness/modules/shop/plans/P2.json', 'the diff shows the design only');
+    const verified = await verifyCli(dir, main, design, 'arch/shop', 'Arch: [DESIGN_MODIFY] [shop] T');
+    assert.equal(verified.code, 1, verified.stdout);
+    assert.match(verified.stdout, /::error::the head has 2 merge bases with the base branch, so merging it would change more than its diff shows/);
   });
 
   it('runs from the command line as the workflow runs it', async () => {

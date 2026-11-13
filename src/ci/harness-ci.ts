@@ -9,7 +9,7 @@
 //   node harness-ci.ts lock --dir <dir>
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { appendFileSync, existsSync, lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync, statSync } from 'node:fs';
+import { appendFileSync, existsSync, lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync } from 'node:fs';
 import { join, posix, relative } from 'node:path';
 import { parseArgs } from 'node:util';
 
@@ -20,27 +20,68 @@ export interface TreeReader {
   list(folder: string): Promise<string[]>;
 }
 
+/**
+ * A folder, read as git would commit it, so that its lock agrees with the daemon's, which
+ * hashes git's blobs: a symbolic link is its link's text, and in a work tree a file that
+ * hasn't changed since HEAD is read as committed, before what attributes such as `eol` do
+ * to a checkout.
+ */
 export function directoryReader(root: string): TreeReader {
-  const isFile = (file: string) => existsSync(file) && statSync(file).isFile();
   const git = (args: string[]) => spawnSync('git', ['-C', root, ...args], { encoding: 'utf8', maxBuffer: 1 << 30 });
+  const exists = (file: string) => {
+    const stat = lstatSync(file, { throwIfNoEntry: false });
+    return stat !== undefined && (stat.isFile() || stat.isSymbolicLink());
+  };
+  const workTree = git(['rev-parse', '--is-inside-work-tree']).stdout?.trim() === 'true';
+  // The paths that differ from HEAD, listed once; undefined when there is no HEAD to read from.
+  let changed: Set<string> | undefined | null = null;
+  const changedSinceHead = () => {
+    if (changed === null) {
+      const diff = workTree ? git(['diff', '--relative', '--name-only', '-z', '--no-renames', 'HEAD', '--']) : undefined;
+      changed = diff?.status === 0 ? new Set(diff.stdout.split('\0').filter(Boolean)) : undefined;
+    }
+    return changed;
+  };
   return {
     async read(path) {
       const file = join(root, path);
-      return isFile(file) ? readFileSync(file, 'utf8') : undefined;
+      if (!exists(file)) return undefined;
+      const differing = changedSinceHead();
+      if (differing && !differing.has(path)) {
+        const committed = git(['cat-file', 'blob', `HEAD:./${path}`]);
+        if (committed.status === 0) return committed.stdout;
+      }
+      return lstatSync(file).isSymbolicLink() ? readlinkSync(file) : readFileSync(file, 'utf8');
     },
     async list(folder) {
       // In a work tree, git's view: what it ignores, such as node_modules, isn't in a checkout either.
-      if (git(['rev-parse', '--is-inside-work-tree']).stdout?.trim() === 'true') {
+      if (workTree) {
         const listed = git(['ls-files', '-z', '--cached', '--others', '--exclude-standard', '--', folder || '.']);
         if (listed.status !== 0) throw new Error(`git ls-files failed in ${root}: ${listed.stderr}`);
-        return listed.stdout.split('\0').filter((path) => path !== '' && isFile(join(root, path)));
+        return listed.stdout.split('\0').filter((path) => path !== '' && exists(join(root, path)));
       }
       const start = join(root, folder);
       if (!existsSync(start)) return [];
       return (readdirSync(start, { recursive: true, encoding: 'utf8' }) as string[])
         .map((entry) => join(start, entry))
-        .filter((file) => isFile(file) && !relative(root, file).startsWith('.git/'))
+        .filter((file) => exists(file) && !relative(root, file).startsWith('.git/'))
         .map((file) => relative(root, file));
+    },
+  };
+}
+
+/** A commit of the repository at `root`, read with git. */
+export function commitReader(root: string, rev: string): TreeReader {
+  const git = (args: string[]) => spawnSync('git', ['-C', root, ...args], { encoding: 'utf8', maxBuffer: 1 << 30 });
+  return {
+    async read(path) {
+      const blob = git(['cat-file', 'blob', `${rev}:${path}`]);
+      return blob.status === 0 ? blob.stdout : undefined;
+    },
+    async list(folder) {
+      const listed = git(['ls-tree', '-r', '-z', '--name-only', '--full-tree', rev, '--', folder || '.']);
+      if (listed.status !== 0) throw new Error(`git ls-tree failed in ${root}: ${listed.stderr}`);
+      return listed.stdout.split('\0').filter(Boolean);
     },
   };
 }
@@ -440,6 +481,9 @@ export function prKind(author: string, branch: string, bot: string | undefined):
 export interface VerifyInput {
   base: TreeReader;
   head: TreeReader;
+  /** The merge bases of the head with the base, `git merge-base --all`: the change starts from them. `[base]` when omitted. */
+  mergeBases?: TreeReader[];
+  /** What changed since the merge base: `git diff base...head`. */
   changedPaths: string[];
   author: string;
   branch: string;
@@ -576,11 +620,17 @@ export async function verify(input: VerifyInput): Promise<string[]> {
   const problems: string[] = [];
   if (!input.title.startsWith(`${kind}: `)) problems.push(`this is a ${kind} PR (from ${input.author}, branch ${input.branch}), so its title must start with "${kind}: "`);
   else if (kind === 'Plan' || kind === 'Fix' || kind === 'Arch') problems.push(...(await titleProblems(input, kind)));
+  const [start = input.base, ...others] = input.mergeBases ?? [input.base];
+  if ((kind === 'Plan' || kind === 'Fix' || kind === 'Arch') && others.length > 0) {
+    // `git diff base...head` shows the change from one merge base only: merging can undo what another brought, unseen.
+    problems.push(`the head has ${others.length + 1} merge bases with the base branch, so merging it would change more than its diff shows`);
+  }
   if (kind === 'Plan' || kind === 'Fix') {
-    for (const change of await protectedChanges(input.base, input.head, input.changedPaths, { progress: 'append' })) {
+    // The base's rules, compared with where the change started: what the base changed since is no part of it.
+    for (const change of await protectedChanges(input.base, input.head, input.changedPaths, { progress: 'append', before: start })) {
       problems.push(`changes a protected file: ${change}`);
     }
-    for (const problem of await lockfileProblems(input.base, input.head)) problems.push(`package-lock.json: ${problem}`);
+    for (const problem of await lockfileProblems(start, input.head)) problems.push(`package-lock.json: ${problem}`);
   }
   if (kind === 'Plan') problems.push(...(await planKindProblems(input, config)));
   if (kind === 'Arch') {
@@ -766,9 +816,12 @@ async function main(): Promise<number> {
       // NUL-separated: otherwise git quotes a path with unusual bytes, and no pattern matches the quoted form.
       const diff = spawnSync('git', ['-C', values.head!, 'diff', '-z', '--name-only', '--no-renames', `${values['base-sha']}...${values['head-sha']}`], { encoding: 'utf8', maxBuffer: 1 << 30 });
       if (diff.status !== 0) throw new Error(`git diff failed: ${diff.stderr}`);
+      const bases = spawnSync('git', ['-C', values.head!, 'merge-base', '--all', values['base-sha']!, values['head-sha']!], { encoding: 'utf8' });
+      if (bases.status !== 0) throw new Error(`git merge-base failed: ${bases.stderr}`);
       const problems = await verify({
         base: directoryReader(values.base!),
         head: directoryReader(values.head!),
+        mergeBases: bases.stdout.split('\n').filter(Boolean).map((sha) => commitReader(values.head!, sha)),
         changedPaths: diff.stdout.split('\0').filter(Boolean),
         author: values.author!,
         branch: values.branch!,
