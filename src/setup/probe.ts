@@ -3,7 +3,8 @@ import { writeFileSync } from 'node:fs';
 import { userInfo } from 'node:os';
 import { join } from 'node:path';
 import type { Config } from '../design/schemas.ts';
-import { PROJECT_LABEL, type SandboxDriver } from '../sandbox/driver.ts';
+import { checkoutId, projectKey } from '../daemon/refs.ts';
+import { CHECKOUT_LABEL, PROJECT_LABEL, type SandboxDriver } from '../sandbox/driver.ts';
 import { apiProviderName, buildPolicy } from '../sandbox/policy.ts';
 import { sh } from '../util.ts';
 
@@ -18,6 +19,8 @@ export interface ProbeResult {
 interface ProbeOptions {
   driver: SandboxDriver;
   config: Config;
+  /** The project's folder: its sandboxes and API providers are named by its checkout too. */
+  projectDir: string;
   /** The state bucket and this project's state key, from the Terraform backend config. */
   state?: { bucket: string; key: string };
   /** A folder on the host for the probe's policy file. */
@@ -37,15 +40,15 @@ export async function probe(options: ProbeOptions): Promise<ProbeResult[]> {
   const policy = buildPolicy({ ...config.network, ...(aws ? { aws } : {}) }) as { network_policies: { read_only_web: { endpoints: Array<{ host: string }> } } };
   writeFileSync(policyFile, `${JSON.stringify(policy, null, 2)}\n`);
   const readOnly = policy.network_policies.read_only_web.endpoints.map((endpoint) => endpoint.host);
-  // As a real sandbox is: the project's label, and the providers of its APIs' keys.
+  // As a real sandbox is: the project's labels, and the providers of its APIs' keys, named as the daemon names them.
   const project = config.project.name;
-  const apiKeys = config.network.apis.flatMap((api) => (api.key ? [apiProviderName(project, api.host)] : []));
+  const apiKeys = config.network.apis.flatMap((api) => (api.key ? [apiProviderName(projectKey(options.projectDir, project), api.host)] : []));
   await driver.create({
     name,
     image: config.sandbox.image,
     providers: [config.sandbox.claudeProvider, ...(aws ? [aws.provider] : []), ...apiKeys],
     policyFile,
-    labels: { [PROJECT_LABEL]: project },
+    labels: { [PROJECT_LABEL]: project, [CHECKOUT_LABEL]: checkoutId(options.projectDir) },
     env: {
       ...(aws ? { AWS_REGION: aws.region, AWS_DEFAULT_REGION: aws.region, AWS_STS_REGIONAL_ENDPOINTS: 'regional', AWS_EC2_METADATA_DISABLED: 'true', AWS_PAGER: '' } : {}),
     },

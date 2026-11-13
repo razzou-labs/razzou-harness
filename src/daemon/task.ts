@@ -1,3 +1,4 @@
+import type { ProtectionRules } from '../ci/harness-ci.ts';
 import type { Check, Feature, Plan } from '../design/schemas.ts';
 import type { Ref } from '../state/events.ts';
 import type { Attempt } from '../state/state.ts';
@@ -18,6 +19,8 @@ export interface TaskInput {
   fix?: 'ci' | 'deploy' | 'review' | 'merge' | 'checks';
   /** The feature was built and accepted before, and a design change redefined it since: its earlier work is on the branch. */
   rebuilding?: boolean;
+  /** What the attempt may not change, as CI judges it: the rules of the commit it starts from. */
+  protect?: ProtectionRules;
 }
 
 /** The Developer's task, given on stdin. Its role text is appended to the system prompt separately. */
@@ -32,6 +35,7 @@ export function buildTask(input: TaskInput): string {
   if (input.guidance) {
     lines.push('', '## Guidance for this attempt', '', input.guidance.trim());
   }
+  if (input.protect && !input.merge) lines.push('', ...protectedLines(input.protect));
   if (input.progressTail.trim() !== '') {
     lines.push('', '## Progress so far', '', '```', input.progressTail.trimEnd(), '```');
   }
@@ -44,6 +48,21 @@ export function buildTask(input: TaskInput): string {
     'If a decision is open that the task and the repository do not settle, ask the Manager with `ask_manager` before you guess.',
   );
   return `${lines.join('\n')}\n`;
+}
+
+/** What the attempt may not change: the files, and the parts of JSON and TOML files, that CI refuses a change to. */
+function protectedLines(rules: ProtectionRules): string[] {
+  const parts = (byFile: Record<string, string[]>, show: (name: string) => string) =>
+    Object.entries(byFile).filter(([, names]) => names.length > 0).map(([file, names]) => `- in \`${file}\`: ${names.map(show).join(', ')}`);
+  return [
+    '## What you may not change',
+    '',
+    'Changing any of these fails the attempt, by whatever means, a script or a build included, and CI refuses them too. If one stands in your way, finish as `blocked` and say why in your finding.',
+    '',
+    `- these files: ${[...rules.paths, 'progress.txt'].map((path) => `\`${path}\``).join(', ')}`,
+    ...parts(rules.fields, (pointer) => `\`${pointer}\``),
+    ...parts(rules.tables, (table) => `\`[${table}]\``),
+  ];
 }
 
 /** What a feature's task opens with: the feature, how it is checked, and what must keep passing. */

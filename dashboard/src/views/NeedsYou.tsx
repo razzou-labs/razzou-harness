@@ -72,6 +72,12 @@ function content(need: Need, go: Go): { body: () => VNodeChild } {
               Comments go to the Architect, in its terminal.
               {module.frozenCommit && ' No new attempt starts in this module until you merge or close it.'}
             </p>
+            {(module.design?.settings?.length ?? 0) > 0 && (
+              <div class="text-caption text-warning">
+                It changes these settings of harness/config.json, which decide what the daemon may do:
+                <ul class="q-my-xs">{module.design!.settings!.map((setting) => <li key={setting}>{setting.replaceAll('`', '')}</li>)}</ul>
+              </div>
+            )}
             {(module.design?.suspect.length ?? 0) > 0 && (
               <p class="text-caption text-warning">These checks already pass before anything is built, so they may test nothing: {module.design?.suspect.join(', ')}</p>
             )}

@@ -3,11 +3,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { randomUUID } from 'node:crypto';
+import { projectKey } from '../daemon/refs.ts';
 import { webRead } from '../daemon/web-read.ts';
 import { loadPty } from '../dashboard/terminals.ts';
 import { ConfigSchema, requiredChecks, type Config } from '../design/schemas.ts';
 import { configDir, GitHubClient, loadAppCredentials } from '../github/app.ts';
-import { checkApp } from '../github/setup.ts';
+import { checkApp, ciFiles, staleCiFiles } from '../github/setup.ts';
 import { BUNDLES } from '../sandbox/allowlist.ts';
 import { OpenShellDriver } from '../sandbox/openshell.ts';
 import { apiProfile, apiProviderName } from '../sandbox/policy.ts';
@@ -229,11 +230,10 @@ async function project(options: DoctorOptions, config: Config, report: (c: Check
           ? "INFRACOST_API_KEY isn't set: the cost job estimates nothing, and Swarm leaves INFRA and MIXED_INFRA_AND_CODE plans to you. `harness setup` asks for it"
           : "your gh login can't tell whether INFRACOST_API_KEY is set" });
     }
-    for (const file of ['.github/workflows/harness.yml', '.github/harness/harness-ci.ts']) {
-      const local = join(options.projectDir, file);
-      const packaged = join(options.packageDir, file.endsWith('.yml') ? 'templates/harness.yml' : 'src/ci/harness-ci.ts');
-      if (!existsSync(local)) report(fail(file, 'missing', 'run `harness install-ci`, and commit the files'));
-      else if (readFileSync(local, 'utf8') !== readFileSync(packaged, 'utf8')) report(warn(file, 'differs from this version of the harness', 'run `harness install-ci`, and commit the files'));
+    const stale = new Set(staleCiFiles(options.projectDir, options.packageDir));
+    for (const [file] of ciFiles(options.packageDir)) {
+      if (!existsSync(join(options.projectDir, file))) report(fail(file, 'missing', 'run `harness install-ci`, and commit the files'));
+      else if (stale.has(file)) report(warn(file, 'differs from this version of the harness', 'run `harness install-ci`, and commit the files'));
       else report(ok(file, 'up to date'));
     }
   }
@@ -294,7 +294,8 @@ async function apis(options: DoctorOptions, config: Config, report: (c: Check) =
       report(ok('API', `${api.host}: every method, no key`));
       continue;
     }
-    const name = apiProviderName(config.project.name, api.host);
+    // The daemon's name for it: the project with this checkout, so two checkouts of one project keep their own keys.
+    const name = apiProviderName(projectKey(options.projectDir, config.project.name), api.host);
     const keys = await providerKeys(name);
     if (keys && keys.includes(api.key)) {
       report(ok('API', `${api.host}: its key in ${name}, as ${api.key}`));
@@ -318,7 +319,7 @@ async function apis(options: DoctorOptions, config: Config, report: (c: Check) =
       report(fail('API', `no key stored for ${api.host}`, 'run `harness doctor` again with the key at hand'));
       continue;
     }
-    const problem = await storeApiKey(config.project.name, { host: api.host, key: api.key }, secret);
+    const problem = await storeApiKey(projectKey(options.projectDir, config.project.name), { host: api.host, key: api.key }, secret);
     report(problem ? fail('API', `${api.host}: ${problem}`, 'fix it, then run `harness doctor` again') : ok('API', `${api.host}: key stored in ${name}`));
   }
 }
@@ -408,7 +409,7 @@ async function probes(options: DoctorOptions, config: Config, report: (c: Check)
   for (const [label, roleConfig] of roles) {
     const scratch = mkdtempSync(join(tmpdir(), 'harness-probe-'));
     try {
-      for (const result of await probe({ driver: new OpenShellDriver(), config: roleConfig, scratch, ...(state ? { state } : {}) })) {
+      for (const result of await probe({ driver: new OpenShellDriver(), config: roleConfig, projectDir: options.projectDir, scratch, ...(state ? { state } : {}) })) {
         report({ status: result.skipped ? 'skip' : result.ok ? 'ok' : 'fail', name: `probe (${label})`, detail: `${result.name}: ${result.detail}` });
       }
     } finally {

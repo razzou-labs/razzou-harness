@@ -2,7 +2,8 @@ import { strict as assert } from 'node:assert';
 import { readFileSync } from 'node:fs';
 import { describe, it } from 'node:test';
 import { ConfigSchema } from '../src/design/schemas.ts';
-import { PROJECT_LABEL, type ExecResult, type SandboxDriver, type SandboxSpec } from '../src/sandbox/driver.ts';
+import { checkoutId } from '../src/daemon/refs.ts';
+import { CHECKOUT_LABEL, PROJECT_LABEL, type ExecResult, type SandboxDriver, type SandboxSpec } from '../src/sandbox/driver.ts';
 import { probe } from '../src/setup/probe.ts';
 import { tempDir } from './helpers/toy-repo.ts';
 
@@ -58,9 +59,11 @@ describe('the probe', () => {
 
   it("is made like a real sandbox, and tries a plain read-only host, npm's publish, DynamoDB and a real secret", async () => {
     const { driver, created, scripts } = fakeDriver('403 0');
-    const results = await probe({ driver, config, scratch: tempDir('probe') });
-    assert.deepEqual(created[0]!.labels, { [PROJECT_LABEL]: 'shop' });
-    assert.deepEqual(created[0]!.providers, ['claude-sub', 'aws-view-shop', 'api-shop-api-stripe-com']);
+    const projectDir = tempDir('shop');
+    const results = await probe({ driver, config, projectDir, scratch: tempDir('probe') });
+    // Named and labeled as the daemon names its own: by the project, and this checkout of it.
+    assert.deepEqual(created[0]!.labels, { [PROJECT_LABEL]: 'shop', [CHECKOUT_LABEL]: checkoutId(projectDir) });
+    assert.deepEqual(created[0]!.providers, ['claude-sub', 'aws-view-shop', `api-shop-${checkoutId(projectDir)}-api-stripe-com`]);
     const byName = new Map(results.map((r) => [r.name, r]));
     for (const name of [
       'the sandbox runs as a user other than root',
@@ -80,9 +83,9 @@ describe('the probe', () => {
   });
 
   it('says nothing answers at the metadata address when it times out, rather than passing it as refused', async () => {
-    const metadata = (await probe({ driver: fakeDriver('000 28').driver, config, scratch: tempDir('probe') })).find((r) => r.name === 'the cloud metadata address is unreachable');
+    const metadata = (await probe({ driver: fakeDriver('000 28').driver, config, projectDir: tempDir('shop'), scratch: tempDir('probe') })).find((r) => r.name === 'the cloud metadata address is unreachable');
     assert.deepEqual([metadata?.skipped, metadata?.detail], [true, 'nothing answers there on this machine, so the refusal is untested']);
-    const answered = (await probe({ driver: fakeDriver('200 0').driver, config, scratch: tempDir('probe') })).find((r) => r.name === 'the cloud metadata address is unreachable');
+    const answered = (await probe({ driver: fakeDriver('200 0').driver, config, projectDir: tempDir('shop'), scratch: tempDir('probe') })).find((r) => r.name === 'the cloud metadata address is unreachable');
     assert.equal(answered?.ok, false);
   });
 });

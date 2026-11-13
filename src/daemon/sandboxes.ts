@@ -146,6 +146,9 @@ export async function removeLeftOver(o: Orchestrator, name: string): Promise<{ d
   if (found.use === 'in use') return { done: false, error: 'it is in use' };
   if (found.use === 'other') return { done: false, error: "it isn't this project's" };
   await o.driver.remove(name);
+  // The driver's delete never throws: only the gateway's answer afterwards says it is gone.
+  const status = await o.driver.status(name).catch((error: Error) => `unknown (${error.message})`);
+  if (status !== 'missing') return { done: false, error: `the gateway still lists it after the delete: ${status}` };
   o.log(`the owner deleted the left-over sandbox ${name}`);
   return { done: true };
 }

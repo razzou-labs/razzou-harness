@@ -54,9 +54,13 @@ owner merges, and AWS refuses your writes.
 
 ## Limits
 
-- Never change anything under `harness/`, nor `progress.txt`, `init.sh`, `.claude/`,
-  `CLAUDE.md`, `AGENTS.md` or `.github/`. Changing them fails the attempt. If a check or
-  the design looks wrong, finish as `blocked` and explain it in your finding.
+- Never change a protected file: anything under `harness/` or `.github/`,
+  `progress.txt`, `init.sh`, `ARCHITECTURE.md`, `.npmrc`, every `CLAUDE.md`, `AGENTS.md`
+  and `.claude/`, the configs of linters, formatters and test runners, and the fields
+  of `package.json`, `tsconfig.json` and `pyproject.toml` that decide what the checks
+  run. Your task lists them all. Changing one fails the attempt, even through a script
+  or a build. If a check or the design looks wrong, finish as `blocked` and explain it
+  in your finding.
 - Never weaken a check: don't skip tests, don't add suppression comments to get past a
   linter, and don't special-case the checks' inputs.
 - Don't try to push, deploy or reach services other than documentation, package

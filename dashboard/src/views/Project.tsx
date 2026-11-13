@@ -394,15 +394,24 @@ const NewModule = defineComponent({
   setup() {
     const id = ref('');
     const title = ref('');
+    // The hours of the owner's time this module may take, set now or later on its card: empty sets none.
+    const hours = ref('');
     const error = ref<string>();
     const busy = ref(false);
     const start = async () => {
+      const n = Number(hours.value.trim());
+      if (hours.value.trim() !== '' && !(Number.isFinite(n) && n > 0)) {
+        error.value = 'the hours are a positive number, or nothing';
+        return;
+      }
       busy.value = true;
-      const result = await post('/api/modules', { id: id.value.trim(), title: title.value }).finally(() => (busy.value = false));
+      const result = await post('/api/modules', { id: id.value.trim(), title: title.value, ...(hours.value.trim() !== '' ? { ownerHours: n } : {}) })
+        .finally(() => (busy.value = false));
       error.value = result.done ? undefined : result.error;
       if (result.done) {
         id.value = '';
         title.value = '';
+        hours.value = '';
       }
     };
     return () => (
@@ -412,10 +421,11 @@ const NewModule = defineComponent({
           <div class="row items-center q-gutter-sm">
             <QInput {...text(id)} dense outlined label="id, like orders" style="width: 180px" />
             <QInput {...text(title)} dense outlined label="what it is for" class="col" style="min-width: 240px; max-width: 480px" />
+            <QInput {...text(hours)} dense outlined label="hours of your time" hint="optional" style="width: 150px" />
             <QBtn label="Start" color="primary" noCaps unelevated loading={busy.value} disable={!id.value.trim()} onClick={() => void start()} />
             {error.value && <span class="text-negative text-caption">{error.value}</span>}
           </div>
-          <p class="text-caption text-muted q-mt-sm">An Architect starts in its own sandbox; talk to it in the Agents view.</p>
+          <p class="text-caption text-muted q-mt-sm">An Architect starts in its own sandbox; talk to it in the Agents view. With hours, it designs your actions in this module within them; without, it has no limit until you set one on the module's card.</p>
         </QCardSection>
       </QCard>
     );

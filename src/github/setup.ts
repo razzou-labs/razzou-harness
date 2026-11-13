@@ -306,6 +306,6 @@ export async function applyModeRules(config: Config | undefined, repo: string, m
 }
 
 /** What the owner reads when the rules couldn't be applied: the fix is theirs, with gh. */
-export function rulesNotChanged(problem: string, repo: string): string {
-  return `GitHub's rules on main were not changed: ${problem}\nRun \`harness github-setup --repo ${repo}\` with gh logged in as an admin of the repository.`;
+export function rulesNotChanged(problem: string, repo: string, mode?: 'manual' | 'swarm'): string {
+  return `GitHub's rules on main were not changed: ${problem}\nRun \`harness github-setup --repo ${repo}${mode ? ` --mode ${mode}` : ''}\` with gh logged in as an admin of the repository.`;
 }

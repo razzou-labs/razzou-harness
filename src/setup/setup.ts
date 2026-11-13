@@ -5,7 +5,7 @@ import { computeLock, directoryReader } from '../ci/harness-ci.ts';
 import { runningDaemon } from '../daemon/main.ts';
 import { ConfigSchema, requiredChecks, type Config } from '../design/schemas.ts';
 import { configDir, loadAppCredentials } from '../github/app.ts';
-import { applyRepositoryRules, checkApp, createApp, installCi, type RulesetOptions } from '../github/setup.ts';
+import { applyRepositoryRules, checkApp, createApp, installCi, staleCiFiles, type RulesetOptions } from '../github/setup.ts';
 import { run, sha256 } from '../util.ts';
 import { doctor, granted, MACHINE_CHECKS, projectMode, repositorySecret, type Check } from './doctor.ts';
 import { appBot, checkedConfig, githubRepo, HARNESS_FILES, init, projectName } from './init.ts';
@@ -188,12 +188,8 @@ async function scaffold(options: SetupOptions, sleep: (ms: number) => Promise<vo
   const { projectDir, say } = options;
   if (existsSync(join(projectDir, 'harness', 'config.json'))) {
     // The CI files follow the harness's version: written again when they differ, and committed with the rest.
-    const stale = ['.github/workflows/harness.yml', '.github/harness/harness-ci.ts'].filter((file) => {
-      const local = join(projectDir, file);
-      const packaged = join(options.packageDir, file.endsWith('.yml') ? 'templates/harness.yml' : 'src/ci/harness-ci.ts');
-      return !existsSync(local) || readFileSync(local, 'utf8') !== readFileSync(packaged, 'utf8');
-    });
-    const written = stale.length === 0 ? [] : installCi(projectDir, options.packageDir, options.owner ?? (await ownerLogin(options)));
+    // CODEOWNERS stays as it is once it exists: install-ci asks gh for the owner only when there is none.
+    const written = staleCiFiles(projectDir, options.packageDir).length === 0 ? [] : await installCi(projectDir, options.packageDir, options.owner);
     for (const path of written) say(`wrote ${path}`);
     return [...written, ...(await linkRepo(options, sleep))];
   }
@@ -268,13 +264,6 @@ async function createAndInstallApp(options: SetupOptions, repo: string, sleep: (
 async function writeLock(projectDir: string): Promise<void> {
   const lock = await computeLock(directoryReader(projectDir));
   writeFileSync(join(projectDir, 'harness', 'lock.json'), `${JSON.stringify(lock, null, 2)}\n`);
-}
-
-/** The owner's GitHub login from gh, for CODEOWNERS. */
-async function ownerLogin(options: SetupOptions): Promise<string | undefined> {
-  const login = await run('gh', ['api', 'user', '--jq', '.login']).catch(() => undefined);
-  if (login?.code !== 0 || !login.stdout.trim()) options.say('No owner login from gh: CODEOWNERS is not written. `harness install-ci --owner <you>` writes it.');
-  return login?.code === 0 ? login.stdout.trim() || undefined : undefined;
 }
 
 /**
@@ -573,8 +562,7 @@ async function applyFix(options: SetupOptions, config: Config, fix: Fix, sleep: 
       }
     }
     case 'install-ci': {
-      const owner = options.owner ?? (await ownerLogin(options));
-      for (const path of installCi(projectDir, options.packageDir, owner)) say(`wrote ${path}`);
+      for (const path of await installCi(projectDir, options.packageDir, options.owner)) say(`wrote ${path}`);
       say('Commit and push the CI files yourself: the App may not change workflows.');
       return false;
     }

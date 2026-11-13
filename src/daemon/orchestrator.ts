@@ -4,8 +4,8 @@ import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync,
 import { join } from 'node:path';
 import { claudeCode, mcpConfig, readResult, reportJsonSchema, sessionTrouble, type AgentAdapter, type AgentRun } from '../agents/claude-code.ts';
 import { LONGEST_WINDOW_MS, usageFromEvent, windowName, type SubscriptionUsage, type UsageLimit } from '../anthropic/usage.ts';
-import { allPassed, initEnvironment, runChecks, type CheckResult, type RunOptions } from '../checks/runner.ts';
-import { protectedChanges } from '../ci/harness-ci.ts';
+import { allPassed, initEnvironment, runChecks, runGuarded, type CheckResult, type RunOptions } from '../checks/runner.ts';
+import { lockfileProblems, protectedChanges, protectionRules } from '../ci/harness-ci.ts';
 import { moduleOwnerTime, type ModuleOwnerTime } from '../design/owner-time.ts';
 import {
   checksHash, definitionHash, featureDependency, KIND_TAGS, loadDesign, planDependencies, planKind, requiredChecks, REVIEWER_ROLES, statusContext,
@@ -1200,6 +1200,7 @@ export class Orchestrator {
       ...(merge ? { merge } : {}),
       ...(state.fix ? { fix: state.fix.kind } : {}),
       rebuilding: state.attempts.some((a) => a.status === 'accepted'),
+      protect: await protectionRules(this.repo.treeReader(attempt.base)),
     }));
     copyFileSync(join(this.options.packageDir, 'roles', 'developer.md'), join(dir, 'developer.md'));
     writeFileSync(join(dir, 'report.schema.json'), reportJsonSchema());
@@ -1343,6 +1344,8 @@ export class Orchestrator {
     } else {
       const touched = await protectedChanges(this.repo.treeReader(attempt.base), this.repo.treeReader(head), files, { progress: 'frozen' });
       if (touched.length > 0) return this.fail(state, attempt, `changed protected files: ${touched.join(', ')}`);
+      const packages = await lockfileProblems(this.repo.treeReader(attempt.base), this.repo.treeReader(head));
+      if (packages.length > 0) return this.fail(state, attempt, `package-lock.json: ${packages.join('; ')}: a package from outside the npm registry comes through the design, which the owner reviews`);
     }
     this.record({ type: 'CHECKS_STARTED', ref, payload: { head, files } });
     await this.driver.remove(attempt.sandbox);
@@ -1526,7 +1529,7 @@ export class Orchestrator {
       await this.forge.push(this.repo, plan.branch);
       this.record({ type: 'PLAN_PUSHED', ref, payload: { head: plan.head } });
     }
-    const pr = (await this.forge.findPullRequest(plan.branch))
+    const pr = (await this.forge.findPullRequest(plan.branch, { head: plan.head }))
       ?? (await this.forge.openPullRequest({ branch: plan.branch, title: noMentions(this.prTitle(plan)), body: noMentions(this.prBody(plan)) }));
     this.record({ type: 'PR_OPENED', ref, payload: pr });
     this.nextPoll.delete(planKey(plan));
@@ -1734,9 +1737,11 @@ export class Orchestrator {
     // The artifact counts only once the cost job itself succeeded: other jobs of the run execute the PR's code.
     const job = (await this.forge.checkRuns(pr.head)).filter((r) => r.name === 'cost').sort((a, b) => b.id - a.id)[0];
     if (job?.status !== 'completed' || job.conclusion !== 'success') return false;
+    // The job's own run, and an artifact made before the job ended: a later job of the run executes the PR's code, and could upload its own.
+    if (job.runId === undefined || !job.completedAt) return false;
     let text: string | undefined;
     try {
-      text = await this.forge.artifactFile(pr.head, 'cost', 'cost.json');
+      text = await this.forge.artifactFile(pr.head, 'cost', 'cost.json', { runId: job.runId, notAfter: job.completedAt });
     } catch (error) {
       this.log(`the cost estimate of ${pr.head.slice(0, 8)} could not be read: ${(error as Error).message}`);
       return false;
@@ -1998,7 +2003,11 @@ export class Orchestrator {
   private async refusePush(plan: PlanState): Promise<Step | undefined> {
     const base = await this.repo.mergeBase('refs/heads/main', plan.head);
     const changed = await this.repo.changedFiles(base, plan.head);
-    const problems = await protectedChanges(this.repo.treeReader(base), this.repo.treeReader(plan.head), changed, { progress: 'append' });
+    // As CI's verify judges it: main's rules, and fields compared with where the branch started.
+    const problems = [
+      ...(await protectedChanges(this.repo.treeReader('refs/heads/main'), this.repo.treeReader(plan.head), changed, { progress: 'append', before: this.repo.treeReader(base) })),
+      ...(await lockfileProblems(this.repo.treeReader(base), this.repo.treeReader(plan.head))).map((p) => `package-lock.json: ${p}`),
+    ];
     if (problems.length === 0) return undefined;
     this.pausePipeline(`refusing to push ${plan.branch}: it changes protected files: ${problems.join(', ')}`);
     return 'wait';
@@ -2085,9 +2094,9 @@ export class Orchestrator {
           'git checkout --quiet candidate',
         ].join(' && '));
         if (fetch.code !== 0) throw new Error(`could not check out the candidate: ${fetch.stderr.trim()}`);
-        const init = await initEnvironment(this.driver, name, p.work);
-        if (init && init.exit !== 0) return [init];
-        return await runChecks(this.driver, name, p.work, checks, this.checkOptions(name));
+        // init.sh, then the checks, under the tripwire: what they run, such as a `prepare` script, may not rewrite
+        // a protected file of the checkout, a check among them, to make the run pass.
+        return await runGuarded(this.driver, name, p.work, checks, { ...this.checkOptions(name), guard: this.repo.treeReader(gitRef) });
       } finally {
         await this.driver.remove(name);
       }
@@ -2233,7 +2242,7 @@ export class Orchestrator {
       outbox: p.outbox,
       inbox: p.inbox,
       repliedFile,
-      onRequest: (request) => void this.onRequest(agent, channel, request),
+      onRequest: (request) => this.onRequest(agent, channel, request),
       onInvalid: (reason) => this.log(`${agent.sandbox} sent ${reason}`),
     });
     channel.start();

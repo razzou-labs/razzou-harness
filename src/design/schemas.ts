@@ -97,6 +97,9 @@ export function featureDependency(planId: string, dep: string): { plan: string; 
   return b === undefined ? { plan: planId, feature: a } : { plan: a, feature: b };
 }
 
+/** The hosts some bundle reaches with git: none of them can be an API. */
+const GIT_HOSTS = new Set(Object.values(BUNDLES).flat().filter((rule) => rule.access === 'git').map((rule) => rule.host));
+
 /** Variables the harness, OpenShell or the system set in a sandbox: an API's key can't take one of their names. */
 const RESERVED_VARIABLES = /^(AWS_|CLAUDE_|OPENSHELL_|HARNESS_|SSL_|NODE_|NPM_)|^(PATH|HOME|USER|SHELL|LANG|TERM|PWD|TMPDIR|REQUESTS_CA_BUNDLE|CURL_CA_BUNDLE|DISABLE_AUTOUPDATER|CHECKPOINT_DISABLE|MCP_TOOL_TIMEOUT)$/;
 
@@ -164,7 +167,9 @@ export const ConfigSchema = z.object({
        */
       apis: z.array(ApiSchema).default([])
         .refine((apis) => new Set(apis.map((a) => a.host)).size === apis.length, 'each host once')
-        .refine((apis) => { const keys = apis.flatMap((a) => (a.key ? [a.key] : [])); return new Set(keys).size === keys.length; }, 'each key once'),
+        .refine((apis) => { const keys = apis.flatMap((a) => (a.key ? [a.key] : [])); return new Set(keys).size === keys.length; }, 'each key once')
+        // An Architect's sandbox has every bundle: a git host there, as an API, would take every method, push included.
+        .refine((apis) => apis.every((api) => !GIT_HOSTS.has(api.host)), "a git host, such as github.com, which sandboxes only clone and fetch from, can't be an API"),
     })
     .prefault({}),
   /** The project's own checks, which every attempt and CI run: commands from the repository's root, as CI has it elsewhere than a sandbox does. */

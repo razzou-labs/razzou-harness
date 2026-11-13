@@ -180,11 +180,7 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
         }
         case 'POST /api/sandboxes/remove': {
           if (typeof body.name !== 'string') return sendJson(res, { done: false, error: 'which sandbox?' });
-          const removed = await removeLeftOver(orchestrator, body.name);
-          if (!removed.done) return sendJson(res, removed);
-          // The driver's delete never throws: only the gateway's answer afterwards says it is gone.
-          const status = await orchestrator.driver.status(body.name).catch((error: Error) => `unknown (${error.message})`);
-          return sendJson(res, status === 'missing' ? { done: true } : { done: false, error: `the gateway still lists it after the delete: ${status}` });
+          return sendJson(res, await removeLeftOver(orchestrator, body.name));
         }
         case 'POST /api/sandboxes/limits': {
           // A number caps, null lifts the cap.

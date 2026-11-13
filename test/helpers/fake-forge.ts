@@ -22,6 +22,12 @@ interface FakePullRequest {
  * GitHub, for tests: a local bare repository is the remote, pull requests live in memory,
  * and `ci` decides how CI ends on each pushed commit (undefined keeps it running).
  */
+/** A job as a test declares it: a conclusion, or `in_progress` and `queued` for one still to end. */
+function settled(conclusion: string): Pick<CheckRun, 'status' | 'conclusion' | 'completedAt'> {
+  if (conclusion === 'in_progress' || conclusion === 'queued') return { status: conclusion, conclusion: null };
+  return { status: 'completed', conclusion, completedAt: new Date().toISOString() };
+}
+
 export class FakeForge implements Forge {
   readonly kind = 'github';
   readonly bot = FAKE_BOT;
@@ -102,7 +108,9 @@ export class FakeForge implements Forge {
       if (await this.unmergeable(sha)) return [];
       const decided = this.ci(sha);
       if (!decided) return [];
-      this.runs.set(sha, Object.entries(decided).map(([name, conclusion]) => ({ id: this.nextRun++, name, status: 'completed', conclusion })));
+      // One workflow run of the jobs, as GitHub has it: the daemon reads an artifact from its job's run.
+      const runId = 9000 + this.nextRun;
+      this.runs.set(sha, Object.entries(decided).map(([name, conclusion]) => ({ id: this.nextRun++, name, runId, ...settled(conclusion) })));
     }
     return this.runs.get(sha)!;
   }
@@ -124,7 +132,8 @@ export class FakeForge implements Forge {
   async rerun(sha: string, conclusions: Record<string, string>): Promise<void> {
     await this.checkRuns(sha);
     const runs = this.runs.get(sha) ?? [];
-    runs.push(...Object.entries(conclusions).map(([name, conclusion]) => ({ id: this.nextRun++, name, status: 'completed', conclusion })));
+    const runId = 9000 + this.nextRun;
+    runs.push(...Object.entries(conclusions).map(([name, conclusion]) => ({ id: this.nextRun++, name, runId, ...settled(conclusion) })));
     this.runs.set(sha, runs);
   }
 

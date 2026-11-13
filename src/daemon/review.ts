@@ -199,7 +199,11 @@ async function prepare(o: Orchestrator, plan: PlanState, review: ReviewState): P
   let planProblem: string | undefined;
   if (terraform) {
     try {
-      const json = await o.forge.artifactFile(review.head, 'tfplan', 'plan.json');
+      // The tf-plan job's own artifact, made before it ended: the checks job after it runs the PR's code.
+      const job = (await o.forge.checkRuns(review.head)).filter((r) => r.name === 'tf-plan').sort((a, b) => b.id - a.id)[0];
+      const json = job?.status === 'completed' && job.conclusion === 'success' && job.runId !== undefined && job.completedAt
+        ? await o.forge.artifactFile(review.head, 'tfplan', 'plan.json', { runId: job.runId, notAfter: job.completedAt, maxBytes: PLAN_LIMIT })
+        : undefined;
       if (json === undefined) planProblem = "CI's tf-plan job uploaded no plan for this head";
       else if (json.length > PLAN_LIMIT) planProblem = `CI's plan is ${Math.round(json.length / 1024 / 1024)} MB of JSON, too large to bring here`;
       else {

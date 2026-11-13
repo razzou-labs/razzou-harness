@@ -7,7 +7,7 @@ import { parseArgs } from 'node:util';
 import { computeLock, directoryReader } from './ci/harness-ci.ts';
 import { isRunning, lockHolder, packageRoot, runDaemon, runningDaemon, STOP_GRACE_MS, version } from './daemon/main.ts';
 import { ConfigSchema } from './design/schemas.ts';
-import { applyModeRules, checkApp, ciFiles, createApp, installCi, rulesNotChanged } from './github/setup.ts';
+import { applyModeRules, checkApp, createApp, installCi, rulesNotChanged, staleCiFiles } from './github/setup.ts';
 import { configDir } from './github/app.ts';
 import { askSecret, doctor, projectMode } from './setup/doctor.ts';
 import { CHECKLIST, init } from './setup/init.ts';
@@ -187,7 +187,7 @@ async function main(): Promise<void> {
     case 'github-app':
       return githubApp(argument, values);
     case 'install-ci': {
-      const written = installCi(projectDir, packageRoot, values.owner);
+      const written = await installCi(projectDir, packageRoot, values.owner);
       for (const path of written) console.log(`wrote ${path}`);
       // The lock hashes .github/**: one written before these files would fail CI's check of it.
       const lock = await writeLock(projectDir);
@@ -262,7 +262,7 @@ async function main(): Promise<void> {
           }
         },
         // The files as the version now in packageRoot writes them; CODEOWNERS follows the owner, not the version.
-        staleCi: () => ciFiles(packageRoot).filter(([path, content]) => !existsSync(join(projectDir, path)) || readFileSync(join(projectDir, path), 'utf8') !== content).map(([path]) => path),
+        staleCi: () => staleCiFiles(projectDir, packageRoot),
       });
       return;
     }
@@ -356,7 +356,7 @@ function recordForDaemon(harnessDir: string, values: Record<string, unknown>): v
 
 /** The hint after rules that couldn't be applied, naming the mode: later, the daemon's mode may be the other one. */
 function rulesHint(problem: string, repo: string, mode: Mode): string {
-  return rulesNotChanged(problem, repo).replace(`--repo ${repo}\``, `--repo ${repo} --mode ${mode}\``);
+  return rulesNotChanged(problem, repo, mode);
 }
 
 /** The project's configuration, when the directory has one. */

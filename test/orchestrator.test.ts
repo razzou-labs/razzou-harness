@@ -365,15 +365,19 @@ describe('orchestrator', () => {
     assert.equal(o.state.features['demo/P1/F02']!.status, 'accepted', 'the commits came back through their bundles');
   });
 
-  it("deletes its left-over sandboxes when it starts and every hour, never an Architect's or another project's", async () => {
+  it("deletes its left-over sandboxes when it starts and every hour, never an Architect's, another project's or another checkout's", async () => {
     let skew = 0;
     const { orchestrator: o, driver } = await setup((f) => solved(f), { now: () => Date.now() + skew });
-    const spec = (name: string, project?: string) => ({ name, image: 'x', providers: [], env: {}, ...(project ? { labels: { 'harness.project': project } } : {}) });
+    const spec = (name: string, project?: string, checkout = o.checkout) => ({
+      name, image: 'x', providers: [], env: {}, ...(project ? { labels: { 'harness.project': project, 'harness.checkout': checkout } } : {}),
+    });
     for (const [name, project] of [['dev-0000aaaa-a9', 'toy'], ['arc-0000bbbb', 'toy'], ['dev-1111cccc-a1', 'elsewhere'], ['prb-12345678', undefined]] as const) await driver.create(spec(name, project));
+    // A clone of the same project in another folder: its daemon knows which of its sandboxes it needs.
+    await driver.create(spec('dev-3333eeee-a1', 'toy', 'feedc0de'));
     await o.tick();
     const status = async (names: string[]) => Promise.all(names.map(async (name) => [name, await driver.status(name)]));
-    assert.deepEqual(await status(['dev-0000aaaa-a9', 'arc-0000bbbb', 'dev-1111cccc-a1', 'prb-12345678']), [
-      ['dev-0000aaaa-a9', 'missing'], ['arc-0000bbbb', 'ready'], ['dev-1111cccc-a1', 'ready'], ['prb-12345678', 'ready'],
+    assert.deepEqual(await status(['dev-0000aaaa-a9', 'arc-0000bbbb', 'dev-1111cccc-a1', 'prb-12345678', 'dev-3333eeee-a1']), [
+      ['dev-0000aaaa-a9', 'missing'], ['arc-0000bbbb', 'ready'], ['dev-1111cccc-a1', 'ready'], ['prb-12345678', 'ready'], ['dev-3333eeee-a1', 'ready'],
     ]);
     // One left within the hour waits for the next sweep.
     await driver.create(spec('chk-2222dddd-a1', 'toy'));
@@ -392,11 +396,12 @@ describe('orchestrator', () => {
     assert.match(o.state.pipeline.paused?.reason ?? '', /^no key stored on this machine for api\.stripe\.com: run `harness doctor` in a terminal, which asks for it, then resume$/);
     assert.equal(driver.created.filter((spec) => spec.name.startsWith('dev-')).length, 0, 'no attempt starts without the key');
 
-    driver.providerNames.push('api-toy-api-stripe-com');
+    // Stored by the doctor under the daemon's name for it: the project with this checkout.
+    driver.providerNames.push(`api-toy-${o.checkout}-api-stripe-com`);
     assert.equal(o.resume(), true);
     await until(o, completed(o));
     const made = driver.created.filter((spec) => !spec.name.startsWith('arc-'));
-    assert.ok(made.length > 0 && made.every((spec) => spec.providers.includes('api-toy-api-stripe-com')), 'every sandbox carries the key');
+    assert.ok(made.length > 0 && made.every((spec) => spec.providers.includes(`api-toy-${o.checkout}-api-stripe-com`)), 'every sandbox carries the key');
     const policy = JSON.parse(readFileSync(join(harnessDir, 'tmp', 'sandbox-policy.yaml'), 'utf8')) as { network_policies: Record<string, { endpoints: Array<{ host: string; access?: string }> }> };
     assert.deepEqual(policy.network_policies.third_party_apis!.endpoints.map((e) => [e.host, e.access]), [['postman-echo.com', 'full']]);
     assert.ok(policy.network_policies.read_only_web!.endpoints.some((e) => e.host === 'pypi.org'), 'every bundle');
@@ -1403,6 +1408,15 @@ describe('deploys', () => {
   };
   const infra = (f: string): StubBehavior => (f === 'F02' ? { files: { ...SOLUTIONS.F02, 'iac/main.tf': '# a bucket\n' } } : f.startsWith('fix') ? { files: { 'iac/fixed.tf': '# the fix\n' } } : solved(f));
   const allGreen = () => ({ verify: 'success', 'tf-plan': 'success', checks: 'success', 'tf-apply': 'success' });
+  /** F02 writes iac/, so it is an infra feature, as CI requires of a plan that changes the Terraform folder: the plan is MIXED. */
+  const mixed = (run: string) => async (dir: string) => {
+    await withPostDeploy(run)(dir);
+    const file = join(dir, 'harness/modules/demo/plans/P1.json');
+    const plan = JSON.parse(readFileSync(file, 'utf8')) as { features: Array<{ kind?: string }> };
+    plan.features[1]!.kind = 'infra';
+    writeFileSync(file, JSON.stringify(plan));
+    await runOk('git', ['-C', dir, '-c', 'user.name=o', '-c', 'user.email=o@test.invalid', 'commit', '--quiet', '-am', 'F02 is infra']);
+  };
 
   it('waits for the apply after the merge, then verifies the deploy', async () => {
     let skew = 0;
@@ -1462,10 +1476,12 @@ describe('deploys', () => {
   it("in Swarm, merges a Fix PR itself under the plans' policy: a failed deploy is fixed, merged and verified without the owner", async () => {
     let skew = 0;
     const { orchestrator: o, fake } = await setup(infra, {
-      github: true, config: { terraform: {}, swarm: { requiredStatuses: [] } }, prepare: withPostDeploy('test -f iac/fixed.tf'), now: () => Date.now() + skew,
+      github: true, config: { terraform: {}, swarm: { requiredStatuses: [] } }, prepare: mixed('test -f iac/fixed.tf'), now: () => Date.now() + skew,
     });
     fake.ci = allGreen;
     o.setMode('swarm');
+    // The owner's button: infrastructure merges without the cost job's estimate, which this CI has no job for.
+    o.setInfraMerge('daemon');
     await fast(o, (ms) => (skew += ms), completed(o));
 
     assert.equal(o.state.pipeline.paused, undefined);
@@ -1484,10 +1500,11 @@ describe('deploys', () => {
   it('in Swarm, a Fix PR waits for the owner once they keep Fix PRs for themselves, and the switch is theirs to turn back', async () => {
     let skew = 0;
     const { orchestrator: o, fake } = await setup(infra, {
-      github: true, config: { terraform: {}, swarm: { requiredStatuses: [] } }, prepare: withPostDeploy('test -f iac/fixed.tf'), now: () => Date.now() + skew,
+      github: true, config: { terraform: {}, swarm: { requiredStatuses: [] } }, prepare: mixed('test -f iac/fixed.tf'), now: () => Date.now() + skew,
     });
     fake.ci = allGreen;
     o.setMode('swarm');
+    o.setInfraMerge('daemon');
     assert.equal(o.setFixMerge('daemon'), false, 'the daemon merges them unless told otherwise');
     assert.equal(o.setFixMerge('owner'), true);
     const plan = () => o.state.plans['demo/P1']!;
@@ -1851,11 +1868,15 @@ describe('dashboard', () => {
   it("lists the gateway's sandboxes, labels its own, shows what a policy refused, and deletes only a left-over one", async () => {
     const { o, driver, port, bearer } = await dashboard();
     await until(o, completed(o), 60_000);
-    assert.ok(driver.created.length > 0 && driver.created.every((spec) => spec.labels?.['harness.project'] === 'toy'), 'every sandbox the daemon made says whose it is');
-    const spec = (name: string, project: string) => ({ name, image: 'x', providers: [], env: {}, labels: { 'harness.project': project } });
+    assert.ok(
+      driver.created.length > 0 && driver.created.every((spec) => spec.labels?.['harness.project'] === 'toy' && spec.labels['harness.checkout'] === o.checkout),
+      'every sandbox the daemon made says whose it is: the project, and this checkout of it',
+    );
+    const spec = (name: string, project: string, checkout = o.checkout) => ({ name, image: 'x', providers: [], env: {}, labels: { 'harness.project': project, 'harness.checkout': checkout } });
     await driver.create(spec('dev-0000aaaa-a9', 'toy'));
     await driver.create(spec('dev-1111bbbb-a1', 'elsewhere'));
     await driver.create(spec('chk-2222cccc-plan', 'toy'));
+    await driver.create(spec('dev-4444ffff-a1', 'toy', 'feedc0de'));
     o.checking.set('chk-2222cccc-plan', 'plan/demo/P1');
     mkdirSync(join(driver.base, 'prb-12345678'));
     writeFileSync(join(driver.rootOf('dev-0000aaaa-a9'), '.harness', 'openshell.log'), '[1794077355.601] [sandbox] [OCSF ] [ocsf] NET:OPEN [MED] DENIED /usr/bin/node(7) -> pypi.org:443 [reason:transparent_tcp_policy_denied]\n');
@@ -1866,6 +1887,7 @@ describe('dashboard', () => {
       ['chk-2222cccc-plan', 'in use', 'Checks'],
       ['dev-0000aaaa-a9', 'left over', 'Developer'],
       ['dev-1111bbbb-a1', 'other', 'elsewhere'],
+      ['dev-4444ffff-a1', 'other', 'toy'],
       ['prb-12345678', 'other', ''],
     ]);
 
@@ -2397,6 +2419,33 @@ describe('pull requests, continued', () => {
     await until(o, () => plan(o)?.leftToOwner !== undefined);
     assert.equal(plan(o)!.costEstimate, undefined);
     assert.match(plan(o)!.leftToOwner!.reason, /none was produced/);
+  });
+
+  it('in Swarm, waits for a cost job that still runs, rather than merging or leaving the pull request to the owner without its estimate', async () => {
+    let skew = 0;
+    const { orchestrator: o, fake } = await setup((f) => solved(f), { github: true, prepare: infraPlan, now: () => Date.now() + skew });
+    o.setMode('swarm');
+    fake.statuses = () => ({ 'harness/security': 'success', 'harness/cost': 'success' });
+    fake.ci = () => ({ verify: 'success', checks: 'success', cost: 'in_progress' });
+    fake.artifacts = () => ({ cost: { 'cost.json': JSON.stringify({ diffTotalMonthlyCost: '12.5' }) } });
+    // CI passed and both reviewers posted: the next looks reach the merge policy, with the cost job still running.
+    await until(o, () => {
+      const pushed = plan(o)?.pushed;
+      return plan(o)?.ci?.status === 'passed' && ['harness/security', 'harness/cost'].every((c) => fake.statusesSet.some((s) => s.sha === pushed && s.context === c));
+    });
+    for (let i = 0; i < 4; i++) {
+      skew += 61_000;
+      await o.tick();
+      await o.settled();
+    }
+    assert.equal(plan(o)!.status, 'pr_open');
+    assert.equal(plan(o)!.leftToOwner, undefined, 'nothing is left to the owner for an estimate minutes away');
+    assert.equal(plan(o)!.costEstimate, undefined);
+    await fake.rerun(plan(o)!.pushed!, { cost: 'success' });
+    skew += 61_000;
+    await until(o, completed(o));
+    assert.equal(plan(o)!.mergedBy, 'daemon');
+    assert.equal(plan(o)!.costEstimate!.monthlyUsd, 12.5);
   });
 
   it('waits for GitHub to show its push on the pull request, rather than taking the lag for a moved branch', async () => {
