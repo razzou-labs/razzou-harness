@@ -14,6 +14,8 @@ import { apiProfile, apiProviderName } from '../sandbox/policy.ts';
 import type { Mode } from '../state/state.ts';
 import { run } from '../util.ts';
 import { buildCache, removeOldAgentImages } from './images.ts';
+import { appBot, MAIN_FILES } from './init.ts';
+import { terraformSource } from './terraform.ts';
 import { probe, stateLocation } from './probe.ts';
 
 /** The OpenShell release the harness is built and probed against (§17.4). */
@@ -40,8 +42,8 @@ export interface DoctorOptions {
   /** The AWS view role's ARN, when `harness setup` asked for it already: the AWS provider takes it without asking again. */
   awsViewRole?: string;
   /**
-   * The optional secrets the owner skipped during this run, by check name: not asked for
-   * again, since `harness setup` runs the doctor up to three times.
+   * The secrets the owner skipped with Enter during this run, by provider name: not asked
+   * for again, since `harness setup` runs the doctor up to three times.
    */
   skipped?: Set<string>;
   /** Asks for a secret without echoing it; the terminal's hidden prompt by default. */
@@ -72,18 +74,25 @@ export async function doctor(options: DoctorOptions): Promise<Check[]> {
   const image = config?.sandbox.image ?? `razzou-harness/agent:${options.version}`;
   const claudeProvider = config?.sandbox.claudeProvider ?? 'claude-sub';
 
-  await machine(options, image, report);
-  await claude(options, claudeProvider, report);
-  if (config) await project(options, config, report);
+  // Without OpenShell, what needs it is a failed check, not an error that ends the run.
+  const openshell = await machine(options, image, report);
+  if (openshell) await claude(options, claudeProvider, report);
+  else report(fail('Claude provider', 'needs OpenShell, which is missing', `install OpenShell ${OPENSHELL_VERSION}`));
+  if (config) await project(options, config, report, openshell);
   else report({ status: 'skip', name: 'project', detail: 'no harness/config.json here', fix: 'run `harness init` in the project repository' });
   if (options.probe) {
-    if (config) await probes(options, config, report);
-    else report({ status: 'skip', name: 'probe', detail: 'the probe needs a project' });
+    if (!config) report({ status: 'skip', name: 'probe', detail: 'the probe needs a project' });
+    else if (!openshell) report({ status: 'skip', name: 'probe', detail: 'the probe needs OpenShell' });
+    else await probes(options, config, report);
   }
   return checks;
 }
 
-async function machine(options: DoctorOptions, image: string, report: (c: Check) => void): Promise<void> {
+/** The checks of this machine, as opposed to the project's: while one fails, the probe has nothing to try from. */
+export const MACHINE_CHECKS = ['Node', 'git', 'Docker', 'OpenShell', 'OpenShell gateway', 'Claude Code', 'image build', 'image', 'container network'];
+
+/** Checks the machine; true when OpenShell is installed. */
+async function machine(options: DoctorOptions, image: string, report: (c: Check) => void): Promise<boolean> {
   const major = Number(process.versions.node.split('.')[0]);
   report(major >= 24 ? ok('Node', process.versions.node) : fail('Node', process.versions.node, 'install Node 24 or later'));
   const git = await run('git', ['--version']).catch(() => undefined);
@@ -133,6 +142,7 @@ async function machine(options: DoctorOptions, image: string, report: (c: Check)
   }
 
   report((await loadPty()) ? ok('terminals', 'node-pty loads') : warn('terminals', 'node-pty is missing', 'the dashboard has no terminals; `harness attach` still works. Install build tools and reinstall to get them'));
+  return found !== undefined;
 }
 
 /**
@@ -151,11 +161,14 @@ async function claude(options: DoctorOptions, provider: string, report: (c: Chec
   const leftover = join(configDir(), 'claude.token');
   if (existsSync(leftover)) report({ status: 'skip', name: 'Claude token', detail: `${leftover} is no longer used: the agents report the subscription's usage. Delete it` });
   if (await providerExists(provider)) return report(ok('Claude provider', provider));
-  if (!options.interactive) {
+  if (!options.interactive || options.skipped?.has(provider)) {
     return report(fail('Claude provider', `${provider} is missing`, 'run `claude setup-token`, then `harness doctor` in a terminal: it asks for the token'));
   }
   const token = await (options.askSecret ?? askSecret)(`Claude provider ${provider} is missing. Paste the token from \`claude setup-token\` (hidden; a token over two lines comes in whole): `);
-  if (!token) return report(fail('Claude provider', 'no token given', 'run `harness doctor` again'));
+  if (!token) {
+    options.skipped?.add(provider);
+    return report(fail('Claude provider', 'no token given', 'run `harness doctor` again'));
+  }
   // The token reaches OpenShell through the environment of one command, never its arguments.
   const created = await run('openshell', ['provider', 'create', '--name', provider, '--type', 'claude-code-subscription', '--from-existing'], {
     env: { ...process.env, CLAUDE_CODE_OAUTH_TOKEN: token },
@@ -168,23 +181,31 @@ export function granted(appCheck: string[], permission: string): string | undefi
   return new RegExp(`\\b${permission}=(\\w+)`).exec(appCheck.find((l) => l.startsWith('Permissions:')) ?? '')?.[1];
 }
 
-async function project(options: DoctorOptions, config: Config, report: (c: Check) => void): Promise<void> {
+async function project(options: DoctorOptions, config: Config, report: (c: Check) => void, openshell: boolean): Promise<void> {
   report(ok('harness/config.json', `project ${config.project.name}`));
+  report(await mainHolds(options.projectDir));
   const repo = config.project.repo;
   const mode = projectMode(options.projectDir);
   if (!repo) {
-    report({ status: 'skip', name: 'GitHub', detail: 'no project.repo: the project stays local' });
+    // Without a repository, plans never reach main: `harness up` refuses such a project.
+    report(fail('GitHub', 'no project.repo: the harness needs a GitHub repository, where each plan reaches main through a pull request', '`harness setup` creates one, and sets project.repo and project.bot'));
   } else {
-    try {
-      const lines = await checkApp(repo);
-      report(ok('GitHub App', lines.find((l) => l.startsWith('App:'))?.slice(5) ?? 'installed'));
-      // In Swarm the reviewers' verdicts are commit statuses the App posts (v3 §3.4), once the installation accepted the permission.
-      // Checked in Manual too, so that `harness setup` makes the project ready for Swarm.
-      if (granted(lines, 'statuses') !== 'write') {
-        report(warn('GitHub App', "can't write commit statuses, which the reviewers' verdicts need in Swarm", 'give the App "Commit statuses: write" on GitHub, and accept the new permission on its installation'));
+    // CI tells the App's pull requests by the bot the config names, and the daemon refuses to start on another App's.
+    const bot = appBot();
+    if (bot && bot !== config.project.bot) {
+      report(fail('GitHub App', `harness/config.json says the bot is ${config.project.bot}, but the App on this machine is ${bot}`, `set project.bot to "${bot}" in harness/config.json and run \`harness lock\`, or run the harness where the App of ${config.project.bot} is`));
+    } else {
+      try {
+        const lines = await checkApp(repo);
+        report(ok('GitHub App', lines.find((l) => l.startsWith('App:'))?.slice(5) ?? 'installed'));
+        // In Swarm the reviewers' verdicts are commit statuses the App posts (v3 §3.4), once the installation accepted the permission.
+        // Checked in Manual too, so that `harness setup` makes the project ready for Swarm.
+        if (granted(lines, 'statuses') !== 'write') {
+          report(warn('GitHub App', "can't write commit statuses, which the reviewers' verdicts need in Swarm", 'give the App "Commit statuses: write" on GitHub, and accept the new permission on its installation'));
+        }
+      } catch (error) {
+        report(fail('GitHub App', firstLine((error as Error).message), 'create it with `harness github-app create --org <org>`, and install it on the repository'));
       }
-    } catch (error) {
-      report(fail('GitHub App', firstLine((error as Error).message), 'create it with `harness github-app create --org <org>`, and install it on the repository'));
     }
     const ruleset = await mainRuleset(repo);
     if (!ruleset) {
@@ -216,14 +237,54 @@ async function project(options: DoctorOptions, config: Config, report: (c: Check
       else report(ok(file, 'up to date'));
     }
   }
-  if (config.aws) await aws(options, config, report);
-  await apis(options, config, report);
+  if (!openshell) {
+    if (config.aws || config.network.apis.some((api) => api.key)) report({ status: 'skip', name: 'providers', detail: "the AWS and API providers need OpenShell, which is missing" });
+  } else {
+    if (config.aws) await aws(options, config, report);
+    await apis(options, config, report);
+  }
   if (config.terraform) {
     const tf = config.terraform;
     for (const file of [tf.backendConfig, tf.varFile]) {
       report(existsSync(join(options.projectDir, tf.dir, file)) ? ok('Terraform', `${tf.dir}/${file}`) : fail('Terraform', `${tf.dir}/${file} is missing`, '`harness setup` writes the missing Terraform scaffold, or see the README\'s AWS section'));
     }
+    report(terraformBackend(options.projectDir, tf.dir));
   }
+}
+
+/**
+ * Without a `backend "s3"` block, CI's `terraform init -backend-config=...` only warns and
+ * keeps the state on the runner: what tf-apply creates would be forgotten with it.
+ */
+export function terraformBackend(projectDir: string, dir: string): Check {
+  return /^\s*backend\s+"s3"/m.test(terraformSource(join(projectDir, dir)))
+    ? ok('Terraform', `${dir}/ has a backend "s3" block`)
+    : fail('Terraform', `no .tf file in ${dir}/ has a backend "s3" block: CI would keep the state on its runner, and lose it`, 'add `terraform { backend "s3" {} }` in a .tf file of its own, or run `harness setup`, which writes it in backend.tf');
+}
+
+/**
+ * main, and origin's main as of the last fetch or push, hold the config and the CI files as
+ * the working tree has them: the daemon reads the config from main, and CI runs the
+ * workflow that main has. Files the working tree hasn't are reported by their own checks.
+ */
+export async function mainHolds(projectDir: string): Promise<Check> {
+  const git = (args: string[]) => run('git', ['-C', projectDir, ...args]).catch(() => undefined);
+  const refs = ['main'];
+  const problems: string[] = [];
+  if ((await git(['rev-parse', '--verify', '--quiet', 'refs/remotes/origin/main']))?.code === 0) refs.push('origin/main');
+  else if ((await git(['remote', 'get-url', 'origin']))?.code === 0) problems.push("origin's main is unknown here: it was never pushed or fetched");
+  const files = MAIN_FILES.filter((file) => existsSync(join(projectDir, file)));
+  for (const ref of refs) {
+    const differ: string[] = [];
+    for (const file of files) {
+      const shown = await git(['show', `refs/${ref === 'main' ? 'heads' : 'remotes'}/${ref}:${file}`]);
+      if (shown?.code !== 0 || shown.stdout !== readFileSync(join(projectDir, file), 'utf8')) differ.push(file);
+    }
+    if (differ.length > 0) problems.push(`${ref} doesn't hold ${differ.join(', ')} as ${differ.length === 1 ? 'it is' : 'they are'} here`);
+  }
+  return problems.length === 0
+    ? ok('main', `holds ${files.join(', ')} as ${files.length === 1 ? 'it is' : 'they are'} here`)
+    : fail('main', problems.join('; '), 'commit them on main and push it: `harness setup` offers both. The daemon reads the config from main, and CI runs the workflow main has');
 }
 
 /** The project's third-party APIs: each key in an OpenShell provider, under the variable the config names. */
@@ -247,8 +308,13 @@ async function apis(options: DoctorOptions, config: Config, report: (c: Check) =
       report(fail('API', `no key stored for ${api.host}`, 'run `harness doctor` in a terminal: it asks for the key'));
       continue;
     }
+    if (options.skipped?.has(name)) {
+      report(fail('API', `no key stored for ${api.host}: skipped`, 'run `harness doctor` again with the key at hand'));
+      continue;
+    }
     const secret = await (options.askSecret ?? askSecret)(`The key of ${api.host}, which the project's code reads as ${api.key} (hidden, or Enter to skip): `);
     if (!secret) {
+      options.skipped?.add(name);
       report(fail('API', `no key stored for ${api.host}`, 'run `harness doctor` again with the key at hand'));
       continue;
     }
@@ -389,15 +455,21 @@ function swarmRuleset(ruleset: Ruleset, config: Config, repo: string): Check {
   return ok('probe (outside)', statuses.length > 0 ? `main needs no approval, and the App's statuses: ${statuses.join(', ')}` : 'main needs no approval, and the daemon merges on CI alone');
 }
 
-/** The daemon's mode, from its state snapshot (v3 §2.1); Manual when there is none. */
-function projectMode(projectDir: string): Mode {
-  const file = join(projectDir, '.harness', 'state.json');
-  if (!existsSync(file)) return 'manual';
-  try {
-    return (JSON.parse(readFileSync(file, 'utf8')) as { mode?: Mode }).mode ?? 'manual';
-  } catch {
-    return 'manual';
+/**
+ * The project's mode (v3 §2.1): the one `harness mode` recorded in .harness/setup.json for
+ * the daemon to switch to, or else the daemon's, from its state snapshot; Manual when there
+ * is neither. Main's rules are judged and applied for the mode the daemon will run in.
+ */
+export function projectMode(projectDir: string): Mode {
+  for (const file of ['setup.json', 'state.json']) {
+    try {
+      const mode = (JSON.parse(readFileSync(join(projectDir, '.harness', file), 'utf8')) as { mode?: unknown }).mode;
+      if (mode === 'manual' || mode === 'swarm') return mode;
+    } catch {
+      // No file, or one that can't be read: the next one says.
+    }
   }
+  return 'manual';
 }
 
 /**

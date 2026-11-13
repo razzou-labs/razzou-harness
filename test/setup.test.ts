@@ -4,10 +4,10 @@ import { join } from 'node:path';
 import { after, before, beforeEach, describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { computeLock, directoryReader } from '../src/ci/harness-ci.ts';
-import { granted, mainRuleset, repositorySecret, secretReader, type Check } from '../src/setup/doctor.ts';
+import { granted, mainRuleset, repositorySecret, secretReader, terraformBackend, type Check } from '../src/setup/doctor.ts';
 import { init } from '../src/setup/init.ts';
 import { recover } from '../src/setup/recover.ts';
-import { awsProviderName, commitAndPush, fixFor, infracostKey, linkRepo, type SetupOptions } from '../src/setup/setup.ts';
+import { askSettings, awsProviderName, commitAndPush, fixFor, infracostKey, linkRepo, setup, type SetupOptions } from '../src/setup/setup.ts';
 import { writeTerraformScaffold } from '../src/setup/terraform.ts';
 import { run, runOk } from '../src/util.ts';
 import { FakeForge } from './helpers/fake-forge.ts';
@@ -67,6 +67,8 @@ describe('harness setup (v4 §4)', () => {
     assert.deepEqual(fixFor(check('image', 'warn', 'has Claude Code 1, this machine 2')), { kind: 'build-image' });
     assert.deepEqual(fixFor(check('GitHub App', 'fail', 'no GitHub App in /home/x/.config/harness: create one')), { kind: 'create-app' });
     assert.deepEqual(fixFor(check('GitHub App', 'fail', 'GET /repos/acme/shop/installation: 404 Not Found')), { kind: 'install-app' });
+    assert.equal(fixFor(check('GitHub App', 'fail', 'fetch failed')), undefined, 'offline, no install page to wait on');
+    assert.equal(fixFor(check('GitHub App', 'fail', 'harness/config.json says the bot is a[bot], but the App on this machine is b[bot]')), undefined);
     assert.deepEqual(fixFor(check('GitHub App', 'warn', "can't write commit statuses, which the reviewers' verdicts need in Swarm")), { kind: 'app-statuses' });
     assert.deepEqual(fixFor(check('ruleset', 'fail', "doesn't require checks")), { kind: 'apply-rules' });
     assert.deepEqual(fixFor(check('ruleset', 'fail', "doesn't apply to main")), { kind: 'apply-rules' });
@@ -91,6 +93,138 @@ describe('harness setup (v4 §4)', () => {
     const result = await init({ projectDir: link, packageDir: fileURLToPath(new URL('..', import.meta.url)), version: '0.2.0', owner: 'owner' });
     assert.ok(result.wrote.includes('harness/config.json'));
     assert.equal(JSON.parse(readFileSync(join(dir, 'harness', 'config.json'), 'utf8')).project.name, 'shop');
+  });
+});
+
+describe('the setup writes nothing the schema refuses', () => {
+  const PACKAGE = fileURLToPath(new URL('..', import.meta.url));
+  const options = (dir: string, answers: string[], said: string[] = []): SetupOptions => ({
+    projectDir: dir, packageDir: PACKAGE, version: '0.6.0', say: (line) => void said.push(line), ask: async () => answers.shift() ?? '', askSecret: async () => '', open: () => {}, interactive: () => 0, up: async () => {},
+  });
+
+  it('asks again for a region or a role the schema refuses, and writes what it accepts', async () => {
+    const { dir } = await project(false);
+    mkdirSync(join(dir, 'harness'));
+    writeFileSync(join(dir, 'harness', 'config.json'), JSON.stringify({ harnessVersion: '0.6.0', project: { name: 'shop' } }));
+    const said: string[] = [];
+    const view = 'arn:aws:iam::123456789012:role/harness-shop-view';
+    const role = 'arn:aws:iam::123456789012:role/harness-shop-plan';
+    await askSettings(options(dir, ['y', 'EU-WEST-1', 'eu-west-1', 'harness-shop-view', view, role, role], said));
+    assert.deepEqual(said.filter((line) => line.includes("won't do")), [
+      '"EU-WEST-1" won\'t do: an AWS region, like us-east-1. Type it again, or Enter to skip.',
+      '"harness-shop-view" won\'t do: a role ARN, like arn:aws:iam::123456789012:role/harness-shop-view. Type it again, or Enter to skip.',
+    ]);
+    const config = JSON.parse(readFileSync(join(dir, 'harness', 'config.json'), 'utf8'));
+    assert.equal(config.aws.region, 'eu-west-1');
+    assert.match(readFileSync(join(dir, 'iac', 'env', 'staging.tfvars'), 'utf8'), /aws_region {5}= "eu-west-1"/);
+  });
+
+  it('writes no file when the config it would write is refused, and says why', async () => {
+    const { dir } = await project(false);
+    mkdirSync(join(dir, 'harness'));
+    const before = JSON.stringify({ harnessVersion: '0.6.0', project: { name: 'a'.repeat(41) } });
+    writeFileSync(join(dir, 'harness', 'config.json'), before);
+    const role = 'arn:aws:iam::123456789012:role/harness-shop-plan';
+    await assert.rejects(askSettings(options(dir, ['y', 'eu-west-1', 'arn:aws:iam::123456789012:role/harness-shop-view', role, role])), /harness\/config\.json would not be valid, so nothing was written:\n.*project\.name/s);
+    assert.equal(readFileSync(join(dir, 'harness', 'config.json'), 'utf8'), before);
+    assert.equal(existsSync(join(dir, 'iac')), false);
+  });
+
+  it('gives a folder whose name is over 40 characters a name the schema takes', async () => {
+    const dir = join(tempDir('long'), `the-${'very-'.repeat(10)}long-shop`);
+    mkdirSync(dir);
+    await runOk('git', ['init', '--quiet', '--initial-branch=main', dir]);
+    await init({ projectDir: dir, packageDir: PACKAGE, version: '0.6.0', owner: 'owner' });
+    const name = JSON.parse(readFileSync(join(dir, 'harness', 'config.json'), 'utf8')).project.name as string;
+    assert.equal(name, 'the-very-very-very-very-very-very-very-v');
+  });
+
+  it('refuses a repository typed without its organization before writing anything', async () => {
+    const { dir } = await project(false);
+    const app = join(process.env.XDG_CONFIG_HOME!, 'harness');
+    mkdirSync(app, { recursive: true });
+    writeFileSync(join(app, 'app.json'), JSON.stringify({ appId: 7, slug: 'acme-harness' }));
+    try {
+      await assert.rejects(init({ projectDir: dir, packageDir: PACKAGE, version: '0.6.0', repo: 'shop', owner: 'owner' }), /would not be valid, so nothing was written:\n.*owner\/name/s);
+      assert.equal(existsSync(join(dir, 'harness')), false);
+    } finally {
+      rmSync(join(app, 'app.json'));
+    }
+  });
+
+  describe('with a gh that is logged in', () => {
+    const path = process.env.PATH;
+    const calls = join(tempDir('gh'), 'calls');
+    before(() => {
+      const bin = tempDir('bin');
+      writeFileSync(join(bin, 'gh'), `#!/bin/sh\necho "$*" >> ${calls}\n[ "$1 $2" = "auth status" ] && exit 0\nexit 1\n`, { mode: 0o755 });
+      process.env.PATH = `${bin}:${path}`;
+    });
+    after(() => {
+      process.env.PATH = path;
+    });
+
+    it('creates nothing on GitHub for a folder that is not the top of its repository', async () => {
+      const { dir } = await project(false);
+      const inner = join(dir, 'app');
+      mkdirSync(inner);
+      rmSync(calls, { force: true });
+      await assert.rejects(setup(options(inner, ['acme/shop'])), /app is inside the repository .*, not at its top/);
+      assert.deepEqual(readFileSync(calls, 'utf8').trim().split('\n'), ['auth status']);
+    });
+
+    it('asks again for a repository typed without its organization', async () => {
+      const { dir } = await project(false);
+      const said: string[] = [];
+      rmSync(calls, { force: true });
+      // The setup stops at the question asked again: nothing past it may run on this machine.
+      const asked: string[] = [];
+      const ask = async (question: string) => {
+        asked.push(question);
+        if (asked.length > 1) throw new Error('asked again');
+        return 'shop';
+      };
+      await assert.rejects(setup({ ...options(dir, [], said), ask }), /asked again/);
+      assert.match(asked[1]!, /^No GitHub remote\. Create a private repository on GitHub\?/);
+      assert.match(said.join('\n'), /"shop" won't do: owner\/name\. Type it again, or Enter to skip\./);
+      assert.doesNotMatch(readFileSync(calls, 'utf8'), /repo create/);
+    });
+  });
+});
+
+describe('the setup on a machine of stand-ins', () => {
+  // Only git and the stand-ins are on the PATH: nothing of this machine's is checked or changed.
+  const path = process.env.PATH;
+  const git = path!.split(':').map((dir) => join(dir, 'git')).find((file) => existsSync(file))!;
+  before(() => {
+    const bin = tempDir('bin');
+    symlinkSync(git, join(bin, 'git'));
+    writeFileSync(join(bin, 'gh'), '#!/bin/sh\n[ "$1 $2" = "auth status" ] && exit 0\nexit 1\n', { mode: 0o755 });
+    // Docker with the agents' image built, and a network: OpenShell is what this machine lacks.
+    writeFileSync(join(bin, 'docker'), '#!/bin/sh\ncase "$1" in\n  info) echo 27.0 ;;\n  image) echo ;;\n  run) printf 200 ;;\n  *) exit 1 ;;\nesac\n', { mode: 0o755 });
+    process.env.PATH = bin;
+  });
+  after(() => {
+    process.env.PATH = path;
+  });
+
+  it('skips the probe while a check of the machine fails, offers no daemon, and ends with problems left', async () => {
+    const { dir } = await project(false);
+    mkdirSync(join(dir, 'harness'));
+    writeFileSync(join(dir, 'harness', 'config.json'), JSON.stringify({ harnessVersion: '0.6.0', project: { name: 'shop' } }));
+    const said: string[] = [];
+    const asked: string[] = [];
+    let started = false;
+    const result = await setup({
+      projectDir: dir, packageDir: fileURLToPath(new URL('..', import.meta.url)), version: '0.6.0', owner: 'owner',
+      say: (line) => void said.push(line), ask: async (question) => (asked.push(question), ''), askSecret: async () => '',
+      open: () => {}, interactive: () => 0, up: async () => void (started = true), sleep: async () => {},
+    });
+    assert.equal(result, false);
+    assert.match(said.at(-1)!, /^\nThe probe needs this machine first: OpenShell, OpenShell gateway, Claude Code\. Fix them, then run `harness setup` again\.$/);
+    assert.equal(said.some((line) => line.includes('The probe: everything an agent must not do')), false);
+    assert.equal(asked.some((question) => question.startsWith('Start the daemon')), false);
+    assert.equal(started, false);
   });
 });
 
@@ -123,11 +257,11 @@ describe('the setup commits only its files, and pushes only main', () => {
   it('commits the files it wrote, and nothing the owner had staged, then pushes main', async () => {
     const { dir, remote } = await project();
     mkdirSync(join(dir, 'harness'), { recursive: true });
-    writeFileSync(join(dir, 'harness', 'config.json'), '{}\n');
+    writeFileSync(join(dir, 'harness', 'config.json'), `${JSON.stringify({ harnessVersion: '0.6.0', project: { name: 'shop' } })}\n`);
     writeFileSync(join(dir, 'notes.txt'), 'work in progress\n');
     await runOk('git', ['-C', dir, 'add', 'notes.txt']);
     const o = owner(dir, ['y']);
-    await commitAndPush(o.options, ['harness/config.json', '.harness/setup.json']);
+    await commitAndPush(o.options);
     assert.deepEqual((await runOk('git', ['-C', dir, 'show', '--name-only', '--format=%s', 'HEAD'])).trim().split('\n'), ['Set up razzou-harness', '', 'harness/config.json']);
     assert.equal((await runOk('git', ['-C', dir, 'diff', '--cached', '--name-only'])).trim(), 'notes.txt', 'still staged, not committed');
     assert.equal(await head(remote, 'main'), await head(dir));
@@ -141,7 +275,7 @@ describe('the setup commits only its files, and pushes only main', () => {
     await runOk('git', ['-C', dir, 'switch', '--quiet', '-c', 'feature']);
     writeFileSync(join(dir, 'init.sh'), '#!/usr/bin/env bash\n');
     const o = owner(dir, ['y']);
-    await commitAndPush(o.options, ['init.sh']);
+    await commitAndPush(o.options);
     assert.match(o.asked[0]!, /^Commit 1 file on feature, as you\? The setup pushes only main/);
     assert.equal(await head(remote, 'main'), before, 'nothing pushed');
     assert.equal((await run('git', ['-C', dir, 'rev-parse', '--abbrev-ref', 'feature@{upstream}'])).code === 0, false, 'no upstream for the branch');
@@ -153,21 +287,63 @@ describe('the setup commits only its files, and pushes only main', () => {
     await runOk('git', ['-C', dir, 'remote', 'add', 'origin', '/nonexistent/repo.git']);
     writeFileSync(join(dir, 'init.sh'), '#!/usr/bin/env bash\n');
     const first = owner(dir, ['y']);
-    await commitAndPush(first.options, ['init.sh']);
+    await commitAndPush(first.options);
     assert.match(first.said.at(-1)!, /^committed, but the push was refused/);
 
     await runOk('git', ['init', '--quiet', '--bare', '--initial-branch=main', remote]);
     await runOk('git', ['-C', dir, 'remote', 'set-url', 'origin', remote]);
     const declined = owner(dir, ['n']);
-    await commitAndPush(declined.options, []);
+    await commitAndPush(declined.options);
     assert.match(declined.asked[0]!, /^main has the setup's commit, and origin's main doesn't yet\. Push main/);
     const again = owner(dir, ['y']);
-    await commitAndPush(again.options, []);
+    await commitAndPush(again.options);
     assert.equal(again.asked.length, 1, 'offered again');
     assert.equal(await head(remote, 'main'), await head(dir));
     const done = owner(dir, []);
-    await commitAndPush(done.options, []);
+    await commitAndPush(done.options);
     assert.deepEqual(done.asked, [], 'pushed: nothing to offer');
+  });
+
+  it("offers again the harness's files an earlier run wrote and didn't commit, and not the owner's edits", async () => {
+    const { dir } = await project();
+    mkdirSync(join(dir, 'iac', 'env'), { recursive: true });
+    writeFileSync(join(dir, 'init.sh'), '#!/usr/bin/env bash\n');
+    writeFileSync(join(dir, 'README.md'), '# shop, edited\n');
+    mkdirSync(join(dir, 'harness'));
+    writeFileSync(join(dir, 'harness', 'config.json'), JSON.stringify({
+      harnessVersion: '0.6.0', project: { name: 'shop' }, aws: { region: 'eu-west-1', provider: 'aws-view-shop' }, terraform: { dir: 'iac' },
+    }));
+    writeFileSync(join(dir, 'iac', 'env', 'staging.tfvars'), 'env = "staging"\n');
+    writeFileSync(join(dir, 'iac', 'main.tf'), '# the owner\'s, in progress\n');
+    const declined = owner(dir, ['n']);
+    await commitAndPush(declined.options);
+    assert.equal(declined.said[0], '\nTo commit on main: harness/config.json, iac/env/staging.tfvars, init.sh');
+    const again = owner(dir, ['y']);
+    await commitAndPush(again.options);
+    assert.match(again.asked[0]!, /^Commit and push 3 files to main, as you\? \[Y\/n\] $/);
+    const left = (await runOk('git', ['-C', dir, 'status', '--porcelain'])).split('\n').filter(Boolean).sort();
+    assert.deepEqual(left, [' M README.md', '?? iac/main.tf'], "the owner's edit and work stay out");
+  });
+
+  it('says how many other commits the push sends, and keeps the upstream the owner set', async () => {
+    const { dir, remote } = await project();
+    await runOk('git', ['-C', dir, 'commit', '--quiet', '--allow-empty', '-m', 'mine']);
+    await runOk('git', ['-C', dir, 'branch', '--quiet', '--set-upstream-to', 'origin/main']);
+    writeFileSync(join(dir, 'init.sh'), '#!/usr/bin/env bash\n');
+    const o = owner(dir, ['y']);
+    await commitAndPush(o.options);
+    assert.match(o.asked[0]!, /^Commit and push 1 file to main, as you\? The push also sends 1 other commit of main that origin doesn't have\./);
+    assert.equal(await head(remote, 'main'), await head(dir));
+  });
+
+  it('commits and pushes nothing while harness/config.json is one the schema refuses', async () => {
+    const { dir, remote } = await project();
+    mkdirSync(join(dir, 'harness'));
+    writeFileSync(join(dir, 'harness', 'config.json'), JSON.stringify({ harnessVersion: '0.6.0', project: { name: 'shop', repo: 'shop', bot: 'shop-harness[bot]' } }));
+    const before = await head(dir);
+    await assert.rejects(commitAndPush(owner(dir, ['y']).options), /harness\/config\.json is not valid, so nothing was committed or pushed:\n.*owner\/name/s);
+    assert.equal(await head(dir), before);
+    assert.equal(await head(remote, 'main'), before);
   });
 });
 
@@ -335,6 +511,31 @@ describe('harness recover', () => {
     assert.equal(notes[0], 'demo/P1: completed');
     assert.match(notes.at(-1)!, /^Nor what you set: the mode is Manual again .*the hours of your time .*the owner tasks you marked done are pending again/);
   });
+
+  it("records a plan whose pull request was closed, to go on from once it is reopened, and names an Architect's open pull request", async () => {
+    const projectDir = tempDir('project');
+    await createToyRepo(projectDir);
+    const fake = await FakeForge.create(projectDir);
+    await runOk('git', ['-C', projectDir, 'push', '--quiet', fake.remote, 'main:refs/heads/plan/demo/P1']);
+    fake.prs.push({ number: 1, branch: 'plan/demo/P1', title: 'P1', body: '', state: 'closed' });
+    fake.prs.push({ number: 2, branch: 'arch/demo', title: 'demo', body: '', state: 'open' });
+    const harnessDir = join(projectDir, '.harness');
+    const notes = await recover({ projectDir, harnessDir, forge: fake });
+    assert.equal(notes[0], 'demo/P1: PR #1 was closed without being merged. Reopen it on GitHub, and the daemon goes on from its branch.');
+    assert.equal(notes[1], "demo: the Architect's PR #2 (arch/demo) was open. Its session is gone: merge the PR on GitHub to build its design, or close it.");
+    const [event] = readFileSync(join(harnessDir, 'events.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    assert.deepEqual([event.type, event.payload.plans['demo/P1'].status, event.payload.plans['demo/P1'].pr.number], ['RECOVERED', 'pr_open', 1]);
+  });
+
+  it('refuses a .harness/ that holds a snapshot or the git mirror but no log: it is damaged, not lost', async () => {
+    const projectDir = tempDir('project');
+    await createToyRepo(projectDir);
+    const harnessDir = join(projectDir, '.harness');
+    mkdirSync(harnessDir);
+    writeFileSync(join(harnessDir, 'state.json'), '{}');
+    await assert.rejects(recover({ projectDir, harnessDir, forge: await FakeForge.create(projectDir) }), /has no event log, but holds state\.json: it isn't lost but damaged\. Move \.harness away/);
+    assert.equal(existsSync(join(harnessDir, 'events.jsonl')), false);
+  });
 });
 
 describe('the Terraform scaffold', () => {
@@ -344,9 +545,11 @@ describe('the Terraform scaffold', () => {
   it("writes what the bootstrap expects, as terraform fmt writes it, with the bucket's own encryption", () => {
     const dir = tempDir('scaffold');
     const written = writeTerraformScaffold(dir, LAYOUT, { ...values, github: { repo: 'acme/shop', ownerId: '42', repoId: '4242' } });
-    assert.deepEqual(written, ['iac/versions.tf', 'iac/backend-configs/staging.hcl', 'iac/env/staging.tfvars', 'iac/variables.tf', 'iac/providers.tf']);
+    assert.deepEqual(written, ['iac/versions.tf', 'iac/backend.tf', 'iac/backend-configs/staging.hcl', 'iac/env/staging.tfvars', 'iac/variables.tf', 'iac/providers.tf']);
     const read = (path: string) => readFileSync(join(dir, 'iac', path), 'utf8');
-    assert.match(read('versions.tf'), /required_version = ">= 1\.10"[\s\S]*source  = "hashicorp\/aws"\n      version = "~> 6\.65"[\s\S]*\n  backend "s3" \{\}\n\}\n$/);
+    assert.match(read('versions.tf'), /required_version = ">= 1\.10"[\s\S]*source  = "hashicorp\/aws"\n      version = "~> 6\.65"\n    \}\n  \}\n\}\n$/);
+    assert.match(read('backend.tf'), /^terraform \{\n[\s\S]*\n  backend "s3" \{\}\n\}\n$/);
+    assert.equal(terraformBackend(dir, 'iac').status, 'ok');
     assert.equal(read('backend-configs/staging.hcl'), [
       'bucket = "tf-state-staging-123456789012"',
       'key    = "staging/shop/terraform.tfstate"',
@@ -377,9 +580,29 @@ describe('the Terraform scaffold', () => {
     mkdirSync(join(dir, 'iac', 'env'), { recursive: true });
     writeFileSync(join(dir, 'iac', 'main.tf'), 'terraform {\n  backend "s3" {}\n}\n');
     writeFileSync(join(dir, 'iac', 'env', 'staging.tfvars'), 'mine = true\n');
-    assert.deepEqual(writeTerraformScaffold(dir, LAYOUT, values), ['iac/backend-configs/staging.hcl']);
+    assert.deepEqual(writeTerraformScaffold(dir, LAYOUT, values), ['iac/versions.tf', 'iac/backend-configs/staging.hcl'], 'no second backend block');
     assert.equal(readFileSync(join(dir, 'iac', 'env', 'staging.tfvars'), 'utf8'), 'mine = true\n');
     assert.deepEqual(writeTerraformScaffold(dir, LAYOUT, values), [], 'a second run writes nothing');
+  });
+
+  it("writes a backend block of its own into a folder that has none, and nothing the project declares already", () => {
+    const dir = tempDir('scaffold-nobackend');
+    mkdirSync(join(dir, 'iac'), { recursive: true });
+    const versions = 'terraform {\n  required_providers {\n    aws = { source = "hashicorp/aws" }\n  }\n}\n';
+    writeFileSync(join(dir, 'iac', 'versions.tf'), versions);
+    writeFileSync(join(dir, 'iac', 'main.tf'), 'provider "aws" {\n  region = var.aws_region\n}\n\nvariable "aws_region" {\n  type = string\n}\n');
+    assert.equal(terraformBackend(dir, 'iac').status, 'fail', 'the doctor sees the state would stay on the runner');
+    const written = writeTerraformScaffold(dir, LAYOUT, values);
+    assert.deepEqual(written, ['iac/backend.tf', 'iac/backend-configs/staging.hcl', 'iac/env/staging.tfvars', 'iac/variables.tf']);
+    assert.equal(readFileSync(join(dir, 'iac', 'versions.tf'), 'utf8'), versions);
+    assert.deepEqual(readFileSync(join(dir, 'iac', 'variables.tf'), 'utf8').match(/^variable "\w+"/gm), ['variable "env"', 'variable "aws_account_id"'], 'no second aws_region');
+    assert.equal(terraformBackend(dir, 'iac').status, 'ok');
+  });
+
+  it('writes a value holding a template sequence as the text it is', () => {
+    const dir = tempDir('scaffold-escape');
+    writeTerraformScaffold(dir, LAYOUT, { ...values, key: 'staging/${var.x}/%{if}/terraform.tfstate' });
+    assert.match(readFileSync(join(dir, 'iac', 'backend-configs', 'staging.hcl'), 'utf8'), /^key {4}= "staging\/\$\$\{var\.x\}\/%%\{if\}\/terraform\.tfstate"$/m);
   });
 
   it('leaves the repository variables out for a local project', () => {

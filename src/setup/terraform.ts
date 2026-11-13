@@ -19,15 +19,30 @@ export interface TerraformScaffold {
   github?: { repo: string; ownerId: string; repoId: string } | undefined;
 }
 
+/** Every file the scaffold may write, from the project's root. */
+export function scaffoldFiles(layout: TerraformLayout): string[] {
+  return ['versions.tf', 'backend.tf', 'variables.tf', 'providers.tf', layout.backendConfig, layout.varFile].map((path) => `${layout.dir}/${path}`);
+}
+
+/** The text of the folder's own `.tf` files, which Terraform reads as one module. */
+export function terraformSource(folder: string): string {
+  if (!existsSync(folder)) return '';
+  return readdirSync(folder).filter((f) => f.endsWith('.tf')).map((f) => readFileSync(join(folder, f), 'utf8')).join('\n');
+}
+
+/** Whether the module declares a block, like `backend "s3"` or `variable "env"`: a second one would be an error. */
+const declares = (source: string, block: string, label?: string) => new RegExp(`^\\s*${block}\\s+"${label ?? '[^"]+'}"`, 'm').test(source);
+
 /**
  * Writes the Terraform scaffold the bootstrap expects in the layout's folder: a partial
- * `backend "s3"` block in `versions.tf`, the backend config and the variables file, and the
- * variables and provider those values feed. Only what is missing is written: an existing
- * file, or a backend block in any of the folder's `.tf` files, is the project's own. The
- * backend config sets no encryption, so the bucket's default, the bootstrap's KMS key,
- * applies: `encrypt = true` without `kms_key_id` would replace it with SSE-S3. Every file
- * is as `terraform fmt` writes it, which CI checks. Returns the paths written, from the
- * project's root.
+ * `backend "s3"` block in a file of its own, `backend.tf`, the backend config and the
+ * variables file, and what those feed: the required provider, the variables and the AWS
+ * provider. Only what is missing is written: an existing file, or a block any of the
+ * folder's `.tf` files declares already, is the project's own; a second one would be an
+ * error. The backend config sets no encryption, so the bucket's default, the bootstrap's
+ * KMS key, applies: `encrypt = true` without `kms_key_id` would replace it with SSE-S3.
+ * Every file is as `terraform fmt` writes it, which CI checks. Returns the paths written,
+ * from the project's root.
  */
 export function writeTerraformScaffold(projectDir: string, layout: TerraformLayout, values: TerraformScaffold): string[] {
   const { dir } = layout;
@@ -40,10 +55,8 @@ export function writeTerraformScaffold(projectDir: string, layout: TerraformLayo
     written.push(`${dir}/${path}`);
     return true;
   };
-  const folder = join(projectDir, dir);
-  const hasBackend = existsSync(folder)
-    && readdirSync(folder).filter((f) => f.endsWith('.tf')).some((f) => /^\s*backend\s+"/m.test(readFileSync(join(folder, f), 'utf8')));
-  if (!hasBackend) {
+  const source = terraformSource(join(projectDir, dir));
+  if (!/^\s*required_providers\s*\{/m.test(source)) {
     write('versions.tf', [
       'terraform {',
       '  required_version = ">= 1.10"',
@@ -54,7 +67,14 @@ export function writeTerraformScaffold(projectDir: string, layout: TerraformLayo
       '      version = "~> 6.65"',
       '    }',
       '  }',
+      '}',
       '',
+    ].join('\n'));
+  }
+  // Without a backend block, CI's `terraform init -backend-config=...` only warns, and the state stays on the runner.
+  if (!declares(source, 'backend')) {
+    write('backend.tf', [
+      'terraform {',
       `  # Partial configuration: the values are in ${layout.backendConfig}, for`,
       `  #   terraform init -backend-config=${layout.backendConfig}`,
       '  backend "s3" {}',
@@ -88,18 +108,26 @@ export function writeTerraformScaffold(projectDir: string, layout: TerraformLayo
   ].join('\n');
   // The variables follow the values: a tfvars file of the project's own sets its own.
   if (write(layout.varFile, tfvars)) {
-    write('variables.tf', variables.map(([name, , description]) => [
-      `variable "${name}" {`,
-      ...assignments([['description', description], ['type', 'string']], ['type']).map((line) => `  ${line}`),
-      '}',
-    ].join('\n')).join('\n\n') + '\n');
-    write('providers.tf', ['provider "aws" {', '  region = var.aws_region', '}', ''].join('\n'));
+    const undeclared = variables.filter(([name]) => !declares(source, 'variable', name));
+    if (undeclared.length > 0) {
+      write('variables.tf', undeclared.map(([name, , description]) => [
+        `variable "${name}" {`,
+        ...assignments([['description', description], ['type', 'string']], ['type']).map((line) => `  ${line}`),
+        '}',
+      ].join('\n')).join('\n\n') + '\n');
+    }
+    if (!declares(source, 'provider', 'aws')) write('providers.tf', ['provider "aws" {', '  region = var.aws_region', '}', ''].join('\n'));
   }
   return written;
 }
 
-/** `name = "value"` lines with their equals signs aligned, as `terraform fmt` aligns them; `bare` names take an expression, unquoted. */
+/**
+ * `name = "value"` lines with their equals signs aligned, as `terraform fmt` aligns them;
+ * `bare` names take an expression, unquoted. In a quoted value, `${` and `%{` would start
+ * a template: they are escaped, so a value is always the text it says.
+ */
 function assignments(pairs: Array<[string, string]>, bare: string[] = []): string[] {
   const width = Math.max(...pairs.map(([name]) => name.length));
-  return pairs.map(([name, value]) => `${name.padEnd(width)} = ${bare.includes(name) ? value : JSON.stringify(value)}`);
+  const quoted = (value: string) => JSON.stringify(value).replace(/([$%])\{/g, '$1$1{');
+  return pairs.map(([name, value]) => `${name.padEnd(width)} = ${bare.includes(name) ? value : quoted(value)}`);
 }

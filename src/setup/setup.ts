@@ -1,14 +1,15 @@
 import { basename, join, resolve } from 'node:path';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { prettifyError, type z } from 'zod';
 import { computeLock, directoryReader } from '../ci/harness-ci.ts';
+import { runningDaemon } from '../daemon/main.ts';
 import { ConfigSchema, requiredChecks, type Config } from '../design/schemas.ts';
 import { configDir, loadAppCredentials } from '../github/app.ts';
 import { applyRepositoryRules, checkApp, createApp, installCi, type RulesetOptions } from '../github/setup.ts';
-import type { Mode, State } from '../state/state.ts';
 import { run, sha256 } from '../util.ts';
-import { doctor, granted, repositorySecret, type Check } from './doctor.ts';
-import { appBot, githubRepo, init } from './init.ts';
-import { writeTerraformScaffold, type TerraformLayout, type TerraformScaffold } from './terraform.ts';
+import { doctor, granted, MACHINE_CHECKS, projectMode, repositorySecret, type Check } from './doctor.ts';
+import { appBot, checkedConfig, githubRepo, HARNESS_FILES, init, projectName } from './init.ts';
+import { scaffoldFiles, writeTerraformScaffold, type TerraformLayout, type TerraformScaffold } from './terraform.ts';
 
 /**
  * `harness setup` (proposal v4 §4): the doctor with hands. It walks the setup in order,
@@ -57,7 +58,8 @@ export function fixFor(check: Check): Fix | undefined {
     case 'GitHub App':
       if (check.detail.startsWith('no GitHub App in')) return { kind: 'create-app' };
       if (check.detail.includes("can't write commit statuses")) return { kind: 'app-statuses' };
-      return { kind: 'install-app' };
+      // Only GitHub's 404 says the App isn't installed there: offline, the install page would wait for nothing.
+      return /\b404\b/.test(check.detail) ? { kind: 'install-app' } : undefined;
     case 'ruleset':
       // The ruleset applies to the default branch: making main the default is the owner's.
       return check.detail.includes('default branch') ? undefined : { kind: 'apply-rules' };
@@ -82,20 +84,46 @@ export function awsProviderName(projectDir: string, repo?: string): string {
 const VIEW_ROLE = /^arn:aws:iam::\d{12}:role\/harness-[\w+=,.@-]+-view$/;
 const ROLE = /^arn:aws:iam::\d{12}:role\/[\w+=,.@/-]+$/;
 
-export async function setup(options: SetupOptions): Promise<void> {
+/** The schema's own fields, so that an answer is checked as the config will be. */
+const REPO_FIELD = ConfigSchema.shape.project.shape.repo.unwrap();
+const REGION_FIELD = ConfigSchema.shape.aws.unwrap().shape.region;
+
+/** What a schema field finds wrong with an answer, if anything. */
+const schemaProblem = (field: z.ZodType) => (answer: string): string | undefined => {
+  const result = field.safeParse(answer);
+  return result.success ? undefined : (result.error.issues[0]?.message ?? 'not valid');
+};
+
+/**
+ * Asks until the answer is empty, which skips the question, or `problem` finds nothing
+ * wrong with it: a value the schema refuses would be written to GitHub and the files, and
+ * stop every later run.
+ */
+async function askValid(options: Pick<SetupOptions, 'ask' | 'say'>, question: string, problem: (answer: string) => string | undefined): Promise<string> {
+  for (;;) {
+    const answer = (await options.ask(question)).trim();
+    const wrong = answer ? problem(answer) : undefined;
+    if (!wrong) return answer;
+    options.say(`"${answer}" won't do: ${wrong}. Type it again, or Enter to skip.`);
+  }
+}
+
+/** Runs the setup; false when it ends with problems left. */
+export async function setup(options: SetupOptions): Promise<boolean> {
   const { projectDir, say } = options;
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
 
   await ghLogin(options);
-  const scaffolded = await scaffold(options, sleep);
+  await scaffold(options, sleep);
   const settings = await askSettings(options);
-  await commitAndPush(options, [...scaffolded, ...settings.written]);
+  await commitAndPush(options);
 
   const config = loadConfig(projectDir);
   if (!config) throw new Error('harness/config.json is missing after init: run `harness setup` again');
   let buildImages = false;
   // An optional secret skipped in one round isn't asked for again in the next.
   const skipped = new Set<string>();
+  let last: Check[] = [];
   for (let round = 1; round <= 3; round++) {
     say(round === 1 ? '\nChecking this machine and the project:' : '\nChecking again:');
     const checks = await doctor({
@@ -103,6 +131,7 @@ export async function setup(options: SetupOptions): Promise<void> {
       skipped, askSecret: options.askSecret,
       ...(settings.viewRole ? { awsViewRole: settings.viewRole } : {}), report: (c) => say(line(c)),
     });
+    last = checks;
     buildImages = false;
     let again = false;
     for (const check of checks) {
@@ -118,15 +147,25 @@ export async function setup(options: SetupOptions): Promise<void> {
     if (!again) break;
   }
 
+  // The probe runs in sandboxes: while the machine can't make them, it would only fail again.
+  const machineFailed = last.filter((c) => c.status === 'fail' && MACHINE_CHECKS.includes(c.name));
+  if (machineFailed.length > 0) {
+    say(`\nThe probe needs this machine first: ${[...new Set(machineFailed.map((c) => c.name))].join(', ')}. Fix ${machineFailed.length === 1 ? 'it' : 'them'}, then run \`harness setup\` again.`);
+    return false;
+  }
   say('\nThe probe: everything an agent must not do, tried.');
   const probe = await doctor({ projectDir, packageDir: options.packageDir, version: options.version, probe: true, buildImages: false, interactive: false, report: (c) => { if (c.name.startsWith('probe')) say(line(c)); } });
+  // A failed check, such as main without the config, would stop the daemon: it isn't offered then.
   const failed = probe.filter((c) => c.status === 'fail');
   if (failed.length > 0) {
     say(`\n${failed.length} problem${failed.length === 1 ? '' : 's'} left: ${failed.map((c) => c.name).join(', ')}. Fix them, then run \`harness setup\` again.`);
-    return;
+    return false;
   }
   say('\nAll good.');
-  if (!/^n/i.test(await options.ask('Start the daemon now? [Y/n] '))) await options.up();
+  const running = runningDaemon(join(projectDir, '.harness'));
+  if (running) say(`A daemon already runs for this project (pid ${running.pid}): \`harness down\`, then \`harness up\`, starts it on what the setup changed.`);
+  else if (!/^n/i.test(await options.ask('Start the daemon now? [Y/n] '))) await options.up();
+  return true;
 }
 
 /** gh must be logged in as an admin of the repository: it applies the rules and creates the repository. */
@@ -159,14 +198,19 @@ async function scaffold(options: SetupOptions, sleep: (ms: number) => Promise<vo
     return [...written, ...(await linkRepo(options, sleep))];
   }
   const top = await run('git', ['-C', projectDir, 'rev-parse', '--show-toplevel']).catch(() => undefined);
+  // Checked before anything is created on GitHub: init writes only at the top of a repository.
+  if (top?.code === 0 && realpathSync(top.stdout.trim()) !== realpathSync(projectDir)) {
+    throw new Error(`${projectDir} is inside the repository ${top.stdout.trim()}, not at its top: run \`harness setup\` there, or in a folder of its own`);
+  }
   if (top?.code !== 0) {
     await run('git', ['init', '--quiet', '--initial-branch=main', projectDir]);
     say('git: a new repository, on main.');
   }
+  if (options.repo && schemaProblem(REPO_FIELD)(options.repo)) throw new Error(`--repo ${options.repo}: ${schemaProblem(REPO_FIELD)(options.repo)}, like acme/shop`);
   let repo = options.repo ?? githubRepo((await run('git', ['-C', projectDir, 'remote', 'get-url', 'origin'])).stdout.trim());
   if (!repo) {
-    const name = basename(projectDir).toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '') || 'project';
-    const answer = (await options.ask(`No GitHub remote. Create a private repository on GitHub? Type org/name (like acme/${name}), or Enter to stay local: `)).trim();
+    const name = projectName(projectDir);
+    const answer = await askValid(options, `No GitHub remote. Create a private repository on GitHub? Type org/name (like acme/${name}), or Enter to stay local: `, schemaProblem(REPO_FIELD));
     if (answer) {
       const created = await run('gh', ['repo', 'create', answer, '--private', `--source=${projectDir}`, '--remote=origin']);
       if (created.code !== 0) throw new Error(`gh repo create: ${(created.stderr || created.stdout).trim()}`);
@@ -199,7 +243,7 @@ export async function linkRepo(options: SetupOptions, sleep: (ms: number) => Pro
   const bot = appBot();
   if (!bot) return [];
   config.project = { ...config.project, repo, bot };
-  writeFileSync(configFile, `${JSON.stringify(config, null, 2)}\n`);
+  writeFileSync(configFile, `${JSON.stringify(checkedConfig(config), null, 2)}\n`);
   await writeLock(projectDir);
   say(`harness/config.json: the project is ${repo} on GitHub, and the App's bot ${bot}.`);
   return ['harness/config.json', 'harness/lock.json'];
@@ -234,13 +278,13 @@ async function ownerLogin(options: SetupOptions): Promise<string | undefined> {
 }
 
 /**
- * The questions (v4 §4), asked once: AWS, Infracost's token once there is Terraform, and
- * the owner's hours. The network needs none: a project gets every bundle unless its config
- * lists fewer. What they settle goes into harness/config.json, with the lock that hashes
- * it, into .harness/setup.json for the daemon, and the token into a repository secret.
- * The view role's ARN goes to the doctor, which creates the AWS provider with it.
+ * The questions (v4 §4), asked once: AWS, and Infracost's token once there is Terraform.
+ * The network needs none: a project gets every bundle unless its config lists fewer. The
+ * owner's hours belong to a module, and none exists yet. What they settle goes into
+ * harness/config.json, with the lock that hashes it, and the token into a repository
+ * secret. The view role's ARN goes to the doctor, which creates the AWS provider with it.
  */
-async function askSettings(options: SetupOptions): Promise<{ written: string[]; viewRole?: string }> {
+export async function askSettings(options: SetupOptions): Promise<{ written: string[]; viewRole?: string }> {
   const { projectDir, say, ask } = options;
   const configFile = join(projectDir, 'harness', 'config.json');
   const config = JSON.parse(readFileSync(configFile, 'utf8')) as Record<string, any>;
@@ -251,15 +295,20 @@ async function askSettings(options: SetupOptions): Promise<{ written: string[]; 
 
   if (!config.aws && /^y/i.test(await ask('Does this project deploy to AWS with Terraform? [y/N] '))) {
     say('The roles come from your bootstrap (see the README\'s AWS section); the key is asked for later, at a hidden prompt.');
-    const region = (await ask('AWS region (like eu-west-1): ')).trim();
-    const view = (await ask("The agents' view role ARN (arn:aws:iam::<account>:role/harness-<project>-view): ")).trim();
-    const plan = (await ask('The CI plan role ARN: ')).trim();
-    const apply = (await ask('The CI apply role ARN: ')).trim();
-    if (!region || !VIEW_ROLE.test(view) || !ROLE.test(plan) || !ROLE.test(apply)) {
-      say('AWS skipped: a value is missing or malformed. Add `aws` and `terraform` to harness/config.json by hand, or run `harness setup` again.');
+    const role = (pattern: RegExp, like: string) => (answer: string) => (pattern.test(answer) ? undefined : `a role ARN, like ${like}`);
+    const region = await askValid(options, 'AWS region (like eu-west-1): ', schemaProblem(REGION_FIELD));
+    const view = region && await askValid(options, "The agents' view role ARN (arn:aws:iam::<account>:role/harness-<project>-view): ", role(VIEW_ROLE, 'arn:aws:iam::123456789012:role/harness-shop-view'));
+    const plan = view && await askValid(options, 'The CI plan role ARN: ', role(ROLE, 'arn:aws:iam::123456789012:role/harness-shop-plan'));
+    const apply = plan && await askValid(options, 'The CI apply role ARN: ', role(ROLE, 'arn:aws:iam::123456789012:role/harness-shop-apply'));
+    if (!apply) {
+      say('AWS skipped: a value is missing. Add `aws` and `terraform` to harness/config.json by hand, or run `harness setup` again.');
     } else {
-      config.aws = { region, provider: awsProviderName(projectDir, config.project?.repo), services: ['all'] };
-      config.terraform = { dir: 'iac', backendConfig: 'backend-configs/staging.hcl', varFile: 'env/staging.tfvars' };
+      // The whole config is checked before GitHub's variables or any file are written.
+      const aws = { region, provider: awsProviderName(projectDir, config.project?.repo), services: ['all'] };
+      const terraform = { dir: 'iac', backendConfig: 'backend-configs/staging.hcl', varFile: 'env/staging.tfvars' };
+      checkedConfig({ ...config, aws, terraform });
+      config.aws = aws;
+      config.terraform = terraform;
       changed = true;
       viewRole = view;
       const repo = config.project?.repo as string | undefined;
@@ -289,24 +338,9 @@ async function askSettings(options: SetupOptions): Promise<{ written: string[]; 
   if (config.terraform && config.project?.repo) await infracostKey(options, config.project.repo);
 
   if (changed) {
-    writeFileSync(configFile, `${JSON.stringify(config, null, 2)}\n`);
+    writeFileSync(configFile, `${JSON.stringify(checkedConfig(config), null, 2)}\n`);
     await writeLock(projectDir);
     written.push('harness/config.json', 'harness/lock.json');
-  }
-
-  // setup.json may hold a mode `harness mode` recorded: the hours join it.
-  const pendingFile = join(projectDir, '.harness', 'setup.json');
-  const pending = existsSync(pendingFile) ? (JSON.parse(readFileSync(pendingFile, 'utf8')) as Record<string, unknown>) : {};
-  const stateFile = join(projectDir, '.harness', 'state.json');
-  const budgeted = existsSync(stateFile) && (JSON.parse(readFileSync(stateFile, 'utf8')) as State).budgets?.ownerHours !== undefined;
-  if (pending.ownerHours === undefined && !budgeted) {
-    const answer = (await ask('How many hours of your time may this whole project take? The Architect designs your actions within it. (Enter to skip) ')).trim();
-    const hours = Number(answer);
-    if (answer && Number.isFinite(hours) && hours > 0) {
-      mkdirSync(join(projectDir, '.harness'), { recursive: true });
-      writeFileSync(pendingFile, `${JSON.stringify({ ...pending, ownerHours: hours }, null, 2)}\n`);
-      say(`${hours} hours: the daemon records it when it starts.`);
-    }
   }
   return { written, ...(viewRole ? { viewRole } : {}) };
 }
@@ -377,22 +411,32 @@ async function configureGitHubForAws(options: SetupOptions, repo: string, aws: {
 const SETUP_COMMIT = 'Set up razzou-harness';
 
 /**
- * The files the setup wrote, committed with the owner's git once they agree, and pushed
- * to main: before the ruleset, which would refuse the push. The commit holds those files
- * only, and only main is pushed. A setup commit on main that origin hasn't, after a push
- * refused or declined, is offered again.
+ * The harness's files, committed with the owner's git once they agree, and pushed to main:
+ * before the ruleset, which would refuse the push. Every run offers whichever of them git
+ * shows untracked or modified, whichever run wrote them: a commit declined or refused once
+ * is offered again. The commit holds those files only, and only main is pushed. A setup
+ * commit on main that origin hasn't, after a push refused or declined, is offered again.
  */
-export async function commitAndPush(options: Pick<SetupOptions, 'projectDir' | 'say' | 'ask'>, paths: string[]): Promise<void> {
+export async function commitAndPush(options: Pick<SetupOptions, 'projectDir' | 'say' | 'ask'>): Promise<void> {
   const { projectDir, say } = options;
   const git = (args: string[]) => run('git', ['-C', projectDir, ...args]);
-  const tracked = paths.filter((p) => !p.startsWith('.harness/'));
-  const status = tracked.length > 0 ? (await git(['status', '--porcelain', '--', ...tracked])).stdout : '';
-  const changed = status.split('\n').filter((l) => l.trim() !== '').map((l) => l.slice(3));
+  const status = (await git(['status', '--porcelain', '--untracked-files=all', '--', ...harnessFiles(projectDir)])).stdout;
+  const changed = status.split('\n').filter((l) => l.trim() !== '')
+    // init writes these only where they are missing: an edit to one is the owner's own.
+    .filter((l) => l.startsWith('??') || !OWNERS_ONCE_WRITTEN.includes(l.slice(3)))
+    .map((l) => l.slice(3));
+  const branch = (await git(['symbolic-ref', '--quiet', '--short', 'HEAD'])).stdout.trim() || 'a detached HEAD';
+  const pushing = changed.length > 0 ? branch === 'main' : await unpushedSetup(projectDir);
+  if (changed.length === 0 && !pushing) return;
+  // A config the schema refuses, once on main, stops every later run and the daemon at the same error.
+  const problem = configProblem(projectDir);
+  if (problem) throw new Error(`harness/config.json is not valid, so nothing was committed or pushed:\n${problem}\nFix it, then run \`harness setup\` again.`);
+  const others = pushing ? await unpushedCommits(projectDir) : 0;
+  const alsoSends = others > 0 ? ` The push also sends ${others} other commit${others === 1 ? '' : 's'} of main that origin doesn't have.` : '';
   if (changed.length > 0) {
-    const branch = (await git(['symbolic-ref', '--quiet', '--short', 'HEAD'])).stdout.trim() || 'a detached HEAD';
     const files = `${changed.length} file${changed.length === 1 ? '' : 's'}`;
     say(`\nTo commit on ${branch}: ${changed.join(', ')}`);
-    const question = branch === 'main' ? `Commit and push ${files} to main, as you? [Y/n] ` : `Commit ${files} on ${branch}, as you? The setup pushes only main. [Y/n] `;
+    const question = branch === 'main' ? `Commit and push ${files} to main, as you?${alsoSends} [Y/n] ` : `Commit ${files} on ${branch}, as you? The setup pushes only main. [Y/n] `;
     if (/^n/i.test(await options.ask(question))) return say('Commit them, and push them to main yourself before `harness up`.');
     const add = await git(['add', '--', ...changed]);
     if (add.code !== 0) throw new Error(`git add: ${add.stderr.trim()}`);
@@ -403,16 +447,53 @@ export async function commitAndPush(options: Pick<SetupOptions, 'projectDir' | '
       const sha = (await git(['rev-parse', '--short', 'HEAD'])).stdout.trim();
       return say(`committed on ${branch} (${sha}), not pushed: the setup pushes only main. Bring the commit to main (\`git switch main && git cherry-pick ${sha}\`, or \`git branch -m main\` if ${branch} is your main line), then run \`harness setup\` again: it offers the push.`);
     }
-  } else if (!(await unpushedSetup(projectDir))) {
-    return;
-  } else if (/^n/i.test(await options.ask("main has the setup's commit, and origin's main doesn't yet. Push main, as you? [Y/n] "))) {
+  } else if (/^n/i.test(await options.ask(`main has the setup's commit, and origin's main doesn't yet. Push main, as you?${others > 1 ? ` The push sends ${others} commits of main that origin doesn't have.` : ''} [Y/n] `))) {
     return say('Push main yourself before `harness up`.');
   }
   const committed = changed.length > 0;
   if ((await git(['remote', 'get-url', 'origin'])).code !== 0) return say('committed; no origin to push to.');
-  const push = await git(['push', '--quiet', '-u', 'origin', 'main']);
+  // An upstream the owner set stays as it is.
+  const upstream = (await git(['rev-parse', '--abbrev-ref', '--quiet', 'main@{upstream}'])).code === 0;
+  const push = await git(['push', '--quiet', ...(upstream ? [] : ['-u']), 'origin', 'main']);
   if (push.code !== 0) say(`${committed ? 'committed, but ' : ''}the push was refused: ${push.stderr.trim()}\nRun \`harness setup\` again to retry, or push main yourself.`);
   else say(committed ? 'committed and pushed to main.' : 'pushed to main.');
+}
+
+/** The files the setup offers to commit: the harness's own, and the Terraform scaffold of the config's layout. */
+function harnessFiles(projectDir: string): string[] {
+  const configFile = join(projectDir, 'harness', 'config.json');
+  let layout: TerraformLayout | undefined;
+  try {
+    layout = ConfigSchema.parse(JSON.parse(readFileSync(configFile, 'utf8'))).terraform;
+  } catch {
+    layout = undefined;
+  }
+  return [...HARNESS_FILES, ...OWNERS_ONCE_WRITTEN, ...(layout ? scaffoldFiles(layout) : [])];
+}
+
+/** The files init writes for the owner to make their own. */
+const OWNERS_ONCE_WRITTEN = ['README.md', 'ARCHITECTURE.md'];
+
+/** What the schema refuses in harness/config.json, if the file exists. */
+function configProblem(projectDir: string): string | undefined {
+  const file = join(projectDir, 'harness', 'config.json');
+  if (!existsSync(file)) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(file, 'utf8'));
+  } catch (error) {
+    return (error as Error).message;
+  }
+  const result = ConfigSchema.safeParse(parsed);
+  return result.success ? undefined : prettifyError(result.error);
+}
+
+/** How many commits of main origin's main hasn't, as of the last fetch or push: all of main, when origin's is unknown. */
+async function unpushedCommits(projectDir: string): Promise<number> {
+  const git = (args: string[]) => run('git', ['-C', projectDir, ...args]);
+  const known = (await git(['rev-parse', '--verify', '--quiet', 'refs/remotes/origin/main'])).code === 0;
+  const count = await git(['rev-list', '--count', 'refs/heads/main', ...(known ? ['^refs/remotes/origin/main'] : [])]);
+  return count.code === 0 ? Number(count.stdout.trim()) : 0;
 }
 
 /** Whether local main has a setup commit that origin's main hasn't, as of the last fetch or push. */
@@ -467,8 +548,7 @@ async function applyFix(options: SetupOptions, config: Config, fix: Fix, sleep: 
     }
     case 'apply-rules': {
       if (!repo) return false;
-      const stateFile = join(projectDir, '.harness', 'state.json');
-      const mode: Mode = existsSync(stateFile) ? ((JSON.parse(readFileSync(stateFile, 'utf8')) as State).mode ?? 'manual') : 'manual';
+      const mode = projectMode(projectDir);
       let ruleset: RulesetOptions = { mode };
       if (mode === 'swarm') {
         let appId: number | undefined;
