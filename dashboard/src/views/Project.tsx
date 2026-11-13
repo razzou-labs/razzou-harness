@@ -2,7 +2,7 @@ import { QBtn, QBtnToggle, QCard, QCardSection, QInput, QLinearProgress, QSepara
 import { defineComponent, onUnmounted, ref, watchEffect, type PropType, type Ref } from 'vue';
 import { post, type Attempt, type DashboardState, type FeatureState, type OwnerTime, type PlanState, type State, type SubscriptionUsage, type UsageLimit } from '../api.ts';
 import { Dependencies } from '../components/Dependencies.tsx';
-import { duration, modelName } from '../format.ts';
+import { clock, duration, modelName } from '../format.ts';
 import { Action, Badge, Fold, GithubLink, text } from '../ui.tsx';
 import { moduleCompleted } from '../../../src/dashboard/needs.ts';
 import { Proposal } from './NeedsYou.tsx';
@@ -330,7 +330,7 @@ const Subscription = defineComponent({
             );
           })}
           <p class="text-caption text-muted">
-            Reported by an agent's model call at {new Date(usage.at).toLocaleTimeString()}. In Swarm no attempt starts at or above {ceiling === null ? 'the ceiling, which is off' : `${ceiling}%`}; the pipeline waits for the window to reset.
+            Reported by an agent's model call at {clock(usage.at)}. In Swarm no attempt starts at or above {ceiling === null ? 'the ceiling, which is off' : `${ceiling}%`}; the pipeline waits for the window to reset.
           </p>
         </>
       );
@@ -399,8 +399,10 @@ const NewModule = defineComponent({
     const id = ref('');
     const title = ref('');
     const error = ref<string>();
+    const busy = ref(false);
     const start = async () => {
-      const result = await post('/api/modules', { id: id.value.trim(), title: title.value });
+      busy.value = true;
+      const result = await post('/api/modules', { id: id.value.trim(), title: title.value }).finally(() => (busy.value = false));
       error.value = result.done ? undefined : result.error;
       if (result.done) {
         id.value = '';
@@ -414,7 +416,7 @@ const NewModule = defineComponent({
           <div class="row items-center q-gutter-sm">
             <QInput {...text(id)} dense outlined label="id, like orders" style="width: 180px" />
             <QInput {...text(title)} dense outlined label="what it is for" class="col" style="min-width: 240px; max-width: 480px" />
-            <QBtn label="Start" color="primary" noCaps unelevated disable={!id.value.trim()} onClick={() => void start()} />
+            <QBtn label="Start" color="primary" noCaps unelevated loading={busy.value} disable={!id.value.trim()} onClick={() => void start()} />
             {error.value && <span class="text-negative text-caption">{error.value}</span>}
           </div>
           <p class="text-caption text-muted q-mt-sm">An Architect starts in its own sandbox; talk to it in the Agents view.</p>

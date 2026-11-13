@@ -256,7 +256,7 @@ const Deadline = defineComponent({
       const share = Math.min(1, (props.now - props.start) / Math.max(1, props.deadline - props.start));
       return (
         <div class="q-mt-xs">
-          <QTooltip>deadline {new Date(props.deadline).toLocaleTimeString()}</QTooltip>
+          <QTooltip>deadline {clock(props.deadline)}</QTooltip>
           <QLinearProgress value={share} color={share > 0.8 ? 'warning' : 'primary'} rounded size="6px" />
           <div class="text-caption text-muted">{duration(props.now - props.start)} of {duration(props.deadline - props.start)}</div>
         </div>

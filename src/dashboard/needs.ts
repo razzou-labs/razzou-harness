@@ -73,7 +73,9 @@ export function listNeeds({ state, design }: { state: State; design: Design }): 
   for (const plan of open) {
     // Main conflicts with the branch: GitHub can't merge the PR, and the plan's Manager has the conflict resolved first.
     if (plan.mainConflict) continue;
-    // In Swarm, the merge policy may leave a PR to the owner, with its reason (v3 §3.2).
+    // In Swarm, the merge policy may leave a PR to the owner, with its reason (v3 §3.2): for the head it was left at.
+    // A head pushed since is the policy's to look at again.
+    if (plan.leftToOwner && plan.leftToOwner.head !== (plan.pushed ?? plan.head)) continue;
     if (plan.leftToOwner) needs.push({ kind: 'left', key: `left:${plan.module}/${plan.plan}`, plan });
     else if (plan.status === 'ready_to_merge') needs.push({ kind: 'merge', key: `merge:${plan.module}/${plan.plan}`, plan });
   }
@@ -210,7 +212,7 @@ export function needTitle(need: Need): string {
  * What the daemon knows of a card that advice about it rests on: a later print that
  * differs means the card isn't what it was. A card's own text is one with its key, so it
  * isn't repeated here; what moves under a card is: a pull request's head, a gate's
- * status, the plans its work builds on and how they stand.
+ * status and its text on main, the plans its work builds on that failed.
  */
 export function needPrint(need: Need): string {
   const facts = (): unknown => {
@@ -224,10 +226,22 @@ export function needPrint(need: Need): string {
       case 'left': return [need.plan.leftToOwner?.head ?? null, need.plan.leftToOwner?.reason ?? null];
       case 'merge': return [need.plan.pushed ?? need.plan.head];
       case 'escalated': return [need.feature.attempts.length, need.feature.escalation ?? null];
-      case 'action': return [need.status?.status ?? 'pending', need.status?.reason ?? null, need.holds, need.waits.map((w) => `${w.plan} ${w.status}`)];
+      // A gate's check running is no change to the card; a gate rewritten on main is. A plan it builds on
+      // matters once it failed: until then, its way to complete is no news.
+      case 'action': return [
+        need.status?.status === 'verifying' ? 'pending' : need.status?.status ?? 'pending', need.status?.reason ?? null,
+        hash(JSON.stringify([need.action.when, need.action.instructions, need.action.verify])), need.holds, need.waits.filter((w) => w.failed).map((w) => w.plan),
+      ];
     }
   };
   return JSON.stringify(facts());
+}
+
+/** FNV-1a, 32 bits, in hex: short, and the same in the browser and in the daemon. */
+function hash(text: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) h = Math.imul(h ^ text.charCodeAt(i), 0x01000193);
+  return (h >>> 0).toString(16).padStart(8, '0');
 }
 
 /**

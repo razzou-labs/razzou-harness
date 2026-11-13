@@ -5,7 +5,15 @@ export function refText(ref?: { module: string; plan?: string; feature?: string;
   return [ref.module, ref.plan, ref.feature].filter(Boolean).join('/') + (ref.attempt ? ` #${ref.attempt}` : '');
 }
 
-export const clock = (ts: string) => new Date(ts).toLocaleTimeString();
+/**
+ * When something happened or will: the time alone today, the day and the time on another
+ * day, as a weekly limit's reset is days away.
+ */
+export function clock(ts: string | number, now = Date.now()): string {
+  const at = new Date(ts);
+  if (at.toDateString() === new Date(now).toDateString()) return at.toLocaleTimeString();
+  return at.toLocaleString(undefined, { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
 
 export function duration(ms: number): string {
   const s = Math.max(0, Math.round(ms / 1000));
