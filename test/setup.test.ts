@@ -511,6 +511,31 @@ describe('harness recover', () => {
     assert.equal(notes[0], 'demo/P1: completed');
     assert.match(notes.at(-1)!, /^Nor what you set: the mode is Manual again .*the hours of your time .*the owner tasks you marked done are pending again/);
   });
+
+  it("records a plan whose pull request was closed, to go on from once it is reopened, and names an Architect's open pull request", async () => {
+    const projectDir = tempDir('project');
+    await createToyRepo(projectDir);
+    const fake = await FakeForge.create(projectDir);
+    await runOk('git', ['-C', projectDir, 'push', '--quiet', fake.remote, 'main:refs/heads/plan/demo/P1']);
+    fake.prs.push({ number: 1, branch: 'plan/demo/P1', title: 'P1', body: '', state: 'closed' });
+    fake.prs.push({ number: 2, branch: 'arch/demo', title: 'demo', body: '', state: 'open' });
+    const harnessDir = join(projectDir, '.harness');
+    const notes = await recover({ projectDir, harnessDir, forge: fake });
+    assert.equal(notes[0], 'demo/P1: PR #1 was closed without being merged. Reopen it on GitHub, and the daemon goes on from its branch.');
+    assert.equal(notes[1], "demo: the Architect's PR #2 (arch/demo) was open. Its session is gone: merge the PR on GitHub to build its design, or close it.");
+    const [event] = readFileSync(join(harnessDir, 'events.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    assert.deepEqual([event.type, event.payload.plans['demo/P1'].status, event.payload.plans['demo/P1'].pr.number], ['RECOVERED', 'pr_open', 1]);
+  });
+
+  it('refuses a .harness/ that holds a snapshot or the git mirror but no log: it is damaged, not lost', async () => {
+    const projectDir = tempDir('project');
+    await createToyRepo(projectDir);
+    const harnessDir = join(projectDir, '.harness');
+    mkdirSync(harnessDir);
+    writeFileSync(join(harnessDir, 'state.json'), '{}');
+    await assert.rejects(recover({ projectDir, harnessDir, forge: await FakeForge.create(projectDir) }), /has no event log, but holds state\.json: it isn't lost but damaged\. Move \.harness away/);
+    assert.equal(existsSync(join(harnessDir, 'events.jsonl')), false);
+  });
 });
 
 describe('the Terraform scaffold', () => {
