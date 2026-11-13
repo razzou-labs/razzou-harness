@@ -344,6 +344,17 @@ export class Orchestrator {
     return true;
   }
 
+  /**
+   * The owner's "Look again now" on a pause that only waits to look again: lifted as the
+   * daemon lifts it at its end, so none of what a resume sets off happens.
+   */
+  lookAgain(): boolean {
+    if (!this.state.pipeline.paused?.retry) return false;
+    this.record({ type: 'PIPELINE_RESUMED', payload: { auto: true } });
+    this.kick();
+    return true;
+  }
+
   /** The owner switches between Manual and Swarm (v3 §2.1). Running attempts finish under the rules they started with. */
   setMode(mode: Mode): boolean {
     if (this.state.mode === mode) return false;

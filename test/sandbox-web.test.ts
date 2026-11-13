@@ -196,6 +196,24 @@ describe('the OpenShell driver', () => {
     assert.equal(dropped, 1);
   });
 
+  it('says a sandbox is missing only when the gateway says so, and throws when the gateway does not answer', async () => {
+    const answering = (script: string) => {
+      const bin = join(tempDir('openshell'), 'openshell');
+      writeFileSync(bin, `#!/bin/sh\n${script}\n`, { mode: 0o755 });
+      return new OpenShellDriver(bin);
+    };
+    // OpenShell 0.1.7's two answers with exit code 1.
+    const notFound = answering(`echo "Error:   × code: 'Some requested entity was not found', message: \\"sandbox not found\\"" >&2; exit 1`);
+    assert.equal(await notFound.status('arc-1'), 'missing');
+    const unreachable = answering('echo "Error:   × connect error: transport error" >&2; exit 1');
+    await assert.rejects(unreachable.status('arc-1'), /openshell sandbox get arc-1 failed: Error: {3}× connect error: transport error/);
+    assert.equal(await answering(`echo '{"phase":"Ready"}'`).status('arc-1'), 'ready');
+    assert.equal(await answering(`echo '{"phase":"Stopped"}'`).status('arc-1'), 'stopped');
+    assert.equal(await answering(`echo '{"phase":"Provisioning"}'`).status('arc-1'), 'other');
+    // A delete that fails never throws: the sweep deletes what it left.
+    await unreachable.remove('arc-1');
+  });
+
   it('kills an exec whose CLI hangs past its timeout', async () => {
     const driver = new OpenShellDriver(fakeOpenShell());
     assert.deepEqual(await driver.exec('sb', 'echo hi', { timeoutSec: 5 }), { code: 0, stdout: 'hi\n', stderr: '' });
