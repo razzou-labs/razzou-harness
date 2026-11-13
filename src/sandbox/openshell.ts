@@ -66,7 +66,12 @@ export class OpenShellDriver implements SandboxDriver {
     // answering gets as long again, 30 s more at most, and is then killed.
     const limitSec = options.timeoutSec ? options.timeoutSec + Math.min(options.timeoutSec, 30) : 0;
     return run(this.bin, [...args, '--', 'bash', '-c', script], { input: options.input, timeout: limitSec * 1000, killSignal: 'SIGKILL' }).catch(
-      (error: Error & { killed?: boolean }) => {
+      (error: Error & { killed?: boolean; code?: unknown }) => {
+        // A command that prints more than run() keeps is the command's failure, not the
+        // harness's: a check whose tests print 70 MB fails, and says why.
+        if (error.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') {
+          return { code: 1, stdout: '', stderr: 'the command printed more than 64 MB: its output went over the limit and was cut, so none of it is shown' };
+        }
         if (!error.killed) throw error;
         return { code: 124, stdout: '', stderr: `openshell sandbox exec did not end within ${limitSec} s, and was killed` };
       },

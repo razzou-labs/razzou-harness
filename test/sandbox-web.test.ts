@@ -302,6 +302,13 @@ describe('the OpenShell driver', () => {
     assert.ok(Date.now() - started < 3000);
   });
 
+  it('fails a command that prints more than the 64 MB kept, and says so', async () => {
+    const result = await new OpenShellDriver(fakeOpenShell()).exec('sb', 'head -c 70000000 /dev/zero; echo done', { timeoutSec: 30 });
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /more than 64 MB: its output went over the limit and was cut/);
+    await assert.rejects(new OpenShellDriver(join(tempDir('no-openshell'), 'openshell')).exec('sb', 'true'), /ENOENT/, 'an openshell that does not start is still an error');
+  });
+
   it('follows a file again when its exec ends, from the line after the last one read', async () => {
     const file = join(tempDir('follow'), 'outbox.jsonl');
     writeFileSync(file, `one\n${'x'.repeat(MAX_FOLLOWED_LINE + 10)}\ntwo\n`);
