@@ -5,9 +5,9 @@ import { join, resolve } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { parseArgs } from 'node:util';
 import { computeLock, directoryReader } from './ci/harness-ci.ts';
-import { isRunning, packageRoot, runDaemon, runningDaemon, version } from './daemon/main.ts';
+import { isRunning, lockHolder, packageRoot, runDaemon, runningDaemon, STOP_GRACE_MS, version } from './daemon/main.ts';
 import { ConfigSchema } from './design/schemas.ts';
-import { applyModeRules, checkApp, createApp, installCi, rulesNotChanged } from './github/setup.ts';
+import { applyModeRules, checkApp, ciFiles, createApp, installCi, rulesNotChanged } from './github/setup.ts';
 import { askSecret, doctor } from './setup/doctor.ts';
 import { CHECKLIST, init } from './setup/init.ts';
 import { recover } from './setup/recover.ts';
@@ -91,7 +91,7 @@ async function main(): Promise<void> {
       await runDaemon(projectDir);
       process.exit(0);
     case 'down':
-      return down(harnessDir);
+      return void (await down(harnessDir));
     case 'status':
       return status(harnessDir);
     case 'resume':
@@ -218,7 +218,7 @@ async function main(): Promise<void> {
     }
     case 'upgrade': {
       const cli = join(packageRoot, 'dist', 'cli.js');
-      await upgrade({
+      process.exitCode = await upgrade({
         version,
         packageDir: packageRoot,
         ...(argument ? { target: argument } : {}),
@@ -231,8 +231,17 @@ async function main(): Promise<void> {
         },
         // The package's own entry, at the path npm installs every version to: after the install, it is the new one.
         harness: (args) => attached(process.execPath, [cli, ...args, '--dir', projectDir]),
-        daemon: () => runningDaemon(harnessDir)?.pid,
+        daemon: () => (runningDaemon(harnessDir) ?? lockHolder(harnessDir))?.pid,
         stop: () => down(harnessDir),
+        installed: () => {
+          try {
+            return (JSON.parse(readFileSync(join(packageRoot, 'package.json'), 'utf8')) as { version?: string }).version;
+          } catch {
+            return undefined;
+          }
+        },
+        // The files as the version now in packageRoot writes them; CODEOWNERS follows the owner, not the version.
+        staleCi: () => ciFiles(packageRoot).filter(([path, content]) => !existsSync(join(projectDir, path)) || readFileSync(join(projectDir, path), 'utf8') !== content).map(([path]) => path),
       });
       return;
     }
@@ -355,12 +364,27 @@ async function runDoctor(projectDir: string, values: { probe?: boolean; 'build-i
   if (failed) process.exitCode = 1;
 }
 
-async function down(harnessDir: string): Promise<void> {
-  const info = runningDaemon(harnessDir);
-  if (!info) return console.log('no daemon is running');
+/**
+ * Stops the daemon, or the one still starting, which holds the lock but has no daemon.json
+ * yet. It waits longer than the daemon waits for its step under way, and fails when the
+ * process outlives that: `harness upgrade` must not install over a daemon that still runs.
+ */
+async function down(harnessDir: string): Promise<boolean> {
+  const info = runningDaemon(harnessDir) ?? lockHolder(harnessDir);
+  if (!info) {
+    console.log('no daemon is running');
+    return true;
+  }
   process.kill(info.pid, 'SIGTERM');
-  for (let i = 0; i < 50 && isRunning(info); i++) await sleep(200);
-  console.log(isRunning(info) ? `pid ${info.pid} is still stopping` : 'stopped');
+  const end = Date.now() + STOP_GRACE_MS + 5_000;
+  while (isRunning(info) && Date.now() < end) await sleep(200);
+  if (isRunning(info)) {
+    console.error(`pid ${info.pid} is still stopping`);
+    process.exitCode = 1;
+    return false;
+  }
+  console.log('stopped');
+  return true;
 }
 
 function status(harnessDir: string): void {

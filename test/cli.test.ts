@@ -6,7 +6,7 @@ import type { AddressInfo } from 'node:net';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { processStart, runningDaemon, takeDaemonLock } from '../src/daemon/main.ts';
+import { processStart, runningDaemon, STOP_GRACE_MS, takeDaemonLock } from '../src/daemon/main.ts';
 import { run } from '../src/util.ts';
 import { tempDir } from './helpers/toy-repo.ts';
 
@@ -64,6 +64,30 @@ describe('a daemon counts as running only while its own process does', () => {
     } finally {
       other.kill();
     }
+  });
+
+  it('`harness down` stops a daemon still starting, and waits past the daemon\'s own grace', async () => {
+    // A daemon that holds the lock, has no daemon.json yet, and takes longer than STOP_GRACE_MS to stop.
+    const starting = spawn('sh', ['-c', `trap 'sleep ${STOP_GRACE_MS / 1000 + 2}; exit 0' TERM; while :; do sleep 1; done`], { stdio: 'ignore' });
+    await new Promise((resolve) => starting.once('spawn', resolve));
+    try {
+      const dir = tempDir('project');
+      mkdirSync(join(dir, '.harness'));
+      writeFileSync(join(dir, '.harness', 'daemon.lock'), JSON.stringify({ pid: starting.pid, processStart: processStart(starting.pid!) }));
+      const down = await harness(dir, 'down');
+      assert.deepEqual([down.code, down.stdout.trim()], [0, 'stopped'], down.stderr);
+    } finally {
+      starting.kill('SIGKILL');
+    }
+  });
+
+  it('counts a daemon.json that can\'t be read as no daemon, and says so', async () => {
+    const dir = tempDir('project');
+    mkdirSync(join(dir, '.harness'));
+    writeFileSync(join(dir, '.harness', 'daemon.json'), '');
+    const down = await harness(dir, 'down');
+    assert.deepEqual([down.code, down.stdout.trim()], [0, 'no daemon is running']);
+    assert.match(down.stderr, /daemon\.json can't be read \(Unexpected end of JSON input\): counted as no daemon/);
   });
 });
 
