@@ -3,6 +3,360 @@
 The notable changes in each release of razzou-harness. Before 1.0, a new minor version
 may change how a project is set up, and its notes say how.
 
+## 0.7.0 (2026-11-13)
+
+**Upgrading from 0.6.0:** install the new version, then run `harness upgrade` in the
+project. It builds the agents' image again, as `harness doctor --build-images` does: the
+image now carries `zip` and pins its base image by digest. It now stops before it
+starts the daemon again while the project's CI files are an earlier version's, as they
+are here: the doctor it runs reports `.github/harness/package.json` missing. Run
+`harness install-ci`, commit what it wrote and push it to `main` yourself, then run
+`harness up` and open the dashboard from the link it prints. `install-ci` writes the
+workflow, `.github/harness/harness-ci.ts`, a new `.github/harness/package.json`
+(`{"type":"module"}`, so the CI script runs in a project whose package.json says
+`"type": "commonjs"`), and `harness/lock.json` again, whose format changed: every lock
+written before mismatches until it is written again. It writes `.github/CODEOWNERS`
+only when there is none, so check yours yourself. `harness upgrade` also fails when the
+copy that runs isn't npm's global one. The hours of your time are now set per module:
+the number you set for the whole project is gone, so set each module's with
+`harness budget --module <id> --owner-hours <n>` or on its card in the Project view. A
+module without hours, a new one included, is designed with no limit on your time.
+Sandboxes and the providers that hold your APIs' keys are now named by the project and
+by its checkout, a hash of the folder's path, so two clones of one project on one
+machine share nothing: store your APIs' keys again with `harness doctor`. The sandboxes
+0.6.0 left over carry no checkout label: the daemon no longer deletes them, and the
+dashboard lists them as another project's; `openshell sandbox delete <name>` deletes
+one. `harness up` refuses a project without `project.repo`, and the doctor's GitHub
+check fails for one, so `harness setup` no longer ends "All good" for it. The
+`terraform` paths must keep the values the workflow uses, `iac`,
+`backend-configs/staging.hcl` and `env/staging.tfvars`, and the doctor fails while no
+`.tf` file in `iac/` has a `backend "s3"` block, which `harness setup` now writes in
+`iac/backend.tf`. A design that 0.6.0 read may be refused now: every check of the
+project needs an id of its own, across all modules and `harness/config.json`; a
+feature can't be named `fix1`, `fix2` and so on; a project check can't use a
+`/sandbox/` path; `network.extraHosts` takes host names only; and a git host such as
+github.com can't be listed in `network.apis`. `roles.<role>.agent` is gone, as Claude
+Code was the only agent, and a config that still has it is read without it;
+`harnessVersion` is optional.
+
+This release comes from a full review of 0.6.0, which looked for what was
+inconsistent, missing or wrong across the daemon, CI, setup, the sandboxes and the
+dashboard, and fixed what it found. What changes for you is above; the README describes
+the harness as it now works.
+
+The daemon:
+- **The daemon's pass no longer waits for one plan's long work.** An attempt's
+  preparation, checks and review, a plan's full check run, a deploy's verification and a
+  design's checks now run beside the pass, one piece of work at a time per plan and per
+  sandbox. A slow check of one plan held every other.
+- **A gateway that doesn't answer costs nothing.** OpenShell 0.1.7 exits 1 both for a
+  sandbox it doesn't have and for a gateway it can't reach, and the daemon read both as
+  a sandbox gone: while the gateway restarted, every attempt under way was interrupted,
+  and the Manager's and the Architect's sandboxes were deleted and made again, their
+  conversations with them.
+  - A sandbox counts as gone only when the gateway says so. Any other failure of the
+    lookup is an error, and every call of the OpenShell CLI has a time limit.
+  - While the gateway doesn't answer, the attempts under way and the Manager stay as
+    they are, and the pipeline waits ten minutes and looks again by itself.
+  - A stopped sandbox, which a reboot leaves, is started again, so a Manager resumes its
+    conversation. A probe that printed nothing no longer passes for an agent that
+    ended, which paused the pipeline with "Claude Code did not start".
+- **Usage limits and failing APIs.**
+  - A usage limit pauses the pipeline until its reset whoever hits it, the Manager and
+    the reviewers included.
+  - A model API that fails (overloaded, a server error, a broken connection) costs no
+    attempt: the attempt or the review is interrupted, nothing starts for ten minutes,
+    then the daemon looks again by itself. A Manager's turn that ends on it has its
+    items sent again ten minutes later.
+  - Like a usage limit, it counts only from the third interruption of the same feature
+    definition, since an attempt's own sandbox writes the stream both are read from.
+  - The reset is read from a window that refused a call or stands at 99% or more, or
+    else from the fullest window when it is nearly full: a report rounded down to 99%
+    led to a retry every hour. A reset that no real window could give is not believed.
+  - While the pipeline is paused, the Manager's silence sets off neither a reminder nor
+    the 180-minute brake, which replaced a pause that lifts itself with one only you
+    could lift.
+- **No build stalls without a word.**
+  - Manual mode finishes the plan under way before it starts another: a plan that a
+    design change added before it stopped both.
+  - `submit_design` refuses a feature added to a plan past its build, where nothing more
+    is built: it goes in a new plan. One added in your own commit pauses the pipeline
+    with the reason, where its module counted as complete without it.
+  - A feature redefined after it was accepted may fit as it is: its Developer may report
+    done with nothing to commit, and the branch goes to its checks and the Manager
+    unchanged.
+  - A reviewer that still blocks after its fix rounds leaves its own pull request to
+    you, with what you can do, and no longer pauses the whole pipeline, which paused
+    again after every resume.
+  - Every plan adds lines to `progress.txt`, which git alone can't merge. An open pull
+    request whose branch lacked `main`'s lines conflicted on GitHub, which then ran no
+    CI on it, and the daemon waited ten minutes at a time for a CI that never came. It
+    now merges `main` into such a branch at once, and pushes it.
+  - A design submitted again into a pull request you closed and reopened is followed,
+    and so is a closed pull request reopened and merged. A plan in a round that merges
+    `main` or makes its checks pass again is still being built, so a design change to
+    it is no longer refused as locked.
+  - The one-line news of the plans waits for the Architect's next prompt, instead of
+    each costing a turn of its model.
+- **Deploys are followed after every merge.** Once `iac/` exists, the daemon waits for
+  CI's apply after every merge, whatever the merge changed, before the post-deploy
+  checks run: CI applies `main` each time, and code that Terraform packages deploys with
+  it. A Fix PR that changed nothing under `iac/` completed its plan while the apply
+  still failed. A skipped `tf-apply` never started: the Manager now gets the jobs it
+  waited for that failed, with their logs.
+- **Merges in Swarm.**
+  - A pull request whose head changes the Terraform folder is never merged as `CODE`, a
+    `CODE` plan's Fix PR included: it needs the cost job's estimate under the ceiling,
+    or the Infra merges switch.
+  - While the cost job still runs, the daemon waits for its estimate, rather than
+    merging, or leaving the pull request to you for want of a number minutes away.
+  - The estimate is read only from the cost job's own run, made before the job ended,
+    and a reviewer's Terraform plan only from the `tf-plan` job's: a later job of the run
+    executes the pull request's code, and could upload its own.
+- **A reviewer's sandbox runs nothing of the pull request.** A verdict is read from files
+  of the reviewer's own sandbox, which any process started there could write, and the
+  sandbox ran `terraform plan`, with the pull request's providers and data sources,
+  before the reviewer started. It now gets the plan's JSON from CI's `tfplan` artifact
+  of that head, up to 20 MB, and has no AWS access. A reviewer's clock starts with its
+  session, a post GitHub failed for a moment is made again, and a Fix PR starts with
+  fresh rounds. The paid-call inventory in the cost reviewer's brief skips lines over
+  2,000 characters, no longer takes quadratic time on a line, and names the code it
+  didn't scan.
+- **A design that would undo merged work unseen is refused.** A design branch with more
+  than one merge base with `main` shows design files in its diff, while merging it takes
+  merged work back out. The daemon refuses it, and CI fails it.
+- **Designs and configs are checked when read**, so that what CI or a sandbox would
+  trip on later is refused at once: an id shared by two checks of the project, a feature
+  named like a fix round (`fix1`, `fix2`…), a project check with a `/sandbox/` path,
+  which CI doesn't have, an `extraHosts` entry that isn't a host name, a git host in
+  `network.apis`, and `terraform` paths other than the workflow's, which were planned in
+  the sandboxes and never applied, while the daemon recorded a deploy.
+- **Modules are built in the order their designs were merged.** The next module was the
+  first by its id. A design written by hand comes after those, by its name.
+- **What a sandbox wrote is taken within limits.** A stream over 64 MB is read by its
+  end. Commits over 512 MB fail the attempt ("what is generated or downloaded belongs in
+  .gitignore"), and a design over 512 MB is refused. A check whose command prints more
+  than 64 MB fails, with a note that its output was cut, instead of being taken for the
+  harness's own error. Git's fetches and pushes are killed after ten minutes without an
+  answer, and a fetch that fails for another reason than a missing branch is an error,
+  not a branch that is gone. The event log is read a piece at a time, and its torn last
+  line is found however long it is: the repair read only the log's last 4 MB, and could
+  cut a whole event in half.
+- **The tripwire and the lockfile rule, in the daemon too.** The checks that judge work,
+  an attempt's, a plan's full run and the post-deploy checks, run under the tripwire
+  that CI's `checks` job now has (below). An attempt that adds a package from outside
+  the npm registry that the base doesn't have fails, as CI would fail it, and the daemon
+  refuses to push a branch that breaks either rule, judged by `main`'s rules from where
+  the branch started.
+- **What the agents are told.**
+  - An Arch PR lists first the settings of `harness/config.json` it changes, with their
+    values before and after, and the check files already on `main` that it changes,
+    which the checks of built features may run. The design's card in Needs you shows the
+    settings too.
+  - The Architect reads an attempt with a new tool, `get_attempt`: its task, the
+    Developer's report and its checks' output. `get_state` lists each attempt with how
+    it ended.
+  - A Developer's task shows the previous failure only when it was of the same
+    definition, says so when every check of the feature runs after the deploy, and lists
+    exactly what the attempt may not change, from the rules CI applies.
+  - The texts that told the Manager to ask you about design choices now say to take them
+    to the Architect, and the Manager's, the Architect's, the Developer's and the
+    security reviewer's roles say what the harness does now.
+- **Text posted on GitHub mentions nobody.** In what an agent wrote and the daemon posts,
+  pull request titles and descriptions and review comments, an `@` outside code gets a
+  zero-width space after it, so GitHub notifies nobody.
+
+CI and GitHub:
+- **Protected files reach every folder, and more of what npm runs by itself.**
+  - The tool configs in any folder, with `.eslintignore` and `.prettierignore` now.
+  - In every package.json, the fields `jest`, `babel`, `mocha`, `eslintConfig`,
+    `eslintIgnore`, `prettier`, `overrides`, `patchedDependencies`, `packageExtensions`
+    and `allowScripts`, and the scripts npm runs as it installs: `preinstall`,
+    `install`, `postinstall`, `preprepare`, `prepare` and `postprepare`.
+  - In every tsconfig.json, `strict`, `noImplicitAny`, `strictNullChecks`,
+    `skipLibCheck`, `exclude`, `include` and `extends`.
+  - `patches/`, and `.npm-extension.mjs` or `.cjs`.
+  - pytest's, tox's and coverage's tables in any `pyproject.toml`, and `[tool:pytest]` in
+    `setup.cfg`. The new `protect.tomlTables` setting protects more TOML tables or INI
+    sections, and `protect.jsonFields` takes globs as keys.
+  - A check's npm scripts, in the package.json its command names, as in
+    `npm --prefix web test` or `cd web && npm test`.
+- **A tripwire in CI's `checks` job.** What `init.sh` or a check runs, such as a
+  `prepare` script, could rewrite a protected file in the checkout, which `verify`
+  judged as committed, and make a check pass. The job now fails with `protected-files`
+  once `init.sh` or a check changes, adds or removes a protected file. It leaves alone
+  what installing fills: `node_modules`, Terraform's downloaded modules in `.terraform`,
+  and Python's virtual environments.
+- **The lockfile rule fails only what the base doesn't have.** New or changed packages
+  resolved from outside the npm registry, linked or patched, fail; what the base already
+  has keeps passing, such as a private registry or a workspace. Without a lockfile, a
+  new `file:` or `link:` dependency fails.
+- **`verify`** compares protected fields with the merge base, so what `main` changed
+  since the branch started is no part of the pull request; fails a pull request whose
+  head has more than one merge base with `main`, and one the App opens from a branch it
+  never opens one from; keeps a `CODE` plan's Fix PR off the Terraform folder; holds a
+  plan file that a check's command names to the plan rules of a `CHANGED_LOCKED_FILES`
+  pull request; and reads a checkout as git committed it, so a symlink or an eol
+  attribute no longer breaks the lock.
+- **The workflow.** `tf-plan` runs only after `verify` passed, so the plan role never
+  runs a pull request's Terraform that changes what it may not, and with `-lock=false`,
+  as the sandboxes plan: two plans, or a plan and `main`'s apply, collided on the lock,
+  and a cancelled run could leave it taken. The `tfplan` artifact, which holds the
+  state's values, is kept one day instead of seven. The apply waits up to ten minutes
+  for the state lock. `checks` always starts, and fails when `tf-plan` failed: a skipped
+  `checks` counted as passed.
+- **GitHub.** The cost artifact can be tied to the cost job's own run and time; an
+  artifact's zip stops inflating at 64 MiB; an Infracost project with errors gives no
+  estimate. Check runs count only when GitHub Actions made them, a job's log ends before
+  its clean-up, a pull request is found by the head the harness pushed, and a closed one
+  counts only at that head. A 401 from GitHub is tried once more with a new token.
+- **The CI script runs in a CommonJS project.** It has a package.json of its own:
+  Node read the project's, where `"type": "commonjs"`, which `npm init` writes, made the
+  script's imports a syntax error. `install-ci` keeps an existing `CODEOWNERS`, writes
+  one only when there is none, with `gh`'s login when none is given, and writes
+  `harness/lock.json` again, since the lock hashes `.github/`.
+
+Setup, the CLI and the daemon's life:
+- **The hours of your time are a module's own.** You set them as a module starts
+  (`harness module new <id> <title> --owner-hours <n>`, or the New module form), on its
+  card in the Project view, or with `harness budget --module <id> --owner-hours <n>`,
+  and clear them with `--clear`; with the daemon down, they wait in `.harness/setup.json`
+  beside the mode. What another module plans takes nothing from them. An action done and
+  then dropped by a redesign counts against what may still be planned, and a design
+  under review is read from its own commit, not from a later submission that was
+  refused. Setup no longer asks for hours. `POST /api/owner-hours` is new, and
+  `POST /api/modules` takes `ownerHours`.
+- **A GitHub repository is required.** A design and its plans reach `main` only through
+  pull requests: `harness up` refuses a project without `project.repo`, however it is
+  started, and a module starts only in a project with one.
+- **The CLI refuses what it would have ignored.**
+  - Every project command fails in a folder without `harness/config.json`, and creates
+    nothing there. A flag that isn't the command's is refused, and so is
+    `harness done a/b/c`. An error's cause is printed.
+  - `harness down` also stops a daemon still starting, waits up to 15 seconds, five
+    longer than the daemon waits for its step, and exits 1 when it still runs.
+  - `harness attach` exits with openshell's code, and tells a running daemon while you
+    are attached.
+  - `harness upgrade` fails unless npm's copy holds the version it installed, stops
+    before the restart while the project's CI files are an earlier version's, and exits
+    with the restarted daemon's code.
+  - `harness install-ci` names what to commit, `harness github-app create` names the
+    folder its key is in, `harness actions` checks the daemon's answer, and the `mode`
+    help no longer cites an internal document.
+- **The daemon survives what stopped it.** Closing the terminal sends SIGHUP twice, and
+  the second killed the daemon mid-shutdown: it now stops cleanly. An exception or a
+  rejection that nothing caught is logged with its stack, and the daemon goes on. The
+  dashboard link with the token is printed to the terminal only, no longer to
+  `daemon.log`. The lock and `daemon.json` are written whole, and an unreadable
+  `daemon.json` counts as no daemon, and says so. `harness up` on a `.harness/` without
+  its event log, while `main` has accepted features, says to run `harness recover`,
+  instead of building the first plan again.
+- **`harness recover`** records a plan whose pull request was closed, and advises
+  reopening it rather than deleting its branch, which led to a pause nobody could lift.
+  It names an Architect's pull request open at the loss, and refuses a `.harness/` that
+  has a snapshot or the git mirror but no log; a recovery that fails removes the mirror
+  it made.
+- **Setup.**
+  - It checks the whole config against the schema before it writes anything, on GitHub
+    or in the files, and asks again for an answer the schema refuses: a region such as
+    `EU-WEST-1`, a role that isn't an ARN, a repository without its organization. A
+    folder name over 40 characters gives a project name cut to 40, and a folder inside
+    another repository is refused before anything is created on GitHub.
+  - It offers the harness's files on every run until they are committed, says what else
+    the push sends, keeps an upstream you set, and commits or pushes nothing while
+    `harness/config.json` is one the schema refuses.
+  - It exits 1 with problems left, skips the probe while a check of the machine fails,
+    offers to start the daemon only when nothing fails and none runs, and waits on
+    GitHub only for a missing installation: offline, a failed App check opened the
+    install page and waited fifteen minutes.
+- **The doctor.** A missing OpenShell gives failed checks instead of stopping the run.
+  `project.bot` is compared with this machine's App. A key you skip with Enter is asked
+  for once a run of `harness setup`, not at each of its rounds. Two new checks: `main`,
+  that `main` and origin's `main` hold the config and the CI files as the working tree
+  has them, and `Terraform`, that a `.tf` file in `iac/` has a `backend "s3"` block. The
+  mode recorded while the daemon is down is the one `main`'s rules are judged and
+  applied for, by the doctor and by `harness github-setup`.
+- **The Terraform scaffold** writes the backend block in `iac/backend.tf`, wherever the
+  project has none: without it, CI's `terraform init` kept the state on its runner, and
+  what `tf-apply` created was forgotten with it. `versions.tf` no longer holds the
+  backend, no provider or variable is declared twice, and values holding `${` or `%{`
+  are written as the text they are.
+
+The sandboxes:
+- **Sandboxes belong to their checkout.** Two folders of the same name, or two clones of
+  one repository, shared sandbox names and API keys. Sandboxes and the providers of the
+  keys are now named and labeled by the project and by its checkout, and the doctor and
+  the probe name them as the daemon does.
+- **The network policy.**
+  - Clone and fetch POST only to a repository's `git-upload-pack`: on github.com under
+    `/<owner>/<repo>/`, on gitlab.com in a path ending `.git/`. `/**` also matched a
+    path of the host's own API that ends that way. Push is still never allowed.
+  - A git host can't be listed in `network.apis`: an Architect's sandbox has every
+    bundle, and a git host there, as an API, would take every method, push included.
+  - `network.extraHosts` takes host names only: lowercase, an optional `*.` or `**.`
+    first label followed by at least two others, no IP address, no port.
+  - With AWS, DynamoDB's account endpoint, `<account>.ddb.<region>.amazonaws.com`, which
+    SDKs and Terraform call by default, is signed, for `all` and for `dynamodb`, and
+    sandboxes get `AWS_ACCOUNT_ID_ENDPOINT_MODE=disabled`, so AWS SDKs call DynamoDB at
+    its regional endpoint.
+- **Tool calls and `web_read`.** A sandbox's tool calls are handled two at a time, at
+  most 60 a minute, and each holds its slot while it is handled; calls over the rate
+  are refused with a reply. A `web_read` URL is at most 2,000 characters, and `WEB_READ`
+  events keep URLs clipped to 300 characters, for failed reads too. `web_read` also
+  refuses IPv4-compatible and IPv4-translated IPv6 addresses, `fec0::/10` and Azure's
+  host endpoint, `168.63.129.16`, and answers when a compressed page is cut short or
+  stalls.
+- **The agents' image** carries `zip`, as CI's runners do, and pins its base image by
+  digest.
+- **The probe** is made like a real sandbox, with the project's labels and its APIs' key
+  providers. It also checks the user the sandbox runs as, not root, a POST to a plain
+  read-only host, a PUT to the npm registry (a publish), DynamoDB's account endpoint,
+  and a real secret's name, with no value read. The metadata check is "skipped" when
+  nothing answers there: a timeout proves nothing.
+- **The MCP shim** has tests of its own over stdio, and no longer dies on a message that
+  is not an object, or on a call whose outbox it cannot write.
+
+The dashboard:
+- **The Architect is told of a note while someone is at its terminal.** The nudge comes
+  at once when nobody is there. When someone is, it comes once nobody has typed there
+  for five minutes, and a nudge not typed is tried again each minute. `harness attach`
+  counts as someone, and its opening as typing, since its keys don't pass through the
+  daemon. Without node-pty, messages wait for your next prompt there.
+  `POST /api/attach` is new.
+- **Pages live through a restart.** An open page reconnects by itself after a daemon
+  restart, or, once the token changed, asks for the new link, and a button no longer
+  spins while the daemon is down. It refreshes when the design on `main` changes, and
+  each minute.
+- **Needs you.**
+  - **Look again now** lifts only a pause that waits to look again, as the daemon lifts
+    it, with none of what a resume sets off (`POST /api/look-again`).
+  - A gate whose work builds on plans not complete asks you to confirm before it is
+    marked done, and an action's card shows your estimated minutes.
+  - The escalated card no longer offers **Send it to the Architect**, which could never
+    work, and `POST /api/architect` is removed: the card shows only in a module without
+    an Architect.
+  - A time not today shows its day. The Manager's order holds while a gate is checked,
+    and ends when the gate is rewritten. Refusals say why.
+- **The Agents and Sandboxes views.** The Agents view keeps showing the agent you chose
+  when its card leaves the list, a terminal takes keys only once clicked, a finished
+  reviewer's transcript opens, and a reviewer's verdict has its color. A shell is
+  offered only while an agent's sandbox exists, not during an attempt's checks or
+  review. Deleting a left-over sandbox says done only once the gateway no longer lists
+  it.
+- **Notifications.** A pause is announced whenever it is news: only a pause that waits to
+  look again, for the same reason, is quiet for an hour, which starts only with a
+  notification shown.
+- **Markdown an agent writes keeps only the tags Markdown makes**: no classes, styles or
+  SVG, so it can no longer cover the page or let clicks through to its buttons.
+- **Nothing a client sends or an agent writes stops the dashboard**: not a malformed
+  terminal request, a long paste into a terminal, now sent in slices, nor a transcript
+  line nested too deep or too large.
+
+Releases:
+- **The release workflow** publishes with Node 24's own npm, through trusted publishing,
+  and checks its version, instead of installing npm from the registry in the job that
+  holds the publishing token.
+
 ## 0.6.0 (2026-11-12)
 
 **Upgrading from 0.5.9:** install the new version, rebuild the agents' image with

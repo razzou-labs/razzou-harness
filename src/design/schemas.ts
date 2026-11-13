@@ -115,7 +115,10 @@ export const ConfigSchema = z.object({
   harnessVersion: z.string().optional(),
   project: z.object({
     name: Id,
-    /** The GitHub repository, like "acme/shop". Without it, the harness works locally and opens no pull requests. */
+    /**
+     * The GitHub repository, like "acme/shop": designs and plans land through its pull requests, so `harness up`
+     * refuses a project without it. The schema lets it out only for the daemon's tests, which run on a local forge.
+     */
     repo: z.string().regex(/^[\w.-]+\/[\w.-]+$/, 'owner/name').optional(),
     /** The harness App's bot login, like "acme-harness[bot]": CI tells its PRs from the owner's by it. */
     bot: z.string().regex(/^[\w.-]+\[bot\]$/, 'an App bot login, like "acme-harness[bot]"').optional(),
