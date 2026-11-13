@@ -3,7 +3,7 @@ import { request as httpRequest, type IncomingMessage } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { BlockList, isIP, type LookupFunction } from 'node:net';
 import { networkInterfaces, type NetworkInterfaceInfo } from 'node:os';
-import type { Readable } from 'node:stream';
+import { finished, pipeline, type Readable, type Transform } from 'node:stream';
 import { createBrotliDecompress, createGunzip, createInflate } from 'node:zlib';
 
 /**
@@ -37,12 +37,18 @@ for (const [net, prefix] of [
   ['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16], ['172.16.0.0', 12],
   ['192.0.0.0', 24], ['192.0.2.0', 24], ['192.88.99.0', 24], ['192.168.0.0', 16], ['198.18.0.0', 15],
   ['198.51.100.0', 24], ['203.0.113.0', 24], ['224.0.0.0', 4], ['240.0.0.0', 4],
+  // Azure's host endpoint (WireServer), a public address that answers inside every Azure VM.
+  ['168.63.129.16', 32],
 ] as const) PRIVATE.addSubnet(net, prefix, 'ipv4');
 // No ::ffff:0:0/96 here: BlockList checks IPv4 addresses against IPv4-mapped rules too, so
 // that rule would block every IPv4 address. Mapped addresses are unwrapped below instead.
+// The other forms that carry an IPv4 address, IPv4-compatible (`::127.0.0.1`, which holds
+// `::` and `::1` too) and IPv4-translated (`::ffff:0:127.0.0.1`), are refused whole: no
+// public site is reached that way, and the system may route them to the IPv4 address.
+// fec0::/10 is the old site-local range, private like fc00::/7.
 for (const [net, prefix] of [
-  ['::', 128], ['::1', 128], ['64:ff9b::', 96], ['64:ff9b:1::', 48], ['100::', 64],
-  ['2001::', 23], ['2001:db8::', 32], ['2002::', 16], ['fc00::', 7], ['fe80::', 10], ['ff00::', 8],
+  ['::', 96], ['::ffff:0:0:0', 96], ['64:ff9b::', 96], ['64:ff9b:1::', 48], ['100::', 64],
+  ['2001::', 23], ['2001:db8::', 32], ['2002::', 16], ['fc00::', 7], ['fe80::', 10], ['fec0::', 10], ['ff00::', 8],
 ] as const) PRIVATE.addSubnet(net, prefix, 'ipv6');
 
 /** Not loopback, private, link-local, carrier-grade NAT (Tailscale), multicast or reserved, even when written as IPv6. */
@@ -172,9 +178,16 @@ function get(url: URL, allow: (ip: string) => boolean, allowPort: (port: number)
 
   return new Promise((resolve, reject) => {
     let settled = false;
+    // The deadline settles the call whatever the streams do: a decoder fed a body cut
+    // short may never end nor fail.
+    const expired = () => {
+      finish(new Error('the deadline passed'));
+      request.destroy();
+    };
     const finish = (error: Error | undefined, response?: Response) => {
       if (settled) return;
       settled = true;
+      deadline.removeEventListener('abort', expired);
       if (error) reject(error);
       else resolve(response!);
     };
@@ -202,7 +215,14 @@ function get(url: URL, allow: (ip: string) => boolean, allowPort: (port: number)
         let size = 0;
         const done = (truncated: boolean) =>
           finish(undefined, { status, type: String(response.headers['content-type'] ?? ''), body: Buffer.concat(chunks), truncated });
-        const body = decoded(response);
+        // A response cut short, or its decoder failing, ends the call with an error.
+        const decoder = decoderOf(response);
+        const body: Readable = decoder ?? response;
+        const failed = (error?: Error | null) => {
+          if (error) finish(error);
+        };
+        if (decoder) pipeline(response, decoder, failed);
+        else finished(response, failed);
         body.on('data', (chunk: Buffer) => {
           if (size > maxBytes) return;
           chunks.push(chunk.subarray(0, maxBytes - size));
@@ -215,10 +235,10 @@ function get(url: URL, allow: (ip: string) => boolean, allowPort: (port: number)
           }
         });
         body.on('end', () => done(false));
-        body.on('error', (error) => finish(error));
       },
     );
     request.on('error', (error) => finish(error));
+    deadline.addEventListener('abort', expired, { once: true });
     request.end();
   });
 }
@@ -239,16 +259,17 @@ function checkedLookup(allow: (ip: string) => boolean): LookupFunction {
   };
 }
 
-function decoded(response: IncomingMessage): Readable {
+/** The decoder of the response's content encoding, if it has one. */
+function decoderOf(response: IncomingMessage): Transform | undefined {
   switch (String(response.headers['content-encoding'] ?? '').toLowerCase()) {
     case 'gzip':
-      return response.pipe(createGunzip());
+      return createGunzip();
     case 'deflate':
-      return response.pipe(createInflate());
+      return createInflate();
     case 'br':
-      return response.pipe(createBrotliDecompress());
+      return createBrotliDecompress();
     default:
-      return response;
+      return undefined;
   }
 }
 

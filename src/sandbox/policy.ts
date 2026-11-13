@@ -22,6 +22,8 @@ const AWS_SERVICES: Record<string, { hosts: (region: string) => string[]; signin
   s3: { hosts: (region) => [`s3.${region}.amazonaws.com`, `*.s3.${region}.amazonaws.com`], signing: 's3' },
   cloudwatch: { hosts: (region) => [`monitoring.${region}.amazonaws.com`], signing: 'monitoring' },
   ecr: { hosts: (region) => [`api.ecr.${region}.amazonaws.com`], signing: 'ecr' },
+  // SDKs and Terraform's AWS provider call DynamoDB at the account's own endpoint by default.
+  dynamodb: { hosts: (region) => [`dynamodb.${region}.amazonaws.com`, `*.ddb.${region}.amazonaws.com`], signing: 'dynamodb' },
   cloudfront: { hosts: () => ['cloudfront.amazonaws.com'], signing: 'cloudfront', global: true },
   route53: { hosts: () => ['route53.amazonaws.com'], signing: 'route53', global: true },
 };
@@ -34,7 +36,8 @@ export const ALL_SERVICES = 'all';
  * role itself is what allows only reads (spike 2). OpenShell signs only for endpoints
  * named with their service, with no rule for every AWS host, so `all` names every one
  * the AWS SDK knows (aws-services.ts), with the hosts that carry a bucket's or an
- * account's name in front.
+ * account's name in front: S3's, S3 Control's and DynamoDB's (`<account>.ddb.<region>`),
+ * which botocore's endpoint data doesn't list.
  *
  * Every service but S3 is signed with `sigv4:body`: the hash of the request's body, an
  * empty one for a GET. OpenShell's automatic `sigv4` signs a request with neither a body
@@ -63,6 +66,7 @@ function awsEndpoints(aws: NonNullable<PolicyOptions['aws']>): object[] {
         ...REGIONAL_SERVICES.map(([prefix, service, template]) => signed((template ?? '{service}.{region}.{dnsSuffix}').replace('{service}', prefix).replace('{region}', aws.region).replace('{dnsSuffix}', 'amazonaws.com'), service)),
         signed(`*.s3.${aws.region}.amazonaws.com`, 's3'),
         signed(`*.s3-control.${aws.region}.amazonaws.com`, 's3'),
+        signed(`*.ddb.${aws.region}.amazonaws.com`, 'dynamodb'),
         ...GLOBAL_SERVICES.map(([, host, service, region]) => signed(host, service, region)),
       ]
     : [];
@@ -94,8 +98,12 @@ export function buildPolicy(options: PolicyOptions): object {
   rules.push(...options.extraHosts.map((host): HostRule => ({ host, access: 'read' })));
 
   // A host's first rule wins: a bundle's, like github.com's with git, over an extra host's read-only one.
-  // An API's own rule wins over both, so a host listed as an API takes every method.
+  // An API's own rule wins over both, so a host listed as an API takes every method; a git
+  // host can't be one, or every method would reach it, push included.
   const apis = options.apis ?? [];
+  const git = new Set(rules.filter((rule) => rule.access === 'git').map((rule) => rule.host));
+  const pushable = apis.find((api) => git.has(api.host));
+  if (pushable) throw new Error(`network.apis: ${pushable.host} is a git host, which sandboxes only clone and fetch from, so it can't be an API`);
   const apiHosts = new Set(apis.map((api) => api.host));
   const unique = rules.filter((rule, i) => rules.findIndex((r) => r.host === rule.host) === i && !apiHosts.has(rule.host));
   unique.forEach((rule) => checkHost(rule.host));
@@ -162,8 +170,21 @@ function readEndpoint(rule: HostRule): object {
   };
 }
 
-/** Clone and fetch over HTTPS: GET and HEAD for refs, POST only to git-upload-pack. Push (git-receive-pack) never. */
+/**
+ * Where each git host takes a fetch's POST: a path that only a repository has. `/**` would
+ * also match a path of the host's own API that ends in git-upload-pack, like a file made
+ * through GitLab's files API. On github.com a repository is `/<owner>/<name>`; GitLab's
+ * groups nest, but its git paths end in `.git`, where git's first request is redirected.
+ * A git host without a shape here gets no POST: clone works through its archives only.
+ */
+const UPLOAD_PACK: Record<string, string> = {
+  'github.com': '/*/*/git-upload-pack',
+  'gitlab.com': '/**/*.git/git-upload-pack',
+};
+
+/** Clone and fetch over HTTPS: GET and HEAD for refs, POST only to a repository's git-upload-pack. Push (git-receive-pack) never. */
 function gitEndpoint(rule: HostRule): object {
+  const post = UPLOAD_PACK[rule.host];
   return {
     host: rule.host,
     port: 443,
@@ -172,7 +193,7 @@ function gitEndpoint(rule: HostRule): object {
     rules: [
       { allow: { method: 'GET', path: '**' } },
       { allow: { method: 'HEAD', path: '**' } },
-      { allow: { method: 'POST', path: '/**/git-upload-pack' } },
+      ...(post ? [{ allow: { method: 'POST', path: post } }] : []),
     ],
   };
 }

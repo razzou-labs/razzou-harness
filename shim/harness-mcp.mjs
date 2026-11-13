@@ -96,7 +96,14 @@ async function call(id, params) {
     }, tool.waitSec * 1000);
   });
   const request = { v: 1, id: requestId, ts: new Date().toISOString(), tool: tool.name, args: params.arguments ?? {} };
-  appendFileSync(outbox, `${JSON.stringify(request)}\n`);
+  try {
+    appendFileSync(outbox, `${JSON.stringify(request)}\n`);
+  } catch (error) {
+    // Thrown out of this call, it would end the shim, and with it every tool of the agent.
+    waiting.delete(requestId);
+    send({ id, result: { content: [{ type: 'text', text: `The harness could not take the call: ${error.message}` }], isError: true } });
+    return;
+  }
   const { ok, text } = await reply;
   send({ id, result: { content: [{ type: 'text', text: String(text) }], isError: ok !== true } });
 }
@@ -111,6 +118,8 @@ lines.on('line', (line) => {
   } catch {
     return;
   }
+  // JSON that isn't a message, like `null`, is dropped as unreadable lines are.
+  if (message === null || typeof message !== 'object' || Array.isArray(message)) return;
   const { id, method, params } = message;
   if (method === 'initialize') {
     send({

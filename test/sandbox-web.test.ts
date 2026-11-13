@@ -11,6 +11,7 @@ import { gzipSync } from 'node:zlib';
 import { readResult, readReview } from '../src/agents/claude-code.ts';
 import { AgentChannel } from '../src/daemon/channel.ts';
 import type { Orchestrator } from '../src/daemon/orchestrator.ts';
+import { handleRequest } from '../src/daemon/requests.ts';
 import { htmlToText, neverRead, onHostNetwork, webRead } from '../src/daemon/web-read.ts';
 import { runningSandboxes, startDashboard } from '../src/dashboard/server.ts';
 import { Terminals, type Pty } from '../src/dashboard/terminals.ts';
@@ -44,6 +45,29 @@ describe('web_read', () => {
     for (const ip of ['192.0.3.1', '2001:db8:1:3::1', '198.51.100.8', '127.0.0.2', 'not an ip']) assert.equal(onHostNetwork(ip, interfaces), false, ip);
   });
 
+  it('refuses a URL over 2,000 characters, and records every read with its URLs clipped, a failed one too', async () => {
+    const recorded: Array<{ type: string; payload: { url: string; finalUrl?: string; ok: boolean; bytes: number } }> = [];
+    let fails = false;
+    const o = {
+      webRead: async (url: string) => {
+        if (fails) throw new Error('the socket broke');
+        return { ok: true, text: 'page', finalUrl: `${url}/final`, status: 200, bytes: 4 };
+      },
+      record: (event: (typeof recorded)[number]) => recorded.push(event),
+    } as unknown as Orchestrator;
+    const agent = { role: 'developer' as const, sandbox: 'dev-x' };
+    const call = (url: string) => handleRequest(o, agent, { v: 1, id: 'r-1', tool: 'web_read', args: { url } });
+    const long = `https://example.com/${'x'.repeat(2000)}`;
+    assert.match((await call(long))!.text, /Invalid arguments/);
+    assert.equal(recorded.length, 0, 'a refused URL is not fetched, nor recorded');
+    const url = `https://example.com/${'x'.repeat(1900)}`;
+    assert.deepEqual(await call(url), { ok: true, text: 'page' });
+    assert.ok(recorded[0]!.payload.url.length <= 300 && recorded[0]!.payload.finalUrl!.length <= 300);
+    fails = true;
+    await assert.rejects(call(url), /the socket broke/);
+    assert.deepEqual([recorded.length, recorded[1]!.type, recorded[1]!.payload.ok, recorded[1]!.payload.bytes], [2, 'WEB_READ', false, 0]);
+  });
+
   it('never reads chat apps', () => {
     for (const host of ['claude.ai', 'chatgpt.com', 'www.chatgpt.com']) assert.equal(neverRead(host), true, host);
   });
@@ -59,6 +83,13 @@ describe('web_read', () => {
         const slow = /^\/slow\/(\d+)$/.exec(req.url ?? '');
         if (slow) {
           setTimeout(() => res.writeHead(302, { location: `/slow/${Number(slow[1]) + 1}` }).end(), 150);
+        } else if (req.url === '/cut' || req.url === '/stall') {
+          // The first half of a compressed page, then the connection drops, or nothing more comes.
+          const page = gzipSync(Buffer.from('<p>words</p>'.repeat(10_000)));
+          res.writeHead(200, { 'content-type': 'text/html', 'content-encoding': 'gzip', 'content-length': page.length });
+          res.write(page.subarray(0, page.length >> 1), () => {
+            if (req.url === '/cut') setTimeout(() => res.destroy(), 50);
+          });
         } else if (req.url === '/bomb') {
           res.writeHead(200, { 'content-type': 'text/plain', 'content-encoding': 'gzip' });
           res.end(Buffer.concat(Array.from({ length: 64 }, () => member)));
@@ -79,6 +110,16 @@ describe('web_read', () => {
       const before = process.memoryUsage().arrayBuffers;
       await sleep(300);
       assert.ok(process.memoryUsage().arrayBuffers - before < 16 * 1024 * 1024);
+    });
+
+    it('answers when a compressed page is cut short, or stalls, within the deadline', async () => {
+      for (const path of ['/cut', '/stall']) {
+        const started = Date.now();
+        const result = await webRead(`${base}${path}`, { ...options, timeoutMs: 1500 });
+        assert.equal(result.ok, false, path);
+        assert.match(result.text, path === '/cut' ? /^failed: / : /^failed: no complete answer within 1.5 s$/, path);
+        assert.ok(Date.now() - started < 2500, path);
+      }
     });
 
     it('gives the whole read one deadline, redirects included', async () => {
@@ -155,6 +196,44 @@ describe('the agent channel', () => {
     assert.equal(invalid.length, 2);
     await driver.removeAll();
   });
+
+  it("handles a sandbox's requests two at a time, and refuses those over sixty a minute", async () => {
+    const driver = new LocalDriver(tempDir('channel-rate'));
+    await driver.create({ name: 'dev-rate', image: 'x', providers: [], env: {} });
+    const harness = join(driver.rootOf('dev-rate'), '.harness');
+    const outbox = join(harness, 'outbox.jsonl');
+    const inbox = join(harness, 'inbox.jsonl');
+    const handled: string[] = [];
+    const pending: Array<() => void> = [];
+    let running = 0;
+    let most = 0;
+    const channel = new AgentChannel({
+      driver, sandbox: 'dev-rate', outbox, inbox, repliedFile: join(tempDir('replied-rate'), 'replied.txt'),
+      onRequest: (request) => {
+        handled.push(request.id);
+        most = Math.max(most, ++running);
+        return new Promise<void>((resolve) => pending.push(() => { running--; resolve(); }));
+      },
+      onInvalid: () => {},
+    });
+    channel.start();
+    const lines = Array.from({ length: 62 }, (_, i) => `${JSON.stringify({ v: 1, id: `r-${i}`, tool: 'web_read', args: { url: 'https://example.com/' } })}\n`);
+    appendFileSync(outbox, lines.join(''));
+    await until(() => existsSync(inbox) && readFileSync(inbox, 'utf8').trim().split('\n').length === 2);
+    assert.deepEqual(handled, ['r-0', 'r-1'], 'two at a time');
+    for (let done = 0; done < 60; done++) {
+      await until(() => pending.length > 0);
+      pending.shift()!();
+    }
+    await until(() => handled.length === 60);
+    channel.stop();
+    assert.equal(handled.length, 60);
+    assert.equal(most, 2);
+    const replies = readFileSync(inbox, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { replyTo: string; ok: boolean; text: string });
+    assert.deepEqual(replies.map((r) => [r.replyTo, r.ok]), [['r-60', false], ['r-61', false]]);
+    assert.match(replies[0]!.text, /^too many requests: at most 60 a minute/);
+    await driver.removeAll();
+  });
 });
 
 describe("the Architect's inbox hook", () => {
@@ -221,6 +300,13 @@ describe('the OpenShell driver', () => {
     const hung = await driver.exec('sb', 'sleep 5', { timeoutSec: 0.2 });
     assert.deepEqual(hung, { code: 124, stdout: '', stderr: 'openshell sandbox exec did not end within 0.4 s, and was killed' });
     assert.ok(Date.now() - started < 3000);
+  });
+
+  it('fails a command that prints more than the 64 MB kept, and says so', async () => {
+    const result = await new OpenShellDriver(fakeOpenShell()).exec('sb', 'head -c 70000000 /dev/zero; echo done', { timeoutSec: 30 });
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /more than 64 MB: its output went over the limit and was cut/);
+    await assert.rejects(new OpenShellDriver(join(tempDir('no-openshell'), 'openshell')).exec('sb', 'true'), /ENOENT/, 'an openshell that does not start is still an error');
   });
 
   it('follows a file again when its exec ends, from the line after the last one read', async () => {

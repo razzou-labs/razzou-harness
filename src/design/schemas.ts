@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { z } from 'zod';
 import type { Repo } from '../git/repo.ts';
-import { ALL_BUNDLES, BUNDLES } from '../sandbox/allowlist.ts';
+import { ALL_BUNDLES, BUNDLES, HOST_PATTERN } from '../sandbox/allowlist.ts';
 import { canonicalJson, sha256 } from '../util.ts';
 
 /** The agents' image is tagged with the harness's version, which may change what goes into it: `harness doctor --build-images` builds it. */
@@ -155,7 +155,7 @@ export const ConfigSchema = z.object({
     .object({
       /** The hosts sandboxes reach directly, read-only, by bundle; `all`, the default, is every bundle. */
       bundles: z.array(z.string().refine((name) => name === ALL_BUNDLES || name in BUNDLES, `a bundle: ${ALL_BUNDLES}, ${Object.keys(BUNDLES).join(', ')}`)).default([ALL_BUNDLES]),
-      extraHosts: z.array(z.string()).default([]),
+      extraHosts: z.array(z.string().regex(HOST_PATTERN, 'a host name like docs.example.com or **.example.com: lowercase, a wildcard only as the first label followed by two others, no address, no port')).default([]),
       /**
        * Third-party APIs sandboxes may call with any method, like a payment provider's test
        * API. `key` names the variable the project's code reads the API's key from: in a

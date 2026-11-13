@@ -504,11 +504,38 @@ describe('sandbox policy', () => {
     assert.deepEqual(endpoints(['sts']).map((e) => e.host), ['sts.eu-west-1.amazonaws.com'], 'a list without all names only its services');
   });
 
-  it('rejects hosts OpenShell would reject', () => {
-    assert.throws(() => checkHost('**.com'));
-    assert.throws(() => checkHost('docs.**.example.com'));
-    assert.doesNotThrow(() => checkHost('**.github.io'));
+  it("signs DynamoDB's account endpoint, which SDKs and Terraform call by default, for all and for dynamodb", () => {
+    type Endpoint = { host: string; signing_service: string; credential_signing: string };
+    const endpoints = (services: string[]) => (buildPolicy({ bundles: ['core'], extraHosts: [], aws: { region: 'eu-west-1', provider: 'aws-view-shop', services } }) as {
+      network_policies: { aws_view: { endpoints: Endpoint[] } };
+    }).network_policies.aws_view.endpoints;
+    for (const services of [['all'], ['dynamodb']]) {
+      const account = endpoints(services).find((e) => e.host === '*.ddb.eu-west-1.amazonaws.com');
+      assert.deepEqual([account?.signing_service, account?.credential_signing], ['dynamodb', 'sigv4:body'], services.join());
+      assert.ok(endpoints(services).some((e) => e.host === 'dynamodb.eu-west-1.amazonaws.com'), services.join());
+    }
+  });
+
+  it('rejects hosts OpenShell would reject, and wildcards, addresses and ports wider than a host', () => {
+    for (const host of ['**.com', '*.com', 'docs.**.example.com', '**.*.*', '*.*.com', '1.2.3.4', '10.0.0.1', 'example.com:8080', 'Docs.example.com', 'localhost', '[::1]', 'docs..example.com', '-x.example.com']) {
+      assert.throws(() => checkHost(host), /not a host name/, host);
+    }
+    for (const host of ['**.github.io', '*.s3.eu-west-1.amazonaws.com', 'docs.example.com', 'xn--80ak6aa92e.com']) assert.doesNotThrow(() => checkHost(host), host);
     assert.throws(() => buildPolicy({ bundles: ['nope'], extraHosts: [] }));
+    const parse = (extraHosts: string[]) => ConfigSchema.safeParse({ harnessVersion: '0.4.1', project: { name: 'p' }, network: { extraHosts } }).success;
+    assert.equal(parse(['docs.example.com', '**.example.org']), true);
+    for (const host of ['**.*.*', '*.*.com', '1.2.3.4', 'example.com:443']) assert.equal(parse([host]), false, `${host} is refused when the design is read`);
+  });
+
+  it("allows a fetch's POST only to a repository's path, and never makes a git host an API", () => {
+    type Policy = { network_policies: { git_fetch: { endpoints: Array<{ host: string; rules: Array<{ allow: { method: string; path: string } }> }> } } };
+    const policy = buildPolicy({ bundles: ['core'], extraHosts: [] }) as Policy;
+    const posts = Object.fromEntries(policy.network_policies.git_fetch.endpoints.map((e) => [e.host, e.rules.filter((r) => r.allow.method === 'POST').map((r) => r.allow.path)]));
+    assert.deepEqual(posts, { 'github.com': ['/*/*/git-upload-pack'], 'gitlab.com': ['/**/*.git/git-upload-pack'] });
+    for (const host of ['github.com', 'gitlab.com']) {
+      assert.throws(() => buildPolicy({ bundles: ['core'], extraHosts: [], apis: [{ host }] }), /git host/, host);
+      assert.throws(() => buildPolicy({ bundles: ['all'], extraHosts: [], apis: [{ host, key: 'GIT_KEY' }] }), /git host/, host);
+    }
   });
 
   it('reads all as every bundle, and opens an API to every method, over a bundle\'s read-only rule', () => {
