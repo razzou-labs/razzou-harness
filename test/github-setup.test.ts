@@ -133,6 +133,25 @@ describe('CODEOWNERS', () => {
   });
 });
 
+describe('the workflow', () => {
+  const workflow = readFileSync(join(import.meta.dirname, '..', 'templates', 'harness.yml'), 'utf8');
+  /** A job's lines, from its key to the next job's. */
+  const job = (name: string) => new RegExp(`\\n  ${name}:\\n([\\s\\S]*?)(?=\\n  [a-z-]+:\\n|$)`).exec(workflow)?.[1] ?? '';
+
+  it("plans a pull request's Terraform only once verify passed, without the state lock, and keeps the plan a day", () => {
+    assert.match(job('tf-plan'), /\n {4}needs: \[verify\]\n/);
+    assert.match(job('tf-plan'), /terraform plan [^\n]*-lock=false/);
+    assert.match(job('tf-plan'), /name: tfplan\n[^\n]*\n {10}retention-days: 1\n/);
+    assert.match(job('tf-apply'), /terraform apply [^\n]*-lock-timeout=10m/);
+  });
+
+  it('always starts the checks, and fails them first when tf-plan failed', () => {
+    const checks = job('checks');
+    assert.match(checks, /\n {4}if: \$\{\{ !cancelled\(\) \}\}\n/);
+    assert.match(checks, /\n {4}steps:\n {6}- name: The Terraform plan passed\n {8}if: needs\.tf-plan\.result == 'failure'\n[\s\S]*?exit 1\n/);
+  });
+});
+
 describe('the CI files', () => {
   it('run in a project whose package.json says "type": "commonjs", and are stale until written again', async () => {
     const packageDir = join(import.meta.dirname, '..');
