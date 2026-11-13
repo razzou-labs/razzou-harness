@@ -467,13 +467,15 @@ export async function designChecks(tree: TreeReader): Promise<Array<{ feature: s
 /**
  * The kind of a PR, from who opened it and its branch; the title must agree, and grants
  * nothing (§11.3). The Architect's changes to built features, `locked/<module>`, are Arch
- * PRs of their own tag (v5).
+ * PRs of their own tag (v5). The App opens no other kind: one of its on another branch is
+ * `Stray`, which always fails, rather than the owner's.
  */
-export function prKind(author: string, branch: string, bot: string | undefined): 'Plan' | 'Fix' | 'Arch' | 'Harness' | 'Owner' {
+export function prKind(author: string, branch: string, bot: string | undefined): 'Plan' | 'Fix' | 'Arch' | 'Harness' | 'Owner' | 'Stray' {
   const byBot = bot !== undefined && author === bot;
   if (byBot && /^plan\/[^/]+\/[^/]+$/.test(branch)) return 'Plan';
   if (byBot && /^fix\/[^/]+\/[^/]+-\d+$/.test(branch)) return 'Fix';
   if (byBot && /^(?:arch|locked)\/[^/]+$/.test(branch)) return 'Arch';
+  if (byBot) return 'Stray';
   if (!byBot && branch.startsWith('harness/upgrade-')) return 'Harness';
   return 'Owner';
 }
@@ -553,8 +555,10 @@ async function lockedProblems(input: VerifyInput, module: string): Promise<strin
   // The scripts in the module's folder: another module's would redefine that module's features too.
   const scripts = new Set([...(await checkScriptsOf(input.base, module)), ...(await checkScriptsOf(input.head, module))]);
   for (const path of input.changedPaths) {
-    if (path === 'harness/lock.json' || (scripts.has(path) && path.startsWith(`harness/modules/${module}/`))) continue;
+    if (path === 'harness/lock.json') continue;
+    // A plan file is held to the plan rules even when a check's command names it, as a script.
     if (!plans.test(path)) {
+      if (scripts.has(path) && path.startsWith(`harness/modules/${module}/`)) continue;
       problems.push(`a CHANGED_LOCKED_FILES PR changes only the definitions of ${module}'s built features and the scripts in harness/modules/${module}/ that their checks run, not ${path}`);
       continue;
     }
@@ -585,13 +589,13 @@ async function checkScriptsOf(tree: TreeReader, module: string): Promise<string[
 }
 
 /**
- * The plan-kind rules of a Plan PR (v3 §3.1), from the plan file on the base branch: a
- * tag in the title must be the plan's kind, and a CODE plan stays off the Terraform
- * folder, so infrastructure can't reach main as code. The tag grants nothing, and a
- * title without one, from an older daemon, passes.
+ * The plan-kind rules of a Plan or Fix PR (v3 §3.1), from the plan file on the base branch:
+ * a tag in a Plan PR's title must be the plan's kind, and a CODE plan, and its fixes after
+ * the deploy, stay off the Terraform folder, so infrastructure can't reach main as code.
+ * The tag grants nothing.
  */
 async function planKindProblems(input: VerifyInput, config: BaseConfig | undefined): Promise<string[]> {
-  const [, module, plan] = /^plan\/([^/]+)\/([^/]+)$/.exec(input.branch) ?? [];
+  const [, module, plan] = /^(?:plan\/([^/]+)\/([^/]+)|fix\/([^/]+)\/([^/]+)-\d+)$/.exec(input.branch)?.filter(Boolean) ?? [];
   if (!module || !plan) return [];
   const file = `harness/modules/${module}/plans/${plan}.json`;
   const definition = parseJson(await input.base.read(file)) as { features?: unknown } | undefined;
@@ -618,6 +622,7 @@ export async function verify(input: VerifyInput): Promise<string[]> {
   const config = parseJson(await input.base.read('harness/config.json')) as BaseConfig | undefined;
   const kind = prKind(input.author, input.branch, config?.project?.bot);
   const problems: string[] = [];
+  if (kind === 'Stray') return [`the App opens pull requests from plan/, fix/, arch/ and locked/ branches only, not from ${input.branch}`];
   if (!input.title.startsWith(`${kind}: `)) problems.push(`this is a ${kind} PR (from ${input.author}, branch ${input.branch}), so its title must start with "${kind}: "`);
   else if (kind === 'Plan' || kind === 'Fix' || kind === 'Arch') problems.push(...(await titleProblems(input, kind)));
   const [start = input.base, ...others] = input.mergeBases ?? [input.base];
@@ -632,7 +637,7 @@ export async function verify(input: VerifyInput): Promise<string[]> {
     }
     for (const problem of await lockfileProblems(start, input.head)) problems.push(`package-lock.json: ${problem}`);
   }
-  if (kind === 'Plan') problems.push(...(await planKindProblems(input, config)));
+  if (kind === 'Plan' || kind === 'Fix') problems.push(...(await planKindProblems(input, config)));
   if (kind === 'Arch') {
     // The base's rules, as for every PR: what its head protects opens nothing to the PR itself.
     const locked = /^locked\/([^/]+)$/.exec(input.branch)?.[1];

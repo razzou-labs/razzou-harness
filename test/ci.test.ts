@@ -354,7 +354,24 @@ describe('verify', () => {
     assert.equal(prKind(BOT, 'locked/shop', BOT), 'Arch', "a change to built features' definitions is the Architect's");
     assert.equal(prKind('owner', 'plan/shop/P1', BOT), 'Owner');
     assert.equal(prKind('owner', 'harness/upgrade-0.2.0', BOT), 'Harness');
-    assert.equal(prKind(BOT, 'feature/x', BOT), 'Owner');
+    assert.equal(prKind(BOT, 'feature/x', BOT), 'Stray');
+    assert.equal(prKind(BOT, 'misc/anything', BOT), 'Stray');
+  });
+
+  it("fails the App's pull request from a branch it never opens one from, whatever its title", async () => {
+    const pr = await change({ 'src/app.js': 'export const x = 2;\n' });
+    for (const title of ['Owner: anything', 'Stray: anything', 'Plan: [CODE] [shop/P1] T']) {
+      assert.deepEqual(await verify({ base: pr.baseTree, head: pr.headTree, changedPaths: pr.changed, author: BOT, branch: 'misc/anything', title }), [
+        'the App opens pull requests from plan/, fix/, arch/ and locked/ branches only, not from misc/anything',
+      ], title);
+    }
+  });
+
+  it('keeps the Fix PR of a CODE plan off the Terraform folder too', async () => {
+    const fix = await change({ 'iac/queue.tf': 'resource "aws_sqs_queue" "q" {}\n' }, withConfig({ terraform: { dir: 'iac' } }));
+    assert.deepEqual(await verify({
+      base: fix.baseTree, head: fix.headTree, changedPaths: fix.changed, author: BOT, branch: 'fix/shop/P1-2', title: 'Fix: [DEPLOY_FAILED] [shop/P1] round 2 after the deploy',
+    }), ['a CODE plan may not change iac/: infrastructure gets plans of its own (v3 §3.1); changed: iac/queue.tf']);
   });
 
   it('fails a Plan PR that changes a protected file, or carries the wrong title', async () => {
@@ -498,6 +515,11 @@ describe('verify', () => {
       'harness/modules/shop/plans/P1.json: a CHANGED_LOCKED_FILES PR neither adds, removes, renames nor moves a feature',
     ]);
     assert.deepEqual(await locked({ 'harness/modules/shop/plans/P2.json': plan([]) }), ['harness/modules/shop/plans/P2.json: a CHANGED_LOCKED_FILES PR neither adds nor removes a plan']);
+    // A plan file that a check's command names, as if a script, is still held to the plan rules.
+    const named = { ...base, 'harness/modules/shop/plans/P1.json': plan([feature('node -e "" harness/modules/shop/plans/P1.json')]) };
+    assert.deepEqual(await locked({ 'harness/modules/shop/plans/P1.json': plan([feature('node -e "" harness/modules/shop/plans/P1.json')], 'Renamed') }, named), [
+      "harness/modules/shop/plans/P1.json: a CHANGED_LOCKED_FILES PR changes features, not the plan's own fields",
+    ]);
     // Its own tag, on its own branch.
     const pr = await change({ 'harness/modules/shop/checks/F01.sh': '[ "$x" -eq 0 ]\n' }, base);
     assert.match((await verify({ base: pr.baseTree, head: pr.headTree, changedPaths: pr.changed, author: BOT, branch: 'locked/shop', title: 'Arch: [DESIGN_MODIFY] [shop] T' })).join('\n'),
