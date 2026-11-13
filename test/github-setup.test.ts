@@ -1,9 +1,10 @@
 import { strict as assert } from 'node:assert';
 import { generateKeyPairSync } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
-import { GitHubClient, GitHubError } from '../src/github/app.ts';
+import { configDir, GitHubClient, GitHubError } from '../src/github/app.ts';
 import { GitHubForge, type BranchRules } from '../src/github/forge.ts';
 import { checkApp, ciFiles, installCi, mainRuleset, rulesProblems, staleCiFiles } from '../src/github/setup.ts';
 import { run } from '../src/util.ts';
@@ -191,6 +192,51 @@ describe('the App on GitHub', () => {
     assert.equal(await client.token(), 't3');
     assert.equal(client.canWriteStatuses, true);
     assert.deepEqual(asked, ['write', 'read', 'write']);
+  });
+
+  it('tries a call GitHub answers 401 once more, with a token minted anew', async () => {
+    let minted = 0;
+    const seen: string[] = [];
+    // Tokens that last an hour: only a 401 makes the client mint another.
+    const fake = async (url: string | URL | Request, init?: RequestInit) => {
+      const path = new URL(String(url)).pathname;
+      if (path === '/repos/acme/shop/installation') return json({ id: 7 });
+      if (path.endsWith('/access_tokens')) return json({ token: `t${++minted}`, expires_at: new Date(Date.now() + 3_600_000).toISOString() }, 201);
+      const auth = String((init?.headers as Record<string, string>).authorization);
+      seen.push(`${path} ${auth}`);
+      // GitHub revoked the first token.
+      return auth === 'token t1' ? json({ message: 'Bad credentials' }, 401) : path.endsWith('/logs') ? new Response('the log') : json({ ok: true });
+    };
+    const client = new GitHubClient({ appId: 1, slug: 'acme-harness', privateKey }, 'acme/shop', fake as typeof fetch);
+    assert.deepEqual(await client.request('GET', '/repos/{repo}/pulls/1'), { ok: true });
+    assert.deepEqual(seen, ['/repos/acme/shop/pulls/1 token t1', '/repos/acme/shop/pulls/1 token t2']);
+    assert.equal(await client.download('/repos/{repo}/actions/jobs/1/logs'), 'the log');
+    assert.equal(minted, 2, 'the new token serves the next calls');
+
+    // Twice refused: GitHub means it.
+    const always = new GitHubClient({ appId: 1, slug: 'acme-harness', privateKey }, 'acme/shop', (async (url: string | URL | Request) => {
+      const path = new URL(String(url)).pathname;
+      if (path === '/repos/acme/shop/installation') return json({ id: 7 });
+      if (path.endsWith('/access_tokens')) return json({ token: 't', expires_at: new Date(Date.now() + 3_600_000).toISOString() }, 201);
+      return json({ message: 'Bad credentials' }, 401);
+    }) as typeof fetch);
+    await assert.rejects(always.request('GET', '/repos/{repo}/pulls/1'), (error: unknown) => error instanceof GitHubError && error.status === 401);
+  });
+
+  it('keeps the App in ~/.config/harness unless XDG_CONFIG_HOME is an absolute path', () => {
+    const before = process.env.XDG_CONFIG_HOME;
+    try {
+      for (const value of ['', 'relative/config']) {
+        process.env.XDG_CONFIG_HOME = value;
+        assert.equal(configDir(), join(homedir(), '.config', 'harness'), JSON.stringify(value));
+      }
+      const absolute = tempDir('xdg');
+      process.env.XDG_CONFIG_HOME = absolute;
+      assert.equal(configDir(), join(absolute, 'harness'));
+    } finally {
+      if (before === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = before;
+    }
   });
 
   it("reads every rule on a branch, on every page, and the strictest of the pull request's", async () => {

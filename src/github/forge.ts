@@ -3,6 +3,9 @@ import { tail } from '../util.ts';
 import { GitHubError, type GitHubClient } from './app.ts';
 import { zipEntry } from './artifacts.ts';
 
+/** GitHub Actions' integration id: the App whose check runs are the workflow's jobs. */
+export const GITHUB_ACTIONS = 15368;
+
 export interface PullRequest {
   number: number;
   url: string;
@@ -19,6 +22,16 @@ export interface CheckRun {
   status: string;
   conclusion: string | null;
   url?: string;
+  /** The workflow run the job belongs to, from the job's URL. */
+  runId?: number;
+  completedAt?: string;
+}
+
+/** What `artifactFile` takes: only the artifact of one run, one made no later than a time, and no more bytes than so many. */
+export interface ArtifactOptions {
+  runId?: number;
+  notAfter?: string;
+  maxBytes?: number;
 }
 
 /** A commit status, the latest of its context: what the reviewers post as the App (v3 §5.4). */
@@ -58,11 +71,16 @@ export interface Forge {
   fetchBranch(repo: Repo, branch: string): Promise<string | undefined>;
   push(repo: Repo, branch: string): Promise<void>;
   openPullRequest(input: { branch: string; title: string; body: string }): Promise<{ number: number; url: string }>;
-  /** The newest PR of a branch (only an open one with `open`): a previous process may have opened it just before stopping. */
-  findPullRequest(branch: string, options?: { open?: boolean }): Promise<{ number: number; url: string } | undefined>;
+  /**
+   * The newest PR of a branch, as a previous process may have opened it just before stopping:
+   * only an open one with `open`; with `head`, a closed or merged one only when its head is
+   * that commit, since a branch name comes back for a new plan.
+   */
+  findPullRequest(branch: string, options?: { open?: boolean; head?: string }): Promise<{ number: number; url: string } | undefined>;
   pullRequest(number: number): Promise<PullRequest>;
+  /** The jobs GitHub Actions ran on a commit: no other App's check runs. */
   checkRuns(sha: string): Promise<CheckRun[]>;
-  /** The end of a failed job's log. */
+  /** The end of a failed job's log, before the clean-up that ends every log. */
   jobLog(run: CheckRun): Promise<string>;
   /** The commit statuses on a commit, the latest per context. */
   commitStatuses(sha: string): Promise<CommitStatus[]>;
@@ -75,8 +93,12 @@ export interface Forge {
   createReview(number: number, review: ReviewPost): Promise<{ comments: number }>;
   /** Sets a commit status, the reviewers' verdict, which the Swarm ruleset requires (v3 §3.3). */
   setCommitStatus(sha: string, status: { context: string; state: 'success' | 'failure' | 'pending'; description: string }): Promise<void>;
-  /** A file out of a named artifact of the commit's workflow run (v3 §5.5), or undefined when no run has one yet. */
-  artifactFile(sha: string, artifact: string, file: string): Promise<string | undefined>;
+  /**
+   * A file out of a named artifact of the commit's workflow runs (v3 §5.5), or undefined when
+   * no run has one yet. With `runId`, only that run's; one created after `notAfter` throws,
+   * since another job of the run replaced it; the file stops at `maxBytes`, 64 MiB by default.
+   */
+  artifactFile(sha: string, artifact: string, file: string, options?: ArtifactOptions): Promise<string | undefined>;
   /** The rules in effect on a branch (v4 §6), or undefined when they can't be read. */
   branchRules(branch: string): Promise<BranchRules | undefined>;
   /** Whether the App may write commit statuses: false once a token had to be minted without it; undefined while unknown. */
@@ -193,12 +215,13 @@ export class GitHubForge implements Forge {
     return { number: pr.number, url: pr.html_url };
   }
 
-  async findPullRequest(branch: string, options: { open?: boolean } = {}): Promise<{ number: number; url: string } | undefined> {
+  async findPullRequest(branch: string, options: { open?: boolean; head?: string } = {}): Promise<{ number: number; url: string } | undefined> {
     const owner = this.client.repo.split('/')[0];
-    const prs = await this.client.request<Array<{ number: number; html_url: string }>>(
+    const prs = await this.client.request<Array<{ number: number; html_url: string; state: string; head: { sha: string } }>>(
       'GET', `/repos/{repo}/pulls?state=${options.open ? 'open' : 'all'}&head=${encodeURIComponent(`${owner}:${branch}`)}`,
     );
-    return prs[0] ? { number: prs[0].number, url: prs[0].html_url } : undefined;
+    const found = prs.find((pr) => pr.state === 'open' || options.head === undefined || pr.head.sha === options.head);
+    return found ? { number: found.number, url: found.html_url } : undefined;
   }
 
   async pullRequest(number: number): Promise<PullRequest> {
@@ -215,17 +238,31 @@ export class GitHubForge implements Forge {
     };
   }
 
+  /** Only GitHub Actions' runs: another App with checks permission could post a run named like a job. */
   async checkRuns(sha: string): Promise<CheckRun[]> {
-    const page = await this.client.request<{ check_runs: Array<{ id: number; name: string; status: string; conclusion: string | null; html_url?: string }> }>(
-      'GET', `/repos/{repo}/commits/${sha}/check-runs?per_page=100`,
-    );
-    return page.check_runs.map((r) => ({ id: r.id, name: r.name, status: r.status, conclusion: r.conclusion, ...(r.html_url ? { url: r.html_url } : {}) }));
+    const page = await this.client.request<{
+      check_runs: Array<{ id: number; name: string; status: string; conclusion: string | null; html_url?: string; completed_at?: string | null; app?: { id: number } | null }>;
+    }>('GET', `/repos/{repo}/commits/${sha}/check-runs?per_page=100`);
+    return page.check_runs.filter((r) => r.app?.id === GITHUB_ACTIONS).map((r) => {
+      const runId = /\/actions\/runs\/(\d+)\//.exec(r.html_url ?? '')?.[1];
+      return {
+        id: r.id, name: r.name, status: r.status, conclusion: r.conclusion,
+        ...(r.html_url ? { url: r.html_url } : {}),
+        ...(runId ? { runId: Number(runId) } : {}),
+        ...(r.completed_at ? { completedAt: r.completed_at } : {}),
+      };
+    });
   }
 
-  /** For Actions, a check run is a job, and the job's log is behind a redirect. */
+  /**
+   * For Actions, a check run is a job, and the job's log is behind a redirect. It ends with
+   * the clean-up after the job, a kilobyte or two per checkout, so its end is taken before that.
+   */
   async jobLog(run: CheckRun): Promise<string> {
     try {
-      return tail(await this.client.download(`/repos/{repo}/actions/jobs/${run.id}/logs`), 4000);
+      const log = await this.client.download(`/repos/{repo}/actions/jobs/${run.id}/logs`);
+      const cleanup = log.indexOf('Post job cleanup.');
+      return tail(cleanup < 0 ? log : log.slice(0, log.lastIndexOf('\n', cleanup) + 1), 4000);
     } catch (error) {
       return `(no log: ${(error as Error).message})`;
     }
@@ -270,16 +307,28 @@ export class GitHubForge implements Forge {
     return { commit: result.sha };
   }
 
-  /** The newest completed run on the commit that has the artifact: its zip, read for the file. */
-  async artifactFile(sha: string, artifact: string, file: string): Promise<string | undefined> {
-    const runs = await this.client.request<{ workflow_runs: Array<{ id: number; status: string; created_at: string }> }>(
-      'GET', `/repos/{repo}/actions/runs?head_sha=${sha}&per_page=20`,
-    );
-    const completed = runs.workflow_runs.filter((r) => r.status === 'completed').sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
-    for (const run of completed) {
-      const list = await this.client.request<{ artifacts: Array<{ id: number; name: string; expired: boolean }> }>('GET', `/repos/{repo}/actions/runs/${run.id}/artifacts?per_page=100`);
+  /** With `runId`, that run's artifact; otherwise the newest completed run on the commit that has one. Its zip, read for the file. */
+  async artifactFile(sha: string, artifact: string, file: string, options: ArtifactOptions = {}): Promise<string | undefined> {
+    let runs: number[];
+    if (options.runId !== undefined) runs = [options.runId];
+    else {
+      const list = await this.client.request<{ workflow_runs: Array<{ id: number; status: string; created_at: string }> }>(
+        'GET', `/repos/{repo}/actions/runs?head_sha=${sha}&per_page=20`,
+      );
+      runs = list.workflow_runs.filter((r) => r.status === 'completed').sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at)).map((r) => r.id);
+    }
+    for (const run of runs) {
+      const list = await this.client.request<{ artifacts: Array<{ id: number; name: string; expired: boolean; created_at?: string; updated_at?: string }> }>(
+        'GET', `/repos/{repo}/actions/runs/${run}/artifacts?per_page=100`,
+      );
       const found = list.artifacts.find((a) => a.name === artifact && !a.expired);
-      if (found) return zipEntry(await this.client.downloadBytes(`/repos/{repo}/actions/artifacts/${found.id}/zip`), file);
+      if (!found) continue;
+      // Uploaded again by name after the job that made it, by a job that runs the pull request's code.
+      const made = found.updated_at ?? found.created_at;
+      if (options.notAfter !== undefined && !(Date.parse(made ?? '') <= Date.parse(options.notAfter))) {
+        throw new Error(`the ${artifact} artifact of run ${run} was made at ${made ?? 'an unknown time'}, after ${options.notAfter}: another job replaced it`);
+      }
+      return zipEntry(await this.client.downloadBytes(`/repos/{repo}/actions/artifacts/${found.id}/zip`), file, options.maxBytes);
     }
     return undefined;
   }

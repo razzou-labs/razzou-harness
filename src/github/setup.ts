@@ -7,7 +7,7 @@ import { ConfigSchema, requiredChecks, type Config } from '../design/schemas.ts'
 import type { Mode } from '../state/state.ts';
 import { run } from '../util.ts';
 import { APP_PERMISSIONS, configDir, GitHubClient, loadAppCredentials } from './app.ts';
-import type { BranchRules } from './forge.ts';
+import { GITHUB_ACTIONS, type BranchRules } from './forge.ts';
 
 export interface CreatedApp {
   appId: number;
@@ -175,9 +175,6 @@ async function ghLogin(): Promise<string | undefined> {
   const login = await run('gh', ['api', 'user', '--jq', '.login']).catch(() => undefined);
   return login?.code === 0 ? login.stdout.trim() || undefined : undefined;
 }
-
-/** GitHub Actions' integration id: pinned to it, a required job can't be posted by another App. */
-const GITHUB_ACTIONS = 15368;
 
 /** What the ruleset on main enforces, per mode (v3 §3.3). */
 export interface RulesetOptions {

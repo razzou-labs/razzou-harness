@@ -52,6 +52,15 @@ describe('workflow artifacts (v3 §5.5)', () => {
     assert.throws(() => zipEntry(Buffer.from('not a zip'), 'x'), /not a zip file/);
   });
 
+  it('stops inflating a file past the most it may hold, 64 MiB unless told otherwise', () => {
+    // 70 MiB of one byte deflates to some 70 kB.
+    const bomb = zip({ 'cost.json': ' '.repeat(70 * 1024 * 1024) }, 8);
+    assert.ok(bomb.length < 1024 * 1024);
+    assert.throws(() => zipEntry(bomb, 'cost.json'), /cost\.json in the zip holds more than 67108864 bytes/);
+    assert.throws(() => zipEntry(zip({ 'cost.json': '{"totalMonthlyCost":1}' }, 0), 'cost.json', 10), /holds more than 10 bytes/);
+    assert.equal(zipEntry(zip({ 'cost.json': '{"totalMonthlyCost":1}' }, 8), 'cost.json', 100), '{"totalMonthlyCost":1}');
+  });
+
   it("reads Infracost's monthly delta, or the total without a base, and nothing from other text", () => {
     assert.deepEqual(parseCostEstimate('{"totalMonthlyCost":"212.4","diffTotalMonthlyCost":"80.25"}'), { monthlyUsd: 80.25, source: 'diffTotalMonthlyCost' });
     assert.deepEqual(parseCostEstimate('{"totalMonthlyCost":12.504}'), { monthlyUsd: 12.5, source: 'totalMonthlyCost' });
@@ -59,5 +68,13 @@ describe('workflow artifacts (v3 §5.5)', () => {
     assert.equal(parseCostEstimate('{"projects":[]}'), undefined);
     assert.equal(parseCostEstimate('{"diffTotalMonthlyCost":""}'), undefined);
     assert.equal(parseCostEstimate('not json'), undefined);
+  });
+
+  it("gives no estimate when a project of Infracost's JSON reports errors, rather than its 0 USD", () => {
+    const errors = [{ code: 101, message: 'Error loading Terraform modules', data: null }];
+    assert.equal(parseCostEstimate(JSON.stringify({ totalMonthlyCost: '0', diffTotalMonthlyCost: '0', projects: [{ name: 'iac', metadata: { errors } }] })), undefined);
+    assert.deepEqual(parseCostEstimate(JSON.stringify({ diffTotalMonthlyCost: '4', projects: [{ name: 'iac', metadata: { errors: [] } }, { name: 'b', metadata: {} }] })), {
+      monthlyUsd: 4, source: 'diffTotalMonthlyCost',
+    });
   });
 });

@@ -1,7 +1,7 @@
 import { join } from 'node:path';
 import type { Repo } from '../../src/git/repo.ts';
 import { GitHubError } from '../../src/github/app.ts';
-import type { BranchRules, CheckRun, CommitStatus, Forge, PullRequest, ReviewPost } from '../../src/github/forge.ts';
+import type { ArtifactOptions, BranchRules, CheckRun, CommitStatus, Forge, PullRequest, ReviewPost } from '../../src/github/forge.ts';
 import { run, runOk } from '../../src/util.ts';
 import { tempDir } from './toy-repo.ts';
 
@@ -14,6 +14,8 @@ interface FakePullRequest {
   body: string;
   state: 'open' | 'closed';
   mergeCommit?: string;
+  /** The head it was merged with: a closed one's head counts for `findPullRequest`'s `head`, and only a merged one's is known. */
+  mergedHead?: string;
 }
 
 /**
@@ -78,8 +80,8 @@ export class FakeForge implements Forge {
     return { number: pr.number, url: `https://github.test/pull/${pr.number}` };
   }
 
-  async findPullRequest(branch: string, options: { open?: boolean } = {}): Promise<{ number: number; url: string } | undefined> {
-    const pr = this.prs.findLast((p) => p.branch === branch && (!options.open || p.state === 'open'));
+  async findPullRequest(branch: string, options: { open?: boolean; head?: string } = {}): Promise<{ number: number; url: string } | undefined> {
+    const pr = this.prs.findLast((p) => p.branch === branch && (p.state === 'open' || (!options.open && (options.head === undefined || p.mergedHead === options.head))));
     return pr ? { number: pr.number, url: `https://github.test/pull/${pr.number}` } : undefined;
   }
 
@@ -147,7 +149,7 @@ export class FakeForge implements Forge {
     this.statusesSet.push({ sha, ...status });
   }
 
-  async artifactFile(sha: string, artifact: string, file: string): Promise<string | undefined> {
+  async artifactFile(sha: string, artifact: string, file: string, _options?: ArtifactOptions): Promise<string | undefined> {
     return this.artifacts(sha)[artifact]?.[file];
   }
 
@@ -184,6 +186,7 @@ export class FakeForge implements Forge {
     const commit = (await runOk('git', ['--git-dir', this.remote, 'commit-tree', tree, '-p', main, '-p', head, '-m', `${pr.title} (#${number})`], { env })).trim();
     await runOk('git', ['--git-dir', this.remote, 'update-ref', 'refs/heads/main', commit, main]);
     pr.mergeCommit = commit;
+    pr.mergedHead = head;
     pr.state = 'closed';
     return commit;
   }
