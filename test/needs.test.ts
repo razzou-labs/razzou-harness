@@ -235,7 +235,7 @@ describe('needs you', () => {
 });
 
 describe('notifications', () => {
-  const paused = (reason: string): Need => ({ kind: 'paused', key: 'paused', paused: { reason, since: '2026-11-12T10:00:00.000Z' } });
+  const paused = (reason: string, retry = true): Need => ({ kind: 'paused', key: 'paused', paused: { reason, since: '2026-11-12T10:00:00.000Z', ...(retry ? { retry } : {}) } });
   const request = (id: string): Need => ({ kind: 'request', key: `request:${id}`, request: { requestId: id, module: 'web', question: 'Which region?', blocking: false, askedAt: '2026-11-12T10:00:00.000Z' } });
   const keys = (needs: Need[]) => needs.map((need) => need.key);
 
@@ -260,5 +260,28 @@ describe('notifications', () => {
     }
     assert.deepEqual(announced, [0, 60, 120]);
     assert.equal(QUIET_MS, 60 * 60_000);
+  });
+
+  it('announces a pause whose reason changed, and an untimed pause after one that waited, within the hour', () => {
+    let told = arrivals([], undefined, 0).told;
+    const retry = arrivals([paused('GitHub does not answer')], told, 0);
+    assert.equal(retry.fresh.length, 1);
+    told = arrivals([], retry.told, 60_000).told;
+    // 25 minutes later: CI still fails, and the pipeline waits for the owner.
+    const stuck = arrivals([paused('CI still fails after 2 fix rounds', false)], told, 25 * 60_000);
+    assert.equal(stuck.fresh.length, 1);
+    // The card changes in place, from a pause that waits to one that doesn't, without leaving.
+    const waiting = arrivals([paused('the API failed')], stuck.told, 26 * 60_000);
+    assert.equal(waiting.fresh.length, 1);
+    const untimed = arrivals([paused('the API failed', false)], waiting.told, 27 * 60_000);
+    assert.equal(untimed.fresh.length, 1);
+  });
+
+  it('starts the quiet hour only with a notification shown', () => {
+    let told = arrivals([], undefined, 0).told;
+    const unseen = arrivals([paused('GitHub does not answer')], told, 0, false);
+    assert.equal(unseen.fresh.length, 1);
+    told = arrivals([], unseen.told, 1_000, false).told;
+    assert.equal(arrivals([paused('GitHub does not answer')], told, 10 * 60_000).fresh.length, 1);
   });
 });

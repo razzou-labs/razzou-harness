@@ -230,26 +230,37 @@ export function needPrint(need: Need): string {
   return JSON.stringify(facts());
 }
 
-/** What the page already told the owner of: the cards that were there at its last look, and when it last announced each. */
+/**
+ * What the page already told the owner of: the cards that were there at its last look,
+ * and the last pause that only waits to look again it showed a notification for.
+ */
 export interface Told {
   present: Set<string>;
-  at: Map<string, number>;
+  retry?: { reason: string; at: number };
 }
 
-/** A card announced within this long isn't announced again: the card of a pause that only waits to look again comes back every ten minutes. */
+/** A pause that only waits to look again, for the same reason, isn't announced again within this long: its card comes back every ten minutes. */
 export const QUIET_MS = 3_600_000;
+
+/** What makes a card new: its key, and for a pause its reason and whether it only waits, as every pause has the key `paused`. */
+const arrival = (need: Need): string => (need.kind === 'paused' ? `paused\n${need.paused.reason}\n${need.paused.retry === true}` : need.key);
 
 /**
  * The cards that arrived since the page's last look, for its notifications, and what it
- * has told by now. The first look announces nothing: what already waits isn't news.
+ * has told by now. The first look announces nothing: what already waits isn't news. A
+ * pause that only waits to look again, with the reason of the last one announced, waits
+ * out the quiet hour; any other pause is news. `shown` says whether the page shows the
+ * notifications: only one shown starts the quiet hour.
  */
-export function arrivals(needs: Need[], told: Told | undefined, now: number): { fresh: Need[]; told: Told } {
-  const present = new Set(needs.map((need) => need.key));
-  if (!told) return { fresh: [], told: { present, at: new Map() } };
-  const at = new Map(told.at);
-  const fresh = needs.filter((need) => !told.present.has(need.key) && now - (at.get(need.key) ?? -Infinity) >= QUIET_MS);
-  for (const need of fresh) at.set(need.key, now);
-  return { fresh, told: { present, at } };
+export function arrivals(needs: Need[], told: Told | undefined, now: number, shown = true): { fresh: Need[]; told: Told } {
+  const present = new Set(needs.map(arrival));
+  if (!told) return { fresh: [], told: { present } };
+  const quiet = (need: Need) =>
+    need.kind === 'paused' && need.paused.retry === true && told.retry?.reason === need.paused.reason && now - told.retry.at < QUIET_MS;
+  const fresh = needs.filter((need) => !told.present.has(arrival(need)) && !quiet(need));
+  const retry = shown ? fresh.find((need) => need.kind === 'paused' && need.paused.retry === true) : undefined;
+  const last = retry?.kind === 'paused' ? { reason: retry.paused.reason, at: now } : told.retry;
+  return { fresh, told: { present, ...(last ? { retry: last } : {}) } };
 }
 
 /** The cards as an order request records them. */
