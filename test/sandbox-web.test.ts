@@ -83,6 +83,13 @@ describe('web_read', () => {
         const slow = /^\/slow\/(\d+)$/.exec(req.url ?? '');
         if (slow) {
           setTimeout(() => res.writeHead(302, { location: `/slow/${Number(slow[1]) + 1}` }).end(), 150);
+        } else if (req.url === '/cut' || req.url === '/stall') {
+          // The first half of a compressed page, then the connection drops, or nothing more comes.
+          const page = gzipSync(Buffer.from('<p>words</p>'.repeat(10_000)));
+          res.writeHead(200, { 'content-type': 'text/html', 'content-encoding': 'gzip', 'content-length': page.length });
+          res.write(page.subarray(0, page.length >> 1), () => {
+            if (req.url === '/cut') setTimeout(() => res.destroy(), 50);
+          });
         } else if (req.url === '/bomb') {
           res.writeHead(200, { 'content-type': 'text/plain', 'content-encoding': 'gzip' });
           res.end(Buffer.concat(Array.from({ length: 64 }, () => member)));
@@ -103,6 +110,16 @@ describe('web_read', () => {
       const before = process.memoryUsage().arrayBuffers;
       await sleep(300);
       assert.ok(process.memoryUsage().arrayBuffers - before < 16 * 1024 * 1024);
+    });
+
+    it('answers when a compressed page is cut short, or stalls, within the deadline', async () => {
+      for (const path of ['/cut', '/stall']) {
+        const started = Date.now();
+        const result = await webRead(`${base}${path}`, { ...options, timeoutMs: 1500 });
+        assert.equal(result.ok, false, path);
+        assert.match(result.text, path === '/cut' ? /^failed: / : /^failed: no complete answer within 1.5 s$/, path);
+        assert.ok(Date.now() - started < 2500, path);
+      }
     });
 
     it('gives the whole read one deadline, redirects included', async () => {

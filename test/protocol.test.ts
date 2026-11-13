@@ -125,7 +125,7 @@ describe('agent channel', () => {
 describe('web_read', () => {
   it('knows public addresses from private ones', () => {
     for (const ip of ['8.8.8.8', '1.1.1.1', '2606:4700:4700::1111', '::ffff:8.8.8.8']) assert.equal(isPublicAddress(ip), true, ip);
-    for (const ip of ['127.0.0.1', '10.1.2.3', '172.20.0.1', '192.168.1.1', '169.254.169.254', '100.101.102.103', '0.0.0.0', '::1', 'fe80::1', 'fd12::1', '::ffff:127.0.0.1', '::ffff:7f00:1', '::ffff:a9fe:a9fe', 'not an ip']) {
+    for (const ip of ['127.0.0.1', '10.1.2.3', '172.20.0.1', '192.168.1.1', '169.254.169.254', '100.101.102.103', '0.0.0.0', '::1', 'fe80::1', 'fd12::1', '::ffff:127.0.0.1', '::ffff:7f00:1', '::ffff:a9fe:a9fe', '::127.0.0.1', '::7f00:1', '::ffff:0:127.0.0.1', '::ffff:0:a9fe:a9fe', 'fec0::1', '168.63.129.16', 'not an ip']) {
       assert.equal(isPublicAddress(ip), false, ip);
     }
   });
@@ -136,7 +136,7 @@ describe('web_read', () => {
   });
 
   it('refuses private addresses, other schemes and credentials before connecting', async () => {
-    for (const url of ['http://127.0.0.1/', 'http://169.254.169.254/latest/meta-data/', 'http://[::1]/', 'http://localhost/', 'ftp://example.com/', 'https://user:pass@example.com/', 'http://example.com:8080/']) {
+    for (const url of ['http://127.0.0.1/', 'http://169.254.169.254/latest/meta-data/', 'http://[::1]/', 'http://[::127.0.0.1]/', 'http://[::ffff:0:127.0.0.1]/', 'http://localhost/', 'ftp://example.com/', 'https://user:pass@example.com/', 'http://example.com:8080/']) {
       const result = await webRead(url);
       assert.equal(result.ok, false, url);
       assert.match(result.text, /^refused: /, url);
