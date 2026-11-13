@@ -7,7 +7,7 @@ import { computeLock, directoryReader } from '../src/ci/harness-ci.ts';
 import { granted, mainRuleset, repositorySecret, secretReader, type Check } from '../src/setup/doctor.ts';
 import { init } from '../src/setup/init.ts';
 import { recover } from '../src/setup/recover.ts';
-import { awsProviderName, commitAndPush, fixFor, infracostKey, linkRepo, type SetupOptions } from '../src/setup/setup.ts';
+import { askSettings, awsProviderName, commitAndPush, fixFor, infracostKey, linkRepo, setup, type SetupOptions } from '../src/setup/setup.ts';
 import { writeTerraformScaffold } from '../src/setup/terraform.ts';
 import { run, runOk } from '../src/util.ts';
 import { FakeForge } from './helpers/fake-forge.ts';
@@ -91,6 +91,102 @@ describe('harness setup (v4 §4)', () => {
     const result = await init({ projectDir: link, packageDir: fileURLToPath(new URL('..', import.meta.url)), version: '0.2.0', owner: 'owner' });
     assert.ok(result.wrote.includes('harness/config.json'));
     assert.equal(JSON.parse(readFileSync(join(dir, 'harness', 'config.json'), 'utf8')).project.name, 'shop');
+  });
+});
+
+describe('the setup writes nothing the schema refuses', () => {
+  const PACKAGE = fileURLToPath(new URL('..', import.meta.url));
+  const options = (dir: string, answers: string[], said: string[] = []): SetupOptions => ({
+    projectDir: dir, packageDir: PACKAGE, version: '0.6.0', say: (line) => void said.push(line), ask: async () => answers.shift() ?? '', askSecret: async () => '', open: () => {}, interactive: () => 0, up: async () => {},
+  });
+
+  it('asks again for a region or a role the schema refuses, and writes what it accepts', async () => {
+    const { dir } = await project(false);
+    mkdirSync(join(dir, 'harness'));
+    writeFileSync(join(dir, 'harness', 'config.json'), JSON.stringify({ harnessVersion: '0.6.0', project: { name: 'shop' } }));
+    const said: string[] = [];
+    const view = 'arn:aws:iam::123456789012:role/harness-shop-view';
+    const role = 'arn:aws:iam::123456789012:role/harness-shop-plan';
+    await askSettings(options(dir, ['y', 'EU-WEST-1', 'eu-west-1', 'harness-shop-view', view, role, role], said));
+    assert.deepEqual(said.filter((line) => line.includes("won't do")), [
+      '"EU-WEST-1" won\'t do: an AWS region, like us-east-1. Type it again, or Enter to skip.',
+      '"harness-shop-view" won\'t do: a role ARN, like arn:aws:iam::123456789012:role/harness-shop-view. Type it again, or Enter to skip.',
+    ]);
+    const config = JSON.parse(readFileSync(join(dir, 'harness', 'config.json'), 'utf8'));
+    assert.equal(config.aws.region, 'eu-west-1');
+    assert.match(readFileSync(join(dir, 'iac', 'env', 'staging.tfvars'), 'utf8'), /aws_region {5}= "eu-west-1"/);
+  });
+
+  it('writes no file when the config it would write is refused, and says why', async () => {
+    const { dir } = await project(false);
+    mkdirSync(join(dir, 'harness'));
+    const before = JSON.stringify({ harnessVersion: '0.6.0', project: { name: 'a'.repeat(41) } });
+    writeFileSync(join(dir, 'harness', 'config.json'), before);
+    const role = 'arn:aws:iam::123456789012:role/harness-shop-plan';
+    await assert.rejects(askSettings(options(dir, ['y', 'eu-west-1', 'arn:aws:iam::123456789012:role/harness-shop-view', role, role])), /harness\/config\.json would not be valid, so nothing was written:\n.*project\.name/s);
+    assert.equal(readFileSync(join(dir, 'harness', 'config.json'), 'utf8'), before);
+    assert.equal(existsSync(join(dir, 'iac')), false);
+  });
+
+  it('gives a folder whose name is over 40 characters a name the schema takes', async () => {
+    const dir = join(tempDir('long'), `the-${'very-'.repeat(10)}long-shop`);
+    mkdirSync(dir);
+    await runOk('git', ['init', '--quiet', '--initial-branch=main', dir]);
+    await init({ projectDir: dir, packageDir: PACKAGE, version: '0.6.0', owner: 'owner' });
+    const name = JSON.parse(readFileSync(join(dir, 'harness', 'config.json'), 'utf8')).project.name as string;
+    assert.equal(name, 'the-very-very-very-very-very-very-very-v');
+  });
+
+  it('refuses a repository typed without its organization before writing anything', async () => {
+    const { dir } = await project(false);
+    const app = join(process.env.XDG_CONFIG_HOME!, 'harness');
+    mkdirSync(app, { recursive: true });
+    writeFileSync(join(app, 'app.json'), JSON.stringify({ appId: 7, slug: 'acme-harness' }));
+    try {
+      await assert.rejects(init({ projectDir: dir, packageDir: PACKAGE, version: '0.6.0', repo: 'shop', owner: 'owner' }), /would not be valid, so nothing was written:\n.*owner\/name/s);
+      assert.equal(existsSync(join(dir, 'harness')), false);
+    } finally {
+      rmSync(join(app, 'app.json'));
+    }
+  });
+
+  describe('with a gh that is logged in', () => {
+    const path = process.env.PATH;
+    const calls = join(tempDir('gh'), 'calls');
+    before(() => {
+      const bin = tempDir('bin');
+      writeFileSync(join(bin, 'gh'), `#!/bin/sh\necho "$*" >> ${calls}\n[ "$1 $2" = "auth status" ] && exit 0\nexit 1\n`, { mode: 0o755 });
+      process.env.PATH = `${bin}:${path}`;
+    });
+    after(() => {
+      process.env.PATH = path;
+    });
+
+    it('creates nothing on GitHub for a folder that is not the top of its repository', async () => {
+      const { dir } = await project(false);
+      const inner = join(dir, 'app');
+      mkdirSync(inner);
+      rmSync(calls, { force: true });
+      await assert.rejects(setup(options(inner, ['acme/shop'])), /app is inside the repository .*, not at its top/);
+      assert.deepEqual(readFileSync(calls, 'utf8').trim().split('\n'), ['auth status']);
+    });
+
+    it('asks again for a repository typed without its organization', async () => {
+      const { dir } = await project(false);
+      const said: string[] = [];
+      rmSync(calls, { force: true });
+      // The setup stops at the question asked again: nothing past it may run on this machine.
+      const asked: string[] = [];
+      const ask = async (question: string) => {
+        asked.push(question);
+        if (asked.length > 1) throw new Error('asked again');
+        return 'shop';
+      };
+      await assert.rejects(setup({ ...options(dir, [], said), ask }), /asked again/);
+      assert.match(asked[1]!, /^No GitHub remote\. Create a private repository on GitHub\?/);
+      assert.match(said.join('\n'), /"shop" won't do: owner\/name\. Type it again, or Enter to skip\./);
+      assert.doesNotMatch(readFileSync(calls, 'utf8'), /repo create/);
+    });
   });
 });
 

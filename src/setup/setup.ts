@@ -1,5 +1,6 @@
 import { basename, join, resolve } from 'node:path';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import type { z } from 'zod';
 import { computeLock, directoryReader } from '../ci/harness-ci.ts';
 import { ConfigSchema, requiredChecks, type Config } from '../design/schemas.ts';
 import { configDir, loadAppCredentials } from '../github/app.ts';
@@ -7,7 +8,7 @@ import { applyRepositoryRules, checkApp, createApp, installCi, type RulesetOptio
 import type { Mode, State } from '../state/state.ts';
 import { run, sha256 } from '../util.ts';
 import { doctor, granted, repositorySecret, type Check } from './doctor.ts';
-import { appBot, githubRepo, init } from './init.ts';
+import { appBot, checkedConfig, githubRepo, init, projectName } from './init.ts';
 import { writeTerraformScaffold, type TerraformLayout, type TerraformScaffold } from './terraform.ts';
 
 /**
@@ -81,6 +82,30 @@ export function awsProviderName(projectDir: string, repo?: string): string {
 
 const VIEW_ROLE = /^arn:aws:iam::\d{12}:role\/harness-[\w+=,.@-]+-view$/;
 const ROLE = /^arn:aws:iam::\d{12}:role\/[\w+=,.@/-]+$/;
+
+/** The schema's own fields, so that an answer is checked as the config will be. */
+const REPO_FIELD = ConfigSchema.shape.project.shape.repo.unwrap();
+const REGION_FIELD = ConfigSchema.shape.aws.unwrap().shape.region;
+
+/** What a schema field finds wrong with an answer, if anything. */
+const schemaProblem = (field: z.ZodType) => (answer: string): string | undefined => {
+  const result = field.safeParse(answer);
+  return result.success ? undefined : (result.error.issues[0]?.message ?? 'not valid');
+};
+
+/**
+ * Asks until the answer is empty, which skips the question, or `problem` finds nothing
+ * wrong with it: a value the schema refuses would be written to GitHub and the files, and
+ * stop every later run.
+ */
+async function askValid(options: Pick<SetupOptions, 'ask' | 'say'>, question: string, problem: (answer: string) => string | undefined): Promise<string> {
+  for (;;) {
+    const answer = (await options.ask(question)).trim();
+    const wrong = answer ? problem(answer) : undefined;
+    if (!wrong) return answer;
+    options.say(`"${answer}" won't do: ${wrong}. Type it again, or Enter to skip.`);
+  }
+}
 
 export async function setup(options: SetupOptions): Promise<void> {
   const { projectDir, say } = options;
@@ -159,14 +184,19 @@ async function scaffold(options: SetupOptions, sleep: (ms: number) => Promise<vo
     return [...written, ...(await linkRepo(options, sleep))];
   }
   const top = await run('git', ['-C', projectDir, 'rev-parse', '--show-toplevel']).catch(() => undefined);
+  // Checked before anything is created on GitHub: init writes only at the top of a repository.
+  if (top?.code === 0 && realpathSync(top.stdout.trim()) !== realpathSync(projectDir)) {
+    throw new Error(`${projectDir} is inside the repository ${top.stdout.trim()}, not at its top: run \`harness setup\` there, or in a folder of its own`);
+  }
   if (top?.code !== 0) {
     await run('git', ['init', '--quiet', '--initial-branch=main', projectDir]);
     say('git: a new repository, on main.');
   }
+  if (options.repo && schemaProblem(REPO_FIELD)(options.repo)) throw new Error(`--repo ${options.repo}: ${schemaProblem(REPO_FIELD)(options.repo)}, like acme/shop`);
   let repo = options.repo ?? githubRepo((await run('git', ['-C', projectDir, 'remote', 'get-url', 'origin'])).stdout.trim());
   if (!repo) {
-    const name = basename(projectDir).toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '') || 'project';
-    const answer = (await options.ask(`No GitHub remote. Create a private repository on GitHub? Type org/name (like acme/${name}), or Enter to stay local: `)).trim();
+    const name = projectName(projectDir);
+    const answer = await askValid(options, `No GitHub remote. Create a private repository on GitHub? Type org/name (like acme/${name}), or Enter to stay local: `, schemaProblem(REPO_FIELD));
     if (answer) {
       const created = await run('gh', ['repo', 'create', answer, '--private', `--source=${projectDir}`, '--remote=origin']);
       if (created.code !== 0) throw new Error(`gh repo create: ${(created.stderr || created.stdout).trim()}`);
@@ -199,7 +229,7 @@ export async function linkRepo(options: SetupOptions, sleep: (ms: number) => Pro
   const bot = appBot();
   if (!bot) return [];
   config.project = { ...config.project, repo, bot };
-  writeFileSync(configFile, `${JSON.stringify(config, null, 2)}\n`);
+  writeFileSync(configFile, `${JSON.stringify(checkedConfig(config), null, 2)}\n`);
   await writeLock(projectDir);
   say(`harness/config.json: the project is ${repo} on GitHub, and the App's bot ${bot}.`);
   return ['harness/config.json', 'harness/lock.json'];
@@ -234,13 +264,13 @@ async function ownerLogin(options: SetupOptions): Promise<string | undefined> {
 }
 
 /**
- * The questions (v4 §4), asked once: AWS, Infracost's token once there is Terraform, and
- * the owner's hours. The network needs none: a project gets every bundle unless its config
- * lists fewer. What they settle goes into harness/config.json, with the lock that hashes
- * it, into .harness/setup.json for the daemon, and the token into a repository secret.
- * The view role's ARN goes to the doctor, which creates the AWS provider with it.
+ * The questions (v4 §4), asked once: AWS, and Infracost's token once there is Terraform.
+ * The network needs none: a project gets every bundle unless its config lists fewer. The
+ * owner's hours belong to a module, and none exists yet. What they settle goes into
+ * harness/config.json, with the lock that hashes it, and the token into a repository
+ * secret. The view role's ARN goes to the doctor, which creates the AWS provider with it.
  */
-async function askSettings(options: SetupOptions): Promise<{ written: string[]; viewRole?: string }> {
+export async function askSettings(options: SetupOptions): Promise<{ written: string[]; viewRole?: string }> {
   const { projectDir, say, ask } = options;
   const configFile = join(projectDir, 'harness', 'config.json');
   const config = JSON.parse(readFileSync(configFile, 'utf8')) as Record<string, any>;
@@ -251,15 +281,20 @@ async function askSettings(options: SetupOptions): Promise<{ written: string[]; 
 
   if (!config.aws && /^y/i.test(await ask('Does this project deploy to AWS with Terraform? [y/N] '))) {
     say('The roles come from your bootstrap (see the README\'s AWS section); the key is asked for later, at a hidden prompt.');
-    const region = (await ask('AWS region (like eu-west-1): ')).trim();
-    const view = (await ask("The agents' view role ARN (arn:aws:iam::<account>:role/harness-<project>-view): ")).trim();
-    const plan = (await ask('The CI plan role ARN: ')).trim();
-    const apply = (await ask('The CI apply role ARN: ')).trim();
-    if (!region || !VIEW_ROLE.test(view) || !ROLE.test(plan) || !ROLE.test(apply)) {
-      say('AWS skipped: a value is missing or malformed. Add `aws` and `terraform` to harness/config.json by hand, or run `harness setup` again.');
+    const role = (pattern: RegExp, like: string) => (answer: string) => (pattern.test(answer) ? undefined : `a role ARN, like ${like}`);
+    const region = await askValid(options, 'AWS region (like eu-west-1): ', schemaProblem(REGION_FIELD));
+    const view = region && await askValid(options, "The agents' view role ARN (arn:aws:iam::<account>:role/harness-<project>-view): ", role(VIEW_ROLE, 'arn:aws:iam::123456789012:role/harness-shop-view'));
+    const plan = view && await askValid(options, 'The CI plan role ARN: ', role(ROLE, 'arn:aws:iam::123456789012:role/harness-shop-plan'));
+    const apply = plan && await askValid(options, 'The CI apply role ARN: ', role(ROLE, 'arn:aws:iam::123456789012:role/harness-shop-apply'));
+    if (!apply) {
+      say('AWS skipped: a value is missing. Add `aws` and `terraform` to harness/config.json by hand, or run `harness setup` again.');
     } else {
-      config.aws = { region, provider: awsProviderName(projectDir, config.project?.repo), services: ['all'] };
-      config.terraform = { dir: 'iac', backendConfig: 'backend-configs/staging.hcl', varFile: 'env/staging.tfvars' };
+      // The whole config is checked before GitHub's variables or any file are written.
+      const aws = { region, provider: awsProviderName(projectDir, config.project?.repo), services: ['all'] };
+      const terraform = { dir: 'iac', backendConfig: 'backend-configs/staging.hcl', varFile: 'env/staging.tfvars' };
+      checkedConfig({ ...config, aws, terraform });
+      config.aws = aws;
+      config.terraform = terraform;
       changed = true;
       viewRole = view;
       const repo = config.project?.repo as string | undefined;
@@ -289,24 +324,9 @@ async function askSettings(options: SetupOptions): Promise<{ written: string[]; 
   if (config.terraform && config.project?.repo) await infracostKey(options, config.project.repo);
 
   if (changed) {
-    writeFileSync(configFile, `${JSON.stringify(config, null, 2)}\n`);
+    writeFileSync(configFile, `${JSON.stringify(checkedConfig(config), null, 2)}\n`);
     await writeLock(projectDir);
     written.push('harness/config.json', 'harness/lock.json');
-  }
-
-  // setup.json may hold a mode `harness mode` recorded: the hours join it.
-  const pendingFile = join(projectDir, '.harness', 'setup.json');
-  const pending = existsSync(pendingFile) ? (JSON.parse(readFileSync(pendingFile, 'utf8')) as Record<string, unknown>) : {};
-  const stateFile = join(projectDir, '.harness', 'state.json');
-  const budgeted = existsSync(stateFile) && (JSON.parse(readFileSync(stateFile, 'utf8')) as State).budgets?.ownerHours !== undefined;
-  if (pending.ownerHours === undefined && !budgeted) {
-    const answer = (await ask('How many hours of your time may this whole project take? The Architect designs your actions within it. (Enter to skip) ')).trim();
-    const hours = Number(answer);
-    if (answer && Number.isFinite(hours) && hours > 0) {
-      mkdirSync(join(projectDir, '.harness'), { recursive: true });
-      writeFileSync(pendingFile, `${JSON.stringify({ ...pending, ownerHours: hours }, null, 2)}\n`);
-      say(`${hours} hours: the daemon records it when it starts.`);
-    }
   }
   return { written, ...(viewRole ? { viewRole } : {}) };
 }
