@@ -37,8 +37,9 @@ export function eventSummary(event: HarnessEvent): string {
 
 /** Status words and the color class they get. */
 export function tone(status: string): string {
-  if (/^(accepted|completed|passed|done|frozen|success|running ok)$/.test(status)) return 'ok';
-  if (/(failed|refused|failure|error|closed)/.test(status)) return 'bad';
+  // A reviewer's verdicts, pass and block, are words of their own.
+  if (/^(accepted|completed|passed|pass|done|frozen|success|running ok)$/.test(status)) return 'ok';
+  if (/(failed|refused|failure|error|closed)|^block$/.test(status)) return 'bad';
   if (/(escalated|paused|proposed|in_review|ready_to_merge|blocked|waiting)/.test(status)) return 'warn';
   if (/^(pending|stopped|exited|skipped|waiting)$/.test(status)) return 'muted';
   return 'run';

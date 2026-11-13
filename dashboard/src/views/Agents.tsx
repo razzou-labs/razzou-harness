@@ -1,6 +1,6 @@
 import { matTerminal } from '@quasar/extras/material-icons';
 import { QBtn, QCard, QCardSection, QItem, QItemLabel, QItemSection, QLinearProgress, QList, QToggle, QTooltip } from 'quasar';
-import { defineComponent, onUnmounted, ref, watch, type PropType } from 'vue';
+import { computed, defineComponent, onUnmounted, ref, watch, type PropType } from 'vue';
 import { post, type DashboardState, type Denial } from '../api.ts';
 import { DenialTable } from '../components/Denials.tsx';
 import { Terminal } from '../components/Terminal.tsx';
@@ -21,6 +21,8 @@ interface Card {
   clock?: { start: number; deadline: number };
   /** What an attempt's sandbox policy refused, kept when its sandbox went. */
   refused?: Denial[];
+  /** The agent the owner chose, whose card the list no longer holds. */
+  gone?: true;
 }
 
 /**
@@ -44,14 +46,21 @@ export const Agents = defineComponent({
     const timer = window.setInterval(() => (now.value = Date.now()), 1000);
     onUnmounted(() => window.clearInterval(timer));
     const shell = ref(false);
-    watch(() => props.selected, () => (shell.value = false));
     const onlyWithSandbox = ref(localStorage.getItem(ONLY_WITH_SANDBOX) === 'yes');
     watch(onlyWithSandbox, (on) => localStorage.setItem(ONLY_WITH_SANDBOX, on ? 'yes' : 'no'));
+    const allCards = computed(() => agentCards(props.data));
+    const shownCards = computed(() => (onlyWithSandbox.value ? allCards.value.filter((c) => c.sandbox) : allCards.value));
+    // The agent the owner chose stays shown when its card leaves the list, as when its
+    // attempt goes to its checks: never another agent, whose terminal would take the next keys.
+    const currentCard = computed<Card | undefined>(() =>
+      props.selected === undefined ? shownCards.value[0] : allCards.value.find((c) => c.id === props.selected) ?? goneCard(props.selected));
+    // A shell belongs to the agent it was opened for.
+    watch(() => currentCard.value?.id, () => (shell.value = false));
     return () => {
-      const cards = agentCards(props.data);
+      const cards = allCards.value;
       if (cards.length === 0) return <p class="text-muted">No agent yet: start a module in the Project view.</p>;
-      const shown = onlyWithSandbox.value ? cards.filter((c) => c.sandbox) : cards;
-      const current = shown.find((c) => c.id === props.selected) ?? shown[0];
+      const shown = shownCards.value;
+      const current = currentCard.value;
       return (
         <div class="row q-col-gutter-md items-start">
           <div class="col-12 col-md-4 col-lg-3">
@@ -88,8 +97,8 @@ export const Agents = defineComponent({
                   {current.sandbox && <QBtn flat dense noCaps color="primary" label="Its sandbox" onClick={() => props.go('sandboxes', current.sandbox)} />}
                 </div>
                 {shell.value && current.sandbox
-                  ? <Terminal key={`shell:${current.sandbox}`} sandbox={current.sandbox} />
-                  : <AgentView card={current} data={props.data} />}
+                  ? <Terminal key={`shell:${current.sandbox}`} sandbox={current.sandbox} focus />
+                  : <AgentView card={current} data={props.data} focus={props.selected === current.id} />}
               </QCardSection>
             </QCard>
           </div>}
@@ -103,16 +112,34 @@ const AgentView = defineComponent({
   props: {
     card: { type: Object as PropType<Card>, required: true },
     data: { type: Object as PropType<DashboardState>, required: true },
+    /** Whether the owner chose this agent: only then does its terminal take the keys. */
+    focus: Boolean,
   },
   setup(props) {
     return () => {
       const card = props.card;
-      if (card.role === 'Architect') {
-        const module = card.id.slice('architect:'.length);
-        if (!props.data.terminals) return <p>The dashboard has no terminals here: node-pty didn't install. Use <code>harness attach {module}</code>.</p>;
+      if (card.gone) {
+        if (card.role === 'Architect') return <p class="text-muted">This project has no such Architect.</p>;
         return (
           <>
-            <Terminal key={`architect:${module}`} module={module} />
+            <p class="text-caption text-muted">No longer in the list: its transcript, as the daemon kept it.</p>
+            <Transcript agent={card.id} />
+          </>
+        );
+      }
+      if (card.role === 'Architect') {
+        const module = card.id.slice('architect:'.length);
+        if (!props.data.terminals) {
+          return (
+            <p>
+              The dashboard has no terminals here: node-pty didn't install. Use <code>harness attach {module}</code>. The daemon can't type into the
+              Architect's terminal either: messages for the Architect wait for your next prompt there.
+            </p>
+          );
+        }
+        return (
+          <>
+            <Terminal key={`architect:${module}`} module={module} focus={props.focus} />
             <p class="text-caption text-muted q-mt-xs">The Architect's own terminal, shared with <code>harness attach {module}</code>. It keeps running when you leave.</p>
           </>
         );
@@ -171,6 +198,8 @@ function agentCards({ state }: DashboardState): Card[] {
   const reviews = Object.values(state.plans)
     .flatMap((plan) => (plan.reviews ?? []).map((review) => ({ plan, review })))
     .sort((a, b) => Date.parse(b.review.startedAt) - Date.parse(a.review.startedAt))
+    // A review run again on the same head has the same agent, and the same transcript: one card, the newest.
+    .filter(({ review }, i, all) => all.findIndex((other) => other.review.role === review.role && other.review.head === review.head) === i)
     .slice(0, 6);
   for (const { plan, review } of reviews) {
     const live = review.status === 'starting' || review.status === 'running';
@@ -204,6 +233,14 @@ function agentCards({ state }: DashboardState): Card[] {
     });
   }
   return cards;
+}
+
+const ROLES: Record<string, Card['role']> = { architect: 'Architect', manager: 'Manager', developer: 'Developer' };
+
+/** The agent an id names, once the list no longer holds it: what the daemon kept of it is its transcript. */
+function goneCard(id: string): Card {
+  const kind = id.slice(0, id.indexOf(':'));
+  return { id, role: ROLES[kind] ?? 'Reviewer', title: id.slice(kind.length + 1), status: 'gone', detail: '', gone: true };
 }
 
 /** `pypi.org:443`, or `pypi.org:443 and 2 more`: the hosts refused, the latest first. */

@@ -13,7 +13,12 @@ const MAC = /Mac|iPhone|iPad/.test(navigator.platform);
  * selects, or with Option on a Mac.
  */
 export const Terminal = defineComponent({
-  props: { module: String, sandbox: String },
+  props: {
+    module: String,
+    sandbox: String,
+    /** Whether it takes the keys as it opens: only when the owner clicked for it, never when the page showed it by itself. */
+    focus: Boolean,
+  },
   setup(props) {
     const element = ref<HTMLDivElement>();
     let cleanup = () => {};
@@ -68,7 +73,7 @@ export const Terminal = defineComponent({
       const resized = term.onResize(({ cols, rows }) => socket.readyState === WebSocket.OPEN && socket.send(JSON.stringify({ cols, rows })));
       const observer = new ResizeObserver(() => fit.fit());
       observer.observe(box);
-      term.focus();
+      if (props.focus) term.focus();
       cleanup = () => {
         window.removeEventListener('mousedown', press, true);
         window.removeEventListener('mouseup', release, true);
