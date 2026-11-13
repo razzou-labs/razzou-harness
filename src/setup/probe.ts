@@ -3,8 +3,8 @@ import { writeFileSync } from 'node:fs';
 import { userInfo } from 'node:os';
 import { join } from 'node:path';
 import type { Config } from '../design/schemas.ts';
-import type { SandboxDriver } from '../sandbox/driver.ts';
-import { buildPolicy } from '../sandbox/policy.ts';
+import { PROJECT_LABEL, type SandboxDriver } from '../sandbox/driver.ts';
+import { apiProviderName, buildPolicy } from '../sandbox/policy.ts';
 import { sh } from '../util.ts';
 
 export interface ProbeResult {
@@ -34,12 +34,18 @@ export async function probe(options: ProbeOptions): Promise<ProbeResult[]> {
   const name = `prb-${randomUUID().slice(0, 8)}`;
   const aws = config.aws ? { ...config.aws, services: [...new Set([...config.aws.services, 'sts', 's3', 'ec2', 'secretsmanager', 'dynamodb'])] } : undefined;
   const policyFile = join(options.scratch, 'probe-policy.yaml');
-  writeFileSync(policyFile, `${JSON.stringify(buildPolicy({ ...config.network, ...(aws ? { aws } : {}) }), null, 2)}\n`);
+  const policy = buildPolicy({ ...config.network, ...(aws ? { aws } : {}) }) as { network_policies: { read_only_web: { endpoints: Array<{ host: string }> } } };
+  writeFileSync(policyFile, `${JSON.stringify(policy, null, 2)}\n`);
+  const readOnly = policy.network_policies.read_only_web.endpoints.map((endpoint) => endpoint.host);
+  // As a real sandbox is: the project's label, and the providers of its APIs' keys.
+  const project = config.project.name;
+  const apiKeys = config.network.apis.flatMap((api) => (api.key ? [apiProviderName(project, api.host)] : []));
   await driver.create({
     name,
     image: config.sandbox.image,
-    providers: [config.sandbox.claudeProvider, ...(aws ? [aws.provider] : [])],
+    providers: [config.sandbox.claudeProvider, ...(aws ? [aws.provider] : []), ...apiKeys],
     policyFile,
+    labels: { [PROJECT_LABEL]: project },
     env: {
       ...(aws ? { AWS_REGION: aws.region, AWS_DEFAULT_REGION: aws.region, AWS_STS_REGIONAL_ENDPOINTS: 'regional', AWS_EC2_METADATA_DISABLED: 'true', AWS_PAGER: '' } : {}),
     },
@@ -76,16 +82,32 @@ export async function probe(options: ProbeOptions): Promise<ProbeResult[]> {
     const allowed = await run('for i in $(seq 1 20); do code="$(curl -s -m 10 -o /dev/null -w "%{http_code}" https://github.com/)"; case "$code" in 2*|3*) echo "$code"; exit 0;; esac; sleep 3; done; echo "$code"; exit 1');
     results.push({ name: 'an allowed host answers (the control)', ok: allowed.code === 0, detail: allowed.out });
     if (allowed.code !== 0) return results;
-    await expectDenied('the cloud metadata address is unreachable', 'curl -s -m 8 -o /dev/null -w "%{http_code}" http://169.254.169.254/latest/meta-data/', notConnected);
+    const user = await run('echo "$(id -u) $(id -un)"');
+    results.push({ name: 'the sandbox runs as a user other than root', ok: user.code === 0 && !/^0 /.test(user.out), detail: `uid ${user.out}` });
+    // A timeout proves nothing: on a machine with no metadata service, nothing would answer even if the policy let it through.
+    const metadata = await run('curl -s -m 8 -o /dev/null -w "%{http_code}" http://169.254.169.254/latest/meta-data/; echo " $?"');
+    const [code, exit] = metadata.out.split(' ');
+    results.push(exit === '28'
+      ? { name: 'the cloud metadata address is unreachable', ok: true, skipped: true, detail: 'nothing answers there on this machine, so the refusal is untested' }
+      : { name: 'the cloud metadata address is unreachable', ok: exit !== '0' || code === '403', detail: `HTTP ${code}, curl exit ${exit}` });
     await expectDenied('an unlisted host is unreachable', 'curl -s -m 8 -o /dev/null -w "%{http_code}" https://example.org/', notConnected);
-    await expectDenied('a POST to a read-only host is refused', 'curl -s -m 8 -o /dev/null -w "%{http_code}" -X POST https://github.com/login', forbidden);
+    await expectDenied("a POST to github.com outside a repository's fetch is refused", 'curl -s -m 8 -o /dev/null -w "%{http_code}" -X POST https://github.com/login', forbidden);
+    const plain = readOnly.find((host) => !host.includes('*') && !host.endsWith('github.com'));
+    if (plain) await expectDenied(`a POST to a read-only host (${plain}) is refused`, `curl -s -m 8 -o /dev/null -w "%{http_code}" -X POST https://${plain}/`, forbidden);
+    if (readOnly.includes('registry.npmjs.org')) {
+      await expectDenied(
+        'a PUT to the npm registry (a publish) is refused',
+        'curl -s -m 8 -o /dev/null -w "%{http_code}" -X PUT -H "content-type: application/json" -d "{}" https://registry.npmjs.org/harness-probe-does-not-exist',
+        forbidden,
+      );
+    }
     await expectDenied(
       'git push is refused',
       `curl -s -m 8 -o /dev/null -w "%{http_code}" -X POST https://github.com/${config.project.repo ?? 'octocat/Hello-World'}.git/git-receive-pack`,
       forbidden,
     );
-    const user = userInfo().username;
-    await expectDenied("the owner's home folder isn't there", `ls ${sh(`/home/${user}`)} 2>&1; test ! -e ${sh(`/home/${user}`)}`, (_out, code) => code === 0);
+    const owner = userInfo().username;
+    await expectDenied("the owner's home folder isn't there", `ls ${sh(`/home/${owner}`)} 2>&1; test ! -e ${sh(`/home/${owner}`)}`, (_out, code) => code === 0);
 
     if (aws) {
       const identity = await run('aws sts get-caller-identity --query Arn --output text');
@@ -103,9 +125,11 @@ export async function probe(options: ProbeOptions): Promise<ProbeResult[]> {
         'vpc="$(aws ec2 describe-vpcs --query "Vpcs[0].VpcId" --output text)" && aws ec2 create-tags --dry-run --resources "$vpc" --tags Key=harness-probe,Value=1',
         (out) => /UnauthorizedOperation|AccessDenied/.test(out) && !/DryRunOperation/.test(out),
       );
+      // A real secret's name when the role may list one: a missing secret's refusal could be
+      // a deny on names alone. The query keeps a value the role could read out of the output.
       await expectDenied(
         'AWS refuses a secret value',
-        'aws secretsmanager get-secret-value --secret-id harness-probe-does-not-exist',
+        'name="$(aws secretsmanager list-secrets --max-results 1 --query "SecretList[0].Name" --output text 2>/dev/null)"; case "$name" in ""|None) name=harness-probe-does-not-exist;; esac; echo "secret $name"; aws secretsmanager get-secret-value --secret-id "$name" --query ARN --output text',
         (out) => /AccessDenied/.test(out),
       );
       if (options.state) {
