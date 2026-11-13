@@ -1,9 +1,9 @@
 import { strict as assert } from 'node:assert';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
 import {
-  computeLock, directoryReader, lockfileProblems, lockMismatches, matches, npmScripts, parseJson, planKindOf, prKind, protectedChanges, protectionRules, verify,
+  commitReader, computeLock, directoryReader, lockfileProblems, lockMismatches, matches, npmScripts, parseJson, planKindOf, prKind, protectedChanges, protectionRules, verify,
 } from '../src/ci/harness-ci.ts';
 import { run, runOk } from '../src/util.ts';
 import { tempDir } from './helpers/toy-repo.ts';
@@ -63,25 +63,91 @@ async function change(changes: Record<string, string>, files: Record<string, str
 
 describe('protection rules', () => {
   it('finds the npm scripts a check runs', () => {
-    assert.deepEqual(npmScripts('npm run lint && npm test -- --watch=false; npm t; npm start'), ['lint', 'test', 'test', 'start']);
-    assert.deepEqual(npmScripts('node --test'), []);
+    const root = (command: string) => npmScripts(command).map(({ dir, script }) => (dir ? `${dir}:${script}` : script));
+    assert.deepEqual(root('npm run lint && npm test -- --watch=false; npm t; npm start'), ['lint', 'test', 'test', 'start']);
+    assert.deepEqual(root('node --test'), []);
     // npm's options are skipped, before the command and after `run`, with the value of those that take one.
-    assert.deepEqual(npmScripts('npm run -s lint'), ['lint']);
-    assert.deepEqual(npmScripts('npm -s test'), ['test']);
-    assert.deepEqual(npmScripts('npm --prefix . test && npm -w app --if-present run-script build:prod'), ['test', 'build:prod']);
-    assert.deepEqual(npmScripts('CI=1 npm --loglevel=silent restart; (npm stop)'), ['restart', 'stop']);
-    assert.deepEqual(npmScripts('node --run lint && node --run=typecheck'), ['lint', 'typecheck']);
-    assert.deepEqual(npmScripts('npm ci && npx vitest --run'), []);
+    assert.deepEqual(root('npm run -s lint'), ['lint']);
+    assert.deepEqual(root('npm -s test'), ['test']);
+    assert.deepEqual(root('npm --prefix . test && npm --if-present run-script build:prod'), ['test', 'build:prod']);
+    assert.deepEqual(root('CI=1 npm --loglevel=silent restart; (npm stop)'), ['restart', 'stop']);
+    assert.deepEqual(root('node --run lint && node --run=typecheck'), ['lint', 'typecheck']);
+    assert.deepEqual(root('npm ci && npx vitest --run'), []);
   });
 
-  it("pin the scripts the checks run, with npm's hooks around them", async () => {
+  it('finds the package.json each script is in: --prefix, -C, --workspace, -w, and a cd before it', () => {
+    const where = (command: string) => npmScripts(command).map(({ dir, script }) => `${dir || '.'}:${script}`);
+    assert.deepEqual(where('npm --prefix web test && npm -C ./api run lint && npm --prefix=docs start'), ['web:test', 'api:lint', 'docs:start']);
+    assert.deepEqual(where('npm -w packages/app run build && npm --workspace=packages/lib test'), ['packages/app:build', 'packages/lib:test']);
+    assert.deepEqual(where('cd web && npm test && cd ../api && node --run lint'), ['web:test', 'api:lint']);
+    assert.deepEqual(where('cd web/ && cd .. && npm test; cd /tmp && npm test; cd ../.. && npm t'), ['.:test', '.:test', '.:test']);
+  });
+
+  it("pin the scripts the checks run, with npm's hooks around them, in the package.json each is in", async () => {
     const { baseTree } = await change({});
     const rules = await protectionRules(baseTree);
     assert.deepEqual(rules.fields['package.json'], [
-      '/jest', '/babel', '/mocha', '/scripts/lint', '/scripts/prelint', '/scripts/postlint', '/scripts/test', '/scripts/pretest', '/scripts/posttest',
+      '/scripts/lint', '/scripts/prelint', '/scripts/postlint', '/scripts/test', '/scripts/pretest', '/scripts/posttest',
     ]);
+    for (const field of ['/jest', '/overrides', '/scripts/prepare', '/scripts/postinstall', '/eslintConfig']) assert.ok(rules.fields['**/package.json']!.includes(field), field);
     assert.ok(rules.paths.includes('eslint.rules.js'));
     assert.ok(rules.paths.includes('harness/**'));
+
+    const web = await change({}, withConfig({ checks: [{ id: 'web', run: 'cd web && npm test', phase: 'pre-merge' }] }));
+    assert.deepEqual((await protectionRules(web.baseTree)).fields['web/package.json'], ['/scripts/test', '/scripts/pretest', '/scripts/posttest']);
+  });
+
+  it("protect what npm runs or applies by itself when it installs, in every package.json", async () => {
+    const pkg = (extra: object) => JSON.stringify({ name: 'shop', scripts: { lint: 'eslint .', test: 'node --test', build: 'tsc', ...extra } }, null, 2);
+    const files = { ...BASE, 'packages/a/package.json': JSON.stringify({ name: 'a' }) };
+    const pr = await change({
+      'package.json': pkg({ prepare: 'node tools/prepare.mjs' }),
+      'packages/a/package.json': JSON.stringify({ name: 'a', scripts: { postinstall: 'node x.js' }, overrides: { b: '1.0.0' } }),
+      'patches/vitest+4.0.0.patch': '-', '.npm-extension.mjs': '-',
+    }, files);
+    assert.deepEqual((await protectedChanges(pr.baseTree, pr.headTree, pr.changed, { progress: 'append' })).sort(), [
+      '.npm-extension.mjs', 'package.json /scripts/prepare', 'packages/a/package.json /overrides', 'packages/a/package.json /scripts/postinstall', 'patches/vitest+4.0.0.patch',
+    ]);
+  });
+
+  it("protect the scripts a check runs in another folder's package.json, and that package's own configs", async () => {
+    const files = {
+      ...withConfig({ checks: [{ id: 'web', run: 'npm --prefix web test', phase: 'pre-merge' }] }),
+      'web/package.json': JSON.stringify({ name: 'web', scripts: { test: 'vitest run' } }),
+      'web/tsconfig.json': JSON.stringify({ compilerOptions: { strict: true }, include: ['src'] }),
+    };
+    const pr = await change({
+      'web/package.json': JSON.stringify({ name: 'web', scripts: { test: 'true' } }),
+      'web/tsconfig.json': JSON.stringify({ compilerOptions: { strict: true }, include: ['src/ok'] }),
+      'web/vitest.config.ts': 'export default {};\n', 'web/.eslintignore': 'src\n', 'web/.prettierignore': 'src\n',
+    }, files);
+    assert.deepEqual((await protectedChanges(pr.baseTree, pr.headTree, pr.changed, { progress: 'append' })).sort(), [
+      'web/.eslintignore', 'web/.prettierignore', 'web/package.json /scripts/test', 'web/tsconfig.json /include', 'web/vitest.config.ts',
+    ]);
+  });
+
+  it("protect pytest's tables in pyproject.toml and setup.cfg, and the owner's own, as text", async () => {
+    const pyproject = '[project]\nname = "shop"\n\n[tool.pytest.ini_options]\naddopts = "-q"\n\n[tool.ruff]\nline-length = 100\n';
+    const files = {
+      ...withConfig({ protect: { files: ['eslint.rules.js'], tomlTables: { 'pyproject.toml': ['tool.mypy'] } } }),
+      'pyproject.toml': pyproject, 'svc/pyproject.toml': pyproject, 'setup.cfg': '[metadata]\nname = shop\n[tool:pytest]\naddopts = -q\n',
+    };
+    // Ordinary changes: the project's version, another tool's table.
+    const fine = await change({ 'pyproject.toml': pyproject.replace('name = "shop"', 'name = "shop2"').replace('100', '120') }, files);
+    assert.deepEqual(await protectedChanges(fine.baseTree, fine.headTree, fine.changed, { progress: 'append' }), []);
+    const pr = await change({
+      'pyproject.toml': `${pyproject.replace('-q', '-q -k nothing')}\n[tool.mypy]\nstrict = false\n`,
+      // A dotted key in a table above pytest's reaches into it.
+      'svc/pyproject.toml': `[tool]\npytest.ini_options.addopts = "-k nothing"\n\n${pyproject}`,
+      'setup.cfg': '[metadata]\nname = shop\n[tool:pytest]\naddopts = -k nothing\n',
+    }, files);
+    assert.deepEqual((await protectedChanges(pr.baseTree, pr.headTree, pr.changed, { progress: 'append' })).sort(), [
+      'pyproject.toml [tool.mypy]', 'pyproject.toml [tool.pytest.ini_options]', 'pyproject.toml [tool.pytest]',
+      'setup.cfg [tool:pytest]', 'svc/pyproject.toml [tool.pytest.ini_options]', 'svc/pyproject.toml [tool.pytest]',
+    ]);
+    const lock = await computeLock(pr.headTree);
+    const entry = lock.entries.find((e) => e.path === 'svc/pyproject.toml');
+    assert.ok(entry && 'tables' in entry && entry.tables?.['tool.pytest'], JSON.stringify(entry));
   });
 
   it('match patterns segment by segment: * and ? within one, ** across any number', () => {
@@ -113,12 +179,12 @@ describe('protection rules', () => {
       'vitest.config.mts': '-', 'vite.config.ts': '-', 'jest.config.cjs': '-', 'jest.config.json': '{}', 'babel.config.js': '-', 'src/.babelrc': '{}',
       '.mocharc.yml': '-', 'playwright.config.mts': '-', 'pytest.ini': '-', 'tests/unit/pytest.ini': '-', 'tox.ini': '-', 'tests/conftest.py': '-',
       'package.json': JSON.stringify({ name: 'shop', scripts: { lint: 'eslint .', test: 'node --test', build: 'tsc' }, jest: { testMatch: [] } }, null, 2),
-      // Not instructions, nor the root's configs.
-      'src/claude.md': '-', 'docs/CLAUDE.md.bak': '-', 'packages/a/vitest.config.ts': '-',
+      // A package's own config, in a monorepo; and what isn't instructions.
+      'packages/a/vitest.config.ts': '-', 'src/claude.md': '-', 'docs/CLAUDE.md.bak': '-',
     });
     const problems = await protectedChanges(pr.baseTree, pr.headTree, pr.changed, { progress: 'append' });
     assert.deepEqual(problems.sort(), [
-      '.mocharc.yml', 'CLAUDE.local.md', 'babel.config.js', 'jest.config.cjs', 'jest.config.json', 'package.json /jest', 'playwright.config.mts', 'pytest.ini',
+      '.mocharc.yml', 'CLAUDE.local.md', 'babel.config.js', 'jest.config.cjs', 'jest.config.json', 'package.json /jest', 'packages/a/vitest.config.ts', 'playwright.config.mts', 'pytest.ini',
       'src/.babelrc', 'src/.claude/rules/x.md', 'src/AGENTS.md', 'src/CLAUDE.local.md', 'src/CLAUDE.md', 'tests/conftest.py', 'tests/unit/pytest.ini', 'tox.ini',
       'vite.config.ts', 'vitest.config.mts',
     ]);
@@ -175,12 +241,40 @@ describe('protection rules', () => {
       }),
     }, base);
     assert.deepEqual(await lockfileProblems(pr.baseTree, pr.headTree), [
-      'node_modules/b resolves from git+ssh://git@example.com/b.git#abc', "node_modules/vitest links to tools/vitest, which the base branch doesn't",
+      "node_modules/b resolves from git+ssh://git@example.com/b.git#abc, which the base branch doesn't have", "node_modules/vitest links to tools/vitest, which the base branch doesn't",
     ]);
     const moved = await change({ 'package-lock.json': lock({ ...workspace, 'node_modules/c': { resolved: 'tools/c', link: true } }) }, base);
     assert.deepEqual(await lockfileProblems(moved.baseTree, moved.headTree), ["node_modules/c links to tools/c, which the base branch doesn't"]);
     const plan = { base: pr.baseTree, head: pr.headTree, changedPaths: pr.changed, author: BOT, branch: 'plan/shop/P1', title: 'Plan: [CODE] [shop/P1] T' };
     assert.ok((await verify(plan)).includes("package-lock.json: node_modules/vitest links to tools/vitest, which the base branch doesn't"));
+  });
+
+  it('let the packages the base already has come from where they do: a private registry, git, a patch', async () => {
+    const lock = (packages: Record<string, object>) => JSON.stringify({ packages: { '': { name: 'shop' }, ...packages } });
+    const own = {
+      'node_modules/@acme/ui': { resolved: 'https://npm.acme.example/@acme/ui/-/ui-1.0.0.tgz', integrity: 'sha512-a' },
+      'node_modules/b': { resolved: 'git+ssh://git@example.com/b.git#abc' },
+      'node_modules/d': { resolved: 'https://registry.npmjs.org/d/-/d-1.0.0.tgz', patched: true },
+    };
+    const base = { ...BASE, 'package-lock.json': lock(own) };
+    const pr = await change({ 'package-lock.json': lock({ ...own, 'node_modules/e': { resolved: 'https://registry.npmjs.org/e/-/e-1.0.0.tgz' } }) }, base);
+    assert.deepEqual(await lockfileProblems(pr.baseTree, pr.headTree), []);
+    const changed = await change({
+      'package-lock.json': lock({
+        ...own,
+        'node_modules/@acme/ui': { resolved: 'https://npm.acme.example/@acme/ui/-/ui-1.0.0.tgz', integrity: 'sha512-other' },
+        'node_modules/e': { resolved: 'https://registry.npmjs.org/e/-/e-1.0.0.tgz', patched: true },
+      }),
+    }, base);
+    assert.deepEqual(await lockfileProblems(changed.baseTree, changed.headTree), [
+      "node_modules/@acme/ui resolves from https://npm.acme.example/@acme/ui/-/ui-1.0.0.tgz, which the base branch doesn't have",
+      "node_modules/e is patched, which the base branch doesn't have",
+    ]);
+
+    // Without a lockfile, package.json says where a package comes from.
+    const manifest = (deps: Record<string, string>) => JSON.stringify({ name: 'shop', scripts: { lint: 'eslint .', test: 'node --test' }, devDependencies: deps });
+    const noLock = await change({ 'package.json': manifest({ old: 'file:../old', vitest: 'link:tools/vitest', left: '^1.0.0' }) }, { ...BASE, 'package.json': manifest({ old: 'file:../old' }) });
+    assert.deepEqual(await lockfileProblems(noLock.baseTree, noLock.headTree), ["vitest comes from link:tools/vitest, which the base branch's package.json doesn't have"]);
   });
 
   it('write a hash list that matches its tree until something protected changes', async () => {
@@ -217,6 +311,29 @@ describe('protection rules', () => {
     assert.deepEqual(await lockMismatches(directoryReader(checkout)), []);
   });
 
+  it('read a checkout as git committed it, so the lock the daemon writes from blobs matches: a symlink as its link, line endings as committed', async () => {
+    const dir = tempDir('lock-blobs');
+    write(dir, { ...BASE, 'CLAUDE.md': '# Rules\nline two\n', '.gitattributes': '*.md text eol=crlf\n' });
+    symlinkSync('CLAUDE.md', join(dir, 'AGENTS.md'));
+    const git = (...args: string[]) => runOk('git', ['-C', dir, '-c', 'user.name=t', '-c', 'user.email=t@test.invalid', ...args]);
+    await runOk('git', ['init', '--quiet', '--initial-branch=main', dir]);
+    await git('add', '-A');
+    await git('commit', '--quiet', '-m', 'base');
+    // The daemon's lock, from the commit's blobs.
+    write(dir, { 'harness/lock.json': JSON.stringify(await computeLock(commitReader(dir, 'HEAD'))) });
+    await git('add', '-A');
+    await git('commit', '--quiet', '-m', 'lock');
+    const checkout = tempDir('checkout');
+    await runOk('git', ['clone', '--quiet', dir, checkout]);
+    assert.match(readFileSync(join(checkout, 'CLAUDE.md'), 'utf8'), /\r\n/, 'the checkout has CRLF');
+    assert.deepEqual(await lockMismatches(directoryReader(checkout)), []);
+    assert.ok((await directoryReader(checkout).list('')).includes('AGENTS.md'));
+    assert.equal(await directoryReader(checkout).read('AGENTS.md'), 'CLAUDE.md');
+    // A change not committed yet is read as it is on disk.
+    writeFileSync(join(checkout, 'init.sh'), 'npm ci\n');
+    assert.equal(await directoryReader(checkout).read('init.sh'), 'npm ci\n');
+  });
+
   it('hash the same whatever the machine\'s locale', async () => {
     const dir = tempDir('locale');
     write(dir, {
@@ -237,7 +354,24 @@ describe('verify', () => {
     assert.equal(prKind(BOT, 'locked/shop', BOT), 'Arch', "a change to built features' definitions is the Architect's");
     assert.equal(prKind('owner', 'plan/shop/P1', BOT), 'Owner');
     assert.equal(prKind('owner', 'harness/upgrade-0.2.0', BOT), 'Harness');
-    assert.equal(prKind(BOT, 'feature/x', BOT), 'Owner');
+    assert.equal(prKind(BOT, 'feature/x', BOT), 'Stray');
+    assert.equal(prKind(BOT, 'misc/anything', BOT), 'Stray');
+  });
+
+  it("fails the App's pull request from a branch it never opens one from, whatever its title", async () => {
+    const pr = await change({ 'src/app.js': 'export const x = 2;\n' });
+    for (const title of ['Owner: anything', 'Stray: anything', 'Plan: [CODE] [shop/P1] T']) {
+      assert.deepEqual(await verify({ base: pr.baseTree, head: pr.headTree, changedPaths: pr.changed, author: BOT, branch: 'misc/anything', title }), [
+        'the App opens pull requests from plan/, fix/, arch/ and locked/ branches only, not from misc/anything',
+      ], title);
+    }
+  });
+
+  it('keeps the Fix PR of a CODE plan off the Terraform folder too', async () => {
+    const fix = await change({ 'iac/queue.tf': 'resource "aws_sqs_queue" "q" {}\n' }, withConfig({ terraform: { dir: 'iac' } }));
+    assert.deepEqual(await verify({
+      base: fix.baseTree, head: fix.headTree, changedPaths: fix.changed, author: BOT, branch: 'fix/shop/P1-2', title: 'Fix: [DEPLOY_FAILED] [shop/P1] round 2 after the deploy',
+    }), ['a CODE plan may not change iac/: infrastructure gets plans of its own (v3 §3.1); changed: iac/queue.tf']);
   });
 
   it('fails a Plan PR that changes a protected file, or carries the wrong title', async () => {
@@ -381,10 +515,79 @@ describe('verify', () => {
       'harness/modules/shop/plans/P1.json: a CHANGED_LOCKED_FILES PR neither adds, removes, renames nor moves a feature',
     ]);
     assert.deepEqual(await locked({ 'harness/modules/shop/plans/P2.json': plan([]) }), ['harness/modules/shop/plans/P2.json: a CHANGED_LOCKED_FILES PR neither adds nor removes a plan']);
+    // A plan file that a check's command names, as if a script, is still held to the plan rules.
+    const named = { ...base, 'harness/modules/shop/plans/P1.json': plan([feature('node -e "" harness/modules/shop/plans/P1.json')]) };
+    assert.deepEqual(await locked({ 'harness/modules/shop/plans/P1.json': plan([feature('node -e "" harness/modules/shop/plans/P1.json')], 'Renamed') }, named), [
+      "harness/modules/shop/plans/P1.json: a CHANGED_LOCKED_FILES PR changes features, not the plan's own fields",
+    ]);
     // Its own tag, on its own branch.
     const pr = await change({ 'harness/modules/shop/checks/F01.sh': '[ "$x" -eq 0 ]\n' }, base);
     assert.match((await verify({ base: pr.baseTree, head: pr.headTree, changedPaths: pr.changed, author: BOT, branch: 'locked/shop', title: 'Arch: [DESIGN_MODIFY] [shop] T' })).join('\n'),
       /a Arch PR's title is "Arch: \[CHANGED_LOCKED_FILES\] \[shop\] <title>"/);
+  });
+
+  /** A repository of BASE on main, for history drawn by hand; `commit` returns the new commit's sha. */
+  async function history() {
+    const dir = tempDir('history');
+    write(dir, BASE);
+    const git = (...args: string[]) => runOk('git', ['-C', dir, '-c', 'user.name=t', '-c', 'user.email=t@test.invalid', ...args]);
+    await runOk('git', ['init', '--quiet', '--initial-branch=main', dir]);
+    const commit = async (files: Record<string, string>, message: string) => {
+      write(dir, files);
+      await git('add', '-A');
+      await git('commit', '--quiet', '--allow-empty', '-m', message);
+      return (await git('rev-parse', 'HEAD')).trim();
+    };
+    return { dir, git, commit, root: await commit({}, 'base') };
+  }
+  /** `verify` on the command line, as the workflow runs it, with the base checked out at `base`. */
+  async function verifyCli(dir: string, base: string, head: string, branch: string, title: string) {
+    const baseDir = tempDir('base');
+    await runOk('git', ['clone', '--quiet', dir, baseDir]);
+    await runOk('git', ['-C', baseDir, 'checkout', '--quiet', base]);
+    const headDir = tempDir('head');
+    await runOk('git', ['clone', '--quiet', dir, headDir]);
+    await runOk('git', ['-C', headDir, 'checkout', '--quiet', head]);
+    return run('node', [script, 'verify', '--base', baseDir, '--head', headDir, '--base-sha', base, '--head-sha', head, '--author', BOT, '--branch', branch, '--title', title]);
+  }
+
+  it("compares a protected field with where the change started, not with what main changed since", async () => {
+    const { git, commit, dir, root } = await history();
+    const pkg = (scripts: Record<string, string>, extra: object = {}) => JSON.stringify({ name: 'shop', scripts: { test: 'node --test', build: 'tsc', ...scripts }, ...extra }, null, 2);
+    await git('checkout', '--quiet', '-b', 'plan/shop/P1');
+    const head = await commit({ 'package.json': pkg({ lint: 'eslint .' }, { dependencies: { a: '^1.0.0' } }) }, 'plan');
+    await git('checkout', '--quiet', 'main');
+    const main = await commit({ 'package.json': pkg({ lint: 'eslint --max-warnings 0 .' }) }, 'main tightens lint');
+    assert.notEqual(root, main);
+    const verified = await verifyCli(dir, main, head, 'plan/shop/P1', 'Plan: [CODE] [shop/P1] T');
+    assert.equal(verified.code, 0, verified.stdout);
+    // The plan itself loosening lint still fails.
+    await git('checkout', '--quiet', 'plan/shop/P1');
+    const loose = await commit({ 'package.json': pkg({ lint: 'true' }, { dependencies: { a: '^1.0.0' } }) }, 'plan loosens lint');
+    const failed = await verifyCli(dir, main, loose, 'plan/shop/P1', 'Plan: [CODE] [shop/P1] T');
+    assert.equal(failed.code, 1);
+    assert.match(failed.stdout, /::error::changes a protected file: package\.json \/scripts\/lint/);
+  });
+
+  it("fails the App's pull request whose head has two merge bases with main: merging it would undo what its diff doesn't show", async () => {
+    const { git, commit, dir } = await history();
+    await git('checkout', '--quiet', '-b', 'plan/shop/P1');
+    const plan = await commit({ 'src/feature.js': 'export const f = 1;\n' }, 'the plan');
+    await git('checkout', '--quiet', 'main');
+    const before = await commit({ 'src/other.js': 'export const o = 1;\n' }, 'another merge');
+    await git('merge', '--quiet', '--no-ff', '-m', 'merge the plan', 'plan/shop/P1');
+    const main = (await git('rev-parse', 'HEAD')).trim();
+    // Main before the last merge, and the merged plan's head: a design on top of the first, which drops the plan.
+    await git('checkout', '--quiet', '-b', 'arch/shop', before);
+    write(dir, { 'harness/modules/shop/plans/P2.json': JSON.stringify({ id: 'P2', module: 'shop', title: 'T', goal: 'G', features: [] }) });
+    await git('add', '-A');
+    const tree = (await git('write-tree')).trim();
+    const design = (await git('commit-tree', tree, '-p', before, '-p', plan, '-m', 'design')).trim();
+    const changed = (await git('diff', '--name-only', `${main}...${design}`)).trim();
+    assert.equal(changed, 'harness/modules/shop/plans/P2.json', 'the diff shows the design only');
+    const verified = await verifyCli(dir, main, design, 'arch/shop', 'Arch: [DESIGN_MODIFY] [shop] T');
+    assert.equal(verified.code, 1, verified.stdout);
+    assert.match(verified.stdout, /::error::the head has 2 merge bases with the base branch, so merging it would change more than its diff shows/);
   });
 
   it('runs from the command line as the workflow runs it', async () => {
@@ -470,6 +673,50 @@ describe('verify', () => {
     assert.equal((await checks(BOT, 'plan/m/P2')).code, 1, "a plan's PR runs main's");
     assert.equal((await checks('someone', 'locked/m')).code, 1, "a branch named locked/ that the App didn't open runs main's");
     assert.equal((await checks('', '')).code, 1, 'a push to main runs its own');
+  });
+
+  it('fails the run once what it runs changes a protected file of the checkout, even through npm ci', async () => {
+    const dir = tempDir('tripwire');
+    const plan = (run: string) => JSON.stringify({
+      id: 'P1', module: 'm', title: 'T', goal: 'G',
+      features: [{ id: 'F01', title: 'A', description: 'd', expected: 'e', checks: [{ id: 'F01-test', run, phase: 'pre-merge' }] }],
+    });
+    write(dir, {
+      'harness/config.json': JSON.stringify({ harnessVersion: '0.1.0', project: { name: 'x' }, checks: [{ id: 'first', run: 'true', phase: 'pre-merge' }] }),
+      'harness/modules/m/plans/P1.json': plan('node harness/modules/m/checks/F01.test.mjs'),
+      'harness/modules/m/checks/F01.test.mjs': 'process.exit(1);\n',
+      'progress.txt': '2026-01-01T00:00:00Z feature.accepted m/P1/F01 attempt=1 "a"\n',
+      // A prepare script, which npm ci runs, rewrites the check to pass.
+      'package.json': JSON.stringify({ name: 'x', version: '1.0.0', scripts: { prepare: 'node tools/prepare.mjs' } }),
+      'package-lock.json': JSON.stringify({ name: 'x', version: '1.0.0', lockfileVersion: 3, requires: true, packages: { '': { name: 'x', version: '1.0.0' } } }),
+      'tools/prepare.mjs': "import { writeFileSync } from 'node:fs';\nwriteFileSync('harness/modules/m/checks/F01.test.mjs', 'process.exit(0);\\n');\n",
+      'init.sh': 'npm ci --no-audit --no-fund\n',
+    });
+    const env = { ...process.env, npm_config_offline: 'true', npm_config_cache: tempDir('npm-cache'), npm_config_update_notifier: 'false' };
+    const tripped = await run('node', [script, 'checks', '--definitions', dir, '--dir', dir], { env });
+    assert.equal(tripped.code, 1, tripped.stdout);
+    assert.match(tripped.stdout, /passed: init\.sh\n::error::the code under test changed protected files while the checks ran: harness\/modules\/m\/checks\/F01\.test\.mjs\n/);
+    assert.doesNotMatch(tripped.stdout, /F01-test|first/, 'no check runs once it tripped');
+
+    // A check that adds a conftest.py: the run stops after it. Installing, a build and a venv write what is no project's config.
+    write(dir, {
+      'harness/modules/m/checks/F01.test.mjs': 'process.exit(0);\n',
+      'harness/config.json': JSON.stringify({ harnessVersion: '0.1.0', project: { name: 'x' }, checks: [{ id: 'first', run: 'touch tests/conftest.py', phase: 'pre-merge' }] }),
+      'tools/prepare.mjs': [
+        "import { mkdirSync, writeFileSync } from 'node:fs';",
+        "for (const dir of ['dist', 'node_modules/a', '.venv/lib/site-packages/b', 'tests']) mkdirSync(dir, { recursive: true });",
+        "writeFileSync('dist/package.json', '{}');",
+        "writeFileSync('node_modules/a/package.json', '{}');",
+        "writeFileSync('node_modules/a/vitest.config.js', '');",
+        "writeFileSync('.venv/pyvenv.cfg', '');",
+        "writeFileSync('.venv/lib/site-packages/b/conftest.py', '');",
+        '',
+      ].join('\n'),
+    });
+    const later = await run('node', [script, 'checks', '--definitions', dir, '--dir', dir], { env });
+    assert.equal(later.code, 1, later.stdout);
+    assert.match(later.stdout, /passed: first\n::error::the code under test changed protected files while the checks ran: tests\/conftest\.py\n/);
+    assert.doesNotMatch(later.stdout, /F01-test/);
   });
 
   it('leaves checks that need AWS to the harness, and runs plan assertions only with a plan', async () => {

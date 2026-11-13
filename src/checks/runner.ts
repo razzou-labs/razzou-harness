@@ -1,3 +1,4 @@
+import { guardChanges, guardTargets, INSTALLED, PARTS_KEY, partHashes, protectionRules, type ProtectionRules, type TreeReader } from '../ci/harness-ci.ts';
 import type { Check } from '../design/schemas.ts';
 import type { SandboxDriver } from '../sandbox/driver.ts';
 import { sh, tail } from '../util.ts';
@@ -32,11 +33,20 @@ export interface RunOptions {
  * need a Terraform plan get it in `$HARNESS_PLAN_JSON`, made once before them with
  * `plan -lock=false` against the real state.
  */
-export async function runChecks(driver: SandboxDriver, sandbox: string, workDir: string, checks: Check[], options: RunOptions = {}): Promise<CheckResult[]> {
+export function runChecks(driver: SandboxDriver, sandbox: string, workDir: string, checks: Check[], options: RunOptions = {}): Promise<CheckResult[]> {
+  return runEach(driver, sandbox, workDir, checks, options, async () => undefined);
+}
+
+/** `runChecks`, with `after` called once the plan and each check ran: a result from it ends the run, last. */
+async function runEach(
+  driver: SandboxDriver, sandbox: string, workDir: string, checks: Check[], options: RunOptions, after: () => Promise<CheckResult | undefined>,
+): Promise<CheckResult[]> {
   const results: CheckResult[] = [];
   let planJson: string | undefined;
   if (checks.some((c) => c.needs.includes('tfplan'))) {
     const plan = await makePlan(driver, sandbox, workDir, options);
+    const stop = await after();
+    if (stop) return plan.exit !== 0 ? [plan, stop] : [stop];
     if (plan.exit !== 0) {
       results.push(plan);
       for (const check of checks.filter((c) => c.needs.includes('tfplan'))) {
@@ -59,8 +69,72 @@ export async function runChecks(driver: SandboxDriver, sandbox: string, workDir:
       timedOut: result.code === 124 || result.code === 137,
       output: tail(`${result.stdout}${result.stderr}`, 4000),
     });
+    const stop = await after();
+    if (stop) return [...results, stop];
   }
   return results;
+}
+
+/** init.sh, then the checks; with `guard`, the run fails once a protected file of the checkout changed, appeared or went while they ran. */
+export async function runGuarded(driver: SandboxDriver, sandbox: string, workDir: string, checks: Check[], options: RunOptions & { guard: TreeReader }): Promise<CheckResult[]> {
+  // What init.sh or a check runs, such as a `prepare` script, could rewrite a protected file of the checkout, which the
+  // daemon judged as committed, and make a check pass. The baseline is the checkout before anything ran in it.
+  const rules = await protectionRules(options.guard);
+  const start = guardTargets(rules, await sandboxFiles(driver, sandbox, workDir));
+  const before = await sandboxState(driver, sandbox, workDir, rules, start);
+  const started = Date.now();
+  const tripwire = async (): Promise<CheckResult | undefined> => {
+    const now = guardTargets(rules, await sandboxFiles(driver, sandbox, workDir), start.parts);
+    const changed = guardChanges(before, await sandboxState(driver, sandbox, workDir, rules, now));
+    if (changed.length === 0) return undefined;
+    return { id: 'protected-files', exit: 1, timedOut: false, durationMs: Date.now() - started, output: `the code under test changed protected files while the checks ran: ${changed.join(', ')}` };
+  };
+  const init = await initEnvironment(driver, sandbox, workDir);
+  if (init && init.exit !== 0) return [init];
+  const stop = await tripwire();
+  if (stop) return [stop];
+  return runEach(driver, sandbox, workDir, checks, options, tripwire);
+}
+
+/** Every file and symbolic link of the checkout but in .git and what installing fills, found inside the sandbox: its git can't be trusted. */
+async function sandboxFiles(driver: SandboxDriver, sandbox: string, workDir: string): Promise<string[]> {
+  const pruned = ['.git', ...INSTALLED].map((name) => `-name ${sh(name)}`).join(' -o ');
+  // In base64, so that NULs, which no path holds, cross any transport.
+  const script = `set -o pipefail; cd ${sh(workDir)} && find . \\( ${pruned} \\) -prune -o \\( -type f -o -type l \\) -print0 | base64 -w0`;
+  const result = await driver.exec(sandbox, script, { timeoutSec: 300 });
+  if (result.code !== 0) throw new Error(`could not list the checkout: ${result.stderr.trim()}`);
+  return Buffer.from(result.stdout.trim(), 'base64').toString('utf8').split('\0').filter(Boolean).map((path) => path.replace(/^\.\//, ''));
+}
+
+/**
+ * The protected files of the checkout, as `guardChanges` compares them: each one's hash, link
+ * or protected parts. Bytes are hashed inside the sandbox, and only files protected by part
+ * are read whole, so what git's attributes do to line endings changes nothing.
+ */
+async function sandboxState(driver: SandboxDriver, sandbox: string, workDir: string, rules: ProtectionRules, targets: { whole: string[]; parts: string[] }): Promise<Map<string, string>> {
+  const paths = [...targets.whole.map((p) => `W${p}`), ...targets.parts.map((p) => `P${p}`)];
+  const script = [
+    `cd ${sh(workDir)} || exit 1`,
+    "base64 -d | while IFS= read -r -d '' entry; do",
+    '  kind=${entry:0:1}; p=${entry:1}',
+    '  if [ -L "$p" ]; then printf "link:%s\\n" "$(readlink -- "$p" | base64 -w0)"',
+    '  elif [ ! -f "$p" ]; then echo absent',
+    '  elif [ "$kind" = W ]; then sha256sum < "$p" | cut -d" " -f1',
+    '  else printf "text:%s\\n" "$(base64 -w0 < "$p")"; fi',
+    'done',
+  ].join('\n');
+  const input = Buffer.from(paths.map((p) => `${p}\0`).join(''), 'utf8').toString('base64');
+  const result = await driver.exec(sandbox, script, { input, timeoutSec: 300 });
+  const lines = result.stdout.split('\n');
+  if (result.code !== 0 || lines.length < paths.length) throw new Error(`could not read the checkout's protected files: ${result.stderr.trim()}`);
+  const state = new Map<string, string>();
+  targets.whole.forEach((path, i) => state.set(path, lines[i]!));
+  targets.parts.forEach((path, i) => {
+    const line = lines[targets.whole.length + i]!;
+    const value = line.startsWith('text:') ? JSON.stringify(partHashes(rules, path, Buffer.from(line.slice(5), 'base64').toString('utf8'))) : line;
+    state.set(`${path}${PARTS_KEY}`, value);
+  });
+  return state;
 }
 
 /** `terraform plan -lock=false` with the real backend: the view role reads the state, and can't take the lock (§12.4). */
