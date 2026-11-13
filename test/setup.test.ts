@@ -67,6 +67,8 @@ describe('harness setup (v4 §4)', () => {
     assert.deepEqual(fixFor(check('image', 'warn', 'has Claude Code 1, this machine 2')), { kind: 'build-image' });
     assert.deepEqual(fixFor(check('GitHub App', 'fail', 'no GitHub App in /home/x/.config/harness: create one')), { kind: 'create-app' });
     assert.deepEqual(fixFor(check('GitHub App', 'fail', 'GET /repos/acme/shop/installation: 404 Not Found')), { kind: 'install-app' });
+    assert.equal(fixFor(check('GitHub App', 'fail', 'fetch failed')), undefined, 'offline, no install page to wait on');
+    assert.equal(fixFor(check('GitHub App', 'fail', 'harness/config.json says the bot is a[bot], but the App on this machine is b[bot]')), undefined);
     assert.deepEqual(fixFor(check('GitHub App', 'warn', "can't write commit statuses, which the reviewers' verdicts need in Swarm")), { kind: 'app-statuses' });
     assert.deepEqual(fixFor(check('ruleset', 'fail', "doesn't require checks")), { kind: 'apply-rules' });
     assert.deepEqual(fixFor(check('ruleset', 'fail', "doesn't apply to main")), { kind: 'apply-rules' });
@@ -187,6 +189,42 @@ describe('the setup writes nothing the schema refuses', () => {
       assert.match(said.join('\n'), /"shop" won't do: owner\/name\. Type it again, or Enter to skip\./);
       assert.doesNotMatch(readFileSync(calls, 'utf8'), /repo create/);
     });
+  });
+});
+
+describe('the setup on a machine of stand-ins', () => {
+  // Only git and the stand-ins are on the PATH: nothing of this machine's is checked or changed.
+  const path = process.env.PATH;
+  const git = path!.split(':').map((dir) => join(dir, 'git')).find((file) => existsSync(file))!;
+  before(() => {
+    const bin = tempDir('bin');
+    symlinkSync(git, join(bin, 'git'));
+    writeFileSync(join(bin, 'gh'), '#!/bin/sh\n[ "$1 $2" = "auth status" ] && exit 0\nexit 1\n', { mode: 0o755 });
+    // Docker with the agents' image built, and a network: OpenShell is what this machine lacks.
+    writeFileSync(join(bin, 'docker'), '#!/bin/sh\ncase "$1" in\n  info) echo 27.0 ;;\n  image) echo ;;\n  run) printf 200 ;;\n  *) exit 1 ;;\nesac\n', { mode: 0o755 });
+    process.env.PATH = bin;
+  });
+  after(() => {
+    process.env.PATH = path;
+  });
+
+  it('skips the probe while a check of the machine fails, offers no daemon, and ends with problems left', async () => {
+    const { dir } = await project(false);
+    mkdirSync(join(dir, 'harness'));
+    writeFileSync(join(dir, 'harness', 'config.json'), JSON.stringify({ harnessVersion: '0.6.0', project: { name: 'shop' } }));
+    const said: string[] = [];
+    const asked: string[] = [];
+    let started = false;
+    const result = await setup({
+      projectDir: dir, packageDir: fileURLToPath(new URL('..', import.meta.url)), version: '0.6.0', owner: 'owner',
+      say: (line) => void said.push(line), ask: async (question) => (asked.push(question), ''), askSecret: async () => '',
+      open: () => {}, interactive: () => 0, up: async () => void (started = true), sleep: async () => {},
+    });
+    assert.equal(result, false);
+    assert.match(said.at(-1)!, /^\nThe probe needs this machine first: OpenShell, OpenShell gateway, Claude Code\. Fix them, then run `harness setup` again\.$/);
+    assert.equal(said.some((line) => line.includes('The probe: everything an agent must not do')), false);
+    assert.equal(asked.some((question) => question.startsWith('Start the daemon')), false);
+    assert.equal(started, false);
   });
 });
 

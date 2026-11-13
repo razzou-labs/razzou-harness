@@ -7,7 +7,7 @@ import { ConfigSchema, requiredChecks, type Config } from '../design/schemas.ts'
 import { configDir, loadAppCredentials } from '../github/app.ts';
 import { applyRepositoryRules, checkApp, createApp, installCi, type RulesetOptions } from '../github/setup.ts';
 import { run, sha256 } from '../util.ts';
-import { doctor, granted, projectMode, repositorySecret, type Check } from './doctor.ts';
+import { doctor, granted, MACHINE_CHECKS, projectMode, repositorySecret, type Check } from './doctor.ts';
 import { appBot, checkedConfig, githubRepo, HARNESS_FILES, init, projectName } from './init.ts';
 import { scaffoldFiles, writeTerraformScaffold, type TerraformLayout, type TerraformScaffold } from './terraform.ts';
 
@@ -58,7 +58,8 @@ export function fixFor(check: Check): Fix | undefined {
     case 'GitHub App':
       if (check.detail.startsWith('no GitHub App in')) return { kind: 'create-app' };
       if (check.detail.includes("can't write commit statuses")) return { kind: 'app-statuses' };
-      return { kind: 'install-app' };
+      // Only GitHub's 404 says the App isn't installed there: offline, the install page would wait for nothing.
+      return /\b404\b/.test(check.detail) ? { kind: 'install-app' } : undefined;
     case 'ruleset':
       // The ruleset applies to the default branch: making main the default is the owner's.
       return check.detail.includes('default branch') ? undefined : { kind: 'apply-rules' };
@@ -122,6 +123,7 @@ export async function setup(options: SetupOptions): Promise<boolean> {
   let buildImages = false;
   // An optional secret skipped in one round isn't asked for again in the next.
   const skipped = new Set<string>();
+  let last: Check[] = [];
   for (let round = 1; round <= 3; round++) {
     say(round === 1 ? '\nChecking this machine and the project:' : '\nChecking again:');
     const checks = await doctor({
@@ -129,6 +131,7 @@ export async function setup(options: SetupOptions): Promise<boolean> {
       skipped, askSecret: options.askSecret,
       ...(settings.viewRole ? { awsViewRole: settings.viewRole } : {}), report: (c) => say(line(c)),
     });
+    last = checks;
     buildImages = false;
     let again = false;
     for (const check of checks) {
@@ -144,6 +147,12 @@ export async function setup(options: SetupOptions): Promise<boolean> {
     if (!again) break;
   }
 
+  // The probe runs in sandboxes: while the machine can't make them, it would only fail again.
+  const machineFailed = last.filter((c) => c.status === 'fail' && MACHINE_CHECKS.includes(c.name));
+  if (machineFailed.length > 0) {
+    say(`\nThe probe needs this machine first: ${[...new Set(machineFailed.map((c) => c.name))].join(', ')}. Fix ${machineFailed.length === 1 ? 'it' : 'them'}, then run \`harness setup\` again.`);
+    return false;
+  }
   say('\nThe probe: everything an agent must not do, tried.');
   const probe = await doctor({ projectDir, packageDir: options.packageDir, version: options.version, probe: true, buildImages: false, interactive: false, report: (c) => { if (c.name.startsWith('probe')) say(line(c)); } });
   // A failed check, such as main without the config, would stop the daemon: it isn't offered then.

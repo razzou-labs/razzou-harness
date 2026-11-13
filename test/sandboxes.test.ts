@@ -1,11 +1,12 @@
 import { strict as assert } from 'node:assert';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, it } from 'node:test';
+import { afterEach, beforeEach, describe, it } from 'node:test';
+import { fileURLToPath } from 'node:url';
 import { bytes, readDockerUsage } from '../src/sandbox/docker.ts';
 import { OpenShellDriver } from '../src/sandbox/openshell.ts';
 import { Denials, parseDenials } from '../src/sandbox/refusals.ts';
-import { mainHolds, projectMode, storeApiKey } from '../src/setup/doctor.ts';
+import { doctor, mainHolds, projectMode, storeApiKey, type Check } from '../src/setup/doctor.ts';
 import { buildCache, removeOldAgentImages } from '../src/setup/images.ts';
 import { runOk } from '../src/util.ts';
 import { tempDir } from './helpers/toy-repo.ts';
@@ -179,6 +180,72 @@ describe("the doctor's mode", () => {
     assert.equal(projectMode(dir), 'swarm', 'the rules are judged for the mode the daemon will run in');
     writeFileSync(join(dir, '.harness', 'setup.json'), JSON.stringify({ ownerHours: { shop: 3 } }));
     assert.equal(projectMode(dir), 'manual');
+  });
+});
+
+describe('the doctor on a machine of stand-ins', () => {
+  // Only git and the stand-ins a test writes are on the PATH: nothing of this machine's is checked or changed.
+  const path = process.env.PATH;
+  const xdg = process.env.XDG_CONFIG_HOME;
+  const git = path!.split(':').map((dir) => join(dir, 'git')).find((file) => existsSync(file))!;
+  let bin: string;
+  beforeEach(() => {
+    bin = tempDir('bin');
+    symlinkSync(git, join(bin, 'git'));
+    process.env.PATH = bin;
+    process.env.XDG_CONFIG_HOME = tempDir('xdg');
+  });
+  afterEach(() => {
+    process.env.PATH = path;
+    if (xdg === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = xdg;
+  });
+  const project = (config: object) => {
+    const dir = tempDir('project');
+    mkdirSync(join(dir, 'harness'));
+    writeFileSync(join(dir, 'harness', 'config.json'), JSON.stringify({ harnessVersion: '0.6.0', ...config }));
+    return dir;
+  };
+  const run = (dir: string, more: Partial<Parameters<typeof doctor>[0]> = {}) => doctor({
+    projectDir: dir, packageDir: fileURLToPath(new URL('..', import.meta.url)), version: '0.6.0', probe: false, buildImages: false, interactive: true, report: () => {}, ...more,
+  });
+  const named = (checks: Check[], name: string) => checks.filter((c) => c.name === name).map((c) => `${c.status} ${c.detail}`);
+
+  it('reports a missing openshell as failed checks, and goes on', async () => {
+    const checks = await run(project({ project: { name: 'shop' }, network: { apis: [{ host: 'api.stripe.com', key: 'STRIPE_API_KEY' }] } }), { probe: true });
+    assert.deepEqual(named(checks, 'OpenShell'), ['fail not found']);
+    assert.deepEqual(named(checks, 'Claude provider'), ['fail needs OpenShell, which is missing']);
+    assert.deepEqual(named(checks, 'providers'), ['skip the AWS and API providers need OpenShell, which is missing']);
+    assert.deepEqual(named(checks, 'probe'), ['skip the probe needs OpenShell']);
+  });
+
+  it('asks for a key skipped with Enter once in a run', async () => {
+    writeFileSync(join(bin, 'openshell'), [
+      '#!/bin/sh',
+      'case "$*" in',
+      "  '--version') echo 'openshell 0.1.7' ;;",
+      "  'status') echo 'Status: Connected' ;;",
+      "  'profile list') echo 'claude-code-subscription  global' ;;",
+      "  'provider list --output json') echo '{\"providers\":[]}' ;;",
+      "  'provider list') echo 'claude-sub  claude-code-subscription' ;;",
+      '  *) exit 1 ;;',
+      'esac',
+      '',
+    ].join('\n'), { mode: 0o755 });
+    const dir = project({ project: { name: 'shop' }, network: { apis: [{ host: 'api.stripe.com', key: 'STRIPE_API_KEY' }] } });
+    const asked: string[] = [];
+    const skipped = new Set<string>();
+    const askSecret = async (question: string) => (asked.push(question), '');
+    for (let round = 0; round < 3; round++) await run(dir, { skipped, askSecret });
+    assert.equal(asked.length, 1, 'the setup runs the doctor up to three times');
+    assert.match(asked[0]!, /^The key of api\.stripe\.com/);
+  });
+
+  it("fails when the config's bot isn't this machine's App, before asking GitHub anything", async () => {
+    mkdirSync(join(process.env.XDG_CONFIG_HOME!, 'harness'));
+    writeFileSync(join(process.env.XDG_CONFIG_HOME!, 'harness', 'app.json'), JSON.stringify({ appId: 7, slug: 'other-harness' }));
+    const checks = await run(project({ project: { name: 'shop', repo: 'acme/shop', bot: 'acme-harness[bot]' } }));
+    assert.deepEqual(named(checks, 'GitHub App'), ['fail harness/config.json says the bot is acme-harness[bot], but the App on this machine is other-harness[bot]']);
   });
 });
 
