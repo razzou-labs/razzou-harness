@@ -1,11 +1,12 @@
 import { strict as assert } from 'node:assert';
 import { generateKeyPairSync } from 'node:crypto';
-import { writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 import { GitHubClient, GitHubError } from '../src/github/app.ts';
 import { GitHubForge, type BranchRules } from '../src/github/forge.ts';
-import { checkApp, ciFiles, mainRuleset, rulesProblems } from '../src/github/setup.ts';
+import { checkApp, ciFiles, installCi, mainRuleset, rulesProblems, staleCiFiles } from '../src/github/setup.ts';
+import { run } from '../src/util.ts';
 import { tempDir } from './helpers/toy-repo.ts';
 
 interface Ruleset {
@@ -103,6 +104,48 @@ describe('CODEOWNERS', () => {
     for (const line of ['/harness/ @boss', '/.github/ @boss', '.claude/ @boss', 'CLAUDE.md @boss', 'CLAUDE.local.md @boss', 'AGENTS.md @boss', '/init.sh @boss']) {
       assert.ok(codeowners.includes(line), line);
     }
+  });
+
+  it("keeps the project's CODEOWNERS, and writes one when there is none, with the login given or gh's", async () => {
+    const packageDir = join(import.meta.dirname, '..');
+    const kept = tempDir('install-ci');
+    mkdirSync(join(kept, '.github'), { recursive: true });
+    writeFileSync(join(kept, '.github', 'CODEOWNERS'), '* @someone\n');
+    assert.ok(!(await installCi(kept, packageDir, 'boss')).includes('.github/CODEOWNERS'));
+    assert.equal(readFileSync(join(kept, '.github', 'CODEOWNERS'), 'utf8'), '* @someone\n');
+
+    const given = tempDir('install-ci');
+    assert.ok((await installCi(given, packageDir, 'boss')).includes('.github/CODEOWNERS'));
+    assert.match(readFileSync(join(given, '.github', 'CODEOWNERS'), 'utf8'), /^\/harness\/ @boss$/m);
+
+    // No login given: gh's, here a stand-in on the PATH.
+    const bin = tempDir('gh');
+    writeFileSync(join(bin, 'gh'), '#!/bin/sh\necho gh-login\n', { mode: 0o755 });
+    const fromGh = tempDir('install-ci');
+    const path = process.env.PATH;
+    process.env.PATH = `${bin}:${path}`;
+    try {
+      await installCi(fromGh, packageDir);
+    } finally {
+      process.env.PATH = path;
+    }
+    assert.match(readFileSync(join(fromGh, '.github', 'CODEOWNERS'), 'utf8'), /^\/harness\/ @gh-login$/m);
+  });
+});
+
+describe('the CI files', () => {
+  it('run in a project whose package.json says "type": "commonjs", and are stale until written again', async () => {
+    const packageDir = join(import.meta.dirname, '..');
+    const project = tempDir('commonjs');
+    writeFileSync(join(project, 'package.json'), JSON.stringify({ name: 'p', version: '1.0.0', type: 'commonjs' }));
+    assert.deepEqual(staleCiFiles(project, packageDir), ['.github/workflows/harness.yml', '.github/harness/harness-ci.ts', '.github/harness/package.json']);
+    await installCi(project, packageDir, 'boss');
+    assert.deepEqual(staleCiFiles(project, packageDir), []);
+    const lock = await run('node', [join(project, '.github', 'harness', 'harness-ci.ts'), 'lock', '--dir', project]);
+    assert.equal(lock.code, 0, lock.stderr);
+    assert.ok((JSON.parse(lock.stdout) as { entries: unknown[] }).entries.length > 0);
+    writeFileSync(join(project, '.github', 'harness', 'package.json'), '{}\n');
+    assert.deepEqual(staleCiFiles(project, packageDir), ['.github/harness/package.json']);
   });
 });
 

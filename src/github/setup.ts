@@ -128,11 +128,16 @@ function escapeHtml(text: string): string {
   return text.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
 }
 
-/** The workflow, the CI script and, with the owner's login, CODEOWNERS (§11.5). */
+/**
+ * The workflow, the CI script and, with the owner's login, CODEOWNERS (§11.5). The CI script
+ * has a package.json of its own: Node reads the project's otherwise, and `"type": "commonjs"`
+ * there, which `npm init` writes, makes the script's imports a syntax error.
+ */
 export function ciFiles(packageDir: string, owner?: string): Array<[string, string]> {
   const files: Array<[string, string]> = [
     ['.github/workflows/harness.yml', readFileSync(join(packageDir, 'templates', 'harness.yml'), 'utf8')],
     ['.github/harness/harness-ci.ts', readFileSync(join(packageDir, 'src', 'ci', 'harness-ci.ts'), 'utf8')],
+    ['.github/harness/package.json', '{"type":"module"}\n'],
   ];
   if (owner) {
     // Without a leading slash, a pattern matches in any folder: Claude Code reads these in every one.
@@ -142,17 +147,33 @@ export function ciFiles(packageDir: string, owner?: string): Array<[string, stri
   return files;
 }
 
+/** The CI files of a project that are missing or differ from this version of the harness. CODEOWNERS is the owner's, so never stale. */
+export function staleCiFiles(projectDir: string, packageDir: string): string[] {
+  return ciFiles(packageDir).filter(([path, content]) => {
+    const local = join(projectDir, path);
+    return !existsSync(local) || readFileSync(local, 'utf8') !== content;
+  }).map(([path]) => path);
+}
+
 /**
- * Writes the CI files into a project, over older versions. The owner commits them with
- * their own credentials: the App can't touch workflows.
+ * Writes the CI files into a project, over older versions. CODEOWNERS is written only when
+ * the project has none, since the owner may have changed it since, with the login given or
+ * gh's. The owner commits the files with their own credentials: the App can't touch workflows.
  */
-export function installCi(projectDir: string, packageDir: string, owner?: string): string[] {
-  const files = ciFiles(packageDir, owner);
+export async function installCi(projectDir: string, packageDir: string, owner?: string): Promise<string[]> {
+  const login = existsSync(join(projectDir, '.github', 'CODEOWNERS')) ? undefined : (owner ?? (await ghLogin()));
+  const files = ciFiles(packageDir, login);
   for (const [path, content] of files) {
     mkdirSync(join(projectDir, path, '..'), { recursive: true });
     writeFileSync(join(projectDir, path), content);
   }
   return files.map(([path]) => path);
+}
+
+/** The login gh is logged in as, or undefined. */
+async function ghLogin(): Promise<string | undefined> {
+  const login = await run('gh', ['api', 'user', '--jq', '.login']).catch(() => undefined);
+  return login?.code === 0 ? login.stdout.trim() || undefined : undefined;
 }
 
 /** GitHub Actions' integration id: pinned to it, a required job can't be posted by another App. */
