@@ -2438,7 +2438,8 @@ describe('pull requests, continued', () => {
       await o.tick();
       await o.settled();
     }
-    assert.equal(plan(o)!.status, 'pr_open');
+    assert.equal(plan(o)!.status, 'ready_to_merge');
+    assert.equal(plan(o)!.mergedBy, undefined);
     assert.equal(plan(o)!.leftToOwner, undefined, 'nothing is left to the owner for an estimate minutes away');
     assert.equal(plan(o)!.costEstimate, undefined);
     await fake.rerun(plan(o)!.pushed!, { cost: 'success' });
@@ -3061,7 +3062,8 @@ describe('problems of the build', () => {
     const first = o.state.pipeline.paused!;
     assert.equal(first.reason, 'no CI has run on PR #1 for 11 minutes: is the harness workflow on main?');
     assert.equal(first.retry, true);
-    assert.equal(Date.parse(first.until!) - Date.parse(first.since), 10 * 60_000);
+    // Ten minutes, from two readings of the clock that may be a millisecond apart.
+    assert.equal(Math.round((Date.parse(first.until!) - Date.parse(first.since)) / 1000), 10 * 60);
 
     // Still none ten minutes later: it waits again, and says for how long it has.
     skew += 10 * 60_000 + 1_000;

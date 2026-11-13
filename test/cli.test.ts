@@ -301,6 +301,6 @@ describe('the CLI', () => {
     const install = await harness(dir, 'install-ci', '--owner', 'owner');
     assert.equal(install.code, 0, install.stderr);
     assert.deepEqual(JSON.parse(readFileSync(join(dir, 'harness', 'lock.json'), 'utf8')), await computeLock(directoryReader(dir)));
-    assert.match(install.stdout, /\nCommit \.github\/workflows\/harness\.yml, \.github\/harness\/harness-ci\.ts, \.github\/CODEOWNERS, harness\/lock\.json and push them to main yourself/);
+    assert.match(install.stdout, /\nCommit \.github\/workflows\/harness\.yml, \.github\/harness\/harness-ci\.ts, \.github\/harness\/package\.json, \.github\/CODEOWNERS, harness\/lock\.json and push them to main yourself/);
   });
 });
