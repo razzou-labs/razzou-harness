@@ -187,7 +187,8 @@ async function project(options: DoctorOptions, config: Config, report: (c: Check
   const repo = config.project.repo;
   const mode = projectMode(options.projectDir);
   if (!repo) {
-    report({ status: 'skip', name: 'GitHub', detail: 'no project.repo: the project stays local' });
+    // Without a repository, plans never reach main: `harness up` refuses such a project.
+    report(fail('GitHub', 'no project.repo: the harness needs a GitHub repository, where each plan reaches main through a pull request', '`harness setup` creates one, and sets project.repo and project.bot'));
   } else {
     // CI tells the App's pull requests by the bot the config names, and the daemon refuses to start on another App's.
     const bot = appBot();

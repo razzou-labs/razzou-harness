@@ -99,14 +99,9 @@ async function main(): Promise<void> {
   }
 
   switch (values.help ? 'help' : command) {
-    case 'up': {
-      // Without a repository, plans never reach main: the harness needs one on GitHub.
-      if (!projectConfig(projectDir)?.project.repo) {
-        throw new Error('harness/config.json has no project.repo: the harness needs a GitHub repository, where each plan reaches main through a pull request. `harness setup` creates one, and sets project.repo and project.bot');
-      }
+    case 'up':
       await runDaemon(projectDir);
       process.exit(0);
-    }
     case 'down':
       return void (await down(harnessDir));
     case 'status':

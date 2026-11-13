@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startDashboard } from '../dashboard/server.ts';
 import { loadPty, Terminals } from '../dashboard/terminals.ts';
+import { ConfigSchema } from '../design/schemas.ts';
 import type { SandboxDriver } from '../sandbox/driver.ts';
 import { OpenShellDriver } from '../sandbox/openshell.ts';
 import type { Ref } from '../state/events.ts';
@@ -135,6 +136,7 @@ export async function runDaemon(projectDir: string, options: DaemonOptions = {})
     throw new Error(`a daemon already runs for this project (pid ${running.pid}, http://127.0.0.1:${running.port})`);
   }
   await refuseLostState(projectDir, harnessDir);
+  refuseLocal(projectDir);
   mkdirSync(join(harnessDir, 'logs'), { recursive: true, mode: 0o700 });
   const unlock = takeDaemonLock(harnessDir);
   try {
@@ -161,6 +163,14 @@ async function refuseLostState(projectDir: string, harnessDir: string): Promise<
   const progress = await run('git', ['-C', projectDir, 'show', 'refs/heads/main:progress.txt']);
   if (progress.code === 0 && / feature\.accepted \S+/.test(progress.stdout)) {
     throw new Error("main's progress.txt has accepted features, but .harness/ has no event log: it was lost. `harness recover` rebuilds it from git and GitHub; run `harness up` after it.");
+  }
+}
+
+/** Without a repository, plans never reach main: the harness needs one on GitHub. */
+function refuseLocal(projectDir: string): void {
+  const config = ConfigSchema.parse(JSON.parse(readFileSync(join(projectDir, 'harness', 'config.json'), 'utf8')));
+  if (!config.project.repo) {
+    throw new Error('harness/config.json has no project.repo: the harness needs a GitHub repository, where each plan reaches main through a pull request. `harness setup` creates one, and sets project.repo and project.bot');
   }
 }
 
