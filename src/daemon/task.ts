@@ -85,12 +85,23 @@ function featureLines(input: TaskInput): string[] {
       '',
       'After you finish, the harness runs every check of the work accepted on this branch, from the repository root, in a fresh sandbox. Each must exit 0. Some fail now, as the report above shows, and they are not yours to change: fix the code they check.',
     );
-  } else {
+  } else if (input.fix) {
     lines.push(
       '',
       '## How it is checked',
       '',
       "CI is the check: after you finish, the harness runs the checks below in a fresh sandbox, then pushes your commits and CI runs again on the pull request. The failure above may not reproduce here; reason from CI's output.",
+    );
+  } else {
+    // Every check of the feature runs once the plan is merged and deployed: none of them can run here.
+    const later = feature.checks.filter((c) => c.phase === 'post-deploy');
+    lines.push(
+      '',
+      '## How it is checked',
+      '',
+      'Its checks run after the deploy: once the plan is merged and CI has applied it, the harness runs them against the real environment, and they must exit 0 there. They cannot pass here, so build what they test and check what you can before you finish, such as with a Terraform plan.',
+      '',
+      ...later.map((c) => `- \`${c.run}\` (${c.id})`),
     );
   }
   if (input.regressionChecks.length > 0) {

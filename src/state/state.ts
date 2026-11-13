@@ -264,14 +264,17 @@ export interface ModuleState {
   /** A design the daemon is checking before it opens the Arch PR. */
   submission?: { requestId: string; summary: string; head: string; at: string };
   /** The design under review: its branch head with the hash list, and its PR. */
-  design?: { head: string; suspect: string[]; summary: string; pr?: { number: number; url: string }; ciNoted?: string };
+  /** `settings`: the settings of harness/config.json it changes, as its PR lists them. */
+  design?: { head: string; suspect: string[]; settings?: string[]; summary: string; pr?: { number: number; url: string }; ciNoted?: string };
   /** The design of a pull request the owner closed: they may open it again, and it is then the design under review again. */
-  closedDesign?: { head: string; suspect: string[]; summary: string; pr?: { number: number; url: string } };
+  closedDesign?: { head: string; suspect: string[]; settings?: string[]; summary: string; pr?: { number: number; url: string } };
   /** A CHANGED_LOCKED_FILES change the daemon is checking before it opens its PR (v5). */
   lockedSubmission?: { requestId: string; summary: string; head: string; at: string };
   /** A CHANGED_LOCKED_FILES change under review: what it changes in each built feature, and its PR (v5). */
   locked?: { head: string; summary: string; changes: LockedChange[]; pr?: { number: number; url: string }; ciNoted?: string };
   frozenCommit?: string;
+  /** When its first design was merged: modules are built in that order. */
+  frozenAt?: string;
   /** Messages for the Architect, written into its sandbox once and shown with the owner's next prompt. */
   notes: Array<{ key: string; text: string; sent?: boolean }>;
   escalations: Array<{ id: string; question: string; feature?: string; manager?: string; askedAt: string; decision?: string; decidedAt?: string }>;
@@ -832,7 +835,7 @@ export function apply(state: State, event: HarnessEvent): State {
       };
       break;
     case 'OWNER_ANSWER': {
-      const request = state.ownerRequests[event.payload.requestId];
+      const request = Object.hasOwn(state.ownerRequests, event.payload.requestId) ? state.ownerRequests[event.payload.requestId] : undefined;
       if (request) Object.assign(request, { answer: event.payload.answer, answeredAt: event.ts });
       // The owner may have fixed what a Manager asked about, such as a host to allow: checks that failed run again.
       for (const plan of Object.values(state.plans)) {
@@ -982,6 +985,7 @@ export function apply(state: State, event: HarnessEvent): State {
       const module = state.modules[event.payload.module]!;
       module.design = {
         head: event.payload.head, suspect: event.payload.suspect, summary: event.payload.summary ?? module.submission?.summary ?? '',
+        ...(event.payload.settings?.length ? { settings: event.payload.settings } : {}),
         ...(module.design?.pr ? { pr: module.design.pr } : {}),
       };
       delete module.submission;
@@ -1044,7 +1048,12 @@ export function apply(state: State, event: HarnessEvent): State {
       const module = state.modules[event.payload.module]!;
       // A design change that was closed leaves the merged design as it was.
       module.status = module.frozenCommit ? 'frozen' : 'decomposing';
-      if (module.design?.pr) module.closedDesign = { head: module.design.head, suspect: module.design.suspect, summary: module.design.summary, pr: module.design.pr };
+      if (module.design?.pr) {
+        module.closedDesign = {
+          head: module.design.head, suspect: module.design.suspect, summary: module.design.summary, pr: module.design.pr,
+          ...(module.design.settings ? { settings: module.design.settings } : {}),
+        };
+      }
       delete module.design;
       module.notes.push({ key: `note:${event.id}`, text: 'The owner closed your Arch PR without merging it. Ask them why before you submit again.' });
       break;
@@ -1066,7 +1075,7 @@ export function apply(state: State, event: HarnessEvent): State {
     }
     case 'DESIGN_FROZEN': {
       const module = state.modules[event.payload.module]!;
-      Object.assign(module, { status: 'frozen', frozenCommit: event.payload.commit });
+      Object.assign(module, { status: 'frozen', frozenCommit: event.payload.commit, frozenAt: module.frozenAt ?? event.ts });
       delete module.design;
       module.notes.push({
         key: `note:${event.id}`,
@@ -1182,7 +1191,7 @@ function forgetSent(state: State, ref: Ref): void {
 
 /** Who gets a piece of mail: the Manager named, while it runs, or else every Manager of the module. */
 function mailTargets(state: State, module: string, manager?: string): ManagerState[] {
-  const named = manager ? state.managers[manager] : undefined;
+  const named = manager && Object.hasOwn(state.managers, manager) ? state.managers[manager] : undefined;
   return named && named.status !== 'stopped' ? [named] : managersOf(state, module);
 }
 

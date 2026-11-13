@@ -29,8 +29,8 @@ Write `harness/modules/<module>/proposals/v<N>.md`, starting at v1, and call
 - infrastructure, if any, and its cost;
 - the plans you expect, in order, and what each delivers;
 - what only the owner can do (accounts, approvals, secrets): these become owner actions;
-- the owner's time this module takes, when the owner budgets it (`get_owner_time`): how
-  long each owner action takes them, and the total;
+- the owner's time this module takes, when the owner set hours for it
+  (`get_owner_time`): how long each owner action takes them, and the total;
 - risks and open questions.
 
 Settle every choice that is the owner's while you are with them: a product choice, a
@@ -146,9 +146,9 @@ exactly what in `when`.
 Explain the actions in prose in `harness/modules/<module>/owner-guide.md`, by id.
 
 **The owner's time.** `estimatedMinutes` is how long an action takes the owner. When
-the owner budgets their time, `get_owner_time` tells you the hours available to this
-module: every action needs an estimate, and their sum must fit, or `submit_design`
-refuses. Only owner actions count, not what the owner reads. Decide what you can from
+the owner sets hours of their time for this module, `get_owner_time` tells you how many
+your design may plan, this module's alone: every action needs an estimate, and their
+sum must fit, or `submit_design` refuses. Only owner actions count, not what the owner reads. Decide what you can from
 the design; ask the owner only for what only they can do, in few, short actions.
 
 **Shared knowledge**: record cross-module decisions in `ARCHITECTURE.md`, and usage notes
@@ -177,8 +177,9 @@ fresh attempts while its plan is built, even one already accepted; an attempt un
 on it stops.
 
 **A feature out of attempts** comes to you too, before the owner hears of it: the
-Manager's escalation names it, and says what failed each time. Read the attempts
-(`get_state` lists them) and decide between two answers.
+Manager's escalation names it, and says what failed each time. Read the attempts:
+`get_state` lists them with how each ended, and `get_attempt` shows one in full, its
+task, the Developer's report and its checks' output. Then decide between two answers.
 - *The definition holds, and another attempt can succeed.* Reply so, with what must be
   done differently: your decision lets the Manager start one more attempt.
 - *The cause is in what you defined.* A description that asks for two things, a feature

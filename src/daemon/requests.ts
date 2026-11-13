@@ -103,9 +103,11 @@ const HANDLERS: Handlers = {
     o.record({ type: 'REJECT', ref: refOf(found.state, found.attempt), from: 'manager', to: 'daemon', payload: { requestId, guidance } });
     o.kick();
     const left = attemptsLeft(o, found.state) - 1;
-    return ok(left > 0
-      ? `Rejected. The next attempt starts with your guidance (${left} left).`
-      : 'Rejected. That was its last attempt, so the owner decides what happens next.');
+    if (left > 0) return ok(`Rejected. The next attempt starts with your guidance (${left} left).`);
+    // Out of attempts, a feature goes to the Architect, not the owner: only a design written by hand has none.
+    return ok(o.state.modules[found.state.module]
+      ? `Rejected. That was its last attempt: take it to the Architect with escalate_to_architect(feature: "${feature}", question), saying what failed each time.`
+      : 'Rejected. That was its last attempt, and this module has no Architect, so the owner decides what happens next.');
   },
 
   retry_feature({ o, agent, requestId }, { feature, guidance }) {
@@ -114,7 +116,11 @@ const HANDLERS: Handlers = {
     const last = state.attempts.at(-1)!;
     if (state.status === 'escalated') {
       // Out of attempts: one more starts once the Architect decided on it, or the owner answered about it.
-      if (!outOfAttempts(o, state)) return refuse(`${feature} is escalated: the owner decides now.`);
+      if (!outOfAttempts(o, state)) {
+        return refuse(o.state.modules[state.module]
+          ? `${feature} is escalated: take it to the Architect with escalate_to_architect(feature: "${feature}", question). A change to its design starts it again.`
+          : `${feature} is escalated, and this module has no Architect: the owner decides now.`);
+      }
       const granted = grantFor(o, state);
       if (!granted) {
         return refuse(`${feature} used up its attempts: take it to the Architect with escalate_to_architect(feature: "${feature}", question). Another attempt starts once its decision has come, or the owner's answer to a question of yours.`);
@@ -403,8 +409,10 @@ function architectState(o: Orchestrator, id: string): string {
     status: p.status,
     // Past its build, a plan's features are locked: submit_locked_change, or a new plan that supersedes them (v5).
     locked: isBuilt(o, id, p.plan),
+    // Each attempt with how it ended: get_attempt shows one in full, its task, report and checks.
     features: Object.values(o.state.features).filter((f) => f.module === id && f.plan === p.plan).map((f) => ({
-      feature: f.feature, status: f.status, attempts: f.attempts.length, ...(f.escalation ? { escalation: f.escalation } : {}),
+      feature: f.feature, status: f.status, ...(f.escalation ? { escalation: f.escalation } : {}),
+      attempts: f.attempts.map((a) => ({ n: a.n, status: a.status, ...(a.outcome ? { outcome: a.outcome } : {}), ...(a.reason ? { reason: clip(a.reason, 300) } : {}) })),
     })),
   }));
   return JSON.stringify({

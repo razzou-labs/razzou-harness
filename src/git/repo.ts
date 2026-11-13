@@ -39,21 +39,23 @@ export class Repo {
 
   /** Copies main from where the project lives: a local repository, or GitHub with `env` carrying the token. */
   async fetchMain(source: string, env: NodeJS.ProcessEnv = {}): Promise<string> {
-    await this.git(['fetch', '--quiet', '--no-tags', source, '+refs/heads/main:refs/heads/main'], env);
+    await this.git(['fetch', '--quiet', '--no-tags', source, '+refs/heads/main:refs/heads/main'], env, undefined, NETWORK);
     const sha = await this.revParse('refs/heads/main');
     if (!sha) throw new Error(`${source} has no main branch`);
     return sha;
   }
 
-  /** Copies a branch from a remote, if it has it. */
+  /** Copies a branch from a remote, if it has it: undefined only when the remote says it has no such branch, an error for any other failure. */
   async fetchBranch(source: string, branch: string, env: NodeJS.ProcessEnv = {}): Promise<string | undefined> {
-    const result = await run('git', ['--git-dir', this.dir, 'fetch', '--quiet', '--no-tags', source, `+refs/heads/${branch}:refs/heads/${branch}`], { env: { ...ISOLATED, ...env } });
-    return result.code === 0 ? this.revParse(`refs/heads/${branch}`) : undefined;
+    const result = await run('git', ['--git-dir', this.dir, 'fetch', '--quiet', '--no-tags', source, `+refs/heads/${branch}:refs/heads/${branch}`], { env: { ...ISOLATED, ...env }, ...NETWORK });
+    if (result.code === 0) return this.revParse(`refs/heads/${branch}`);
+    if (/couldn't find remote ref/i.test(result.stderr)) return undefined;
+    throw new Error(`git fetch of ${branch} failed: ${result.stderr.trim().slice(0, 300) || `exit code ${result.code}`}`);
   }
 
   /** Pushes one branch. Never forced: a branch that was pushed is never rewritten (§11.3). */
   async push(target: string, branch: string, env: NodeJS.ProcessEnv = {}): Promise<void> {
-    await this.git(['push', '--quiet', '--no-verify', target, `refs/heads/${branch}:refs/heads/${branch}`], env);
+    await this.git(['push', '--quiet', '--no-verify', target, `refs/heads/${branch}:refs/heads/${branch}`], env, undefined, NETWORK);
   }
 
   /** The tree of a commit, for the protection rules shared with CI. */
@@ -297,8 +299,8 @@ export class Repo {
     }
   }
 
-  private git(args: string[], env: NodeJS.ProcessEnv = {}, input?: string): Promise<string> {
-    return runOk('git', ['--git-dir', this.dir, ...args], { env: { ...ISOLATED, ...env }, input });
+  private git(args: string[], env: NodeJS.ProcessEnv = {}, input?: string, limits: { timeout?: number; killSignal?: NodeJS.Signals } = {}): Promise<string> {
+    return runOk('git', ['--git-dir', this.dir, ...args], { env: { ...ISOLATED, ...env }, input, ...limits });
   }
 }
 
@@ -307,6 +309,9 @@ export class Repo {
  * helper or an `insteadOf` rule there must never turn the App's push into the owner's.
  */
 const ISOLATED: NodeJS.ProcessEnv = { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
+
+/** A fetch or a push that got no answer for ten minutes is killed: a remote that hangs must not hold the daemon's pass. */
+const NETWORK = { timeout: 600_000, killSignal: 'SIGKILL' } as const;
 
 function lines(text: string): string[] {
   return text.split('\n').filter((line) => line !== '');

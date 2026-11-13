@@ -115,9 +115,10 @@ async function until(o: Orchestrator, done: () => boolean, timeoutMs = 30_000): 
     await o.tick();
     await sleep(100);
   }
-  // A pass that an agent's request kicked off may still run: it finishes here, so that what
-  // the test does next, a merge or a jump of the clock, doesn't land in the middle of it.
+  // A pass that an agent's request kicked off may still run, and so may a long step beside it: they finish
+  // here, so that what the test does next, a merge or a jump of the clock, doesn't land in the middle of one.
   await o.tick();
+  await o.settled();
 }
 
 const solved = (feature: string): StubBehavior => ({ files: SOLUTIONS[feature as keyof typeof SOLUTIONS] });
@@ -1796,7 +1797,7 @@ describe('dashboard', () => {
     const fact = (facts: Array<{ name: string; value: string }>, name: string) => facts.find((f) => f.name === name)?.value;
     // The mode and who merges infrastructure are switches of the page now, read from its state.
     assert.deepEqual(view.daemon.map((f) => f.name), ['Your hours', 'Pipeline', 'Daemon', 'Project folder']);
-    assert.equal(fact(view.daemon, 'Your hours'), 'not set');
+    assert.equal(fact(view.daemon, 'Your hours'), 'set for no module');
     assert.equal(fact(view.machine, 'Node.js'), process.version);
     assert.equal(fact(view.machine, 'GitHub App'), 'acme-harness (acme-harness, id 42), owned by acme; its private key is on this machine');
     assert.doesNotMatch(JSON.stringify(view), /PRIVATE KEY|not a real key/);

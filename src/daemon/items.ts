@@ -295,7 +295,7 @@ function questionItem(feature: FeatureState, attempt: Attempt, requestId: string
       '',
       question,
       '',
-      `Answer with answer_developer(question_id: "${requestId}", answer). The Developer waits for you, at most 15 minutes. Decide within the design; if only the owner can decide, give your best default and ask the owner as well.`,
+      `Answer with answer_developer(question_id: "${requestId}", answer). The Developer waits for you, at most 15 minutes. Decide within the design. If the design leaves the choice open and it isn't yours to make, answer with your best default so the Developer goes on, and take the choice to the Architect with escalate_to_architect.`,
     ].join('\n'),
   };
 }

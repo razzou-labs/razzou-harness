@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { managerSettings, readReview, reviewJsonSchema, type AgentRun } from '../agents/claude-code.ts';
 import { KIND_TAGS, planKind, REVIEWER_ROLES, statusContext, type Plan, type ReviewerRole, type ReviewFinding } from '../design/schemas.ts';
@@ -7,7 +7,7 @@ import { GitHubError } from '../github/app.ts';
 import type { PullRequest, ReviewPost } from '../github/forge.ts';
 import { describePaidCalls, paidCallDiff } from '../review/paid-calls.ts';
 import { planKey, type PlanState, type ReviewState } from '../state/state.ts';
-import { clip, sh } from '../util.ts';
+import { clip, noMentions, sh } from '../util.ts';
 import type { Orchestrator } from './orchestrator.ts';
 import { probeScript, sandboxName, waitForFile } from './refs.ts';
 
@@ -116,7 +116,7 @@ export async function reviewStep(o: Orchestrator, plan: PlanState, pr: PullReque
           role,
           head: pr.head,
           // Sandbox names are short: the role's initial and the head's first five hex digits make the suffix.
-          sandbox: sandboxName('rev', o.design.config.project.name, planKey(plan), `${role[0]}${pr.head.slice(0, 5)}`),
+          sandbox: sandboxName('rev', o.projectKey, planKey(plan), `${role[0]}${pr.head.slice(0, 5)}`),
           sessionId: randomUUID(),
           deadline: new Date(o.now() + minutes * 60_000).toISOString(),
         },
@@ -283,9 +283,8 @@ async function poll(o: Orchestrator, plan: PlanState, review: ReviewState): Prom
   }
   if (status === 'gone') return end('error', 'the reviewer stopped without finishing');
   const dir = reviewDir(o, plan, review);
-  const fetch = (from: string, to: string) => o.driver.download(review.sandbox, from, join(dir, to)).then(() => readFileSync(join(dir, to), 'utf8'), () => '');
-  const stream = await fetch(p.stream, 'stream.jsonl');
-  const stderr = await fetch(p.stderr, 'stderr.log');
+  const stream = await o.readAgentFile(review.sandbox, p.stream, join(dir, 'stream.jsonl'));
+  const stderr = await o.readAgentFile(review.sandbox, p.stderr, join(dir, 'stderr.log'));
   const result = readReview(stream, Number(status), stderr);
   o.stopFollowingReview(review.sandbox);
   await o.driver.remove(review.sandbox);
@@ -330,7 +329,7 @@ async function post(o: Orchestrator, plan: PlanState, pr: PullRequest, review: R
     '',
     `<!-- harness: ${review.role} review ${review.head} -->`,
   ].join('\n');
-  const posting: ReviewPost = { head: review.head, body, comments: inline.map((f) => ({ path: f.file!, line: f.line!, body: `${title(f)}\n\n${f.detail}` })) };
+  const posting: ReviewPost = { head: review.head, body: noMentions(body), comments: inline.map((f) => ({ path: f.file!, line: f.line!, body: noMentions(`${title(f)}\n\n${f.detail}`) })) };
   const { state, description } = verdictStatus(review);
   let comments = review.posted?.comments ?? 0;
   let problem: string | undefined;

@@ -62,6 +62,18 @@ export async function runOk(file: string, args: string[], options: RunOptions = 
   return result.stdout;
 }
 
+/**
+ * Text an agent wrote, made safe to post on GitHub, where an `@name` notifies that person
+ * or team: a zero-width space follows the `@`. Code keeps its text: GitHub notifies nobody
+ * from a code span or block, and a reader may copy it.
+ */
+export function noMentions(text: string): string {
+  return text
+    .split(/(```[\s\S]*?(?:```|$)|`[^`\n]*`)/)
+    .map((part, i) => (i % 2 === 1 ? part : part.replace(/(^|[^\w`])@(?=[A-Za-z0-9])/g, '$1@\u200b')))
+    .join('');
+}
+
 /** Shortens text to at most `max` characters, cutting at a space when one is near, and marks the cut with "…". */
 export function clip(text: string, max: number): string {
   if (text.length <= max) return text;

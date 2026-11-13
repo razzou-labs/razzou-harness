@@ -128,7 +128,7 @@ export class Managers {
     const o = this.o;
     const key = managerKey(scope);
     if (!existing) {
-      const sandbox = sandboxName('mgr', o.design.config.project.name, key);
+      const sandbox = sandboxName('mgr', o.projectKey, key);
       o.record({ type: 'MANAGER_STARTING', payload: { ...identity(scope), sandbox, sessionId: randomUUID() } });
     }
     const manager = o.state.managers[key]!;

@@ -10,6 +10,7 @@ import { clip, sh } from '../util.ts';
 import type { AgentChannel } from './channel.ts';
 import { architectRef, lockedRef, submitDesign, submitLockedChange } from './design.ts';
 import type { Orchestrator } from './orchestrator.ts';
+import { BUNDLE_BYTES } from './refs.ts';
 
 /**
  * The Architects (proposal v2 §7.1, §7.5): one long-lived interactive Claude Code session
@@ -20,7 +21,6 @@ import type { Orchestrator } from './orchestrator.ts';
 export class Architects {
   private readonly o: Orchestrator;
   private readonly channels = new Map<string, AgentChannel>();
-  private readonly busy = new Set<string>();
   private readonly nextPoll = new Map<string, number>();
 
   constructor(o: Orchestrator) {
@@ -57,7 +57,8 @@ export class Architects {
       `cd ${sh(p.work)} || exit 1`,
       '[ -z "$(git status --porcelain)" ] || { echo "commit everything first: uncommitted changes would be left out" >&2; exit 4; }',
       '[ "$(git rev-list --count main..HEAD)" -gt 0 ] || { echo "there is nothing committed since main" >&2; exit 4; }',
-      `mkdir -p ${sh(p.out)} && git bundle create --quiet ${sh(`${p.out}/design.bundle`)} main..HEAD`,
+      `mkdir -p ${sh(p.out)} && git bundle create --quiet ${sh(`${p.out}/design.bundle`)} main..HEAD || exit 1`,
+      `[ "$(wc -c < ${sh(`${p.out}/design.bundle`)})" -le ${BUNDLE_BYTES} ] || { echo "what you committed since main is more than ${BUNDLE_BYTES / 1024 / 1024} MB: a design is text, and data belongs outside the repository" >&2; exit 4; }`,
     ].join('\n'));
     if (result.code === 4) return { problem: result.stderr.trim() };
     if (result.code !== 0) throw new Error(`could not take the design: ${(result.stderr || result.stdout).trim()}`);
@@ -88,8 +89,10 @@ export class Architects {
     await this.sendNotes(module);
     await o.noteTokens(`architect:${module.module}`, module.architect.sandbox);
     await this.refreshMainIfMoved(module);
-    if (module.submission && !this.busy.has(module.module)) await this.process(module);
-    if (module.lockedSubmission && !this.busy.has(`${module.module}:locked`)) await this.processLocked(module);
+    // A submitted design is checked beside the pass: its new checks run once on the unbuilt repository, which takes
+    // minutes, and the build of another module must not stand still for it.
+    if (module.submission) o.runBeside(`design:${module.module}`, () => this.process(module));
+    if (module.lockedSubmission) o.runBeside(`locked:${module.module}`, () => this.processLocked(module));
   }
 
   /** A sandbox whose main command waits for the launcher; the launcher, uploaded last, starts Claude. */
@@ -194,8 +197,7 @@ export class Architects {
   private async process(module: ModuleState): Promise<void> {
     const o = this.o;
     const submission = module.submission!;
-    this.busy.add(module.module);
-    try {
+    {
       const outcome = await submitDesign(o, module, submission.summary, submission.head).catch((error: Error) => ({
         ok: false as const,
         problems: [`the harness failed while handling it (${error.message.split('\n')[0]}); submit again`],
@@ -205,7 +207,7 @@ export class Architects {
         await this.reply(module.module, submission.requestId, false, `Refused:\n${outcome.problems.map((p) => `- ${p}`).join('\n')}`);
         return;
       }
-      o.record({ type: 'DESIGN_SUBMITTED', payload: { module: module.module, head: outcome.head, suspect: outcome.suspect } });
+      o.record({ type: 'DESIGN_SUBMITTED', payload: { module: module.module, head: outcome.head, suspect: outcome.suspect, ...(outcome.settings.length > 0 ? { settings: outcome.settings } : {}) } });
       // Also a pull request found open that the state no longer knew, as one the owner closed and opened again: without it nothing follows the design.
       if (outcome.opened || module.design?.pr?.number !== outcome.pr.number) {
         o.record({ type: 'ARCH_PR_OPENED', payload: { module: module.module, number: outcome.pr.number, url: outcome.pr.url } });
@@ -214,18 +216,15 @@ export class Architects {
       const checks = outcome.suspect.length
         ? `These checks already pass on the unbuilt repository, so they may be too weak: ${outcome.suspect.join(', ')}. The PR lists them for the owner.`
         : 'Every new check failed on the unbuilt repository, as it should.';
-      await this.reply(module.module, submission.requestId, true, `Arch PR #${outcome.pr.number}: ${outcome.pr.url}. ${checks} The owner reviews and merges it.`);
-    } finally {
-      this.busy.delete(module.module);
+      const settings = outcome.settings.length > 0 ? ` It changes ${outcome.settings.length} setting(s) of harness/config.json, which the PR lists first for the owner.` : '';
+      await this.reply(module.module, submission.requestId, true, `Arch PR #${outcome.pr.number}: ${outcome.pr.url}. ${checks}${settings} The owner reviews and merges it.`);
     }
   }
 
   private async processLocked(module: ModuleState): Promise<void> {
     const o = this.o;
     const submission = module.lockedSubmission!;
-    const key = `${module.module}:locked`;
-    this.busy.add(key);
-    try {
+    {
       const outcome = await submitLockedChange(o, module, submission.summary, submission.head).catch((error: Error) => ({
         ok: false as const,
         problems: [`the harness failed while handling it (${error.message.split('\n')[0]}); submit again`],
@@ -246,8 +245,6 @@ export class Architects {
         true,
         `CHANGED_LOCKED_FILES PR #${outcome.pr.number}: ${outcome.pr.url}. It changes ${outcome.changes.map((c) => `${c.plan}/${c.feature}`).join(', ')}, and their pre-merge checks pass. The owner reviews and merges it.`,
       );
-    } finally {
-      this.busy.delete(key);
     }
   }
 
@@ -390,7 +387,7 @@ export class Architects {
     const closed = module.closedDesign!;
     const pr = await o.forge.pullRequest(closed.pr!.number);
     if (pr.state !== 'open' && !pr.merged) return;
-    o.record({ type: 'DESIGN_SUBMITTED', payload: { module: module.module, head: closed.head, suspect: closed.suspect, summary: closed.summary } });
+    o.record({ type: 'DESIGN_SUBMITTED', payload: { module: module.module, head: closed.head, suspect: closed.suspect, summary: closed.summary, ...(closed.settings ? { settings: closed.settings } : {}) } });
     o.record({ type: 'ARCH_PR_OPENED', payload: { module: module.module, number: closed.pr!.number, url: closed.pr!.url } });
     this.nextPoll.delete(module.module);
     o.kick();

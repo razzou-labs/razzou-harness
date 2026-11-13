@@ -18,6 +18,12 @@ export interface SandboxSpec {
 
 /** The label that tells which project a sandbox belongs to: names are hashes, and every project shares the gateway. */
 export const PROJECT_LABEL = 'harness.project';
+/**
+ * The label that tells which checkout of it: two folders of the same name, or two clones
+ * of one repository, each run a daemon, and neither may take the other's sandboxes for
+ * its own left-overs.
+ */
+export const CHECKOUT_LABEL = 'harness.checkout';
 
 /** A sandbox as the gateway lists it, whichever project made it. */
 export interface SandboxInfo {
