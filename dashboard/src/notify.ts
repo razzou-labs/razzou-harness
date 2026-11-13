@@ -56,9 +56,10 @@ export function watchNeeds(): void {
     if (!data) return;
     const needs: Need[] = listNeeds(data);
     document.title = `${needs.length > 0 ? `(${needs.length}) ` : ''}harness · ${data.design.project}`;
-    const next = arrivals(needs, told, Date.now());
+    const shown = notifying.value && !(document.visibilityState === 'visible' && document.hasFocus());
+    const next = arrivals(needs, told, Date.now(), shown);
     told = next.told;
-    if (!notifying.value || (document.visibilityState === 'visible' && document.hasFocus())) return;
+    if (!shown) return;
     for (const need of next.fresh) show(`harness · ${data.design.project}: needs you`, needTitle(need), `harness-${need.key}`);
   }, { immediate: true });
 }

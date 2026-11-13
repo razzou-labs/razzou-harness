@@ -3,18 +3,19 @@ import { spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createServer, request, type Server } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import { connect, type AddressInfo } from 'node:net';
 import type { NetworkInterfaceInfo } from 'node:os';
 import { join } from 'node:path';
 import { after, describe, it } from 'node:test';
 import { gzipSync } from 'node:zlib';
+import { WebSocket } from 'ws';
 import { readResult, readReview } from '../src/agents/claude-code.ts';
 import { AgentChannel } from '../src/daemon/channel.ts';
 import type { Orchestrator } from '../src/daemon/orchestrator.ts';
 import { handleRequest } from '../src/daemon/requests.ts';
 import { htmlToText, neverRead, onHostNetwork, webRead } from '../src/daemon/web-read.ts';
-import { runningSandboxes, startDashboard } from '../src/dashboard/server.ts';
-import { Terminals, type Pty } from '../src/dashboard/terminals.ts';
+import { parseLine, runningSandboxes, startDashboard } from '../src/dashboard/server.ts';
+import { ARCHITECT_NUDGE, QUIET_MS, Terminals, type Pty } from '../src/dashboard/terminals.ts';
 import { MAX_FOLLOWED_LINE, OpenShellDriver, splitLines } from '../src/sandbox/openshell.ts';
 import { buildPolicy } from '../src/sandbox/policy.ts';
 import type { State } from '../src/state/state.ts';
@@ -385,11 +386,13 @@ describe('the dashboard', () => {
   const token = 'ab'.repeat(16);
   const code = 'cd'.repeat(16);
 
-  async function dashboard(loginCode?: string) {
+  async function dashboard(loginCode?: string, extra: Record<string, unknown> = {}, terminals = new Terminals(undefined)) {
     const webRoot = tempDir('web');
     writeFileSync(join(webRoot, 'index.html'), '<!doctype html><title>harness</title>');
-    const orchestrator = { events: new EventEmitter() } as unknown as Orchestrator;
-    const server = await startDashboard({ orchestrator, port: 0, token, loginCode, webRoot, terminals: new Terminals(undefined) });
+    const logged: string[] = [];
+    const state = { modules: {}, managers: {}, features: {}, plans: {}, ownerRequests: {}, actions: {} };
+    const orchestrator = { events: new EventEmitter(), state, log: (line: string) => logged.push(line), ...extra } as unknown as Orchestrator;
+    const server = await startDashboard({ orchestrator, port: 0, token, loginCode, webRoot, terminals });
     servers.push(server);
     const port = (server.address() as AddressInfo).port;
     const get = (path: string, cookie?: string) =>
@@ -400,8 +403,98 @@ describe('the dashboard', () => {
           resolve({ status: res.statusCode ?? 0, cookie: String(res.headers['set-cookie'] ?? '') });
         }).on('error', reject).end();
       });
-    return { port, get };
+    const call = (method: string, path: string, body?: unknown) =>
+      new Promise<{ status: number; text: string }>((resolve, reject) => {
+        const headers = { host: `127.0.0.1:${port}`, origin: `http://127.0.0.1:${port}`, authorization: `Bearer ${token}`, 'content-type': 'application/json' };
+        const req = request({ host: '127.0.0.1', port, path, method, headers }, (res) => {
+          let text = '';
+          res.setEncoding('utf8');
+          res.on('data', (chunk: string) => (text += chunk));
+          res.on('end', () => resolve({ status: res.statusCode ?? 0, text }));
+        });
+        req.on('error', reject);
+        req.end(body === undefined ? undefined : JSON.stringify(body));
+      });
+    const post = async (path: string, body: unknown) => JSON.parse((await call('POST', path, body)).text) as { done: boolean; error?: string };
+    return { port, get, call, post, logged, orchestrator, state };
   }
+
+  /** Writes a raw request to the dashboard and gives back what came before the socket closed. */
+  const raw = (port: number, text: string) =>
+    new Promise<string>((resolve) => {
+      let answer = '';
+      const socket = connect(port, '127.0.0.1', () => socket.write(text));
+      socket.setEncoding('utf8');
+      socket.on('data', (chunk: string) => (answer += chunk));
+      socket.on('error', () => {});
+      // A daemon that died on the request never answers: the test fails rather than waits.
+      socket.setTimeout(2000, () => socket.destroy());
+      socket.on('close', () => resolve(answer));
+    });
+
+  it('lives through an upgrade whose path is no URL', async () => {
+    const { port, get } = await dashboard();
+    const host = `127.0.0.1:${port}`;
+    await raw(port, `GET // HTTP/1.1\r\nHost: ${host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n`);
+    assert.match(await raw(port, `GET /x HTTP/1.1\r\nHost: elsewhere\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n`), /^$|403/);
+    assert.equal((await get(`/?token=${token}`)).status, 303, 'the daemon still answers');
+  });
+
+  it("lives through a message over a terminal's limit, and takes a long paste", async () => {
+    const written: string[] = [];
+    const pty: Pty = { onData: () => {}, onExit: () => {}, write: (data) => written.push(data), resize: () => {}, kill: () => {} };
+    const { port, get, state } = await dashboard(undefined, {}, new Terminals(() => pty));
+    (state.modules as Record<string, unknown>).shop = { module: 'shop', architect: { sandbox: 'arc-1' } };
+    const open = () => {
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/api/terminal?module=shop`, { headers: { authorization: `Bearer ${token}` }, origin: `http://127.0.0.1:${port}` });
+      return new Promise<WebSocket>((resolve, reject) => ws.on('open', () => resolve(ws)).on('error', reject));
+    };
+    const paste = await open();
+    paste.send(JSON.stringify({ i: 'p'.repeat(600 * 1024) }));
+    await until(() => written.some((data) => data.length === 600 * 1024));
+    assert.ok(written.some((data) => data.length === 600 * 1024), 'the paste reached the terminal');
+    paste.close();
+    const big = await open();
+    const closed = new Promise<number>((resolve) => big.on('close', (code) => resolve(code)));
+    big.send('x'.repeat(2 * 1024 * 1024));
+    assert.equal(await Promise.race([closed, sleep(3000).then(() => 0)]), 1009);
+    assert.equal((await get(`/?token=${token}`)).status, 303, 'the daemon still answers');
+  });
+
+  it('tells the open pages when the design on main changed', async () => {
+    const { port, orchestrator } = await dashboard();
+    const received = await new Promise<string>((resolve, reject) => {
+      const headers = { host: `127.0.0.1:${port}`, authorization: `Bearer ${token}` };
+      const req = request({ host: '127.0.0.1', port, path: '/api/events', headers }, (res) => {
+        let text = '';
+        res.setEncoding('utf8');
+        res.on('data', (chunk: string) => {
+          text += chunk;
+          if (text.includes(': connected')) orchestrator.events.emit('design');
+          if (text.includes('event: design')) {
+            req.destroy();
+            resolve(text);
+          }
+        });
+      });
+      req.on('error', reject);
+      req.setTimeout(3000, () => req.destroy(new Error('no design event')));
+      req.end();
+    });
+    assert.match(received, /event: design\ndata: \{\}/);
+  });
+
+  it('keeps a transcript line nested deeper than its limit, and one too heavy, as markers', async () => {
+    const { orchestrator, call } = await dashboard();
+    const deep = `${'['.repeat(5000)}${']'.repeat(5000)}`;
+    orchestrator.events.emit('transcript', { agent: 'manager:shop', line: deep });
+    orchestrator.events.emit('transcript', { agent: 'manager:shop', line: JSON.stringify({ type: 'user', parts: Array.from({ length: 40 }, () => 'y'.repeat(3000)) }) });
+    const items = JSON.parse((await call('GET', '/api/transcript?agent=manager:shop')).text) as unknown[];
+    assert.equal(items.length, 2);
+    assert.match(JSON.stringify(items[0]), /nested too deep to show/);
+    assert.deepEqual(items[1], { type: 'clipped', text: `an item of ${JSON.stringify({ type: 'user', parts: Array.from({ length: 40 }, () => 'y'.repeat(3000)) }).length} characters, too large to show` });
+    assert.ok(JSON.stringify(parseLine(deep)).length < 200);
+  });
 
   it('names its cookie for its port, and logs in once with the code of the link it opened', async () => {
     const { port, get } = await dashboard(code);
@@ -422,10 +515,98 @@ describe('the dashboard', () => {
     assert.equal((await get(`/?code=${code}`)).status, 401);
   });
 
+  it('hears `harness attach` come and go, for a module of the project only', async () => {
+    const terminals = new Terminals(undefined);
+    const { post, state } = await dashboard(undefined, {}, terminals);
+    (state.modules as Record<string, unknown>).shop = { module: 'shop', architect: { sandbox: 'arc-1' } };
+    assert.deepEqual(await post('/api/attach', { module: 'shop', attached: true }), { done: true });
+    assert.equal(terminals.watched('arc-1'), true);
+    assert.deepEqual(await post('/api/attach', { module: 'shop', attached: false }), { done: true });
+    assert.equal(terminals.watched('arc-1'), false);
+    assert.equal((await post('/api/attach', { module: '__proto__', attached: true })).done, false);
+    assert.equal((await post('/api/attach', { module: 'shop' })).done, false);
+  });
+
   it("opens a shell in a reviewer's sandbox while its review runs", () => {
     const reviews = [['rev-old', 'reported'], ['rev-now', 'running'], ['rev-next', 'starting'], ['rev-bad', 'failed']].map(([sandbox, status]) => ({ sandbox, status }));
     const state = { modules: {}, managers: {}, features: {}, plans: { 'shop/P1': { reviews }, 'shop/P2': {} } } as unknown as State;
     assert.deepEqual(runningSandboxes(state), ['rev-now', 'rev-next']);
+  });
+
+  it('lifts a pause that only waits to look again, and nothing else, with "Look again now"', async () => {
+    let lifted = 0;
+    let resumed = 0;
+    const { post } = await dashboard(undefined, { lookAgain: () => ++lifted === 1, resume: () => ++resumed > 0 });
+    assert.deepEqual(await post('/api/look-again', {}), { done: true });
+    assert.deepEqual(await post('/api/look-again', {}), { done: false, error: 'no pause waits to look again' });
+    assert.equal(resumed, 0);
+  });
+
+  it("looks up the ids a request names as the state's own: `__proto__` is no question", async () => {
+    let answered = 0;
+    const { post } = await dashboard(undefined, { answerOwnerRequest: () => ++answered > 0 });
+    for (const id of ['__proto__', 'constructor', 'toString']) assert.deepEqual(await post('/api/answer', { id, text: 'yes' }), { done: false, error: 'no such question' }, id);
+    assert.equal((await post('/api/retry', { feature: '__proto__' })).error, 'no such feature');
+    assert.equal(answered, 0);
+  });
+
+  it('gives at least one line of the log, whatever the limit', async () => {
+    const lines = Array.from({ length: 10 }, (_, i) => ({ id: i }));
+    const { call } = await dashboard(undefined, { store: { readAll: () => lines } });
+    for (const limit of ['-3', '0.2', '2']) {
+      const answer = JSON.parse((await call('GET', `/api/log?limit=${limit}`)).text) as unknown[];
+      assert.deepEqual(answer, limit === '2' ? lines.slice(-2) : lines.slice(-1), limit);
+    }
+  });
+
+  it('refuses a body too large, and still answers', async () => {
+    const { call, post } = await dashboard(undefined, { messageManager: () => true });
+    const answer = await call('POST', '/api/message', { text: 'x'.repeat(200 * 1024) });
+    assert.equal(answer.status, 500);
+    assert.equal(answer.text, 'body too large');
+    assert.deepEqual(await post('/api/message', { text: 'hello' }), { done: true });
+  });
+
+  it('says a left-over sandbox is deleted only once the gateway no longer lists it', async () => {
+    let status = 'ready';
+    const removed: string[] = [];
+    const driver = {
+      list: async () => [{ name: 'dev-old', phase: 'Ready', labels: { 'harness.project': 'toy' } }],
+      remove: async (name: string) => void removed.push(name),
+      status: async () => status,
+    };
+    const { post } = await dashboard(undefined, { driver, checking: new Map(), design: { config: { project: { name: 'toy' } } } });
+    assert.deepEqual(await post('/api/sandboxes/remove', { name: 'dev-old' }), { done: false, error: 'the gateway still lists it after the delete: ready' });
+    status = 'missing';
+    assert.deepEqual(await post('/api/sandboxes/remove', { name: 'dev-old' }), { done: true });
+    assert.deepEqual(removed, ['dev-old', 'dev-old']);
+  });
+
+  it('logs when the login code is used, and when another try comes', async () => {
+    const { get, logged } = await dashboard(code);
+    await get(`/?code=${code}`);
+    await get(`/?code=${code}`);
+    assert.deepEqual(logged, ['dashboard: the login code of the opened link was used', 'dashboard: a login with a code was refused (the code was used already)']);
+  });
+
+  it("opens no shell in an attempt's sandbox once its checks started, as the daemon deleted it", () => {
+    const attempts = ['running', 'collecting', 'checking', 'reviewing'].map((status) => ({ sandbox: `dev-${status}`, status }));
+    const state = { modules: {}, managers: {}, features: { 'shop/P1/F1': { attempts } }, plans: {} } as unknown as State;
+    assert.deepEqual(runningSandboxes(state), ['dev-running', 'dev-collecting']);
+  });
+
+  it("serves a finished reviewer's transcript from its review's folder", async () => {
+    const harnessDir = tempDir('harness');
+    const { call, state } = await dashboard(undefined, { options: { harnessDir } });
+    const head = '0123456789abcdef';
+    (state.plans as Record<string, unknown>)['shop/P1'] = { module: 'shop', plan: 'P1', reviews: [{ role: 'security', head, status: 'reported' }] };
+    const dir = join(harnessDir, 'modules', 'shop', 'reviews', 'P1-security-01234567');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'brief.md'), '# Review P1');
+    writeFileSync(join(dir, 'stream.jsonl'), `${JSON.stringify({ type: 'result', subtype: 'success' })}\n`);
+    const answer = await call('GET', '/api/transcript?agent=security:01234567');
+    assert.equal(answer.status, 200, answer.text);
+    assert.deepEqual(JSON.parse(answer.text), [{ type: 'prompt', text: '# Review P1' }, { type: 'result', subtype: 'success' }]);
   });
 });
 
@@ -445,5 +626,62 @@ describe('terminals', () => {
     // The resize after 100 ms, from a timer, too.
     await sleep(150);
     view.detach();
+  });
+
+  describe("an Architect's nudge", () => {
+    /** Terminals whose connections answer at once, and what was typed into them; `failing` connections fail to start. */
+    const recording = () => {
+      const typed: string[] = [];
+      const control = { failing: false };
+      const terminals = new Terminals(() => {
+        if (control.failing) throw new Error('openshell did not start');
+        let output = (_data: string) => {};
+        setTimeout(() => output('$ '), 1);
+        return { onData: (listener) => (output = listener), onExit: () => {}, write: (data) => typed.push(data), resize: () => {}, kill: () => {} };
+      });
+      const nudges = () => typed.filter((data) => data === ARCHITECT_NUDGE).length;
+      return { terminals, typed, control, nudges };
+    };
+    const viewer = { send: () => {}, close: () => {} };
+
+    it('is typed at once when nobody is at the terminal, and once only', async () => {
+      const { terminals, nudges } = recording();
+      await terminals.announce('arc-1');
+      await terminals.announceDue();
+      assert.equal(nudges(), 1);
+    });
+
+    it('waits, while a viewer is there, until nobody typed for five minutes', async () => {
+      const { terminals, nudges } = recording();
+      const view = terminals.attach('arc-1', viewer, { cols: 80, rows: 24 });
+      view.input('ls');
+      await terminals.announce('arc-1');
+      await terminals.announceDue(Date.now() + QUIET_MS - 10_000);
+      assert.equal(nudges(), 0, 'the owner typed four minutes ago');
+      await terminals.announceDue(Date.now() + QUIET_MS + 1000);
+      assert.equal(nudges(), 1);
+      view.detach();
+    });
+
+    it("counts `harness attach` as somebody at the terminal, until it leaves", async () => {
+      const { terminals, nudges } = recording();
+      terminals.attachOutside('arc-1', true);
+      assert.equal(terminals.watched('arc-1'), true);
+      await terminals.announce('arc-1');
+      assert.equal(nudges(), 0);
+      terminals.attachOutside('arc-1', false);
+      assert.equal(terminals.watched('arc-1'), false);
+      await terminals.announceDue();
+      assert.equal(nudges(), 1);
+    });
+
+    it('stays due when typing it fails, and is typed on the next try', async () => {
+      const { terminals, control, nudges } = recording();
+      control.failing = true;
+      await assert.rejects(terminals.announce('arc-1'), /arc-1: openshell did not start/);
+      control.failing = false;
+      await terminals.announceDue();
+      assert.equal(nudges(), 1);
+    });
   });
 });

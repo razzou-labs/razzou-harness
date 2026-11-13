@@ -1827,7 +1827,7 @@ describe('dashboard', () => {
     const post = async (body: object) => JSON.parse((await callWith(port, '/api/fix-merge', bearer, body)).body) as { done: boolean; error?: string };
     assert.equal(o.state.fixMerge, undefined, "never switched: the daemon's");
     assert.deepEqual(await post({ by: 'owner' }), { done: true });
-    assert.deepEqual(await post({ by: 'owner' }), { done: false });
+    assert.deepEqual(await post({ by: 'owner' }), { done: false, error: 'it is so already' });
     assert.deepEqual(await post({ by: 'nobody' }), { done: false, error: 'by is daemon or owner' });
     const page = JSON.parse((await call(port, '/api/state', bearer)).body) as DashboardState;
     assert.equal(page.state.fixMerge, 'owner');

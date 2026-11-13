@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { copiedText, copiesSelection, type Key } from '../dashboard/src/clipboard.ts';
+import { copiedText, copiesSelection, inputSlices, type Key } from '../dashboard/src/clipboard.ts';
 
 const C = 67;
 const V = 86;
@@ -46,5 +46,21 @@ describe('what a program copies with OSC 52', () => {
     assert.equal(copiedText('c;'), undefined);
     assert.equal(copiedText('c;not base64!'), undefined);
     assert.equal(copiedText(`c;${Buffer.from([0xff, 0xfe]).toString('base64')}`), undefined);
+  });
+});
+
+describe("a dashboard terminal's input", () => {
+  it('goes in slices of at most 32 KiB, so a long paste fits the daemon\'s limit per message', () => {
+    const paste = 'x'.repeat(100_000);
+    const slices = inputSlices(paste);
+    assert.equal(slices.length, 4);
+    assert.ok(slices.every((slice) => slice.length <= 32 * 1024));
+    assert.equal(slices.join(''), paste);
+    assert.deepEqual(inputSlices(''), []);
+  });
+
+  it('never cuts a surrogate pair in two', () => {
+    const slices = inputSlices('ab😀cd', 3);
+    assert.deepEqual(slices, ['ab', '😀c', 'd']);
   });
 });

@@ -50,9 +50,6 @@ export interface DashboardState {
   tokens: RoleTokens[];
 }
 
-/** What the daemon types into an Architect's terminal so that its hook delivers the inbox. */
-export const ARCHITECT_NUDGE = '[harness] New messages for you.';
-
 const TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
@@ -83,15 +80,24 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
   orchestrator.events.on('event', (event: HarnessEvent) => broadcast('event', event));
   // An agent reported the subscription's usage: the pages fetch the state again.
   orchestrator.events.on('usage', () => broadcast('usage', {}));
+  // The design read from main changed, which records no event: the pages fetch the state again.
+  orchestrator.events.on('design', () => broadcast('design', {}));
+  // It runs inside a follower's data handler, on lines an agent writes: nothing may throw out of it.
   orchestrator.events.on('transcript', ({ agent, line }: { agent: string; line: string }) => {
-    for (const item of transcripts.add(agent, line)) broadcast('transcript', { agent, item });
-  });
-  orchestrator.events.on('architect-inbox', ({ sandbox }: { module: string; sandbox: string }) => {
-    // At the terminal, the owner's own next prompt delivers it; typing there would mix with theirs.
-    if (terminals.available && !terminals.watched(sandbox)) {
-      terminals.prompt(sandbox, ARCHITECT_NUDGE).catch((error: Error) => orchestrator.log(`architect prompt: ${error.message}`));
+    try {
+      for (const item of transcripts.add(agent, line)) broadcast('transcript', { agent, item });
+    } catch (error) {
+      orchestrator.log(`transcript of ${agent}: ${(error as Error).message}`);
     }
   });
+  // A note for an Architect stays unannounced until the nudge is typed in its terminal: at
+  // once when nobody is there, after five quiet minutes when somebody is, tried each minute.
+  // Without node-pty nothing can be typed: the owner's next prompt there delivers it.
+  const announce = (attempt: Promise<void>) => attempt.catch((error: Error) => orchestrator.log(`architect prompt: ${error.message}`));
+  orchestrator.events.on('architect-inbox', ({ sandbox }: { module: string; sandbox: string }) => {
+    if (terminals.available) void announce(terminals.announce(sandbox));
+  });
+  setInterval(() => terminals.available && void announce(terminals.announceDue()), 60_000).unref();
   setInterval(() => clients.forEach((client) => client.write(': keepalive\n\n')), 20_000).unref();
 
   const authorized = (req: IncomingMessage, url: URL) =>
@@ -113,9 +119,14 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
       if (!allowedHosts.has(req.headers.host ?? '')) return send(res, 421, 'wrong host');
       if (req.method === 'POST' && req.headers.origin && !sameOrigin(req.headers.origin)) return send(res, 403, 'wrong origin');
       const url = new URL(req.url ?? '/', 'http://127.0.0.1');
-      if (req.method === 'GET' && url.pathname === '/' && code !== undefined && Date.now() - started < 120_000 && matches(url.searchParams.get('code'), code)) {
-        code = undefined;
-        return login(res);
+      if (req.method === 'GET' && url.pathname === '/' && url.searchParams.has('code')) {
+        // The code sits on a command line other users can read: the log says when it is used, and when another try comes.
+        if (code !== undefined && Date.now() - started < 120_000 && matches(url.searchParams.get('code'), code)) {
+          code = undefined;
+          orchestrator.log('dashboard: the login code of the opened link was used');
+          return login(res);
+        }
+        orchestrator.log(`dashboard: a login with a code was refused (${code === undefined ? 'the code was used already' : Date.now() - started >= 120_000 ? 'the code expired' : 'not the code'})`);
       }
       if (!authorized(req, url)) return send(res, 401, 'open the URL the daemon printed, with its token');
 
@@ -143,7 +154,8 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
           req.on('close', () => clients.delete(res));
           return;
         case 'GET /api/log': {
-          const limit = Math.min(Number(url.searchParams.get('limit')) || 300, 5000);
+          // At least one line: slice(-0) and a negative limit would give the whole log.
+          const limit = clamp(Number(url.searchParams.get('limit')) || 300, 1, 5000);
           return sendJson(res, orchestrator.store.readAll().slice(-limit));
         }
         case 'GET /api/transcript': {
@@ -160,14 +172,20 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
         }
         case 'GET /api/proposal': {
           // Only files the state names: a module that exists, and one of its versions.
-          const module = orchestrator.state.modules[url.searchParams.get('module') ?? ''];
+          const module = own(orchestrator.state.modules, url.searchParams.get('module'));
           const version = Number(url.searchParams.get('version'));
           if (!module || !module.proposals.some((p) => p.version === version)) return send(res, 404, 'no such proposal');
           const file = join(orchestrator.options.harnessDir, 'modules', module.module, 'proposals', `v${version}.md`);
           return send(res, existsSync(file) ? 200 : 404, existsSync(file) ? readFileSync(file, 'utf8') : 'not found');
         }
-        case 'POST /api/sandboxes/remove':
-          return sendJson(res, typeof body.name === 'string' ? await removeLeftOver(orchestrator, body.name) : { done: false, error: 'which sandbox?' });
+        case 'POST /api/sandboxes/remove': {
+          if (typeof body.name !== 'string') return sendJson(res, { done: false, error: 'which sandbox?' });
+          const removed = await removeLeftOver(orchestrator, body.name);
+          if (!removed.done) return sendJson(res, removed);
+          // The driver's delete never throws: only the gateway's answer afterwards says it is gone.
+          const status = await orchestrator.driver.status(body.name).catch((error: Error) => `unknown (${error.message})`);
+          return sendJson(res, status === 'missing' ? { done: true } : { done: false, error: `the gateway still lists it after the delete: ${status}` });
+        }
         case 'POST /api/sandboxes/limits': {
           // A number caps, null lifts the cap.
           const cap = (key: string) => (body[key] === null ? null : typeof body[key] === 'number' ? body[key] : undefined);
@@ -178,14 +196,17 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
           return sendJson(res, error ? { done: false, error } : { done: true });
         }
         case 'POST /api/pause':
-          return sendJson(res, { done: orchestrator.pause() });
+          return sendJson(res, orchestrator.pause() ? { done: true } : { done: false, error: 'the pipeline is paused already' });
         case 'POST /api/resume':
-          return sendJson(res, { done: orchestrator.resume() });
+          return sendJson(res, orchestrator.resume() ? { done: true } : { done: false, error: 'the pipeline is not paused' });
+        case 'POST /api/look-again':
+          // A pause that only waits to look again is lifted as the daemon lifts it: none of what a resume sets off happens.
+          return sendJson(res, orchestrator.lookAgain() ? { done: true } : { done: false, error: 'no pause waits to look again' });
         case 'POST /api/infra-merge':
-          return sendJson(res, body.by === 'daemon' || body.by === 'ceiling' ? { done: orchestrator.setInfraMerge(body.by) } : { done: false, error: 'by is daemon or ceiling' });
+          return sendJson(res, body.by === 'daemon' || body.by === 'ceiling' ? (orchestrator.setInfraMerge(body.by) ? { done: true } : { done: false, error: 'it is so already' }) : { done: false, error: 'by is daemon or ceiling' });
         case 'POST /api/fix-merge':
           // Who merges a Fix PR in Swarm: the daemon, under the plans' policy, or the owner.
-          return sendJson(res, body.by === 'daemon' || body.by === 'owner' ? { done: orchestrator.setFixMerge(body.by) } : { done: false, error: 'by is daemon or owner' });
+          return sendJson(res, body.by === 'daemon' || body.by === 'owner' ? (orchestrator.setFixMerge(body.by) ? { done: true } : { done: false, error: 'it is so already' }) : { done: false, error: 'by is daemon or owner' });
         case 'POST /api/reviews': {
           // A reviewer's switch: every plan's pull request, infrastructure plans' only (the cost reviewer's), or none.
           const { role, scope } = body;
@@ -211,15 +232,25 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
           const error = orchestrator.requestOrder();
           return sendJson(res, error ? { done: false, error } : { done: true });
         }
-        case 'POST /api/retry':
-          return sendJson(res, { done: typeof body.feature === 'string' && orchestrator.retry(body.feature, text('note')) });
-        case 'POST /api/message':
-          return sendJson(res, { done: text('text') !== undefined && orchestrator.messageManager(text('text')!, text('manager')) });
-        case 'POST /api/architect': {
-          // The owner writes to an Architect from the dashboard: typed into its terminal, as they would.
-          const module = orchestrator.state.modules[typeof body.module === 'string' ? body.module : ''];
-          if (!module || !text('text') || !terminals.available) return sendJson(res, { done: false });
-          await terminals.prompt(module.architect.sandbox, text('text')!.replace(/\s*\n\s*/g, ' '));
+        // The ids a request names are looked up as the state's own keys only: `__proto__` is none.
+        case 'POST /api/retry': {
+          const feature = own(orchestrator.state.features, body.feature);
+          if (!feature) return sendJson(res, { done: false, error: 'no such feature' });
+          if (feature.status !== 'escalated') return sendJson(res, { done: false, error: 'the feature is not escalated' });
+          return sendJson(res, orchestrator.retry(body.feature as string, text('note')) ? { done: true } : { done: false, error: 'refused: the state changed meanwhile' });
+        }
+        case 'POST /api/message': {
+          if (text('text') === undefined) return sendJson(res, { done: false, error: 'the message is empty' });
+          const manager = text('manager');
+          if (manager !== undefined && !own(orchestrator.state.managers, manager)) return sendJson(res, { done: false, error: 'no such Manager' });
+          return sendJson(res, orchestrator.messageManager(text('text')!, manager) ? { done: true } : { done: false, error: 'no Manager is running to read it' });
+        }
+        case 'POST /api/attach': {
+          // `harness attach` reports that it opened, or left, the Architect's terminal: a nudge then waits for a quiet moment.
+          const module = own(orchestrator.state.modules, body.module);
+          if (!module || typeof body.attached !== 'boolean') return sendJson(res, { done: false, error: 'module: a module of this project; attached: true or false' });
+          terminals.attachOutside(module.architect.sandbox, body.attached);
+          if (!body.attached && terminals.available) void announce(terminals.announceDue());
           return sendJson(res, { done: true });
         }
         case 'POST /api/modules': {
@@ -228,12 +259,24 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
           const error = orchestrator.createModule(body.id, typeof body.title === 'string' ? body.title : '', body.ownerHours);
           return sendJson(res, error ? { done: false, error } : { done: true });
         }
-        case 'POST /api/accept':
-          return sendJson(res, { done: typeof body.module === 'string' && typeof body.version === 'number' && orchestrator.acceptProposal(body.module, body.version) });
-        case 'POST /api/actions/done':
-          return sendJson(res, { done: typeof body.module === 'string' && typeof body.action === 'string' && orchestrator.claimAction(body.module, body.action, text('note')) });
-        case 'POST /api/answer':
-          return sendJson(res, { done: typeof body.id === 'string' && text('text') !== undefined && orchestrator.answerOwnerRequest(body.id, text('text')!) });
+        case 'POST /api/accept': {
+          const module = own(orchestrator.state.modules, body.module);
+          if (!module || typeof body.version !== 'number') return sendJson(res, { done: false, error: 'no such module, or no version' });
+          return sendJson(res, orchestrator.acceptProposal(module.module, body.version) ? { done: true } : { done: false, error: `v${body.version} of ${module.module} can't be accepted now: the module is ${module.status.replace(/_/g, ' ')}` });
+        }
+        case 'POST /api/actions/done': {
+          if (typeof body.module !== 'string' || typeof body.action !== 'string') return sendJson(res, { done: false, error: 'which action?' });
+          const status = own(orchestrator.state.actions, `${body.module}/${body.action}`)?.status;
+          if (status === 'done' || status === 'verifying') return sendJson(res, { done: false, error: status === 'done' ? 'it is done already' : 'its check is running' });
+          return sendJson(res, orchestrator.claimAction(body.module, body.action, text('note')) ? { done: true } : { done: false, error: 'the design on main has no such action' });
+        }
+        case 'POST /api/answer': {
+          const request = own(orchestrator.state.ownerRequests, body.id);
+          if (!request) return sendJson(res, { done: false, error: 'no such question' });
+          if (request.answer !== undefined) return sendJson(res, { done: false, error: 'it was answered already' });
+          if (text('text') === undefined) return sendJson(res, { done: false, error: 'the answer is empty' });
+          return sendJson(res, orchestrator.answerOwnerRequest(request.requestId, text('text')!) ? { done: true } : { done: false, error: 'refused: the state changed meanwhile' });
+        }
       }
       send(res, 404, 'not found');
     } catch (error) {
@@ -243,14 +286,22 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
   });
 
   // Terminals: the same checks as any request, and a browser always sends its Origin.
-  const sockets = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
+  // A paste comes as one message: 1 MiB holds a long one, and the page sends it in slices anyway.
+  const sockets = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 });
   server.on('upgrade', (req, socket, head) => {
-    const url = new URL(req.url ?? '/', 'http://127.0.0.1');
-    if (!allowedHosts.has(req.headers.host ?? '') || !sameOrigin(req.headers.origin) || !authorized(req, url) || url.pathname !== '/api/terminal') {
-      socket.end('HTTP/1.1 403 Forbidden\r\n\r\n');
-      return;
+    // A client that hangs up while it is refused makes the socket emit an error, which would stop the daemon.
+    socket.on('error', () => {});
+    try {
+      if (!allowedHosts.has(req.headers.host ?? '')) throw new Error('wrong host');
+      const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+      if (!sameOrigin(req.headers.origin) || !authorized(req, url) || url.pathname !== '/api/terminal') {
+        socket.end('HTTP/1.1 403 Forbidden\r\n\r\n');
+        return;
+      }
+      sockets.handleUpgrade(req, socket, head, (ws) => openTerminal(ws, url, orchestrator.state, terminals));
+    } catch {
+      socket.destroy();
     }
-    sockets.handleUpgrade(req, socket, head, (ws) => openTerminal(ws, url, orchestrator.state, terminals));
   });
   server.on('close', () => {
     terminals.closeAll();
@@ -267,6 +318,8 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
       server.once('error', onError);
       server.listen(candidate, '127.0.0.1', () => {
         server.off('error', onError);
+        // Once it listens, a server error is only logged: nothing a client does may stop the daemon.
+        server.on('error', (error) => orchestrator.log(`dashboard: ${error.message}`));
         const actual = (server.address() as AddressInfo).port;
         allowedHosts = new Set([`127.0.0.1:${actual}`, `localhost:${actual}`]);
         cookie = `harness_token_${actual}`;
@@ -312,12 +365,18 @@ function openTerminal(ws: WebSocket, url: URL, state: State, terminals: Terminal
       // not ours: ignored
     }
   });
+  // A message over maxPayload, or a socket torn down, emits an error: without a listener, it would stop the daemon.
+  ws.on('error', () => {});
   ws.on('close', () => terminal.detach());
 }
 
-/** The sandboxes the owner may open a shell in: the agents' that are still there. */
+/**
+ * The sandboxes the owner may open a shell in: the agents' that are still there. An
+ * attempt's goes as its checks start, which run in a sandbox of their own; the page's
+ * Agents view offers a shell for the same statuses.
+ */
 export function runningSandboxes(state: State): string[] {
-  const live = ['starting', 'running', 'collecting', 'checking', 'reviewing'];
+  const live = ['starting', 'running', 'collecting'];
   return [
     ...Object.values(state.modules).map((m) => m.architect.sandbox),
     ...Object.values(state.managers).filter((m) => m.status !== 'stopped').map((m) => m.sandbox),
@@ -386,10 +445,13 @@ class Transcripts {
     return clip({ type: 'prompt', text: readFileSync(file, 'utf8') }, 0);
   }
 
-  /** Only files the state names: the attempt of a known feature, or a module's Manager. */
+  /** Only files the state names: the attempt of a known feature, a known review, or a module's Manager. */
   private file(agent: string): string | undefined {
     const attempt = this.attemptDir(agent);
     if (attempt) return join(attempt, 'stream.jsonl');
+    // A review's stream is saved in its folder as its session ends.
+    const review = this.reviewDir(agent);
+    if (review) return join(review, 'stream.jsonl');
     // A module's Manager, or a plan's (v3 §6.4): each keeps its transcripts in its own folder.
     const manager = /^manager:([^/]+)(?:\/([^/]+))?$/.exec(agent);
     if (!manager) return undefined;
@@ -414,18 +476,29 @@ class Transcripts {
   /** The folder of a review the state knows, for "<role>:<first 8 characters of the head>". */
   private reviewDir(agent: string): string | undefined {
     for (const plan of Object.values(this.orchestrator.state.plans)) {
-      const review = plan.reviews?.find((r) => `${r.role}:${r.head.slice(0, 8)}` === agent);
+      const review = plan.reviews?.findLast((r) => `${r.role}:${r.head.slice(0, 8)}` === agent);
       if (review) return join(this.orchestrator.options.harnessDir, 'modules', plan.module, 'reviews', `${plan.plan}-${review.role}-${review.head.slice(0, 8)}`);
     }
     return undefined;
   }
 }
 
-/** One stream-json line, with long strings cut: a tool's output can be megabytes. */
-function parseLine(line: string): unknown {
+/** The most a transcript item weighs once serialized: it bounds what the 1,000 items an agent keeps in memory can hold. */
+export const MAX_ITEM = 64 * 1024;
+/** How deep a transcript item goes: stream-json's own items stay well above it. */
+const MAX_DEPTH = 8;
+
+/**
+ * One stream-json line, with long strings cut, as a tool's output can be megabytes, what
+ * lies deeper than the limit replaced, and an item too heavy replaced as a whole. An agent
+ * writes these lines: nothing in one may make the dashboard throw.
+ */
+export function parseLine(line: string): unknown {
   if (!line.trim()) return undefined;
   try {
-    return clip(JSON.parse(line), 0);
+    const item = clip(JSON.parse(line), 0);
+    const size = JSON.stringify(item).length;
+    return size > MAX_ITEM ? { type: 'clipped', text: `an item of ${size} characters, too large to show` } : item;
   } catch {
     return undefined;
   }
@@ -433,7 +506,8 @@ function parseLine(line: string): unknown {
 
 function clip(value: unknown, depth: number): unknown {
   if (typeof value === 'string') return value.length > 4000 ? `${value.slice(0, 4000)}… (${value.length - 4000} more characters)` : value;
-  if (depth > 8 || value === null || typeof value !== 'object') return value;
+  if (value === null || typeof value !== 'object') return value;
+  if (depth >= MAX_DEPTH) return '… (nested too deep to show)';
   if (Array.isArray(value)) return value.map((v) => clip(v, depth + 1));
   return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, clip(v, depth + 1)]));
 }
@@ -472,13 +546,24 @@ function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     let body = '';
     req.setEncoding('utf8');
-    req.on('data', (chunk: string) => {
+    const read = (chunk: string) => {
       body += chunk;
-      if (body.length > 64 * 1024) reject(new Error('body too large'));
-    });
+      if (body.length <= 64 * 1024) return;
+      // Refused: the rest is read and dropped, never kept, so the answer can still be sent.
+      req.off('data', read);
+      body = '';
+      req.resume();
+      reject(new Error('body too large'));
+    };
+    req.on('data', read);
     req.on('end', () => resolve(body || '{}'));
     req.on('error', reject);
   });
+}
+
+/** A record's own entry for a key a request gave, never one of Object.prototype's (`__proto__`, `constructor`). */
+function own<T>(record: Record<string, T>, key: unknown): T | undefined {
+  return typeof key === 'string' && Object.hasOwn(record, key) ? record[key] : undefined;
 }
 
 const clamp = (n: number, min: number, max: number) => Math.min(max, Math.max(min, Math.round(n)));

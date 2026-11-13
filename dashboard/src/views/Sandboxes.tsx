@@ -174,7 +174,8 @@ const Limits = defineComponent({
   setup(props) {
     const cpu = ref(props.limits.cpu?.toString() ?? '');
     const memory = ref(props.limits.memoryGiB?.toString() ?? '');
-    const value = (field: string) => (field.trim() === '' ? null : Number(field));
+    // Empty lifts a cap. Anything else must be a number: JSON would send NaN as null, which lifts it too.
+    const value = (field: string) => (field.trim() === '' ? null : Number(field.trim().replace(',', '.')));
     return () => {
       const { limits, machine } = props;
       const capped = limits.cpu !== undefined || limits.memoryGiB !== undefined;
@@ -184,12 +185,15 @@ const Limits = defineComponent({
           <QCardSection>
             <div class="text-h6 q-mb-sm">Caps on each new sandbox</div>
             <div class="row items-center q-gutter-sm">
-              <QInput {...text(cpu)} type="number" dense outlined label="CPUs, or no cap" style="width: 150px" />
-              <QInput {...text(memory)} type="number" dense outlined label="Memory GiB, or no cap" style="width: 190px" />
+              {/* Text fields: a number field hands back nothing for what isn't a number, the same as when it is empty. */}
+              <QInput {...text(cpu)} dense outlined label="CPUs, or no cap" style="width: 150px" />
+              <QInput {...text(memory)} dense outlined label="Memory GiB, or no cap" style="width: 190px" />
               <Action
                 label="Save"
                 run={async () => {
-                  const result = await post('/api/sandboxes/limits', { cpu: value(cpu.value), memoryGiB: value(memory.value) });
+                  const caps = { cpu: value(cpu.value), memoryGiB: value(memory.value) };
+                  if (Object.values(caps).some((cap) => cap !== null && !Number.isFinite(cap))) return { done: false, error: 'a cap is a number, or empty for no cap' };
+                  const result = await post('/api/sandboxes/limits', caps);
                   if (result.done) await props.onSaved();
                   return result;
                 }}
