@@ -32,6 +32,29 @@ describe('event store', () => {
     assert.equal(reopened.readAll().length, 2);
     assert.ok(readFileSync(file, 'utf8').endsWith('}\n'));
   });
+
+  it('reads a log larger than a piece, whose lines and characters cross the pieces', () => {
+    const file = join(tempDir('events'), 'events.jsonl');
+    const store = new EventStore(file);
+    // A reason of 700 kB, of two-byte characters: each event spans a piece's end, mid-line and mid-character.
+    const reason = 'é'.repeat(350_000);
+    for (let i = 0; i < 4; i++) store.append({ type: 'PIPELINE_PAUSED', payload: { reason: `${i}${reason}` } });
+    const events = new EventStore(file).readAll();
+    assert.deepEqual(events.map((e) => (e.payload as { reason: string }).reason.slice(0, 2)), ['0é', '1é', '2é', '3é']);
+    assert.ok(events.every((e) => (e.payload as { reason: string }).reason.length === 350_001));
+  });
+
+  it('drops a torn last line at the end of a large log, and keeps a whole one that only lacks its newline', () => {
+    const file = join(tempDir('events'), 'events.jsonl');
+    const store = new EventStore(file);
+    store.append({ type: 'PIPELINE_PAUSED', payload: { reason: 'x'.repeat(5 * 1024 * 1024) } });
+    appendFileSync(file, '{"v":1,"kind":"event","type":"PIPE');
+    assert.equal(new EventStore(file).readAll().length, 1);
+    appendFileSync(file, JSON.stringify({ ...store.readAll()[0], id: 'whole' }));
+    const reopened = new EventStore(file);
+    assert.equal(reopened.readAll().length, 2);
+    assert.ok(readFileSync(file, 'utf8').endsWith('}\n'));
+  });
 });
 
 describe('state projection', () => {

@@ -1,4 +1,4 @@
-import { closeSync, existsSync, fstatSync, fsyncSync, mkdirSync, openSync, readSync, truncateSync, writeSync } from 'node:fs';
+import { closeSync, existsSync, fstatSync, fsyncSync, ftruncateSync, mkdirSync, openSync, readSync, writeSync } from 'node:fs';
 import { StringDecoder } from 'node:string_decoder';
 import { dirname } from 'node:path';
 import type { CheckResult } from '../checks/runner.ts';
@@ -311,29 +311,42 @@ export class EventStore {
   }
 
   /** A crash can leave half a line at the end of the log; drop it so the next append starts clean. */
+  /**
+   * A last line without its newline is what a crash mid-write leaves: kept with a newline
+   * when it is a whole event, dropped otherwise. Only the last line is read, found by
+   * looking back from the end a piece at a time: one event may be larger than any piece.
+   */
   private dropTornLastLine(): void {
     if (!existsSync(this.file)) return;
-    // The end of the file is enough: an event is far smaller than this.
-    const fd = openSync(this.file, 'r');
-    let tail: Buffer;
-    let start: number;
+    const fd = openSync(this.file, 'r+');
     try {
       const size = fstatSync(fd).size;
-      start = Math.max(0, size - 4 * 1024 * 1024);
-      tail = Buffer.alloc(size - start);
-      readSync(fd, tail, 0, tail.length, start);
+      if (size === 0) return;
+      const end = Buffer.alloc(1);
+      readSync(fd, end, 0, 1, size - 1);
+      if (end[0] === 0x0a) return;
+      let start = 0;
+      const piece = Buffer.alloc(1024 * 1024);
+      for (let to = size; to > 0;) {
+        const from = Math.max(0, to - piece.length);
+        const read = readSync(fd, piece, 0, to - from, from);
+        const newline = piece.subarray(0, read).lastIndexOf(0x0a);
+        if (newline >= 0) {
+          start = from + newline + 1;
+          break;
+        }
+        to = from;
+      }
+      const line = Buffer.alloc(size - start);
+      readSync(fd, line, 0, line.length, start);
+      try {
+        JSON.parse(line.toString('utf8'));
+        writeSync(fd, '\n', size);
+      } catch {
+        ftruncateSync(fd, start);
+      }
     } finally {
       closeSync(fd);
-    }
-    if (tail.length === 0 || tail[tail.length - 1] === 0x0a) return;
-    const lastNewline = tail.lastIndexOf(0x0a);
-    try {
-      JSON.parse(tail.subarray(lastNewline + 1).toString('utf8'));
-      const out = openSync(this.file, 'a');
-      writeSync(out, '\n');
-      closeSync(out);
-    } catch {
-      truncateSync(this.file, start + lastNewline + 1);
     }
   }
 
