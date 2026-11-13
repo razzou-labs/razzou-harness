@@ -98,8 +98,12 @@ export function buildPolicy(options: PolicyOptions): object {
   rules.push(...options.extraHosts.map((host): HostRule => ({ host, access: 'read' })));
 
   // A host's first rule wins: a bundle's, like github.com's with git, over an extra host's read-only one.
-  // An API's own rule wins over both, so a host listed as an API takes every method.
+  // An API's own rule wins over both, so a host listed as an API takes every method; a git
+  // host can't be one, or every method would reach it, push included.
   const apis = options.apis ?? [];
+  const git = new Set(rules.filter((rule) => rule.access === 'git').map((rule) => rule.host));
+  const pushable = apis.find((api) => git.has(api.host));
+  if (pushable) throw new Error(`network.apis: ${pushable.host} is a git host, which sandboxes only clone and fetch from, so it can't be an API`);
   const apiHosts = new Set(apis.map((api) => api.host));
   const unique = rules.filter((rule, i) => rules.findIndex((r) => r.host === rule.host) === i && !apiHosts.has(rule.host));
   unique.forEach((rule) => checkHost(rule.host));
@@ -166,8 +170,21 @@ function readEndpoint(rule: HostRule): object {
   };
 }
 
-/** Clone and fetch over HTTPS: GET and HEAD for refs, POST only to git-upload-pack. Push (git-receive-pack) never. */
+/**
+ * Where each git host takes a fetch's POST: a path that only a repository has. `/**` would
+ * also match a path of the host's own API that ends in git-upload-pack, like a file made
+ * through GitLab's files API. On github.com a repository is `/<owner>/<name>`; GitLab's
+ * groups nest, but its git paths end in `.git`, where git's first request is redirected.
+ * A git host without a shape here gets no POST: clone works through its archives only.
+ */
+const UPLOAD_PACK: Record<string, string> = {
+  'github.com': '/*/*/git-upload-pack',
+  'gitlab.com': '/**/*.git/git-upload-pack',
+};
+
+/** Clone and fetch over HTTPS: GET and HEAD for refs, POST only to a repository's git-upload-pack. Push (git-receive-pack) never. */
 function gitEndpoint(rule: HostRule): object {
+  const post = UPLOAD_PACK[rule.host];
   return {
     host: rule.host,
     port: 443,
@@ -176,7 +193,7 @@ function gitEndpoint(rule: HostRule): object {
     rules: [
       { allow: { method: 'GET', path: '**' } },
       { allow: { method: 'HEAD', path: '**' } },
-      { allow: { method: 'POST', path: '/**/git-upload-pack' } },
+      ...(post ? [{ allow: { method: 'POST', path: post } }] : []),
     ],
   };
 }
