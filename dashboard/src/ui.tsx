@@ -120,8 +120,14 @@ export const Action = defineComponent({
     const error = ref<string>();
     const click = async () => {
       busy.value = true;
-      const result = await props.run();
-      busy.value = false;
+      let result: Outcome;
+      try {
+        result = await props.run();
+      } catch (error) {
+        result = { done: false, error: (error as Error).message };
+      } finally {
+        busy.value = false;
+      }
       const problem = result.done ? result.warning : result.error ?? 'refused';
       if (props.toast) {
         if (problem) Notify.create({ type: result.done ? 'warning' : 'negative', message: problem, timeout: 8000 });
@@ -163,8 +169,14 @@ export const Reply = defineComponent({
     const error = ref<string>();
     const go = async () => {
       busy.value = true;
-      const result = await props.send(value.value.trim());
-      busy.value = false;
+      let result: Outcome;
+      try {
+        result = await props.send(value.value.trim());
+      } catch (error) {
+        result = { done: false, error: (error as Error).message };
+      } finally {
+        busy.value = false;
+      }
       if (result.done) value.value = '';
       error.value = result.done ? undefined : result.error ?? 'refused: the state changed meanwhile';
     };

@@ -83,6 +83,8 @@ export function startDashboard({ orchestrator, port, token, loginCode, webRoot, 
   orchestrator.events.on('event', (event: HarnessEvent) => broadcast('event', event));
   // An agent reported the subscription's usage: the pages fetch the state again.
   orchestrator.events.on('usage', () => broadcast('usage', {}));
+  // The design read from main changed, which records no event: the pages fetch the state again.
+  orchestrator.events.on('design', () => broadcast('design', {}));
   // It runs inside a follower's data handler, on lines an agent writes: nothing may throw out of it.
   orchestrator.events.on('transcript', ({ agent, line }: { agent: string; line: string }) => {
     try {

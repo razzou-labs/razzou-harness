@@ -375,6 +375,29 @@ describe('the dashboard', () => {
     assert.equal((await get(`/?token=${token}`)).status, 303, 'the daemon still answers');
   });
 
+  it('tells the open pages when the design on main changed', async () => {
+    const { port, orchestrator } = await dashboard();
+    const received = await new Promise<string>((resolve, reject) => {
+      const headers = { host: `127.0.0.1:${port}`, authorization: `Bearer ${token}` };
+      const req = request({ host: '127.0.0.1', port, path: '/api/events', headers }, (res) => {
+        let text = '';
+        res.setEncoding('utf8');
+        res.on('data', (chunk: string) => {
+          text += chunk;
+          if (text.includes(': connected')) orchestrator.events.emit('design');
+          if (text.includes('event: design')) {
+            req.destroy();
+            resolve(text);
+          }
+        });
+      });
+      req.on('error', reject);
+      req.setTimeout(3000, () => req.destroy(new Error('no design event')));
+      req.end();
+    });
+    assert.match(received, /event: design\ndata: \{\}/);
+  });
+
   it('keeps a transcript line nested deeper than its limit, and one too heavy, as markers', async () => {
     const { orchestrator, call } = await dashboard();
     const deep = `${'['.repeat(5000)}${']'.repeat(5000)}`;
