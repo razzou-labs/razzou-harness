@@ -16,6 +16,8 @@ code { background: var(--h-soft); padding: 1px 5px; border-radius: 4px; }
 .command code { user-select: all; }
 .status { font-weight: 500; }
 .document { border: 1px solid var(--h-line); border-radius: 6px; padding: 4px 14px; margin: 8px 0; max-height: 60vh; overflow: auto; }
+/* Whatever an agent's text holds stays inside its own box. */
+.markdown { contain: layout paint; }
 .markdown p, .markdown ul, .markdown ol { margin: 6px 0; }
 .markdown img { max-width: 100%; }
 .text-warning { color: var(--h-amber) !important; }
