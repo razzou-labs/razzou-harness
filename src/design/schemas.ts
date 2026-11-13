@@ -173,6 +173,8 @@ export const ConfigSchema = z.object({
     .object({
       files: z.array(z.string()).default([]),
       jsonFields: z.record(z.string(), z.array(z.string().startsWith('/'))).default({}),
+      /** TOML tables, or INI sections, by file or glob, such as `{ "pyproject.toml": ["tool.mypy"] }`. */
+      tomlTables: z.record(z.string(), z.array(z.string().min(1))).default({}),
     })
     .prefault({}),
   github: z

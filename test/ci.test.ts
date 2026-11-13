@@ -63,25 +63,91 @@ async function change(changes: Record<string, string>, files: Record<string, str
 
 describe('protection rules', () => {
   it('finds the npm scripts a check runs', () => {
-    assert.deepEqual(npmScripts('npm run lint && npm test -- --watch=false; npm t; npm start'), ['lint', 'test', 'test', 'start']);
-    assert.deepEqual(npmScripts('node --test'), []);
+    const root = (command: string) => npmScripts(command).map(({ dir, script }) => (dir ? `${dir}:${script}` : script));
+    assert.deepEqual(root('npm run lint && npm test -- --watch=false; npm t; npm start'), ['lint', 'test', 'test', 'start']);
+    assert.deepEqual(root('node --test'), []);
     // npm's options are skipped, before the command and after `run`, with the value of those that take one.
-    assert.deepEqual(npmScripts('npm run -s lint'), ['lint']);
-    assert.deepEqual(npmScripts('npm -s test'), ['test']);
-    assert.deepEqual(npmScripts('npm --prefix . test && npm -w app --if-present run-script build:prod'), ['test', 'build:prod']);
-    assert.deepEqual(npmScripts('CI=1 npm --loglevel=silent restart; (npm stop)'), ['restart', 'stop']);
-    assert.deepEqual(npmScripts('node --run lint && node --run=typecheck'), ['lint', 'typecheck']);
-    assert.deepEqual(npmScripts('npm ci && npx vitest --run'), []);
+    assert.deepEqual(root('npm run -s lint'), ['lint']);
+    assert.deepEqual(root('npm -s test'), ['test']);
+    assert.deepEqual(root('npm --prefix . test && npm --if-present run-script build:prod'), ['test', 'build:prod']);
+    assert.deepEqual(root('CI=1 npm --loglevel=silent restart; (npm stop)'), ['restart', 'stop']);
+    assert.deepEqual(root('node --run lint && node --run=typecheck'), ['lint', 'typecheck']);
+    assert.deepEqual(root('npm ci && npx vitest --run'), []);
   });
 
-  it("pin the scripts the checks run, with npm's hooks around them", async () => {
+  it('finds the package.json each script is in: --prefix, -C, --workspace, -w, and a cd before it', () => {
+    const where = (command: string) => npmScripts(command).map(({ dir, script }) => `${dir || '.'}:${script}`);
+    assert.deepEqual(where('npm --prefix web test && npm -C ./api run lint && npm --prefix=docs start'), ['web:test', 'api:lint', 'docs:start']);
+    assert.deepEqual(where('npm -w packages/app run build && npm --workspace=packages/lib test'), ['packages/app:build', 'packages/lib:test']);
+    assert.deepEqual(where('cd web && npm test && cd ../api && node --run lint'), ['web:test', 'api:lint']);
+    assert.deepEqual(where('cd web/ && cd .. && npm test; cd /tmp && npm test; cd ../.. && npm t'), ['.:test', '.:test', '.:test']);
+  });
+
+  it("pin the scripts the checks run, with npm's hooks around them, in the package.json each is in", async () => {
     const { baseTree } = await change({});
     const rules = await protectionRules(baseTree);
     assert.deepEqual(rules.fields['package.json'], [
-      '/jest', '/babel', '/mocha', '/scripts/lint', '/scripts/prelint', '/scripts/postlint', '/scripts/test', '/scripts/pretest', '/scripts/posttest',
+      '/scripts/lint', '/scripts/prelint', '/scripts/postlint', '/scripts/test', '/scripts/pretest', '/scripts/posttest',
     ]);
+    for (const field of ['/jest', '/overrides', '/scripts/prepare', '/scripts/postinstall', '/eslintConfig']) assert.ok(rules.fields['**/package.json']!.includes(field), field);
     assert.ok(rules.paths.includes('eslint.rules.js'));
     assert.ok(rules.paths.includes('harness/**'));
+
+    const web = await change({}, withConfig({ checks: [{ id: 'web', run: 'cd web && npm test', phase: 'pre-merge' }] }));
+    assert.deepEqual((await protectionRules(web.baseTree)).fields['web/package.json'], ['/scripts/test', '/scripts/pretest', '/scripts/posttest']);
+  });
+
+  it("protect what npm runs or applies by itself when it installs, in every package.json", async () => {
+    const pkg = (extra: object) => JSON.stringify({ name: 'shop', scripts: { lint: 'eslint .', test: 'node --test', build: 'tsc', ...extra } }, null, 2);
+    const files = { ...BASE, 'packages/a/package.json': JSON.stringify({ name: 'a' }) };
+    const pr = await change({
+      'package.json': pkg({ prepare: 'node tools/prepare.mjs' }),
+      'packages/a/package.json': JSON.stringify({ name: 'a', scripts: { postinstall: 'node x.js' }, overrides: { b: '1.0.0' } }),
+      'patches/vitest+4.0.0.patch': '-', '.npm-extension.mjs': '-',
+    }, files);
+    assert.deepEqual((await protectedChanges(pr.baseTree, pr.headTree, pr.changed, { progress: 'append' })).sort(), [
+      '.npm-extension.mjs', 'package.json /scripts/prepare', 'packages/a/package.json /overrides', 'packages/a/package.json /scripts/postinstall', 'patches/vitest+4.0.0.patch',
+    ]);
+  });
+
+  it("protect the scripts a check runs in another folder's package.json, and that package's own configs", async () => {
+    const files = {
+      ...withConfig({ checks: [{ id: 'web', run: 'npm --prefix web test', phase: 'pre-merge' }] }),
+      'web/package.json': JSON.stringify({ name: 'web', scripts: { test: 'vitest run' } }),
+      'web/tsconfig.json': JSON.stringify({ compilerOptions: { strict: true }, include: ['src'] }),
+    };
+    const pr = await change({
+      'web/package.json': JSON.stringify({ name: 'web', scripts: { test: 'true' } }),
+      'web/tsconfig.json': JSON.stringify({ compilerOptions: { strict: true }, include: ['src/ok'] }),
+      'web/vitest.config.ts': 'export default {};\n', 'web/.eslintignore': 'src\n', 'web/.prettierignore': 'src\n',
+    }, files);
+    assert.deepEqual((await protectedChanges(pr.baseTree, pr.headTree, pr.changed, { progress: 'append' })).sort(), [
+      'web/.eslintignore', 'web/.prettierignore', 'web/package.json /scripts/test', 'web/tsconfig.json /include', 'web/vitest.config.ts',
+    ]);
+  });
+
+  it("protect pytest's tables in pyproject.toml and setup.cfg, and the owner's own, as text", async () => {
+    const pyproject = '[project]\nname = "shop"\n\n[tool.pytest.ini_options]\naddopts = "-q"\n\n[tool.ruff]\nline-length = 100\n';
+    const files = {
+      ...withConfig({ protect: { files: ['eslint.rules.js'], tomlTables: { 'pyproject.toml': ['tool.mypy'] } } }),
+      'pyproject.toml': pyproject, 'svc/pyproject.toml': pyproject, 'setup.cfg': '[metadata]\nname = shop\n[tool:pytest]\naddopts = -q\n',
+    };
+    // Ordinary changes: the project's version, another tool's table.
+    const fine = await change({ 'pyproject.toml': pyproject.replace('name = "shop"', 'name = "shop2"').replace('100', '120') }, files);
+    assert.deepEqual(await protectedChanges(fine.baseTree, fine.headTree, fine.changed, { progress: 'append' }), []);
+    const pr = await change({
+      'pyproject.toml': `${pyproject.replace('-q', '-q -k nothing')}\n[tool.mypy]\nstrict = false\n`,
+      // A dotted key in a table above pytest's reaches into it.
+      'svc/pyproject.toml': `[tool]\npytest.ini_options.addopts = "-k nothing"\n\n${pyproject}`,
+      'setup.cfg': '[metadata]\nname = shop\n[tool:pytest]\naddopts = -k nothing\n',
+    }, files);
+    assert.deepEqual((await protectedChanges(pr.baseTree, pr.headTree, pr.changed, { progress: 'append' })).sort(), [
+      'pyproject.toml [tool.mypy]', 'pyproject.toml [tool.pytest.ini_options]', 'pyproject.toml [tool.pytest]',
+      'setup.cfg [tool:pytest]', 'svc/pyproject.toml [tool.pytest.ini_options]', 'svc/pyproject.toml [tool.pytest]',
+    ]);
+    const lock = await computeLock(pr.headTree);
+    const entry = lock.entries.find((e) => e.path === 'svc/pyproject.toml');
+    assert.ok(entry && 'tables' in entry && entry.tables?.['tool.pytest'], JSON.stringify(entry));
   });
 
   it('match patterns segment by segment: * and ? within one, ** across any number', () => {
@@ -113,12 +179,12 @@ describe('protection rules', () => {
       'vitest.config.mts': '-', 'vite.config.ts': '-', 'jest.config.cjs': '-', 'jest.config.json': '{}', 'babel.config.js': '-', 'src/.babelrc': '{}',
       '.mocharc.yml': '-', 'playwright.config.mts': '-', 'pytest.ini': '-', 'tests/unit/pytest.ini': '-', 'tox.ini': '-', 'tests/conftest.py': '-',
       'package.json': JSON.stringify({ name: 'shop', scripts: { lint: 'eslint .', test: 'node --test', build: 'tsc' }, jest: { testMatch: [] } }, null, 2),
-      // Not instructions, nor the root's configs.
-      'src/claude.md': '-', 'docs/CLAUDE.md.bak': '-', 'packages/a/vitest.config.ts': '-',
+      // A package's own config, in a monorepo; and what isn't instructions.
+      'packages/a/vitest.config.ts': '-', 'src/claude.md': '-', 'docs/CLAUDE.md.bak': '-',
     });
     const problems = await protectedChanges(pr.baseTree, pr.headTree, pr.changed, { progress: 'append' });
     assert.deepEqual(problems.sort(), [
-      '.mocharc.yml', 'CLAUDE.local.md', 'babel.config.js', 'jest.config.cjs', 'jest.config.json', 'package.json /jest', 'playwright.config.mts', 'pytest.ini',
+      '.mocharc.yml', 'CLAUDE.local.md', 'babel.config.js', 'jest.config.cjs', 'jest.config.json', 'package.json /jest', 'packages/a/vitest.config.ts', 'playwright.config.mts', 'pytest.ini',
       'src/.babelrc', 'src/.claude/rules/x.md', 'src/AGENTS.md', 'src/CLAUDE.local.md', 'src/CLAUDE.md', 'tests/conftest.py', 'tests/unit/pytest.ini', 'tox.ini',
       'vite.config.ts', 'vitest.config.mts',
     ]);

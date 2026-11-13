@@ -10,7 +10,7 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { appendFileSync, existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
-import { join, relative } from 'node:path';
+import { join, posix, relative } from 'node:path';
 import { parseArgs } from 'node:util';
 
 /** A tree to read: a checkout in CI, a commit in the daemon. */
@@ -55,24 +55,70 @@ export const ALWAYS_PROTECTED = [
   'ARCHITECTURE.md', 'init.sh', '.npmrc',
 ];
 
-/** Configs that decide what a tool or a test runner runs, written as code: protected whole when they exist. */
+/**
+ * Configs that decide what a tool or a test runner runs, written as code: protected whole
+ * when they exist, in any folder, since a monorepo's packages each have their own.
+ */
 const TOOL_FILES = [
-  'eslint.config.*', '.eslintrc', '.eslintrc.*', 'biome.json', 'biome.jsonc', '.prettierrc', '.prettierrc.*', 'prettier.config.*',
-  'vitest.config.*', 'vitest.workspace.*', 'vite.config.*', 'jest.config.*', 'babel.config.*', '**/.babelrc', '**/.babelrc.*',
-  'playwright.config.*', '.mocharc.*', '**/pytest.ini', '**/.pytest.ini', '**/tox.ini', '**/conftest.py',
-];
+  'eslint.config.*', '.eslintrc', '.eslintrc.*', '.eslintignore', 'biome.json', 'biome.jsonc', '.prettierrc', '.prettierrc.*', '.prettierignore', 'prettier.config.*',
+  'vitest.config.*', 'vitest.workspace.*', 'vite.config.*', 'jest.config.*', 'babel.config.*', '.babelrc', '.babelrc.*',
+  'playwright.config.*', '.mocharc.*', 'pytest.ini', '.pytest.ini', 'tox.ini', 'conftest.py',
+].map((name) => `**/${name}`);
 
-/** JSON configs: protected by field, so ordinary changes stay possible. */
+/** What npm applies on its own when it installs: patches to packages, and its extensions. */
+const INSTALL_FILES = ['patches/**', '.npm-extension.mjs', '.npm-extension.cjs'];
+
+/** The scripts npm runs by itself during `npm ci` or `npm install`, before any check. */
+const INSTALL_SCRIPTS = ['preinstall', 'install', 'postinstall', 'preprepare', 'prepare', 'postprepare'];
+
+/** JSON configs, in every folder: protected by field, so ordinary changes stay possible. */
 const JSON_FIELDS: Record<string, string[]> = {
-  'tsconfig.json': ['/compilerOptions/strict', '/compilerOptions/noImplicitAny', '/compilerOptions/skipLibCheck', '/exclude'],
-  'package.json': ['/jest', '/babel', '/mocha'],
+  '**/tsconfig.json': [
+    '/compilerOptions/strict', '/compilerOptions/noImplicitAny', '/compilerOptions/strictNullChecks', '/compilerOptions/skipLibCheck', '/exclude', '/include', '/extends',
+  ],
+  '**/package.json': [
+    '/jest', '/babel', '/mocha', '/eslintConfig', '/eslintIgnore', '/prettier', '/overrides', '/patchedDependencies', '/packageExtensions', '/allowScripts',
+    ...INSTALL_SCRIPTS.map((script) => `/scripts/${script}`),
+  ],
+};
+
+/** TOML tables, and INI sections, that configure a test runner inside a file that holds much else. */
+const TOML_TABLES: Record<string, string[]> = {
+  '**/pyproject.toml': ['tool.pytest.ini_options', 'tool.pytest', 'tool.tox', 'tool.coverage'],
+  '**/setup.cfg': ['tool:pytest'],
 };
 
 export interface ProtectionRules {
   /** A path matching one of these may not change at all. */
   paths: string[];
-  /** These JSON fields, by file, may not change. A missing field counts as a value. */
+  /** These JSON fields, by file or glob, may not change. A missing field counts as a value. */
   fields: Record<string, string[]>;
+  /** These TOML tables, by file or glob, may not change, compared as text. */
+  tables: Record<string, string[]>;
+}
+
+const isGlob = (pattern: string) => /[*?]/.test(pattern);
+
+/** The JSON pointers and TOML tables protected in one file, by every rule whose file or glob matches it. */
+function partsOf(rules: ProtectionRules, path: string): { pointers: string[]; tables: string[] } {
+  const pick = (byFile: Record<string, string[]>) => [...new Set(Object.entries(byFile).filter(([file]) => matches(path, file)).flatMap(([, names]) => names))];
+  return { pointers: pick(rules.fields), tables: pick(rules.tables) };
+}
+
+/** The files among `files` protected by field or table, and the rules' named files whether or not they exist. */
+function partFiles(rules: ProtectionRules, files: string[]): string[] {
+  const keys = [...Object.keys(rules.fields), ...Object.keys(rules.tables)];
+  const found = [...keys.filter((key) => !isGlob(key)), ...files.filter((file) => keys.some((key) => matches(file, key)))];
+  return [...new Set(found)].sort((a, b) => a.localeCompare(b, 'en'));
+}
+
+/** The hashes of a file's protected fields and tables, as the lock lists them. */
+export function partHashes(rules: ProtectionRules, path: string, text: string | undefined): { fields?: Record<string, string>; tables?: Record<string, string> } {
+  const { pointers, tables } = partsOf(rules, path);
+  return {
+    ...(pointers.length > 0 ? { fields: Object.fromEntries(pointers.map((pointer) => [pointer, fieldHash(text, pointer)])) } : {}),
+    ...(tables.length > 0 ? { tables: Object.fromEntries(tables.map((table) => [table, tableHash(text, table)])) } : {}),
+  };
 }
 
 interface Check {
@@ -85,43 +131,69 @@ interface Check {
 
 /** The rules a tree's own `harness/config.json` and plans set. The base of a change decides them. */
 export async function protectionRules(tree: TreeReader): Promise<ProtectionRules> {
-  const config = parseJson(await tree.read('harness/config.json')) as { checks?: Check[]; protect?: { files?: string[]; jsonFields?: Record<string, string[]> } } | undefined;
+  const config = parseJson(await tree.read('harness/config.json')) as {
+    checks?: Check[];
+    protect?: { files?: string[]; jsonFields?: Record<string, string[]>; tomlTables?: Record<string, string[]> };
+  } | undefined;
   const fields: Record<string, string[]> = {};
-  const add = (file: string, pointers: string[]) => {
-    fields[file] = [...new Set([...(fields[file] ?? []), ...pointers])];
+  const tables: Record<string, string[]> = {};
+  const add = (into: Record<string, string[]>, file: string, names: string[]) => {
+    const key = normalisePattern(file);
+    into[key] = [...new Set([...(into[key] ?? []), ...names])];
   };
-  for (const [file, pointers] of Object.entries(JSON_FIELDS)) add(file, pointers);
-  for (const [file, pointers] of Object.entries(config?.protect?.jsonFields ?? {})) add(file, pointers);
-  // A check written as `npm run X` is only as good as the script X, and the hooks npm runs around it.
+  for (const [file, pointers] of Object.entries(JSON_FIELDS)) add(fields, file, pointers);
+  for (const [file, pointers] of Object.entries(config?.protect?.jsonFields ?? {})) add(fields, file, pointers);
+  for (const [file, names] of Object.entries(TOML_TABLES)) add(tables, file, names);
+  for (const [file, names] of Object.entries(config?.protect?.tomlTables ?? {})) add(tables, file, names);
+  // A check written as `npm run X` is only as good as the script X, and the hooks npm runs around it, in the package.json it names.
   const checks = [...(config?.checks ?? []), ...(await designChecks(tree)).map((c) => c.check)];
-  for (const script of new Set(checks.flatMap((c) => npmScripts(c.run)))) {
-    add('package.json', [`/scripts/${script}`, `/scripts/pre${script}`, `/scripts/post${script}`]);
+  for (const { dir, script } of checks.flatMap((c) => npmScripts(c.run))) {
+    add(fields, dir ? `${dir}/package.json` : 'package.json', [`/scripts/${script}`, `/scripts/pre${script}`, `/scripts/post${script}`]);
   }
-  return { paths: [...ALWAYS_PROTECTED, ...TOOL_FILES, ...(config?.protect?.files ?? [])].map(normalisePattern), fields };
+  return { paths: [...ALWAYS_PROTECTED, ...TOOL_FILES, ...INSTALL_FILES, ...(config?.protect?.files ?? [])].map(normalisePattern), fields, tables };
 }
 
 /** npm's options that take the next word as their value. */
 const NPM_VALUE_OPTIONS = ['--prefix', '-C', '--workspace', '-w', '--userconfig', '--globalconfig', '--loglevel'];
 
-/** npm scripts a command line runs: `npm run lint`, `npm -s test`, `npm --prefix . start`, `node --run lint`. */
-export function npmScripts(command: string): string[] {
-  const scripts: string[] = [];
+/** npm's options that name the folder of the package.json it runs a script from. */
+const NPM_DIR_OPTIONS = ['--prefix', '-C', '--workspace', '-w'];
+
+/**
+ * npm scripts a command line runs, and the folder of the package.json that defines each, ''
+ * for the root: `npm run lint`, `npm -s test`, `npm --prefix web start`, `cd web && npm test`,
+ * `node --run lint`.
+ */
+export function npmScripts(command: string): Array<{ dir: string; script: string }> {
+  const scripts: Array<{ dir: string; script: string }> = [];
   const words = command.split(/[\s;&|()<>'"`]+/);
-  // The next word that isn't one of npm's options, or an option's value.
-  const next = (i: number) => {
-    while (words[++i]?.startsWith('-')) if (NPM_VALUE_OPTIONS.includes(words[i]!)) i++;
-    return i;
+  // A folder of the repository, from the one a command is in; '' for the root, and for one outside it.
+  const within = (from: string, to: string) => {
+    const dir = posix.normalize(posix.join(from, to));
+    return posix.isAbsolute(to) || dir === '.' || dir === '..' || dir.startsWith('../') ? '' : dir.replace(/\/$/, '');
   };
+  let cwd = '';
   for (let i = 0; i < words.length; i++) {
-    if (words[i] === 'node' && words[i + 1] === '--run' && words[i + 2]) scripts.push(words[i + 2]!);
-    if (words[i] === 'node' && words[i + 1]?.startsWith('--run=')) scripts.push(words[i + 1]!.slice('--run='.length));
+    if (words[i] === 'cd') cwd = words[i + 1] && words[i + 1] !== '-' ? within(cwd, words[i + 1]!) : '';
+    if (words[i] === 'node' && words[i + 1] === '--run' && words[i + 2]) scripts.push({ dir: cwd, script: words[i + 2]! });
+    if (words[i] === 'node' && words[i + 1]?.startsWith('--run=')) scripts.push({ dir: cwd, script: words[i + 1]!.slice('--run='.length) });
     if (words[i] !== 'npm') continue;
+    let dir = cwd;
+    // The next word that isn't one of npm's options, or an option's value.
+    const next = (at: number) => {
+      while (words[++at]?.startsWith('-')) {
+        const [option, value] = words[at]!.split('=', 2) as [string, string | undefined];
+        const given = value ?? (NPM_VALUE_OPTIONS.includes(option) ? words[++at] : undefined);
+        if (NPM_DIR_OPTIONS.includes(option) && given !== undefined) dir = within(cwd, given);
+      }
+      return at;
+    };
     const at = next(i);
     if (words[at] === 'run' || words[at] === 'run-script') {
       const script = words[next(at)];
-      if (script) scripts.push(script);
-    } else if (words[at] === 'test' || words[at] === 't') scripts.push('test');
-    else if (words[at] === 'start' || words[at] === 'stop' || words[at] === 'restart') scripts.push(words[at]!);
+      if (script) scripts.push({ dir, script });
+    } else if (words[at] === 'test' || words[at] === 't') scripts.push({ dir, script: 'test' });
+    else if (words[at] === 'start' || words[at] === 'stop' || words[at] === 'restart') scripts.push({ dir, script: words[at]! });
   }
   return scripts;
 }
@@ -159,28 +231,31 @@ export function matches(path: string, pattern: string): boolean {
 export function archMayChange(path: string, rules: ProtectionRules): boolean {
   if (path.startsWith('.github/')) return false;
   if (['README.md', 'package.json', 'package-lock.json'].includes(path)) return true;
-  return rules.paths.some((pattern) => matches(path, pattern)) || Object.hasOwn(rules.fields, path);
+  return rules.paths.some((pattern) => matches(path, pattern)) || partFiles(rules, [path]).includes(path);
 }
 
-/** What a change did to protected territory, compared with its base. Empty means nothing. */
+/**
+ * What a change did to protected territory. The rules are `base`'s; fields, tables and
+ * progress.txt are compared with `options.before`, the tree the change started from, when
+ * that isn't `base`: what the base changed since is no part of the change. Empty means nothing.
+ */
 export async function protectedChanges(
   base: TreeReader,
   head: TreeReader,
   changedPaths: string[],
-  options: { progress: 'append' | 'frozen' },
+  options: { progress: 'append' | 'frozen'; before?: TreeReader },
 ): Promise<string[]> {
   const rules = await protectionRules(base);
+  const start = options.before ?? base;
   const problems = changedPaths.filter((path) => rules.paths.some((pattern) => matches(path, pattern)));
-  for (const [file, pointers] of Object.entries(rules.fields)) {
-    if (!changedPaths.includes(file)) continue;
-    const [before, after] = [await base.read(file), await head.read(file)];
-    for (const pointer of pointers) {
-      if (fieldHash(before, pointer) !== fieldHash(after, pointer)) problems.push(`${file} ${pointer}`);
-    }
+  for (const file of partFiles(rules, changedPaths).filter((path) => changedPaths.includes(path))) {
+    const [before, after] = [partHashes(rules, file, await start.read(file)), partHashes(rules, file, await head.read(file))];
+    for (const [pointer, hash] of Object.entries(before.fields ?? {})) if (after.fields?.[pointer] !== hash) problems.push(`${file} ${pointer}`);
+    for (const [table, hash] of Object.entries(before.tables ?? {})) if (after.tables?.[table] !== hash) problems.push(`${file} [${table}]`);
   }
   if (changedPaths.includes('progress.txt')) {
     if (options.progress === 'frozen') problems.push('progress.txt');
-    else if (!((await head.read('progress.txt')) ?? '').startsWith((await base.read('progress.txt')) ?? '')) {
+    else if (!((await head.read('progress.txt')) ?? '').startsWith((await start.read('progress.txt')) ?? '')) {
       problems.push('progress.txt (only lines may be added)');
     }
   }
@@ -210,31 +285,27 @@ export async function lockfileProblems(base: TreeReader, head: TreeReader): Prom
 
 export interface Lock {
   version: 1;
-  entries: Array<{ path: string; sha256: string } | { path: string; fields: Record<string, string> }>;
+  entries: Array<{ path: string; sha256: string } | { path: string; fields?: Record<string, string>; tables?: Record<string, string> }>;
+}
+
+/** The files of a tree protected whole: those of `files` that a pattern matches, and the root's always-protected files, present or not. */
+function wholeFiles(rules: ProtectionRules, files: string[]): string[] {
+  const found = new Set(files.filter((file) => rules.paths.some((pattern) => matches(file, pattern))));
+  for (const path of ALWAYS_PROTECTED) if (!isGlob(path)) found.add(path);
+  found.delete('harness/lock.json');
+  return [...found].sort();
 }
 
 /** `harness/lock.json`: the hash of everything protected in a tree, so a design change shows every protected change. */
 export async function computeLock(tree: TreeReader): Promise<Lock> {
   const rules = await protectionRules(tree);
-  const files = new Set<string>();
-  let all: string[] | undefined;
-  for (const pattern of rules.paths) {
-    if (/[*?]/.test(pattern)) {
-      // A glob is matched against every file of the tree, listed once.
-      all ??= await tree.list('');
-      for (const file of all) if (matches(file, pattern)) files.add(file);
-    } else if ((await tree.read(pattern)) !== undefined || ALWAYS_PROTECTED.includes(pattern)) files.add(pattern);
-  }
-  files.delete('harness/lock.json');
+  const all = await tree.list('');
   const entries: Lock['entries'] = [];
-  for (const path of [...files].sort()) {
+  for (const path of wholeFiles(rules, all)) {
     const text = await tree.read(path);
     entries.push({ path, sha256: text === undefined ? 'absent' : sha256(text) });
   }
-  for (const [file, pointers] of Object.entries(rules.fields).sort(([a], [b]) => a.localeCompare(b, 'en'))) {
-    const text = await tree.read(file);
-    entries.push({ path: file, fields: Object.fromEntries(pointers.map((pointer) => [pointer, fieldHash(text, pointer)])) });
-  }
+  for (const path of partFiles(rules, all)) entries.push({ path, ...partHashes(rules, path, await tree.read(path)) });
   return { version: 1, entries };
 }
 
@@ -515,6 +586,30 @@ export function sha256(text: string): string {
 export function fieldHash(text: string | undefined, pointer: string): string {
   const value = text === undefined ? undefined : resolvePointer(parseJson(text), pointer);
   return value === undefined ? 'absent' : sha256(canonicalJson(value));
+}
+
+/**
+ * The hash of one TOML table, or INI section, as raw text, or "absent": the block of each
+ * header that is the table or under it, from the header to the next one, and a block above
+ * it that reaches into it with a dotted key, as `[tool]` then `pytest.ini_options.addopts = …`.
+ * Raw text needs no TOML parser, and any change to the table, a comment's too, counts.
+ */
+export function tableHash(text: string | undefined, table: string): string {
+  if (text === undefined) return 'absent';
+  const bare = (s: string) => s.replace(/["'\s]/g, '');
+  const blocks: Array<{ name: string; text: string }> = [{ name: '', text: '' }];
+  for (const line of text.split('\n')) {
+    const header = /^\s*\[\[?([^[\]]+)\]\]?\s*(?:#.*)?$/.exec(line);
+    if (header) blocks.push({ name: bare(header[1]!), text: '' });
+    blocks.at(-1)!.text += `${line}\n`;
+  }
+  const picked = blocks.filter(({ name, text: block }) => {
+    if (name === table || name.startsWith(`${table}.`)) return true;
+    if (name !== '' && !table.startsWith(`${name}.`)) return false;
+    const key = (name === '' ? table : table.slice(name.length + 1)).split('.')[0]!;
+    return block.split('\n').some((line) => bare(line).startsWith(`${key}.`) || bare(line).startsWith(`${key}=`));
+  });
+  return picked.length === 0 ? 'absent' : sha256(picked.map((b) => b.text).join(''));
 }
 
 export function resolvePointer(value: unknown, pointer: string): unknown {
